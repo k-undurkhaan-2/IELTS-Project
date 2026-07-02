@@ -933,7 +933,11 @@ function createAuthRouter(options = {}) {
             if (!passwordOk) {
                 return res.status(401).json({ error: 'Current password is incorrect' });
             }
-            if (totpEnabled && !(await ensureTotpFreshForAuthAction(req, res, totpStore, currentUser))) {
+            if (
+                totpEnabled
+                && context.state.intent === 'password-change'
+                && !(await ensureTotpFreshForAuthAction(req, res, totpStore, currentUser))
+            ) {
                 return;
             }
             const marker = markAuthActionStepUp(req, currentUser, context.state, parsed.data.authState);

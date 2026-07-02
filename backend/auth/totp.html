@@ -18,6 +18,14 @@
 
                 <section id="totp-summary" class="totp-summary" hidden></section>
 
+                <form id="totp-step-up-form" class="totp-form" hidden>
+                    <label>
+                        <span>Current password</span>
+                        <input id="totp-step-up-password" name="currentPassword" type="password" autocomplete="current-password" required />
+                    </label>
+                    <button id="totp-step-up-submit" type="submit">Continue</button>
+                </form>
+
                 <section id="totp-setup-panel" class="totp-setup" hidden>
                     <p>Scan the QR code with your authenticator, then enter the current code.</p>
                     <img id="totp-qr" alt="TOTP QR code" />

@@ -3057,8 +3057,10 @@ test('admin dashboard redirects anonymous users through auth handoff', async () 
         const authTotpScript = await client.request('GET', '/auth/totp.js');
         assert.equal(authTotpScript.response.status, 200);
         assert.match(authTotpScript.text, /\/api\/auth\/totp\/status/);
+        assert.match(authTotpScript.text, /\/api\/auth\/action-step-up/);
         assert.match(authTotpScript.text, /replace\(\/\\s\+\/g/);
-        assert.match(authTotpScript.text, /await startSetup\(\)/);
+        assert.match(authTotpScript.text, /Confirm your current password before managing two-factor authentication/);
+        assert.doesNotMatch(authTotpScript.text, /if \(!status\.enabled\)\s*\{\s*await startSetup\(\)/);
         assert.doesNotMatch(authTotpScript.text, /\/api\/auth\/totp\/disable/);
 
         const authTotpPageSource = await client.request('GET', '/auth/totp?state=invalid', undefined, {

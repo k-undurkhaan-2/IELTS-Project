@@ -2,12 +2,18 @@
     const params = new URLSearchParams(window.location.search || '');
     const authState = params.get('state') || '';
     const state = {
-        csrfToken: ''
+        csrfToken: '',
+        stepUpVerified: false,
+        stepUpExpiresAt: 0,
+        totpEnabled: false
     };
 
     const nodes = {
         status: document.getElementById('totp-status'),
         summary: document.getElementById('totp-summary'),
+        stepUpForm: document.getElementById('totp-step-up-form'),
+        stepUpPassword: document.getElementById('totp-step-up-password'),
+        stepUpSubmit: document.getElementById('totp-step-up-submit'),
         setupPanel: document.getElementById('totp-setup-panel'),
         setupQr: document.getElementById('totp-qr'),
         setupSecret: document.getElementById('totp-secret'),
@@ -52,6 +58,12 @@
 
     function setVisible(node, visible) {
         node.hidden = !visible;
+    }
+
+    function isStepUpFresh() {
+        return state.stepUpVerified
+            && Number.isFinite(state.stepUpExpiresAt)
+            && state.stepUpExpiresAt > Date.now();
     }
 
     function normalizeQrDataUrl(value) {
@@ -116,21 +128,31 @@
     async function renderStatus() {
         const payload = await request('/api/auth/totp/status');
         const status = payload.status || {};
+        state.totpEnabled = Boolean(status.enabled);
+        const canManage = isStepUpFresh();
         setVisible(nodes.summary, true);
         nodes.summary.textContent = status.enabled
             ? `TOTP is enabled. Recovery codes remaining: ${Number(status.recoveryCodesRemaining || 0)}.`
             : 'TOTP is not enabled for this account.';
-        setVisible(nodes.startSetup, !status.enabled);
-        setVisible(nodes.recoveryForm, Boolean(status.enabled));
+        setVisible(nodes.stepUpForm, !canManage);
+        setVisible(nodes.startSetup, !status.enabled && canManage);
+        setVisible(nodes.recoveryForm, Boolean(status.enabled) && canManage);
         setVisible(nodes.setupPanel, false);
         setVisible(nodes.recoveryCodes, false);
-        setStatus(status.enabled
-            ? 'Use your current TOTP or recovery code to generate a fresh recovery-code set.'
-            : 'Enable TOTP to add a second authentication factor.');
+        setStatus(canManage
+            ? (status.enabled
+                ? 'Use your current TOTP or recovery code to generate a fresh recovery-code set.'
+                : 'Enable TOTP to add a second authentication factor.')
+            : 'Confirm your current password before managing two-factor authentication.');
         return status;
     }
 
     async function startSetup() {
+        if (!isStepUpFresh()) {
+            setStatus('Confirm your current password before starting TOTP setup.', 'error');
+            setVisible(nodes.stepUpForm, true);
+            return;
+        }
         nodes.startSetup.disabled = true;
         setStatus('Preparing TOTP setup...');
         try {
@@ -186,6 +208,11 @@
 
     async function submitRecovery(event) {
         event.preventDefault();
+        if (!isStepUpFresh()) {
+            setStatus('Confirm your current password before generating recovery codes.', 'error');
+            setVisible(nodes.stepUpForm, true);
+            return;
+        }
         nodes.recoverySubmit.disabled = true;
         setStatus('Generating recovery codes...');
         try {
@@ -205,6 +232,37 @@
         }
     }
 
+    async function submitStepUp(event) {
+        event.preventDefault();
+        nodes.stepUpSubmit.disabled = true;
+        setStatus('Confirming recent authentication...');
+        try {
+            const payload = await request('/api/auth/action-step-up', {
+                method: 'POST',
+                body: {
+                    authState,
+                    password: nodes.stepUpPassword.value
+                }
+            });
+            state.stepUpVerified = true;
+            state.stepUpExpiresAt = Number(payload.expiresAt || 0);
+            nodes.stepUpForm.reset();
+            setVisible(nodes.stepUpForm, false);
+            if (state.totpEnabled) {
+                await renderStatus();
+                setStatus('Confirmed. Use your current TOTP or recovery code to generate a fresh recovery-code set.', 'success');
+            } else {
+                await startSetup();
+            }
+        } catch (error) {
+            state.stepUpVerified = false;
+            state.stepUpExpiresAt = 0;
+            setStatus(error.message || 'Recent authentication failed.', 'error');
+        } finally {
+            nodes.stepUpSubmit.disabled = false;
+        }
+    }
+
     async function init() {
         if (!authState) {
             throw new Error('Valid auth action state is required.');
@@ -212,7 +270,8 @@
         configureBackLink();
         await loadCsrf();
         await request('/api/auth/me');
-        const status = await renderStatus();
+        await renderStatus();
+        nodes.stepUpForm.addEventListener('submit', submitStepUp);
         nodes.startSetup.addEventListener('click', startSetup);
         nodes.setupQr.addEventListener('error', () => {
             nodes.setupQr.hidden = true;
@@ -220,9 +279,6 @@
         });
         nodes.setupForm.addEventListener('submit', submitSetup);
         nodes.recoveryForm.addEventListener('submit', submitRecovery);
-        if (!status.enabled) {
-            await startSetup();
-        }
     }
 
     init().catch((error) => setStatus(error.message || 'TOTP page failed to initialize.', 'error'));
