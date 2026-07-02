@@ -1,6 +1,6 @@
 # IELTS Practice Repository Threat Model
 
-Generated: 2026-07-01
+Generated: 2026-07-02
 
 This document is the current repository-local threat model for the IELTS Practice deployment work. It is intended to guide future security fixes and reviews across unrelated changes. It does not contain `.env` values, bridge lines, client authorization contents, hidden service private keys, database dumps, or other secrets.
 
@@ -14,11 +14,11 @@ The current production architecture separates three public entrypoints:
 - Admin onion: `admin-tor -> admin-proxy -> app:3000`, with Tor v3 client authorization
 - Auth onion: `auth-tor -> auth-proxy -> app:3000`
 
-Business and admin do not directly host password login forms. They start an auth handoff flow through the auth onion. The auth service authenticates the user, creates a short-lived one-time handoff ticket, and the target entrypoint redeems it to create a local Express session. The app uses server-side `express-session` backed by PostgreSQL and a companion HttpOnly verifier cookie, `ielts.sv`, to reduce copied-cookie replay risk when only `ielts.sid` is stolen. Sensitive successful mutations rotate the verifier.
+Business and admin do not directly host password login forms. They start an auth handoff flow through the auth onion. The auth service authenticates the user, creates a short-lived one-time handoff ticket, and the target entrypoint redeems it to create a local Express session. The app uses server-side `express-session` backed by PostgreSQL, a companion HttpOnly verifier cookie, `ielts.sv`, and a server-side auth session registry with audience binding and user security epochs. These controls reduce copied-cookie replay risk, reject wrong-audience session reuse, and invalidate copied full cookie jars after selected security-sensitive account changes.
 
 Important assets include:
 
-- User accounts, password hashes, roles, and session state
+- User accounts, password hashes, roles, session registry rows, security epochs, and session state
 - TOTP secrets, recovery codes, TOTP verification state, and admin step-up state
 - Auth handoff signed state, one-time tickets, ticket verifier hashes, and public URL configuration
 - Practice records, answer history, duration/correctness metrics, analytics, and admin exports
@@ -60,22 +60,22 @@ Current assumptions:
 - Production split-onion deployments provide explicit `AUTH_PUBLIC_URL`, `BUSINESS_PUBLIC_URL`, and `ADMIN_PUBLIC_URL`; blank or inferred production URLs are unsafe.
 - Public URL construction must not derive callback origins from `Host` or `X-Forwarded-Host`.
 - Admin onion client authorization protects network-level access to admin UI, but backend role/TOTP checks remain mandatory because client auth is not a substitute for application authorization.
-- `ielts.sid` and `ielts.sv` together are still bearer-like credentials. The current verifier design narrows partial-cookie replay and rotates after selected sensitive mutations, but a copied full cookie jar remains a residual risk until a stronger session registry/security-epoch design is implemented.
+- `ielts.sid` and `ielts.sv` together are still bearer-like credentials. The current verifier, auth session registry, audience binding, and security epoch design narrow partial-cookie replay and reduce copied full-cookie-jar replay windows, but a copied complete cookie jar can still be used until logout, registry revocation, expiration, verifier rotation, or a security epoch bump invalidates it.
 - Operator-managed secrets and backups are out of source control and must not be printed in logs, terminal output, docs, commits, or support transcripts.
 
 ## Attack Surface, Mitigations, and Attacker Stories
 
 Authentication and session management are centered in `backend/src/auth.js`, `backend/src/authHandoff.js`, `backend/src/totp.js`, and session middleware in `backend/src/app.js`. Relevant attacker stories include credential stuffing, CSRF, login CSRF, TOTP replay, auth handoff ticket reuse, poisoned callback origins, copied-cookie replay, and account-type confusion between business and admin flows.
 
-Existing mitigations include bcrypt password hashing, password validation, session regeneration on login/register/account-sensitive changes, CSRF tokens for mutations, signed auth handoff state, one-time ticket storage with hashed tokens, audience and return-path checks, public URL validation, exact proxy audience headers, TOTP verification and replay controls, and the HttpOnly `ielts.sv` verifier cookie. Sensitive TOTP and admin mutations rotate `ielts.sv`.
+Existing mitigations include bcrypt password hashing, password validation, session regeneration on login/register/account-sensitive changes, CSRF tokens for mutations, signed auth handoff state, one-time ticket storage with hashed tokens, audience and return-path checks, public URL validation, exact proxy audience headers, TOTP verification and replay controls, the HttpOnly `ielts.sv` verifier cookie, server-side auth session handles, audience-bound session validation, and user security epochs. Sensitive TOTP, password, account, and admin mutations rotate or invalidate session state as appropriate.
 
 Authorization is centered in `backend/src/admin.js`, `backend/src/practiceRecords.js`, `backend/src/app.js`, and the proxy allowlists. Relevant attacker stories include normal users reaching `/api/admin/*`, admins bypassing TOTP, users reading or deleting another user's records, business onion exposing admin routes, auth onion exposing account-management or practice APIs, and role confusion during auth handoff.
 
-Existing mitigations include `requireAuth`, `requireAdmin`, `requireAdminTotp`, user-scoped SQL predicates, admin route blocking at business/auth proxies, admin-proxy allowlisting, auth-proxy blocking of account-management API exposure, last-admin protection, role checks during handoff, and backend regression tests around these route boundaries.
+Existing mitigations include `requireAuth`, `requireAdmin`, `requireAdminTotp`, user-scoped SQL predicates, admin route blocking at business/auth proxies, business-proxy allowlist/default-deny routing, admin-proxy allowlisting, auth-proxy blocking of account-management API exposure, last-admin protection, role checks during handoff, business-flow admin-username oracle hardening, and backend regression tests around these route boundaries.
 
 Static file and practice content serving are attack surfaces because exam assets, generated JS, listening pages, and templates are loaded by URL. Relevant attacker stories include direct unauthenticated access to generated exam assets, URL guessing, path traversal, serving dotfiles/secrets, symlink escape, or using legacy listening pages to bypass auth.
 
-Existing mitigations include authenticated wrappers for protected reading/listening routes, resource URL guards, manifest-based listening route resolution, static boundary middleware, dotfile and null-byte denial, realpath containment checks, and route tests that unauthenticated protected content returns an auth error rather than serving the exercise.
+Existing mitigations include authenticated wrappers for protected reading/listening routes, resource URL guards, manifest-based listening route resolution, shortened practice URLs, root `view` query allowlisting, unified app-level HTML 404 responses for page-level retired/invalid routes, static boundary middleware, dotfile and null-byte denial, realpath containment checks, and route tests that unauthenticated protected content returns an auth error rather than serving the exercise.
 
 Frontend/browser surfaces include localStorage preferences, data import/export, admin/business UI state, timers, postMessage bridges, generated exam assets, and copied browser storage. Relevant attacker stories include XSS through imported data or generated content, malicious `postMessage` payloads, corrupt backup import, open external links, and URL route manipulation.
 
@@ -125,4 +125,4 @@ Low findings:
 - Cosmetic UI/security-copy inconsistencies that do not affect route guards, auth flow, or data exposure.
 - Stale generated or test-only assets that are not reachable in production and do not contain secrets.
 
-Future security work should prioritize the remaining bearer-like full-cookie-jar replay risk. The recommended next design direction is a server-side session registry with active/revoked session state, audience binding, and user security epochs, followed by admin step-up freshness for high-risk operations. This should be done before larger proof-of-possession or client-bound cryptographic designs.
+Future security work should treat full-cookie-jar replay as a residual bearer-credential risk rather than an unmitigated session-store issue. The recommended next design direction is operational session management and freshness: expose user/admin session revocation controls, consider admin step-up freshness for high-risk operations, and add targeted regression tests around auth/business/admin proxy surfaces. Larger proof-of-possession or cryptographically client-bound session designs remain possible later, but they are higher-risk changes and should not be started without a focused design pass.
