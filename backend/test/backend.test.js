@@ -3558,6 +3558,27 @@ test('business settings password and TOTP actions require scoped auth state', as
         });
         assert.equal(wrongUserPasswordPage.response.status, 403);
 
+        const crossUserStepUp = await otherAuthSession.request('POST', '/api/auth/action-step-up', {
+            authState: passwordState,
+            password: 'StrongPass1'
+        }, { headers: authHeaders });
+        assert.equal(crossUserStepUp.response.status, 403);
+
+        const wrongStepUpPassword = await authSession.request('POST', '/api/auth/action-step-up', {
+            authState: passwordState,
+            password: 'WrongPass1'
+        }, { headers: authHeaders });
+        assert.equal(wrongStepUpPassword.response.status, 401);
+
+        const passwordStepUp = await authSession.request('POST', '/api/auth/action-step-up', {
+            authState: passwordState,
+            password: 'StrongPass1'
+        }, { headers: authHeaders });
+        assert.equal(passwordStepUp.response.status, 200);
+        assert.equal(passwordStepUp.json.ok, true);
+        assert.equal(passwordStepUp.json.intent, 'password-change');
+        assert(Number.isSafeInteger(passwordStepUp.json.expiresAt));
+
         const totpStart = await businessSession.request('GET', '/auth/business/totp/start?return_to=/settings', undefined, {
             redirect: 'manual',
             headers: businessHeaders
@@ -3574,6 +3595,14 @@ test('business settings password and TOTP actions require scoped auth state', as
         });
         assert.equal(totpPage.response.status, 200);
         assert.match(totpPage.text, /Two-factor authentication/);
+
+        const totpStepUp = await authSession.request('POST', '/api/auth/action-step-up', {
+            authState: totpState,
+            password: 'StrongPass1'
+        }, { headers: authHeaders });
+        assert.equal(totpStepUp.response.status, 200);
+        assert.equal(totpStepUp.json.ok, true);
+        assert.equal(totpStepUp.json.intent, 'totp-manage');
 
         const wrongCurrentPassword = await authSession.request('PATCH', '/api/auth/password-change', {
             authState: passwordState,

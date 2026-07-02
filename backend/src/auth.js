@@ -9,6 +9,8 @@ const DUMMY_PASSWORD_HASH = '$2a$12$OOrmAQgyb0OR42FfRf/D6.GOTtaUGKbmYgyZT2MoQOJM
 const MAX_MEMORY_SESSION_JSON_LENGTH = 256 * 1024;
 const MAX_BCRYPT_PASSWORD_BYTES = 72;
 const MAX_RATE_LIMIT_KEY_LENGTH = 256;
+const AUTH_ACTION_STEP_UP_MAX_AGE_MS = 5 * 60 * 1000;
+const AUTH_ACTION_STEP_UP_ALLOWED_INTENTS = new Set(['password-change', 'totp-manage']);
 
 const credentialsSchema = z.object({
     username: z.string().trim().min(3).max(32).regex(USERNAME_PATTERN),
@@ -31,6 +33,11 @@ const updatePasswordSchema = z.object({
 
 const passwordChangeSchema = updatePasswordSchema.extend({
     authState: z.string().trim().min(1).max(4096)
+});
+
+const authActionStepUpSchema = z.object({
+    authState: z.string().trim().min(1).max(4096),
+    password: z.string().min(1).max(128)
 });
 
 const deleteAccountSchema = z.object({
@@ -296,6 +303,18 @@ function resolveAuthRequestAudience(req, resolveAuthState) {
 }
 
 async function resolveBusinessAccountActionUser(req, res, store, resolveAuthState, rawState, expectedIntent) {
+    const context = await resolveBusinessAccountActionContext(
+        req,
+        res,
+        store,
+        resolveAuthState,
+        rawState,
+        expectedIntent
+    );
+    return context?.user || null;
+}
+
+async function resolveBusinessAccountActionContext(req, res, store, resolveAuthState, rawState, expectedIntent = '') {
     if (!req.session?.user) {
         res.status(401).json({ error: 'Authentication required' });
         return null;
@@ -305,9 +324,12 @@ async function resolveBusinessAccountActionUser(req, res, store, resolveAuthStat
         return null;
     }
     const state = resolveAuthState(rawState);
+    const intentMatches = expectedIntent
+        ? state?.intent === expectedIntent
+        : AUTH_ACTION_STEP_UP_ALLOWED_INTENTS.has(state?.intent);
     if (!state
         || state.audience !== 'business'
-        || state.intent !== expectedIntent
+        || !intentMatches
         || state.userId !== req.session.user.id) {
         res.status(403).json({ error: 'Valid auth action state is required' });
         return null;
@@ -326,7 +348,78 @@ async function resolveBusinessAccountActionUser(req, res, store, resolveAuthStat
         res.status(403).json({ error: 'Valid auth action state is required' });
         return null;
     }
-    return currentUser;
+    return { user: currentUser, state };
+}
+
+function hashAuthActionState(rawState) {
+    return crypto.createHash('sha256').update(String(rawState || ''), 'utf8').digest('base64url');
+}
+
+function getFreshAuthActionStepUp(req, currentUser, state, rawState, maxAgeMs = AUTH_ACTION_STEP_UP_MAX_AGE_MS) {
+    const marker = req.session?.authActionStepUp;
+    const verifiedAt = Number(marker?.verifiedAt);
+    const markerAge = Date.now() - verifiedAt;
+    if (
+        marker?.userId === currentUser?.id
+        && marker?.audience === 'business'
+        && marker?.intent === state?.intent
+        && marker?.stateHash === hashAuthActionState(rawState)
+        && marker?.securityEpoch === getUserSecurityEpoch(currentUser)
+        && Number.isFinite(verifiedAt)
+        && verifiedAt > 0
+        && markerAge >= 0
+        && markerAge <= maxAgeMs
+    ) {
+        return marker;
+    }
+    return null;
+}
+
+function markAuthActionStepUp(req, currentUser, state, rawState, verifiedAt = Date.now()) {
+    if (!req.session || !currentUser?.id || !state?.intent) {
+        return null;
+    }
+    req.session.authActionStepUp = {
+        userId: currentUser.id,
+        audience: 'business',
+        intent: state.intent,
+        stateHash: hashAuthActionState(rawState),
+        securityEpoch: getUserSecurityEpoch(currentUser),
+        verifiedAt
+    };
+    return req.session.authActionStepUp;
+}
+
+function clearAuthActionStepUp(req) {
+    if (req.session?.authActionStepUp) {
+        delete req.session.authActionStepUp;
+    }
+}
+
+async function ensureTotpFreshForAuthAction(req, res, totpStore, currentUser) {
+    if (!totpStore || typeof totpStore.getStatus !== 'function') {
+        return true;
+    }
+    const status = await totpStore.getStatus(currentUser.id);
+    if (!status.enabled) {
+        return true;
+    }
+    const marker = getSessionTotpVerificationMarker(req, currentUser);
+    const verifiedAt = Number(marker?.verifiedAt);
+    const markerAge = Date.now() - verifiedAt;
+    if (
+        marker
+        && Number.isFinite(verifiedAt)
+        && markerAge >= 0
+        && markerAge <= AUTH_ACTION_STEP_UP_MAX_AGE_MS
+    ) {
+        return true;
+    }
+    res.status(403).json({
+        error: 'Recent TOTP verification required',
+        requiresTotp: true
+    });
+    return false;
 }
 
 function rejectUserForAudience(res, user, audience) {
@@ -814,6 +907,47 @@ function createAuthRouter(options = {}) {
         }
     });
 
+    router.post('/action-step-up', requireAuth, verifyCsrfToken, async (req, res, next) => {
+        try {
+            const parsed = authActionStepUpSchema.safeParse(req.body || {});
+            if (!parsed.success) {
+                return sendValidationError(res, parsed, 'Invalid auth action step-up payload');
+            }
+            const context = await resolveBusinessAccountActionContext(
+                req,
+                res,
+                store,
+                resolveAuthState,
+                parsed.data.authState
+            );
+            if (!context) {
+                return;
+            }
+            const currentUser = context.user;
+            const clientIp = getCanonicalClientIp(req);
+            checkRateLimit(`auth-action-step-up:${clientIp}:${currentUser.id}:${context.state.intent}`);
+            if (!isPasswordWithinBcryptByteLimit(parsed.data.password)) {
+                return res.status(401).json({ error: 'Current password is incorrect' });
+            }
+            const passwordOk = await bcryptImpl.compare(parsed.data.password, currentUser.password_hash);
+            if (!passwordOk) {
+                return res.status(401).json({ error: 'Current password is incorrect' });
+            }
+            if (totpEnabled && !(await ensureTotpFreshForAuthAction(req, res, totpStore, currentUser))) {
+                return;
+            }
+            const marker = markAuthActionStepUp(req, currentUser, context.state, parsed.data.authState);
+            return res.json({
+                ok: true,
+                intent: context.state.intent,
+                expiresAt: marker.verifiedAt + AUTH_ACTION_STEP_UP_MAX_AGE_MS,
+                csrfToken: ensureCsrfToken(req)
+            });
+        } catch (error) {
+            return next(error);
+        }
+    });
+
     router.patch('/account/username', requireAuth, verifyCsrfToken, async (req, res, next) => {
         try {
             const parsed = updateUsernameSchema.safeParse(req.body || {});
@@ -929,7 +1063,7 @@ function createAuthRouter(options = {}) {
             if (!parsed.success) {
                 return sendValidationError(res, parsed, 'Invalid password update payload');
             }
-            const currentUser = await resolveBusinessAccountActionUser(
+            const context = await resolveBusinessAccountActionContext(
                 req,
                 res,
                 store,
@@ -937,9 +1071,10 @@ function createAuthRouter(options = {}) {
                 parsed.data.authState,
                 'password-change'
             );
-            if (!currentUser) {
+            if (!context) {
                 return;
             }
+            const currentUser = context.user;
             const clientIp = getCanonicalClientIp(req);
             checkRateLimit(`account-password:${clientIp}:${req.session.user.id}`);
             if (!isPasswordWithinBcryptByteLimit(parsed.data.currentPassword)) {
@@ -948,6 +1083,12 @@ function createAuthRouter(options = {}) {
             const passwordOk = await bcryptImpl.compare(parsed.data.currentPassword, currentUser.password_hash);
             if (!passwordOk) {
                 return res.status(401).json({ error: 'Current password is incorrect' });
+            }
+            if (totpEnabled && !(await ensureTotpFreshForAuthAction(req, res, totpStore, currentUser))) {
+                return;
+            }
+            if (!getFreshAuthActionStepUp(req, currentUser, context.state, parsed.data.authState)) {
+                markAuthActionStepUp(req, currentUser, context.state, parsed.data.authState);
             }
             const passwordCheck = validatePasswordStrength(parsed.data.newPassword);
             if (!passwordCheck.valid) {
@@ -969,6 +1110,7 @@ function createAuthRouter(options = {}) {
             }
             await revokeAllRequestAuthSessionsForUser(req, currentUser.id);
             await revokeRequestAuthSession(req);
+            clearAuthActionStepUp(req);
             await destroySession(req);
             clearSessionCookies(res);
             return res.json({ ok: true, signedOut: true, user: publicUser(updatedUser) });
