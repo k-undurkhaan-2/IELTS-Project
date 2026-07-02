@@ -3046,6 +3046,8 @@ test('admin shell and business account menu do not link back through the busines
     assert(!adminProxyConfig.includes('location = /auth/business/start'));
     assert(!adminProxyConfig.includes('location = /api/auth/login'));
     assert(businessProxyConfig.includes('location = /auth/business/start'));
+    assert(businessProxyConfig.includes('location = /auth/business/password/start'));
+    assert(businessProxyConfig.includes('location = /auth/business/totp/start'));
     assert(businessProxyConfig.includes('location = /auth/business/callback'));
     assert(businessProxyConfig.includes('location = /auth/business/logout'));
     assert(businessProxyConfig.includes('location = /auth/admin/callback'));
@@ -3060,12 +3062,45 @@ test('admin shell and business account menu do not link back through the busines
     assert(!businessProxyConfig.includes('proxy_set_header X-Forwarded-Proto $scheme;'));
     assert(!businessProxyConfig.includes('location = /auth/admin/start'));
     assert(!businessProxyConfig.includes('location = /auth/business/account'));
-    assert(businessProxyConfig.includes('location = /api/auth/login { return 404; }'));
+    assert(businessProxyConfig.includes('location ~* ^/(api/admin|admin|internal|debug|metrics)(/|$) { return 404; }'));
+    assert(businessProxyConfig.includes('location ~* ^/api/auth/(login|register|totp|account)(/|$) { return 404; }'));
+    assert(businessProxyConfig.includes('location ~* ^/auth/(admin|password|totp|account)(/|$) { return 404; }'));
     assert(businessProxyConfig.includes('location = /auth/login { return 302 /auth/business/start?return_to=/; }'));
-    assert(businessProxyConfig.includes('location ^~ /api/auth/totp/ { return 404; }'));
+    assert(businessProxyConfig.includes('location = /api/auth/csrf { proxy_pass http://ielts_app; }'));
+    assert(businessProxyConfig.includes('location = /api/auth/me { proxy_pass http://ielts_app; }'));
+    assert(businessProxyConfig.includes('location = /api/auth/logout { proxy_pass http://ielts_app; }'));
+    assert(businessProxyConfig.includes('location ^~ /api/practice-records { proxy_pass http://ielts_app; }'));
+    assert(businessProxyConfig.includes('location ^~ /assets/generated/ { proxy_pass http://ielts_app; }'));
+    assert(businessProxyConfig.includes('location ^~ /practice/ { proxy_pass http://ielts_app; }'));
+    assert(businessProxyConfig.includes('location ^~ /ListeningPractice/ { proxy_pass http://ielts_app; }'));
+    assert(businessProxyConfig.includes('location / { return 404; }'));
+    const businessProxyDenyRules = [
+        /^\/(api\/admin|admin|internal|debug|metrics)(\/|$)/i,
+        /^\/api\/auth\/(login|register|totp|account)(\/|$)/i,
+        /^\/auth\/(admin|password|totp|account)(\/|$)/i
+    ];
+    const businessProxyBypassPaths = [
+        '/API/ADMIN',
+        '/ADMIN',
+        '/api/auth/login/',
+        '/API/AUTH/LOGIN',
+        '/API/AUTH/TOTP/SETUP'
+    ];
+    for (const requestPath of businessProxyBypassPaths) {
+        assert(
+            businessProxyDenyRules.some((rule) => rule.test(requestPath)),
+            `business-proxy deny rules should match ${requestPath}`
+        );
+    }
     assert(authProxyConfig.includes('location = /auth/login'));
     assert(authProxyConfig.includes('location = /auth/business/login'));
     assert(authProxyConfig.includes('location = /auth/admin/login'));
+    assert(authProxyConfig.includes('location = /auth/password'));
+    assert(authProxyConfig.includes('location = /auth/password.js'));
+    assert(authProxyConfig.includes('location = /auth/password.css'));
+    assert(authProxyConfig.includes('location = /auth/totp'));
+    assert(authProxyConfig.includes('location = /auth/totp.js'));
+    assert(authProxyConfig.includes('location = /auth/totp.css'));
     assert(authProxyConfig.includes('location = /auth/complete'));
     assert(authProxyConfig.includes('location = /auth/business/logout'));
     assert(authProxyConfig.includes('location = /auth/admin/logout'));
@@ -3073,11 +3108,14 @@ test('admin shell and business account menu do not link back through the busines
     assert(!authProxyConfig.includes('location = /auth/account/'));
     assert(!authProxyConfig.includes('location = /auth/account.js'));
     assert(!authProxyConfig.includes('location = /auth/account.css'));
+    assert(authProxyConfig.includes('location = /api/auth/password-change { proxy_pass http://ielts_app; }'));
+    assert(!authProxyConfig.includes('location = /api/auth/account/password { proxy_pass http://ielts_app; }'));
     assert(authProxyConfig.includes('location = /api/auth/account { return 404; }'));
     assert(authProxyConfig.includes('location ^~ /api/auth/account/ { return 404; }'));
     assert(authProxyConfig.includes('location = /api/auth/totp/disable { return 404; }'));
     assert(authProxyConfig.includes('location ^~ /api/auth/ { proxy_pass http://ielts_app; }'));
     const authApiAllowIndex = authProxyConfig.indexOf('location ^~ /api/auth/ { proxy_pass http://ielts_app; }');
+    assert(authProxyConfig.indexOf('location = /api/auth/password-change { proxy_pass http://ielts_app; }') < authApiAllowIndex);
     assert(authProxyConfig.indexOf('location = /api/auth/account { return 404; }') < authApiAllowIndex);
     assert(authProxyConfig.indexOf('location ^~ /api/auth/account/ { return 404; }') < authApiAllowIndex);
     assert(authProxyConfig.indexOf('location = /api/auth/totp/disable { return 404; }') < authApiAllowIndex);
