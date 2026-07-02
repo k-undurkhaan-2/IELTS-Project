@@ -43,13 +43,18 @@ If only app code or static assets changed:
 
 1. Back up changed target files.
 2. Build/load `backend-app:latest`.
-3. Recreate only `app`.
+3. Recreate only `app` with `--no-build`.
 4. Verify:
    - `curl -s http://127.0.0.1:3000/api/health`
    - onion hostnames unchanged
    - host ports still only `127.0.0.1:3000`
 
 Proxy/Tor recreation is not required for app-only changes.
+
+Use `--no-build` for target-host app recreates after loading an exported
+`backend-app:latest` image. The compose graph still contains a `build:` entry
+for development, and omitting `--no-build` can make the target host attempt a
+slow or failing rebuild instead of using the already loaded image.
 
 ## Legacy Base Tor Service
 

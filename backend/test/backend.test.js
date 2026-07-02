@@ -41,6 +41,7 @@ test('docker image hardening excludes secrets and runs app as non-root', () => {
     const smokePostgres = fs.readFileSync(path.join(repoRoot, 'backend', 'scripts', 'smoke-postgres.mjs'), 'utf8');
     const backendPackage = JSON.parse(fs.readFileSync(path.join(repoRoot, 'backend', 'package.json'), 'utf8'));
     const composeProfileCheck = fs.readFileSync(path.join(repoRoot, 'backend', 'scripts', 'check-compose-profiles.mjs'), 'utf8');
+    const deploymentRunbook = fs.readFileSync(path.join(repoRoot, 'backend', 'DEPLOYMENT-RUNBOOK.md'), 'utf8');
 
     assert.match(dockerfile, /^FROM node:24-alpine/m);
     assert.doesNotMatch(dockerfile, /^FROM node:20-alpine/m);
@@ -138,6 +139,8 @@ test('docker image hardening excludes secrets and runs app as non-root', () => {
     assert(composeProfileCheck.includes("assertServiceState(defaultServices, 'tor', false"));
     assert(composeProfileCheck.includes("assertServiceState(legacyServices, 'tor', true"));
     assert(!composeProfileCheck.includes("'up'"));
+    assert(deploymentRunbook.includes('Recreate only `app` with `--no-build`.'));
+    assert(deploymentRunbook.includes('omitting `--no-build` can make the target host attempt'));
     assert(!composeProfileCheck.includes("'run'"));
     assert(!/obfs4\s+\S+\s+[A-Fa-f0-9]{40}\s+cert=/.test(bridgesTemplate));
     assert(bridgesTemplate.includes('encrypt the private bridge'));
