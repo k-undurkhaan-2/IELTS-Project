@@ -30,6 +30,9 @@
         metricScore: document.getElementById('metric-score'),
         metricAccuracy: document.getElementById('metric-accuracy'),
         metricDuration: document.getElementById('metric-duration'),
+        sessionsRefreshButton: document.getElementById('sessions-refresh-button'),
+        sessionsRevokeOthersButton: document.getElementById('sessions-revoke-others-button'),
+        sessionsList: document.getElementById('sessions-list'),
         recordsRange: document.getElementById('records-range'),
         recordsBody: document.getElementById('records-body')
     };
@@ -186,6 +189,13 @@
         return `${formatNumber(number, 1)} min`;
     }
 
+    function formatSessionAudience(value) {
+        const text = String(value || '').trim().toLowerCase();
+        if (text === 'admin') return 'Admin';
+        if (text === 'auth') return 'Auth';
+        return 'Business';
+    }
+
     function formatRecordTitle(record) {
         return record.title || record.payload?.title || record.examId || record.id || 'Untitled practice';
     }
@@ -251,29 +261,127 @@
         }
     }
 
+    function setSessionsMessage(message) {
+        if (!nodes.sessionsList) return;
+        nodes.sessionsList.textContent = '';
+        const empty = document.createElement('p');
+        empty.className = 'sessions-empty';
+        empty.textContent = message;
+        nodes.sessionsList.append(empty);
+    }
+
+    function renderSessions(payload) {
+        if (!nodes.sessionsList) return;
+        const sessions = Array.isArray(payload.sessions) ? payload.sessions : [];
+        nodes.sessionsList.textContent = '';
+        if (!sessions.length) {
+            setSessionsMessage('No active sessions found.');
+            return;
+        }
+        for (const session of sessions) {
+            const card = document.createElement('article');
+            card.className = 'session-card';
+            card.setAttribute('role', 'listitem');
+
+            const body = document.createElement('div');
+            body.className = 'session-card__body';
+            const title = document.createElement('strong');
+            title.textContent = session.deviceLabel || 'Signed-in browser';
+            const meta = document.createElement('div');
+            meta.className = 'session-card__meta';
+            const audience = document.createElement('span');
+            audience.textContent = formatSessionAudience(session.audience);
+            const lastSeen = document.createElement('span');
+            lastSeen.textContent = `Last seen ${formatDate(session.lastSeenAt || session.createdAt)}`;
+            const expires = document.createElement('span');
+            expires.textContent = `Expires ${formatDate(session.expiresAt)}`;
+            meta.append(audience, lastSeen, expires);
+            if (session.current) {
+                const current = document.createElement('span');
+                current.className = 'session-card__current';
+                current.textContent = 'Current admin session';
+                meta.append(current);
+            }
+            body.append(title, meta);
+
+            const revoke = document.createElement('button');
+            revoke.type = 'button';
+            revoke.className = 'session-card__revoke';
+            revoke.textContent = session.current ? 'Current session' : 'Revoke session';
+            revoke.disabled = Boolean(session.current || !session.id);
+            revoke.addEventListener('click', () => {
+                revokeSession(session.id).catch((error) => setStatus(error.message, 'error'));
+            });
+
+            card.append(body, revoke);
+            nodes.sessionsList.append(card);
+        }
+    }
+
+    function setSessionControlsDisabled(disabled) {
+        if (nodes.sessionsRefreshButton) {
+            nodes.sessionsRefreshButton.disabled = disabled;
+        }
+        if (nodes.sessionsRevokeOthersButton) {
+            nodes.sessionsRevokeOthersButton.disabled = disabled;
+        }
+    }
+
+    async function revokeSession(sessionId) {
+        const normalizedId = String(sessionId || '');
+        if (!normalizedId) return;
+        if (typeof window.confirm === 'function' && !window.confirm('Revoke this user session?')) {
+            return;
+        }
+        await request(`/api/admin/users/${encodeURIComponent(state.userId)}/sessions/${encodeURIComponent(normalizedId)}`, {
+            method: 'DELETE'
+        });
+        setStatus('Session revoked');
+        await loadAccount();
+    }
+
+    async function revokeOtherSessions() {
+        if (!state.userId) return;
+        if (typeof window.confirm === 'function' && !window.confirm('Revoke every other active session for this user?')) {
+            return;
+        }
+        await request(`/api/admin/users/${encodeURIComponent(state.userId)}/sessions/revoke-others`, {
+            method: 'POST',
+            body: {}
+        });
+        setStatus('Other sessions revoked');
+        await loadAccount();
+    }
+
     async function loadAccount() {
         if (!state.userId) {
             setRecordsMessage('Select a user from the admin user list first.');
+            setSessionsMessage('Select a user from the admin user list first.');
             nodes.profileUsername.textContent = 'No user selected';
             setStatus('Missing user id', 'error');
             return;
         }
         state.loading = true;
         nodes.refreshButton.disabled = true;
+        setSessionControlsDisabled(true);
         setRecordsMessage('Loading practice records...');
+        setSessionsMessage('Loading active sessions...');
         try {
-            const [stats, records] = await Promise.all([
+            const [stats, records, sessions] = await Promise.all([
                 request(`/api/admin/users/${encodeURIComponent(state.userId)}/stats`, { csrf: false }),
-                request(`/api/admin/users/${encodeURIComponent(state.userId)}/practice-records?limit=${RECORD_LIMIT}&offset=0`, { csrf: false })
+                request(`/api/admin/users/${encodeURIComponent(state.userId)}/practice-records?limit=${RECORD_LIMIT}&offset=0`, { csrf: false }),
+                request(`/api/admin/users/${encodeURIComponent(state.userId)}/sessions`, { csrf: false })
             ]);
             renderUser(stats);
             renderRecords(records);
+            renderSessions(sessions);
             setStatus('Account data refreshed');
         } catch (error) {
             setStatus(error.message || 'Failed to load account data', 'error');
         } finally {
             state.loading = false;
             nodes.refreshButton.disabled = false;
+            setSessionControlsDisabled(false);
         }
     }
 
@@ -295,6 +403,20 @@
                 loadAccount();
             }
         });
+        if (nodes.sessionsRefreshButton) {
+            nodes.sessionsRefreshButton.addEventListener('click', () => {
+                if (!state.loading) {
+                    loadAccount();
+                }
+            });
+        }
+        if (nodes.sessionsRevokeOthersButton) {
+            nodes.sessionsRevokeOthersButton.addEventListener('click', () => {
+                if (!state.loading) {
+                    revokeOtherSessions().catch((error) => setStatus(error.message, 'error'));
+                }
+            });
+        }
         window.setInterval(() => {
             if (!state.loading && document.visibilityState === 'visible') {
                 loadAccount();

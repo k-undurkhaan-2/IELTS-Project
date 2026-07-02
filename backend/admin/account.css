@@ -132,6 +132,7 @@ h2 {
 
 .profile-panel,
 .metric-grid article,
+.sessions-panel,
 .records-panel,
 .status {
     border: 1px solid var(--border);
@@ -230,6 +231,85 @@ h2 {
     gap: 16px;
     border-bottom: 1px solid var(--border);
     padding: 16px;
+}
+
+.panel-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: flex-end;
+}
+
+.panel-actions button {
+    padding: 0 12px;
+    font-weight: 800;
+}
+
+.sessions-list {
+    display: grid;
+    gap: 10px;
+    padding: 16px;
+}
+
+.session-card {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--soft);
+    padding: 12px;
+}
+
+.session-card__body {
+    min-width: 0;
+}
+
+.session-card__body strong {
+    display: block;
+    overflow: hidden;
+    color: var(--text);
+    font-size: 15px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.session-card__meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 6px;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.session-card__meta span {
+    display: inline-flex;
+    align-items: center;
+    min-height: 24px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: #fff;
+    padding: 0 8px;
+}
+
+.session-card__current {
+    border-color: #bbf7d0 !important;
+    background: #f0fdf4 !important;
+    color: #166534;
+}
+
+.session-card__revoke {
+    min-width: 132px;
+    padding: 0 12px;
+    font-weight: 800;
+}
+
+.sessions-empty {
+    margin: 0;
+    color: var(--muted);
 }
 
 .records-table-wrap {
@@ -332,11 +412,17 @@ td span {
     }
 
     .account-actions,
+    .panel-actions,
     .metric-grid {
         grid-template-columns: 1fr;
     }
 
     .account-actions {
+        display: grid;
+    }
+
+    .panel-actions,
+    .session-card {
         display: grid;
     }
 }

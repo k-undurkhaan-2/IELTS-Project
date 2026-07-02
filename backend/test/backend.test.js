@@ -3187,11 +3187,16 @@ test('admin shell and business account menu do not link back through the busines
     assert(adminIndex.includes('open-account-center'));
     assert(adminAccountPage.includes('/admin/account.js'));
     assert(adminAccountPage.includes('/admin/account.css'));
+    assert(adminAccountPage.includes('id="sessions-list"'));
+    assert(adminAccountPage.includes('id="sessions-revoke-others-button"'));
     assert.doesNotMatch(adminAccountPage, /js\/bundles\//);
     assert(adminAccountScript.includes('/api/admin/users/'));
     assert(adminAccountScript.includes('/practice-records?limit='));
+    assert(adminAccountScript.includes('/sessions/revoke-others'));
+    assert(adminAccountScript.includes('/sessions/${encodeURIComponent(normalizedId)}'));
     assert(adminAccountScript.includes('/auth/admin/start?return_to=/admin/account'));
     assert(adminAccountScript.includes('/auth/admin/logout?return_to=/admin/account'));
+    assert.doesNotMatch(adminAccountScript, /session_handle_hash|user_agent_summary|ip_hash/);
     assert(adminProxyConfig.includes('location = /admin/account'));
     assert(adminProxyConfig.includes('location = /admin/account.js'));
     assert(adminProxyConfig.includes('location = /admin/account.css'));
@@ -4683,16 +4688,21 @@ test('admin can list users, inspect records, and delete one record', async () =>
         assert.equal(accountPage.response.status, 200);
         assert.match(accountPage.text, /Admin Account Center/);
         assert.match(accountPage.text, /\/admin\/account\.js/);
+        assert.match(accountPage.text, /id="sessions-list"/);
+        assert.match(accountPage.text, /id="sessions-revoke-others-button"/);
         assert.doesNotMatch(accountPage.text, /js\/bundles\//);
 
         const accountScript = await client.request('GET', '/admin/account.js');
         assert.equal(accountScript.response.status, 200);
         assert.match(accountScript.text, /\/api\/admin\/users\//);
         assert.match(accountScript.text, /practice-records\?limit=/);
+        assert.match(accountScript.text, /\/sessions\/revoke-others/);
+        assert.match(accountScript.text, /Revoke session/);
 
         const accountStyles = await client.request('GET', '/admin/account.css');
         assert.equal(accountStyles.response.status, 200);
         assert.match(accountStyles.text, /account-shell/);
+        assert.match(accountStyles.text, /session-card/);
 
         const summary = await client.request('GET', '/api/admin/summary');
         assert.equal(summary.response.status, 200);
