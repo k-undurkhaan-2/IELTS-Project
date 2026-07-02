@@ -3043,6 +3043,8 @@ test('admin dashboard redirects anonymous users through auth handoff', async () 
         const authPasswordScript = await client.request('GET', '/auth/password.js');
         assert.equal(authPasswordScript.response.status, 200);
         assert.match(authPasswordScript.text, /\/api\/auth\/password-change/);
+        assert.match(authPasswordScript.text, /\/api\/auth\/action-step-up/);
+        assert.match(authPasswordScript.text, /\/api\/auth\/totp\/verify/);
         assert.match(authPasswordScript.text, /configureBackLink/);
         assert.match(authPasswordScript.text, /Returning to the app in 3 seconds/);
         assert.match(authPasswordScript.text, /window\.location\.assign/);

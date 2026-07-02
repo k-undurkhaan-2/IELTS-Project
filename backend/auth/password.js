@@ -2,13 +2,16 @@
     const params = new URLSearchParams(window.location.search || '');
     const authState = params.get('state') || '';
     const state = {
-        csrfToken: ''
+        csrfToken: '',
+        totpEnabled: false
     };
 
     const nodes = {
         status: document.getElementById('password-status'),
         form: document.getElementById('password-form'),
         currentPassword: document.getElementById('current-password'),
+        totpRow: document.getElementById('password-totp-row'),
+        totpToken: document.getElementById('password-totp-token'),
         newPassword: document.getElementById('new-password'),
         submit: document.getElementById('password-submit'),
         backLink: document.getElementById('password-back-link')
@@ -97,6 +100,13 @@
         state.csrfToken = payload.csrfToken;
     }
 
+    async function loadTotpStatus() {
+        const payload = await request('/api/auth/totp/status');
+        state.totpEnabled = Boolean(payload?.status?.enabled);
+        nodes.totpRow.hidden = !state.totpEnabled;
+        nodes.totpToken.required = state.totpEnabled;
+    }
+
     async function init() {
         if (!authState) {
             throw new Error('Valid auth action state is required.');
@@ -104,19 +114,41 @@
         configureBackLink();
         await loadCsrf();
         await request('/api/auth/me');
+        await loadTotpStatus();
         nodes.form.hidden = false;
-        setStatus('Enter your current password and a new password.');
+        setStatus(state.totpEnabled
+            ? 'Enter your current password, current TOTP or recovery code, and a new password.'
+            : 'Enter your current password and a new password.');
 
         nodes.form.addEventListener('submit', async (event) => {
             event.preventDefault();
             nodes.submit.disabled = true;
-            setStatus('Updating password...');
+            setStatus('Confirming recent authentication...');
+            const currentPassword = nodes.currentPassword.value;
+            const totpToken = nodes.totpToken.value.trim();
             try {
+                if (state.totpEnabled) {
+                    if (!totpToken) {
+                        throw new Error('Enter your current TOTP or recovery code.');
+                    }
+                    await request('/api/auth/totp/verify', {
+                        method: 'POST',
+                        body: { token: totpToken }
+                    });
+                }
+                await request('/api/auth/action-step-up', {
+                    method: 'POST',
+                    body: {
+                        authState,
+                        password: currentPassword
+                    }
+                });
+                setStatus('Updating password...');
                 await request('/api/auth/password-change', {
                     method: 'PATCH',
                     body: {
                         authState,
-                        currentPassword: nodes.currentPassword.value,
+                        currentPassword,
                         newPassword: nodes.newPassword.value
                     }
                 });
