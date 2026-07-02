@@ -191,9 +191,20 @@
 
     function formatSessionAudience(value) {
         const text = String(value || '').trim().toLowerCase();
-        if (text === 'admin') return 'Admin';
+        if (text === 'admin') return 'Admin session';
         if (text === 'auth') return 'Authentication session';
-        return 'Business';
+        return 'Business session';
+    }
+
+    function getSessionRevokeConfirm(session) {
+        const audience = String(session?.audience || '').trim().toLowerCase();
+        if (audience === 'auth') {
+            return 'Revoke this authentication session? The user may need to sign in again before changing password, managing TOTP, or starting a new handoff.';
+        }
+        if (audience === 'admin') {
+            return 'Revoke this admin session?';
+        }
+        return 'Revoke this business session?';
     }
 
     function formatRecordTitle(record) {
@@ -310,7 +321,7 @@
             revoke.textContent = session.current ? 'Current session' : 'Revoke session';
             revoke.disabled = Boolean(session.current || !session.id);
             revoke.addEventListener('click', () => {
-                revokeSession(session.id).catch((error) => setStatus(error.message, 'error'));
+                revokeSession(session.id, session).catch((error) => setStatus(error.message, 'error'));
             });
 
             card.append(body, revoke);
@@ -327,10 +338,10 @@
         }
     }
 
-    async function revokeSession(sessionId) {
+    async function revokeSession(sessionId, session = null) {
         const normalizedId = String(sessionId || '');
         if (!normalizedId) return;
-        if (typeof window.confirm === 'function' && !window.confirm('Revoke this user session?')) {
+        if (typeof window.confirm === 'function' && !window.confirm(getSessionRevokeConfirm(session))) {
             return;
         }
         await request(`/api/admin/users/${encodeURIComponent(state.userId)}/sessions/${encodeURIComponent(normalizedId)}`, {
@@ -342,7 +353,7 @@
 
     async function revokeOtherSessions() {
         if (!state.userId) return;
-        if (typeof window.confirm === 'function' && !window.confirm('Revoke every other active session for this user?')) {
+        if (typeof window.confirm === 'function' && !window.confirm('Revoke every other active session for this user, including authentication sessions used for sign-in and security settings?')) {
             return;
         }
         await request(`/api/admin/users/${encodeURIComponent(state.userId)}/sessions/revoke-others`, {

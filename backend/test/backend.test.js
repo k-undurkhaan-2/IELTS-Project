@@ -3189,12 +3189,15 @@ test('admin shell and business account menu do not link back through the busines
     assert(adminAccountPage.includes('/admin/account.css'));
     assert(adminAccountPage.includes('id="sessions-list"'));
     assert(adminAccountPage.includes('id="sessions-revoke-others-button"'));
+    assert(adminAccountPage.includes('Revoke all other sessions'));
     assert.doesNotMatch(adminAccountPage, /js\/bundles\//);
     assert(adminAccountScript.includes('/api/admin/users/'));
     assert(adminAccountScript.includes('/practice-records?limit='));
     assert(adminAccountScript.includes('/sessions/revoke-others'));
     assert(adminAccountScript.includes('/sessions/${encodeURIComponent(normalizedId)}'));
     assert(adminAccountScript.includes('Authentication session'));
+    assert(adminAccountScript.includes('Revoke every other active session for this user, including authentication sessions used for sign-in and security settings?'));
+    assert(adminAccountScript.includes('Revoke this authentication session?'));
     assert(adminAccountScript.includes('/auth/admin/start?return_to=/admin/account'));
     assert(adminAccountScript.includes('/auth/admin/logout?return_to=/admin/account'));
     assert.doesNotMatch(adminAccountScript, /session_handle_hash|user_agent_summary|ip_hash/);
