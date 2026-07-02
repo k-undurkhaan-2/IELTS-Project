@@ -4989,6 +4989,7 @@ storageManager.ready
             const settings = createAccountMenuItem('button', 'remote-auth-account__menu-item remote-auth-account__settings', '设置', '管理题库、数据备份和安全');
             settings.type = 'button';
             settings.setAttribute('role', 'menuitem');
+            const settingsPassword = window.document.getElementById('settings-password-btn');
             const settingsTotp = window.document.getElementById('settings-totp-btn');
             const logout = createAccountMenuItem('button', 'remote-auth-account__menu-item remote-auth-account__logout', '退出', '结束当前登录会话');
             logout.type = 'button';
@@ -5190,15 +5191,11 @@ storageManager.ready
                 }
             });
 
+            if (settingsPassword) {
+                settingsPassword.addEventListener('click', () => startBusinessAuthAction('password'));
+            }
             if (settingsTotp) {
-                settingsTotp.addEventListener('click', async () => {
-                    if (totpPanel.hidden) {
-                        totpPanel.hidden = false;
-                        await loadTotpPanel();
-                    } else {
-                        hideTotpPanel();
-                    }
-                });
+                settingsTotp.addEventListener('click', () => startBusinessAuthAction('totp'));
             }
 
             accountToggle.addEventListener('click', (event) => {
@@ -5275,6 +5272,12 @@ storageManager.ready
             window.location.href = `/auth/business/start?return_to=${encodeURIComponent(returnTo)}`;
         }
 
+        function startBusinessAuthAction(action) {
+            const normalizedAction = action === 'totp' ? 'totp' : 'password';
+            const returnTo = getCurrentReturnTo();
+            window.location.href = `/auth/business/${normalizedAction}/start?return_to=${encodeURIComponent(returnTo)}`;
+        }
+
         function hide() {
             ensureUi();
             if (typeof clearOverlaySensitiveFields === 'function') {
@@ -5341,6 +5344,7 @@ storageManager.ready
             const menuName = account.querySelector('.remote-auth-account__menu-name');
             const menuRole = account.querySelector('.remote-auth-account__menu-role');
             const menuAvatar = account.querySelector('.remote-auth-account__menu-avatar');
+            const settingsPassword = window.document.getElementById('settings-password-btn');
             const settingsTotp = window.document.getElementById('settings-totp-btn');
             const profileName = window.document.getElementById('account-profile-name');
             const profileRole = window.document.getElementById('account-profile-role');
@@ -5373,6 +5377,9 @@ storageManager.ready
                 if (profileAvatar) {
                     profileAvatar.textContent = initial;
                 }
+                if (settingsPassword) {
+                    settingsPassword.hidden = false;
+                }
                 if (settingsTotp) {
                     settingsTotp.hidden = false;
                 }
@@ -5403,6 +5410,9 @@ storageManager.ready
                 }
                 if (profileAvatar) {
                     profileAvatar.textContent = 'U';
+                }
+                if (settingsPassword) {
+                    settingsPassword.hidden = true;
                 }
                 if (settingsTotp) {
                     settingsTotp.hidden = true;

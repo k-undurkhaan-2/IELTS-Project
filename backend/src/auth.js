@@ -29,6 +29,10 @@ const updatePasswordSchema = z.object({
     newPassword: z.string().min(1).max(128)
 });
 
+const passwordChangeSchema = updatePasswordSchema.extend({
+    authState: z.string().trim().min(1).max(4096)
+});
+
 const deleteAccountSchema = z.object({
     password: z.string().min(1).max(128),
     confirm: z.string().trim().min(1).max(64)
@@ -291,6 +295,40 @@ function resolveAuthRequestAudience(req, resolveAuthState) {
         : null;
 }
 
+async function resolveBusinessAccountActionUser(req, res, store, resolveAuthState, rawState, expectedIntent) {
+    if (!req.session?.user) {
+        res.status(401).json({ error: 'Authentication required' });
+        return null;
+    }
+    if (!rawState || typeof resolveAuthState !== 'function') {
+        res.status(403).json({ error: 'Valid auth action state is required' });
+        return null;
+    }
+    const state = resolveAuthState(rawState);
+    if (!state
+        || state.audience !== 'business'
+        || state.intent !== expectedIntent
+        || state.userId !== req.session.user.id) {
+        res.status(403).json({ error: 'Valid auth action state is required' });
+        return null;
+    }
+    const currentUser = await getCurrentStoredUser(store, req.session.user);
+    if (!currentUser) {
+        res.status(401).json({ error: 'Authentication required' });
+        return null;
+    }
+    const safeUser = publicUser(currentUser);
+    if (safeUser.role === 'admin') {
+        res.status(403).json({ error: 'Business account required' });
+        return null;
+    }
+    if (getUserSecurityEpoch(currentUser) !== getUserSecurityEpoch(state)) {
+        res.status(403).json({ error: 'Valid auth action state is required' });
+        return null;
+    }
+    return currentUser;
+}
+
 function rejectUserForAudience(res, user, audience) {
     if (audience === 'business' && user?.role === 'admin') {
         return res.status(401).json({ error: INVALID_CREDENTIALS_ERROR });
@@ -326,6 +364,20 @@ async function establishRequestAuthSession(req, user, audience) {
 async function revokeRequestAuthSession(req) {
     if (typeof req.revokeAuthSession === 'function') {
         await req.revokeAuthSession();
+    }
+}
+
+async function revokeOtherRequestAuthSessionsForUser(req, userId) {
+    if (typeof req.revokeAuthSessionsForUser === 'function') {
+        await req.revokeAuthSessionsForUser(userId, {
+            exceptId: req.session?.authSession?.id || null
+        });
+    }
+}
+
+async function revokeAllRequestAuthSessionsForUser(req, userId) {
+    if (typeof req.revokeAuthSessionsForUser === 'function') {
+        await req.revokeAuthSessionsForUser(userId);
     }
 }
 
@@ -806,6 +858,7 @@ function createAuthRouter(options = {}) {
             if (typeof store.deleteSessionsForUser === 'function') {
                 await store.deleteSessionsForUser(currentUser.id, req.sessionID);
             }
+            await revokeOtherRequestAuthSessionsForUser(req, currentUser.id);
             const authSessionAudience = req.session.authSession?.audience || resolveSessionAudience(req, currentUser);
             await revokeRequestAuthSession(req);
             const totpVerification = getSessionTotpVerificationMarker(req, currentUser);
@@ -856,6 +909,7 @@ function createAuthRouter(options = {}) {
             if (typeof store.deleteSessionsForUser === 'function') {
                 await store.deleteSessionsForUser(currentUser.id, req.sessionID);
             }
+            await revokeOtherRequestAuthSessionsForUser(req, currentUser.id);
             const authSessionAudience = req.session.authSession?.audience || resolveSessionAudience(req, currentUser);
             await revokeRequestAuthSession(req);
             const totpVerification = getSessionTotpVerificationMarker(req, currentUser);
@@ -864,6 +918,60 @@ function createAuthRouter(options = {}) {
             restoreSessionTotpVerification(req, totpVerification, req.session.user);
             await establishRequestAuthSession(req, req.session.user, authSessionAudience);
             return res.json({ ok: true, user: req.session.user, csrfToken: ensureCsrfToken(req) });
+        } catch (error) {
+            return next(error);
+        }
+    });
+
+    router.patch('/password-change', requireAuth, verifyCsrfToken, async (req, res, next) => {
+        try {
+            const parsed = passwordChangeSchema.safeParse(req.body || {});
+            if (!parsed.success) {
+                return sendValidationError(res, parsed, 'Invalid password update payload');
+            }
+            const currentUser = await resolveBusinessAccountActionUser(
+                req,
+                res,
+                store,
+                resolveAuthState,
+                parsed.data.authState,
+                'password-change'
+            );
+            if (!currentUser) {
+                return;
+            }
+            const clientIp = getCanonicalClientIp(req);
+            checkRateLimit(`account-password:${clientIp}:${req.session.user.id}`);
+            if (!isPasswordWithinBcryptByteLimit(parsed.data.currentPassword)) {
+                return res.status(401).json({ error: 'Current password is incorrect' });
+            }
+            const passwordOk = await bcryptImpl.compare(parsed.data.currentPassword, currentUser.password_hash);
+            if (!passwordOk) {
+                return res.status(401).json({ error: 'Current password is incorrect' });
+            }
+            const passwordCheck = validatePasswordStrength(parsed.data.newPassword);
+            if (!passwordCheck.valid) {
+                return res.status(400).json({ error: 'Password strength is insufficient', details: passwordCheck.errors });
+            }
+            if (parsed.data.currentPassword === parsed.data.newPassword) {
+                return res.status(400).json({ error: 'New password must be different from the current password' });
+            }
+            const passwordHash = await bcryptImpl.hash(parsed.data.newPassword, 12);
+            const updatedUser = await store.updatePassword(currentUser.id, passwordHash);
+            if (!updatedUser) {
+                return res.status(404).json({ error: 'User not found' });
+            }
+            if (typeof store.bumpSecurityEpoch === 'function') {
+                await store.bumpSecurityEpoch(currentUser.id);
+            }
+            if (typeof store.deleteSessionsForUser === 'function') {
+                await store.deleteSessionsForUser(currentUser.id, req.sessionID);
+            }
+            await revokeAllRequestAuthSessionsForUser(req, currentUser.id);
+            await revokeRequestAuthSession(req);
+            await destroySession(req);
+            clearSessionCookies(res);
+            return res.json({ ok: true, signedOut: true, user: publicUser(updatedUser) });
         } catch (error) {
             return next(error);
         }

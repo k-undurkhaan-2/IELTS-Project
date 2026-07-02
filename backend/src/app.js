@@ -1038,6 +1038,13 @@ function createApp(options = {}) {
         }
     }
 
+    async function revokeAuthSessionsForUser(userId, options = {}) {
+        if (!userId || !authSessionStore || typeof authSessionStore.revokeSessionsForUser !== 'function') {
+            return 0;
+        }
+        return authSessionStore.revokeSessionsForUser(userId, options.exceptId || null);
+    }
+
     async function establishAuthSession(req, user, options = {}) {
         const safeUser = publicUser(user || req.session?.user);
         if (!req.session || !safeUser?.id || !authSessionStore || typeof authSessionStore.createSession !== 'function') {
@@ -1084,6 +1091,7 @@ function createApp(options = {}) {
     function attachAuthSessionControls(req, _res, next) {
         req.establishAuthSession = (user, establishOptions = {}) => establishAuthSession(req, user, establishOptions);
         req.revokeAuthSession = () => revokeCurrentAuthSession(req);
+        req.revokeAuthSessionsForUser = (userId, revokeOptions = {}) => revokeAuthSessionsForUser(userId, revokeOptions);
         return next();
     }
 
@@ -1398,6 +1406,107 @@ function createApp(options = {}) {
     });
     app.get('/auth/login.css', (req, res) => {
         res.sendFile(path.join(authRoot, 'login.css'));
+    });
+
+    function sendAuthActionStateError(res, status, message) {
+        const title = status === 401 ? 'Authentication required' : 'Valid auth action state required';
+        res.status(status).type('html').send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>${status} ${title}</title>
+  <style>
+    :root { color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; padding: 24px; background: #f5f7fb; color: #111827; }
+    main { width: min(100%, 420px); padding: 28px; border: 1px solid rgba(148, 163, 184, 0.28); border-radius: 8px; background: rgba(255, 255, 255, 0.94); box-shadow: 0 20px 55px rgba(15, 23, 42, 0.12); }
+    p:first-child { margin: 0 0 6px; color: #2563eb; font-size: 0.82rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+    h1 { margin: 0 0 12px; font-size: 1.45rem; line-height: 1.2; }
+    p { color: #475569; line-height: 1.5; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #020617; color: #e5e7eb; }
+      main { border-color: rgba(148, 163, 184, 0.25); background: rgba(15, 23, 42, 0.94); }
+      p:first-child { color: #93c5fd; }
+      p { color: #cbd5e1; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <p>IELTS Atlas</p>
+    <h1>${status} ${title}</h1>
+    <p>${message}</p>
+  </main>
+</body>
+</html>`);
+    }
+
+    async function requireBusinessAuthActionState(req, res, expectedIntent) {
+        if (!req.session?.user) {
+            sendAuthActionStateError(res, 401, 'Sign in from the business settings page before using this auth action.');
+            return null;
+        }
+        const stateParam = typeof req.query.state === 'string' ? req.query.state.trim() : '';
+        if (!stateParam) {
+            sendAuthActionStateError(res, 403, 'Open this page from the business settings page so the request includes a valid action state.');
+            return null;
+        }
+        const state = verifySignedAuthState(authHandoffSecret, stateParam);
+        if (!state
+            || state.audience !== 'business'
+            || state.intent !== expectedIntent
+            || state.userId !== req.session.user.id) {
+            sendAuthActionStateError(res, 403, 'Open this page from the business settings page so the request includes a valid action state.');
+            return null;
+        }
+        const currentUser = typeof authStore.findById === 'function'
+            ? await authStore.findById(req.session.user.id)
+            : null;
+        const safeUser = publicUser(currentUser || req.session.user);
+        if (!safeUser?.id) {
+            sendAuthActionStateError(res, 401, 'Sign in from the business settings page before using this auth action.');
+            return null;
+        }
+        if (safeUser.role === 'admin') {
+            sendAuthActionStateError(res, 403, 'This auth action is only available for business user accounts.');
+            return null;
+        }
+        if (getUserSecurityEpoch(currentUser || req.session.user) !== getUserSecurityEpoch(state)) {
+            sendAuthActionStateError(res, 403, 'Open this page from the business settings page so the request includes a valid action state.');
+            return null;
+        }
+        return state;
+    }
+
+    app.get(['/auth/password', '/auth/password/'], async (req, res, next) => {
+        try {
+            const state = await requireBusinessAuthActionState(req, res, 'password-change');
+            if (!state) return;
+            res.sendFile(path.join(authRoot, 'password.html'));
+        } catch (error) {
+            next(error);
+        }
+    });
+    app.get('/auth/password.js', (req, res) => {
+        res.sendFile(path.join(authRoot, 'password.js'));
+    });
+    app.get('/auth/password.css', (req, res) => {
+        res.sendFile(path.join(authRoot, 'password.css'));
+    });
+    app.get(['/auth/totp', '/auth/totp/'], async (req, res, next) => {
+        try {
+            const state = await requireBusinessAuthActionState(req, res, 'totp-manage');
+            if (!state) return;
+            res.sendFile(path.join(authRoot, 'totp.html'));
+        } catch (error) {
+            next(error);
+        }
+    });
+    app.get('/auth/totp.js', (req, res) => {
+        res.sendFile(path.join(authRoot, 'totp.js'));
+    });
+    app.get('/auth/totp.css', (req, res) => {
+        res.sendFile(path.join(authRoot, 'totp.css'));
     });
     app.get(['/auth/account', '/auth/account/', '/auth/account.js', '/auth/account.css'], (req, res) => {
         res.status(404).type('text/plain').send('Not found');

@@ -2943,6 +2943,42 @@ test('admin dashboard redirects anonymous users through auth handoff', async () 
         assert.equal(authLoginStyles.response.status, 200);
         assert.match(authLoginStyles.text, /auth-shell/);
 
+        const anonymousAuthPasswordPage = await client.request('GET', '/auth/password', undefined, { redirect: 'manual' });
+        assert.equal(anonymousAuthPasswordPage.response.status, 401);
+
+        const anonymousAuthTotpPage = await client.request('GET', '/auth/totp', undefined, { redirect: 'manual' });
+        assert.equal(anonymousAuthTotpPage.response.status, 401);
+
+        const authPasswordScript = await client.request('GET', '/auth/password.js');
+        assert.equal(authPasswordScript.response.status, 200);
+        assert.match(authPasswordScript.text, /\/api\/auth\/password-change/);
+        assert.match(authPasswordScript.text, /configureBackLink/);
+        assert.match(authPasswordScript.text, /Returning to the app in 3 seconds/);
+        assert.match(authPasswordScript.text, /window\.location\.assign/);
+        assert.doesNotMatch(authPasswordScript.text, /\/api\/auth\/account\/username|\/api\/auth\/totp\/disable/);
+
+        const authPasswordStyles = await client.request('GET', '/auth/password.css');
+        assert.equal(authPasswordStyles.response.status, 200);
+        assert.match(authPasswordStyles.text, /password-shell/);
+
+        const authTotpScript = await client.request('GET', '/auth/totp.js');
+        assert.equal(authTotpScript.response.status, 200);
+        assert.match(authTotpScript.text, /\/api\/auth\/totp\/status/);
+        assert.match(authTotpScript.text, /replace\(\/\\s\+\/g/);
+        assert.match(authTotpScript.text, /await startSetup\(\)/);
+        assert.doesNotMatch(authTotpScript.text, /\/api\/auth\/totp\/disable/);
+
+        const authTotpPageSource = await client.request('GET', '/auth/totp?state=invalid', undefined, {
+            redirect: 'manual'
+        });
+        assert.equal(authTotpPageSource.response.status, 401);
+
+        const authTotpStyles = await client.request('GET', '/auth/totp.css');
+        assert.equal(authTotpStyles.response.status, 200);
+        assert.match(authTotpStyles.text, /totp-shell/);
+        assert.match(authTotpStyles.text, /aspect-ratio:\s*1\s*\/\s*1/);
+        assert.match(authTotpStyles.text, /totp-otpauth-link/);
+
         const authAccountPage = await client.request('GET', '/auth/account', undefined, { redirect: 'manual' });
         assert.equal(authAccountPage.response.status, 404);
         const authAccountScript = await client.request('GET', '/auth/account.js', undefined, { redirect: 'manual' });
@@ -3063,7 +3099,209 @@ test('admin shell and business account menu do not link back through the busines
     assert.doesNotMatch(authOverlay, /href\s*=\s*['"]\/admin['"]/);
     assert.doesNotMatch(authOverlay, /\/auth\/business\/account|Open auth account center/);
     assert.doesNotMatch(mainIndex, /\/auth\/business\/account|Open auth account center|account-username-form|account-password-form|account-delete-form/);
+    assert.doesNotMatch(mainIndex, /Account Management/);
+    assert(mainIndex.includes('id="settings-password-btn"'));
+    assert(authOverlay.includes("const normalizedAction = action === 'totp' ? 'totp' : 'password';"));
+    assert(authOverlay.includes('/auth/business/${normalizedAction}/start?return_to='));
     assert(authOverlay.includes('/auth/business/logout?return_to='));
+});
+
+test('business settings password and TOTP actions require scoped auth state', async () => {
+    const client = await createClient();
+    const businessHeaders = {
+        host: 'business.local',
+        'x-forwarded-host': 'business.local',
+        'x-forwarded-proto': 'http',
+        'x-ielts-onion-audience': 'business'
+    };
+    const authHeaders = {
+        host: 'auth.local',
+        'x-forwarded-host': 'auth.local',
+        'x-forwarded-proto': 'http',
+        'x-ielts-onion-audience': 'auth'
+    };
+    try {
+        const businessSession = client.createSession();
+        const authSession = client.createSession();
+        const otherAuthSession = client.createSession();
+
+        const created = await register(businessSession, 'settings_user', 'StrongPass1');
+        assert.equal(created.response.status, 201);
+        const other = await register(otherAuthSession, 'settings_other', 'StrongPass1');
+        assert.equal(other.response.status, 201);
+        await otherAuthSession.request('POST', '/api/auth/logout');
+        const otherLoginTarget = client.createSession();
+        const otherLoginStart = await otherLoginTarget.request('GET', '/auth/business/start?return_to=/', undefined, {
+            redirect: 'manual',
+            headers: businessHeaders
+        });
+        const otherLoginState = getRedirectParam(otherLoginStart.response.headers.get('location'), 'state');
+        await otherAuthSession.csrf();
+        const otherLogin = await otherAuthSession.request('POST', '/api/auth/login', {
+            username: 'settings_other',
+            password: 'StrongPass1',
+            authState: otherLoginState
+        }, { headers: authHeaders });
+        assert.equal(otherLogin.response.status, 200);
+
+        const loginTarget = client.createSession();
+        const loginStart = await loginTarget.request('GET', '/auth/business/start?return_to=/', undefined, {
+            redirect: 'manual',
+            headers: businessHeaders
+        });
+        const loginState = getRedirectParam(loginStart.response.headers.get('location'), 'state');
+        await authSession.csrf();
+        const login = await authSession.request('POST', '/api/auth/login', {
+            username: 'settings_user',
+            password: 'StrongPass1',
+            authState: loginState
+        }, { headers: authHeaders });
+        assert.equal(login.response.status, 200);
+
+        const passwordNoSession = await client.request('GET', '/auth/password', undefined, {
+            redirect: 'manual',
+            headers: authHeaders
+        });
+        assert.equal(passwordNoSession.response.status, 401);
+        assert.match(passwordNoSession.text, /401 Authentication required/);
+
+        const passwordNoState = await authSession.request('GET', '/auth/password', undefined, {
+            redirect: 'manual',
+            headers: authHeaders
+        });
+        assert.equal(passwordNoState.response.status, 403);
+        assert.match(passwordNoState.text, /403 Valid auth action state required/);
+
+        const anonymousPasswordStart = await client.request('GET', '/auth/business/password/start?return_to=/settings', undefined, {
+            redirect: 'manual',
+            headers: businessHeaders
+        });
+        assert.equal(anonymousPasswordStart.response.status, 401);
+
+        const passwordStart = await businessSession.request('GET', '/auth/business/password/start?return_to=/settings', undefined, {
+            redirect: 'manual',
+            headers: businessHeaders
+        });
+        assert.equal(passwordStart.response.status, 302);
+        const passwordLocation = passwordStart.response.headers.get('location');
+        assert.equal(parseRedirectLocation(passwordLocation).pathname, '/auth/password');
+        const passwordState = getRedirectParam(passwordLocation, 'state');
+        assert(passwordState);
+
+        const passwordPage = await authSession.request('GET', `/auth/password?state=${encodeURIComponent(passwordState)}`, undefined, {
+            redirect: 'manual',
+            headers: authHeaders
+        });
+        assert.equal(passwordPage.response.status, 200);
+        assert.match(passwordPage.text, /IELTS Atlas Password/);
+        assert.match(passwordPage.text, /id="password-back-link"/);
+        assert.doesNotMatch(passwordPage.text, /href="\/auth\/login"/);
+
+        const wrongUserPasswordPage = await otherAuthSession.request('GET', `/auth/password?state=${encodeURIComponent(passwordState)}`, undefined, {
+            redirect: 'manual',
+            headers: authHeaders
+        });
+        assert.equal(wrongUserPasswordPage.response.status, 403);
+
+        const totpStart = await businessSession.request('GET', '/auth/business/totp/start?return_to=/settings', undefined, {
+            redirect: 'manual',
+            headers: businessHeaders
+        });
+        assert.equal(totpStart.response.status, 302);
+        const totpLocation = totpStart.response.headers.get('location');
+        assert.equal(parseRedirectLocation(totpLocation).pathname, '/auth/totp');
+        const totpState = getRedirectParam(totpLocation, 'state');
+        assert(totpState);
+
+        const totpPage = await authSession.request('GET', `/auth/totp?state=${encodeURIComponent(totpState)}`, undefined, {
+            redirect: 'manual',
+            headers: authHeaders
+        });
+        assert.equal(totpPage.response.status, 200);
+        assert.match(totpPage.text, /Two-factor authentication/);
+
+        const wrongCurrentPassword = await authSession.request('PATCH', '/api/auth/password-change', {
+            authState: passwordState,
+            currentPassword: 'WrongPass1',
+            newPassword: 'StrongerPass2'
+        }, { headers: authHeaders });
+        assert.equal(wrongCurrentPassword.response.status, 401);
+
+        const changed = await authSession.request('PATCH', '/api/auth/password-change', {
+            authState: passwordState,
+            currentPassword: 'StrongPass1',
+            newPassword: 'StrongerPass2'
+        }, { headers: authHeaders });
+        assert.equal(changed.response.status, 200);
+        assert.equal(changed.json.ok, true);
+        assert.equal(changed.json.signedOut, true);
+
+        const businessSessionAfterPassword = await businessSession.request('GET', '/api/auth/me', undefined, {
+            headers: businessHeaders
+        });
+        assert.equal(businessSessionAfterPassword.response.status, 401);
+
+        const authSessionAfterPassword = await authSession.request('GET', '/api/auth/me', undefined, {
+            headers: authHeaders
+        });
+        assert.equal(authSessionAfterPassword.response.status, 401);
+
+        const oldPasswordLogin = await client.createSession();
+        await oldPasswordLogin.csrf();
+        const oldLogin = await oldPasswordLogin.request('POST', '/api/auth/login', {
+            username: 'settings_user',
+            password: 'StrongPass1'
+        });
+        assert.equal(oldLogin.response.status, 401);
+
+        const newPasswordLogin = await client.createSession();
+        await newPasswordLogin.csrf();
+        const newLogin = await newPasswordLogin.request('POST', '/api/auth/login', {
+            username: 'settings_user',
+            password: 'StrongerPass2'
+        });
+        assert.equal(newLogin.response.status, 200);
+
+        const staleTotpPage = await authSession.request('GET', `/auth/totp?state=${encodeURIComponent(totpState)}`, undefined, {
+            redirect: 'manual',
+            headers: authHeaders
+        });
+        assert.equal(staleTotpPage.response.status, 401);
+
+        const freshAuthSession = client.createSession();
+        const freshLoginStart = await client.createSession().request('GET', '/auth/business/start?return_to=/', undefined, {
+            redirect: 'manual',
+            headers: businessHeaders
+        });
+        const freshLoginState = getRedirectParam(freshLoginStart.response.headers.get('location'), 'state');
+        await freshAuthSession.csrf();
+        const freshLogin = await freshAuthSession.request('POST', '/api/auth/login', {
+            username: 'settings_user',
+            password: 'StrongerPass2',
+            authState: freshLoginState
+        }, { headers: authHeaders });
+        assert.equal(freshLogin.response.status, 200);
+        const freshTotpStart = await newPasswordLogin.request('GET', '/auth/business/totp/start?return_to=/settings', undefined, {
+            redirect: 'manual',
+            headers: businessHeaders
+        });
+        const freshTotpState = getRedirectParam(freshTotpStart.response.headers.get('location'), 'state');
+        const freshTotpPage = await freshAuthSession.request('GET', `/auth/totp?state=${encodeURIComponent(freshTotpState)}`, undefined, {
+            redirect: 'manual',
+            headers: authHeaders
+        });
+        assert.equal(freshTotpPage.response.status, 200);
+        assert.match(freshTotpPage.text, /Two-factor authentication/);
+
+        const freshTotpSetup = await freshAuthSession.request('POST', '/api/auth/totp/setup', {}, {
+            headers: authHeaders
+        });
+        assert.equal(freshTotpSetup.response.status, 200);
+        assert.match(freshTotpSetup.json.qrCodeDataUrl, /^data:image\/png;base64,/);
+        assert.match(freshTotpSetup.json.otpauthUrl, /^otpauth:\/\/totp\//);
+    } finally {
+        await client.close();
+    }
 });
 
 test('auth handoff creates a one-time business session ticket', async () => {

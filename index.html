@@ -200,9 +200,9 @@
                 </section>
 
                 <section class="account-view__section account-view__management" id="account-management">
-                    <h3 class="account-view__section-title">Account Management</h3>
+                    <h3 class="account-view__section-title">Security</h3>
                     <p class="account-view__form-status">
-                        Account security settings are managed from the Settings page.
+                        Use Settings > Security to manage password and TOTP.
                     </p>
                 </section>
             </div>
@@ -956,6 +956,14 @@
                             账号登录保护与二次验证设置。
                         </p>
                         <div class="hero-settings-actions">
+                            <button
+                                class="btn hero-btn settings-security__password"
+                                id="settings-password-btn"
+                                type="button"
+                                hidden
+                            >
+                                修改密码
+                            </button>
                             <button
                                 class="btn hero-btn settings-security__totp"
                                 id="settings-totp-btn"

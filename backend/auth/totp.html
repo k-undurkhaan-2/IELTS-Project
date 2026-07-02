@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>IELTS Atlas TOTP</title>
+        <link rel="stylesheet" href="/auth/totp.css" />
+    </head>
+    <body>
+        <main class="totp-shell">
+            <section class="totp-panel" aria-labelledby="totp-title">
+                <div class="totp-heading">
+                    <p>IELTS Atlas</p>
+                    <h1 id="totp-title">Two-factor authentication</h1>
+                </div>
+
+                <div id="totp-status" class="totp-status" role="status" aria-live="polite">Checking session...</div>
+
+                <section id="totp-summary" class="totp-summary" hidden></section>
+
+                <section id="totp-setup-panel" class="totp-setup" hidden>
+                    <p>Scan the QR code with your authenticator, then enter the current code.</p>
+                    <img id="totp-qr" alt="TOTP QR code" />
+                    <code id="totp-secret"></code>
+                    <a id="totp-otpauth-link" class="totp-otpauth-link" href="#" hidden>Open setup URI</a>
+                    <form id="totp-setup-form" class="totp-form">
+                        <label>
+                            <span>TOTP code</span>
+                            <input id="totp-setup-token" name="setupToken" inputmode="numeric" autocomplete="one-time-code" maxlength="64" required />
+                        </label>
+                        <button id="totp-setup-submit" type="submit">Enable TOTP</button>
+                    </form>
+                </section>
+
+                <form id="totp-recovery-form" class="totp-form" hidden>
+                    <label>
+                        <span>Current TOTP or recovery code</span>
+                        <input id="totp-recovery-token" name="recoveryToken" inputmode="numeric" autocomplete="one-time-code" maxlength="64" required />
+                    </label>
+                    <button id="totp-recovery-submit" type="submit">Generate new recovery codes</button>
+                </form>
+
+                <ol id="totp-recovery-codes" class="totp-recovery-codes" hidden></ol>
+
+                <div class="totp-actions">
+                    <button id="totp-start-setup" type="button" hidden>Enable TOTP</button>
+                    <a id="totp-back-link" class="totp-secondary-link" href="/">Back to app</a>
+                </div>
+            </section>
+        </main>
+        <script src="/auth/totp.js"></script>
+    </body>
+</html>

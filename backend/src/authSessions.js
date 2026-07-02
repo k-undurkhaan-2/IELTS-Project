@@ -78,6 +78,27 @@ class PostgresAuthSessionStore {
         );
         return result.rows[0] || null;
     }
+
+    async revokeSessionsForUser(userId, exceptId = null) {
+        if (!userId) {
+            return 0;
+        }
+        const params = [userId];
+        let exceptClause = '';
+        if (exceptId) {
+            params.push(exceptId);
+            exceptClause = ` AND id <> $${params.length}`;
+        }
+        const result = await this.db.query(
+            `UPDATE auth_sessions
+             SET revoked_at = COALESCE(revoked_at, now())
+             WHERE user_id = $1
+               AND revoked_at IS NULL
+               ${exceptClause}`,
+            params
+        );
+        return result.rowCount || 0;
+    }
 }
 
 class MemoryAuthSessionStore {
@@ -127,6 +148,17 @@ class MemoryAuthSessionStore {
             record.revoked_at = new Date().toISOString();
         }
         return { ...record };
+    }
+
+    async revokeSessionsForUser(userId, exceptId = null) {
+        let count = 0;
+        for (const record of this.sessions.values()) {
+            if (record.user_id === userId && record.id !== exceptId && !record.revoked_at) {
+                record.revoked_at = new Date().toISOString();
+                count += 1;
+            }
+        }
+        return count;
     }
 }
 

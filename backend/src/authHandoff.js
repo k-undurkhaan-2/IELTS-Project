@@ -1,5 +1,5 @@
 const crypto = require('node:crypto');
-const { publicUser } = require('./auth');
+const { getUserSecurityEpoch, publicUser } = require('./auth');
 const { getSessionTotpVerification, markSessionTotpVerified } = require('./totp');
 
 const DEFAULT_TICKET_TTL_MS = 60_000;
@@ -436,6 +436,52 @@ function createAuthHandoffRouter(options = {}) {
 
     router.get('/business/start', createStartHandler('business'));
     router.get('/admin/start', createStartHandler('admin'));
+
+    function createBusinessAccountActionStartHandler(intent, authPath) {
+        return async (req, res, next) => {
+            try {
+                if (!requireConfig(res)) {
+                    return;
+                }
+                if ((configuredTargetUrls.business || !localDevelopment) && !validateExactAllowedHost(req, 'business', configuredTargetUrls, {
+                    allowLocalLoopbackHost: localDevelopment
+                })) {
+                    return rejectInvalidHost(res);
+                }
+                const sessionUser = publicUser(req.session?.user);
+                if (!sessionUser?.id) {
+                    return res.status(401).type('text/plain').send('Authentication required');
+                }
+                const currentUser = typeof authStore.findById === 'function'
+                    ? await authStore.findById(sessionUser.id)
+                    : null;
+                const safeUser = publicUser(currentUser || sessionUser);
+                if (!safeUser?.id) {
+                    return res.status(401).type('text/plain').send('Authentication required');
+                }
+                if (safeUser.role === 'admin') {
+                    return res.status(403).type('text/plain').send('Business account required');
+                }
+                const returnTo = sanitizeReturnTo(req.query.return_to, 'business');
+                const state = createSignedAuthState(stateSecret, {
+                    audience: 'business',
+                    intent,
+                    userId: safeUser.id,
+                    securityEpoch: getUserSecurityEpoch(currentUser || sessionUser),
+                    returnTo,
+                    targetBaseUrl: configuredTargetUrls.business,
+                    issuedAt: Date.now(),
+                    nonce: crypto.randomBytes(16).toString('base64url')
+                });
+                return res.redirect(appendQuery(`${authPublicUrl}${authPath}`, { state }));
+            } catch (error) {
+                return next(error);
+            }
+        };
+    }
+
+    router.get('/business/password/start', createBusinessAccountActionStartHandler('password-change', '/auth/password'));
+    router.get('/business/totp/start', createBusinessAccountActionStartHandler('totp-manage', '/auth/totp'));
 
     function createLogoutHandler(audience) {
         return async (req, res, next) => {

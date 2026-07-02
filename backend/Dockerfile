@@ -13,6 +13,7 @@ COPY js ./js
 COPY templates ./templates
 COPY index.html ./index.html
 COPY backend ./backend
+RUN chmod -R a+rX /app/backend/auth
 
 WORKDIR /app/backend
 ENV NODE_ENV=production
