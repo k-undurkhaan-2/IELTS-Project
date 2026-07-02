@@ -1516,6 +1516,23 @@ function createApp(options = {}) {
         res.sendFile(path.join(repoRoot, 'index.html'));
     });
 
+    app.get([
+        '/assets/generated/listening-exams/manifest.js',
+        '/assets/generated/listening-exams/listening-index.compat.js'
+    ], (req, res, next) => {
+        const assetName = req.path.endsWith('/manifest.js')
+            ? 'manifest.js'
+            : 'listening-index.compat.js';
+        const targetPath = path.join(repoRoot, 'assets', 'generated', 'listening-exams', assetName);
+        res.sendFile(targetPath, {
+            dotfiles: 'deny'
+        }, (error) => {
+            if (error) {
+                next(error);
+            }
+        });
+    });
+
     app.use(createCanonicalProtectedContentMiddleware(requireContentAuth));
     app.use(PROTECTED_CONTENT_ROUTES, requireContentAuth);
 
