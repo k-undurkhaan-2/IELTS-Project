@@ -3446,13 +3446,18 @@ test('admin shell and business account menu do not link back through the busines
     assert(mainIndex.includes('id="settings-password-btn"'));
     assert(mainIndex.includes('id="settings-session-manager"'));
     assert(mainIndex.includes('id="settings-sessions-revoke-others-btn"'));
+    assert(mainIndex.includes('Sign out all other sessions'));
     assert(authOverlay.includes("const normalizedAction = action === 'totp' ? 'totp' : 'password';"));
     assert(authOverlay.includes('/auth/business/${normalizedAction}/start?return_to='));
     assert(authOverlay.includes('/auth/business/logout?return_to='));
     assert(authOverlay.includes("apiClient.request('/api/account/sessions'"));
     assert(authOverlay.includes("apiClient.request('/api/account/sessions/revoke-others'"));
     assert(authOverlay.includes('Authentication session'));
+    assert(authOverlay.includes('Authentication sessions'));
+    assert(authOverlay.includes('Business sessions'));
     assert(authOverlay.includes('Used for sign-in, security settings, and onion handoff.'));
+    assert(authOverlay.includes('Sign out all other sessions for this account, including authentication sessions used for sign-in and security settings?'));
+    assert(authOverlay.includes('Signing out this authentication session may require signing in again'));
     assert.doesNotMatch(authOverlay, /session_handle_hash|user_agent_summary|ip_hash/);
 });
 

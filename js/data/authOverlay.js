@@ -742,12 +742,48 @@
         function formatSessionAudience(value) {
             const text = String(value || '').trim().toLowerCase();
             if (text === 'admin') {
-                return 'Admin';
+                return 'Admin session';
             }
             if (text === 'auth') {
                 return 'Authentication session';
             }
-            return 'Business';
+            return 'Business session';
+        }
+
+        function getSessionAudienceRank(value) {
+            const text = String(value || '').trim().toLowerCase();
+            if (text === 'business') {
+                return 0;
+            }
+            if (text === 'auth') {
+                return 1;
+            }
+            if (text === 'admin') {
+                return 2;
+            }
+            return 3;
+        }
+
+        function getSessionAudienceGroupTitle(value) {
+            const text = String(value || '').trim().toLowerCase();
+            if (text === 'auth') {
+                return 'Authentication sessions';
+            }
+            if (text === 'admin') {
+                return 'Admin sessions';
+            }
+            return 'Business sessions';
+        }
+
+        function getSessionRevokeConfirm(session) {
+            const audience = String(session?.audience || '').trim().toLowerCase();
+            if (audience === 'auth') {
+                return 'Signing out this authentication session may require signing in again before changing password, managing TOTP, or starting a new handoff.';
+            }
+            if (audience === 'admin') {
+                return 'Sign out this admin session?';
+            }
+            return 'Sign out this business session?';
         }
 
         function renderAccountSessions(payload) {
@@ -761,7 +797,20 @@
                 list.append(createElement('p', 'settings-session-list__empty', 'No active sessions found.'));
                 return;
             }
-            sessions.forEach((session) => {
+            const sortedSessions = sessions.slice().sort((left, right) => {
+                const rank = getSessionAudienceRank(left.audience) - getSessionAudienceRank(right.audience);
+                if (rank !== 0) {
+                    return rank;
+                }
+                return Number(new Date(right.lastSeenAt || right.createdAt || 0)) - Number(new Date(left.lastSeenAt || left.createdAt || 0));
+            });
+            let currentGroup = '';
+            sortedSessions.forEach((session) => {
+                const groupTitle = getSessionAudienceGroupTitle(session.audience);
+                if (groupTitle !== currentGroup) {
+                    currentGroup = groupTitle;
+                    list.append(createElement('h5', 'settings-session-list__group', groupTitle));
+                }
                 const card = createElement('article', 'settings-session-card');
                 card.setAttribute('role', 'listitem');
                 const head = createElement('div', 'settings-session-card__head');
@@ -791,7 +840,7 @@
                 revoke.type = 'button';
                 revoke.disabled = Boolean(session.current || !session.id);
                 revoke.addEventListener('click', () => {
-                    revokeAccountSession(session.id).catch((requestError) => {
+                    revokeAccountSession(session.id, session).catch((requestError) => {
                         setSessionManagerStatus(formatRemoteAuthError(requestError), 'error');
                     });
                 });
@@ -836,12 +885,12 @@
             }
         }
 
-        async function revokeAccountSession(sessionId) {
+        async function revokeAccountSession(sessionId, session = null) {
             const normalizedId = String(sessionId || '');
             if (!normalizedId) {
                 return;
             }
-            if (typeof window.confirm === 'function' && !window.confirm('Sign out this session?')) {
+            if (typeof window.confirm === 'function' && !window.confirm(getSessionRevokeConfirm(session))) {
                 return;
             }
             setSessionManagerStatus('Signing out selected session...');
@@ -854,7 +903,7 @@
         }
 
         async function revokeOtherAccountSessions() {
-            if (typeof window.confirm === 'function' && !window.confirm('Sign out all other sessions for this account?')) {
+            if (typeof window.confirm === 'function' && !window.confirm('Sign out all other sessions for this account, including authentication sessions used for sign-in and security settings?')) {
                 return;
             }
             setSessionManagerStatus('Signing out other sessions...');

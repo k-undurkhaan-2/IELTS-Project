@@ -8886,6 +8886,14 @@ body.blue-dark-mode .practice-timer-field input[type="number"] {
     font-size: 0.92rem;
 }
 
+#settings-view .settings-session-list__group {
+    margin: 8px 0 0;
+    color: var(--text-primary);
+    font-size: 0.88rem;
+    font-weight: 900;
+    letter-spacing: 0.02em;
+}
+
 #settings-view .settings-session-manager__status[data-kind="error"] {
     color: #b42318;
 }
