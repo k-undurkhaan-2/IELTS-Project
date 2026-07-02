@@ -8,7 +8,7 @@
 
 为保证项目能够长期稳定存在，请遵循以下原则：**自行部署，个人使用，控制传播范围，不以项目或其题源牟利。**
 
-代码授权以 [LICENSE](LICENSE) 为准。题源、文章、音频、PDF、图片和其他第三方内容版权归原权利人所有，仅建议用于个人学习与备考场景。
+授权边界见下文“许可证与内容版权”。题源、文章、音频、PDF、图片和其他第三方内容版权归原权利人所有，仅建议用于个人学习与备考场景。
 
 ## 项目概述
 
@@ -656,7 +656,28 @@ ReadingPractice/
 
 ## 许可证与内容版权
 
-代码许可证见 [LICENSE](LICENSE)。使用、修改和再分发代码时，应遵守许可证条款。
+本仓库采用分区授权。除目录或文件内另有明确声明外：
+
+- `frontend/` is licensed under `GPL-3.0-only`. In the current repository layout, this covers the static frontend application files, including `index.html`, `css/`, `js/`, frontend runtime assets, and the GPL text in [LICENSE](LICENSE).
+- `backend/` is independently developed and is not licensed under `GPL-3.0`.
+
+  Unless otherwise agreed in writing, `backend/` is proprietary and all rights are reserved.
+
+- The API schema/docs are licensed under `LicenseRef-Proprietary` / proprietary terms, as stated in [api-contract/](api-contract/README.md).
+- Third-party libraries and assets retain their own upstream license terms and notices.
+
+GPL 前端文件应使用 GPL 标识，例如：
+
+```js
+// SPDX-License-Identifier: GPL-3.0-only
+```
+
+专有文件（例如 `backend/` 或 proprietary API contract 文件）应使用：
+
+```js
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright © 2026 Kevin. All rights reserved.
+```
 
 题源、文章、音频、PDF、图片和解析材料可能来自第三方或原始考试资料，版权归原权利人所有。本项目不授予这些内容的商业使用权或公开传播权。使用者应自行承担因复制、部署、传播或商业化使用相关内容产生的法律和平台风险。
 
