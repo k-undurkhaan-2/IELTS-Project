@@ -3001,6 +3001,77 @@ test('admin dashboard redirects anonymous users through auth handoff', async () 
     }
 });
 
+function parseNginxLocations(config) {
+    const locations = [];
+    const pattern = /location\s+(?:(=|\^~|~\*)\s+)?([^\s{]+)\s*\{\s*([^{}]*)\}/g;
+    let match;
+    while ((match = pattern.exec(config)) !== null) {
+        locations.push({
+            modifier: match[1] || '',
+            pattern: match[2],
+            body: match[3]
+        });
+    }
+    return locations;
+}
+
+function getNginxLocationAction(location) {
+    if (/return\s+404\b/.test(location.body)) {
+        return 'deny';
+    }
+    if (/proxy_pass\s+http:\/\/ielts_app|return\s+302\b/.test(location.body)) {
+        return 'allow';
+    }
+    return 'other';
+}
+
+function classifyNginxPath(config, requestPath) {
+    const locations = parseNginxLocations(config);
+    const exact = locations.find((location) => location.modifier === '=' && location.pattern === requestPath);
+    if (exact) {
+        return getNginxLocationAction(exact);
+    }
+
+    let bestPrefix = null;
+    for (const location of locations) {
+        if ((location.modifier === '^~' || location.modifier === '') && requestPath.startsWith(location.pattern)) {
+            if (!bestPrefix || location.pattern.length > bestPrefix.pattern.length) {
+                bestPrefix = location;
+            }
+        }
+    }
+    if (bestPrefix?.modifier === '^~') {
+        return getNginxLocationAction(bestPrefix);
+    }
+
+    for (const location of locations) {
+        if (location.modifier === '~*' && new RegExp(location.pattern, 'i').test(requestPath)) {
+            return getNginxLocationAction(location);
+        }
+    }
+    if (bestPrefix) {
+        return getNginxLocationAction(bestPrefix);
+    }
+    return 'none';
+}
+
+function assertProxySurface(proxyName, config, expectations) {
+    for (const requestPath of expectations.allow || []) {
+        assert.equal(
+            classifyNginxPath(config, requestPath),
+            'allow',
+            `${proxyName} should allow ${requestPath}`
+        );
+    }
+    for (const requestPath of expectations.deny || []) {
+        assert.equal(
+            classifyNginxPath(config, requestPath),
+            'deny',
+            `${proxyName} should deny ${requestPath}`
+        );
+    }
+}
+
 test('admin shell and business account menu do not link back through the business home', () => {
     const repoRoot = path.resolve(__dirname, '..', '..');
     const adminScript = fs.readFileSync(path.join(repoRoot, 'backend', 'admin', 'admin.js'), 'utf8');
@@ -3116,12 +3187,14 @@ test('admin shell and business account menu do not link back through the busines
     assert(authProxyConfig.includes('location = /api/auth/account { return 404; }'));
     assert(authProxyConfig.includes('location ^~ /api/auth/account/ { return 404; }'));
     assert(authProxyConfig.includes('location = /api/auth/totp/disable { return 404; }'));
+    assert(authProxyConfig.includes('location ^~ /api/auth/totp/disable/ { return 404; }'));
     assert(authProxyConfig.includes('location ^~ /api/auth/ { proxy_pass http://ielts_app; }'));
     const authApiAllowIndex = authProxyConfig.indexOf('location ^~ /api/auth/ { proxy_pass http://ielts_app; }');
     assert(authProxyConfig.indexOf('location = /api/auth/password-change { proxy_pass http://ielts_app; }') < authApiAllowIndex);
     assert(authProxyConfig.indexOf('location = /api/auth/account { return 404; }') < authApiAllowIndex);
     assert(authProxyConfig.indexOf('location ^~ /api/auth/account/ { return 404; }') < authApiAllowIndex);
     assert(authProxyConfig.indexOf('location = /api/auth/totp/disable { return 404; }') < authApiAllowIndex);
+    assert(authProxyConfig.indexOf('location ^~ /api/auth/totp/disable/ { return 404; }') < authApiAllowIndex);
     assert(authProxyConfig.includes('location ^~ /api/admin/ { return 404; }'));
     assert(authProxyConfig.includes('location ^~ /api/practice-records { return 404; }'));
     assert(authProxyConfig.includes('proxy_set_header X-Ielts-Onion-Audience auth;'));
@@ -3133,6 +3206,129 @@ test('admin shell and business account menu do not link back through the busines
     assert(!authProxyConfig.includes('$proxy_add_x_forwarded_for'));
     assert(!authProxyConfig.includes('proxy_set_header X-Forwarded-Host $host;'));
     assert(!authProxyConfig.includes('proxy_set_header X-Forwarded-Proto $scheme;'));
+    assertProxySurface('business-proxy', businessProxyConfig, {
+        allow: [
+            '/',
+            '/index.html',
+            '/api/health',
+            '/api/site-content',
+            '/api/auth/csrf',
+            '/api/auth/me',
+            '/api/auth/logout',
+            '/api/practice-records',
+            '/auth/business/start',
+            '/auth/business/password/start',
+            '/auth/business/totp/start',
+            '/auth/business/callback',
+            '/auth/business/logout',
+            '/auth/login',
+            '/assets/generated/listening-exams/manifest.js',
+            '/practice/listening/example',
+            '/ListeningPractice/example.html'
+        ],
+        deny: [
+            '/admin',
+            '/ADMIN',
+            '/admin/',
+            '/api/admin',
+            '/API/ADMIN',
+            '/api/admin/users',
+            '/auth/admin/start',
+            '/AUTH/ADMIN/START',
+            '/auth/password',
+            '/auth/totp',
+            '/api/auth/login',
+            '/api/auth/login/',
+            '/API/AUTH/LOGIN',
+            '/api/auth/register',
+            '/API/AUTH/TOTP/SETUP',
+            '/internal',
+            '/debug',
+            '/metrics',
+            '/templates'
+        ]
+    });
+    assertProxySurface('auth-proxy', authProxyConfig, {
+        allow: [
+            '/',
+            '/auth/login',
+            '/auth/business/login',
+            '/auth/admin/login',
+            '/auth/login.js',
+            '/auth/login.css',
+            '/auth/password',
+            '/auth/password.js',
+            '/auth/totp',
+            '/auth/totp.js',
+            '/auth/complete',
+            '/auth/business/logout',
+            '/auth/admin/logout',
+            '/api/auth/csrf',
+            '/api/auth/login',
+            '/api/auth/register',
+            '/api/auth/totp/setup',
+            '/api/auth/password-change'
+        ],
+        deny: [
+            '/admin',
+            '/ADMIN',
+            '/api/admin',
+            '/API/ADMIN',
+            '/api/admin/users',
+            '/api/practice-records',
+            '/api/site-content',
+            '/api/export',
+            '/auth/account',
+            '/auth/account.js',
+            '/api/auth/account',
+            '/api/auth/account/password',
+            '/api/auth/totp/disable',
+            '/api/auth/totp/disable/',
+            '/API/AUTH/TOTP/DISABLE',
+            '/practice/listening/example',
+            '/assets/generated/listening-exams/manifest.js',
+            '/templates/example.html',
+            '/ListeningPractice/example.html',
+            '/internal',
+            '/debug',
+            '/metrics'
+        ]
+    });
+    assertProxySurface('admin-proxy', adminProxyConfig, {
+        allow: [
+            '/',
+            '/admin',
+            '/admin/',
+            '/admin/account',
+            '/admin/admin.js',
+            '/admin/admin.css',
+            '/api/auth/csrf',
+            '/api/auth/me',
+            '/api/auth/logout',
+            '/auth/admin/start',
+            '/auth/admin/callback',
+            '/auth/admin/logout',
+            '/api/admin/summary',
+            '/api/admin/users'
+        ],
+        deny: [
+            '/ADMIN',
+            '/api/admin',
+            '/auth/business/start',
+            '/auth/login',
+            '/api/auth/login',
+            '/api/auth/totp/setup',
+            '/api/practice-records',
+            '/api/site-content',
+            '/practice/listening/example',
+            '/assets/generated/listening-exams/manifest.js',
+            '/templates/example.html',
+            '/ListeningPractice/example.html',
+            '/internal',
+            '/debug',
+            '/metrics'
+        ]
+    });
     assert.doesNotMatch(adminScript, /\/api\/auth\/user/);
     assert.doesNotMatch(adminScript, /window\.location\.href\s*=\s*['"]\/['"]/);
     assert.doesNotMatch(adminIndex, /href=["']\/["'][^>]*>\s*App\s*</);
