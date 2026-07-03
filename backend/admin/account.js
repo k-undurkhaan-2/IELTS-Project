@@ -10,7 +10,9 @@
     const state = {
         csrfToken: '',
         userId: new URLSearchParams(window.location.search).get('userId') || '',
-        loading: false
+        loading: false,
+        adminStepUpResolver: null,
+        adminStepUpExpiresAt: 0
     };
     const ADMIN_AUTH_START = '/auth/admin/start?return_to=/admin/account';
     const ADMIN_AUTH_LOGOUT = '/auth/admin/logout?return_to=/admin/account';
@@ -34,7 +36,13 @@
         sessionsRevokeOthersButton: document.getElementById('sessions-revoke-others-button'),
         sessionsList: document.getElementById('sessions-list'),
         recordsRange: document.getElementById('records-range'),
-        recordsBody: document.getElementById('records-body')
+        recordsBody: document.getElementById('records-body'),
+        adminStepUpDialog: document.getElementById('admin-step-up-dialog'),
+        adminStepUpForm: document.getElementById('admin-step-up-form'),
+        adminStepUpPassword: document.getElementById('admin-step-up-password'),
+        adminStepUpCancel: document.getElementById('admin-step-up-cancel'),
+        adminStepUpSubmit: document.getElementById('admin-step-up-submit'),
+        adminStepUpError: document.getElementById('admin-step-up-error')
     };
 
     function truncateAdminText(value, maxLength, suffix = '') {
@@ -128,6 +136,17 @@
         const text = await response.text();
         const payload = parseAdminResponseJson(text);
         storeCsrfTokenFromPayload(payload);
+        if (response.status === 403 && payload && payload.requiresAdminStepUp) {
+            const error = new Error(payload.error || 'Admin step-up required');
+            error.requiresAdminStepUp = true;
+            throw error;
+        }
+        if ((response.status === 401 || response.status === 403) && options.authErrorMode === 'throw') {
+            const error = new Error(formatRequestError(response, payload));
+            error.status = response.status;
+            error.payload = payload;
+            throw error;
+        }
         if (response.status === 401 || response.status === 403) {
             window.location.href = ADMIN_AUTH_START;
             throw new Error('Admin session expired');
@@ -205,6 +224,79 @@
             return 'Revoke this admin session?';
         }
         return 'Revoke this business session?';
+    }
+
+    function closeAdminStepUp(value) {
+        if (!state.adminStepUpResolver) return;
+        const resolve = state.adminStepUpResolver;
+        state.adminStepUpResolver = null;
+        nodes.adminStepUpDialog.hidden = true;
+        nodes.adminStepUpPassword.value = '';
+        nodes.adminStepUpError.textContent = '';
+        resolve(value);
+    }
+
+    function promptAdminStepUp() {
+        if (state.adminStepUpResolver) {
+            return Promise.resolve(false);
+        }
+        nodes.adminStepUpPassword.value = '';
+        nodes.adminStepUpError.textContent = '';
+        nodes.adminStepUpDialog.hidden = false;
+        nodes.adminStepUpPassword.focus();
+        return new Promise((resolve) => {
+            state.adminStepUpResolver = resolve;
+        });
+    }
+
+    async function submitAdminStepUp(event) {
+        event.preventDefault();
+        const password = nodes.adminStepUpPassword.value;
+        nodes.adminStepUpPassword.value = '';
+        nodes.adminStepUpError.textContent = '';
+        nodes.adminStepUpSubmit.disabled = true;
+        try {
+            const payload = await request('/api/admin/action-step-up', {
+                method: 'POST',
+                body: { password },
+                authErrorMode: 'throw'
+            });
+            const expiresAt = Date.parse(payload.expiresAt || '');
+            state.adminStepUpExpiresAt = Number.isFinite(expiresAt) ? expiresAt : 0;
+            closeAdminStepUp(true);
+        } catch (error) {
+            state.adminStepUpExpiresAt = 0;
+            nodes.adminStepUpError.textContent = sanitizeStatusMessage(
+                error.message || 'Admin confirmation failed'
+            );
+            nodes.adminStepUpPassword.focus();
+        } finally {
+            nodes.adminStepUpSubmit.disabled = false;
+        }
+    }
+
+    async function ensureAdminStepUp() {
+        if (state.adminStepUpExpiresAt && Date.now() < state.adminStepUpExpiresAt - 5000) {
+            return;
+        }
+        const confirmed = await promptAdminStepUp();
+        if (!confirmed) {
+            throw new Error('Admin confirmation cancelled');
+        }
+    }
+
+    async function withAdminStepUp(action) {
+        await ensureAdminStepUp();
+        try {
+            return await action();
+        } catch (error) {
+            if (!error.requiresAdminStepUp) {
+                throw error;
+            }
+            state.adminStepUpExpiresAt = 0;
+            await ensureAdminStepUp();
+            return action();
+        }
     }
 
     function formatRecordTitle(record) {
@@ -344,9 +436,9 @@
         if (typeof window.confirm === 'function' && !window.confirm(getSessionRevokeConfirm(session))) {
             return;
         }
-        await request(`/api/admin/users/${encodeURIComponent(state.userId)}/sessions/${encodeURIComponent(normalizedId)}`, {
+        await withAdminStepUp(() => request(`/api/admin/users/${encodeURIComponent(state.userId)}/sessions/${encodeURIComponent(normalizedId)}`, {
             method: 'DELETE'
-        });
+        }));
         setStatus('Session revoked');
         await loadAccount();
     }
@@ -356,10 +448,10 @@
         if (typeof window.confirm === 'function' && !window.confirm('Revoke every other active session for this user, including authentication sessions used for sign-in and security settings?')) {
             return;
         }
-        await request(`/api/admin/users/${encodeURIComponent(state.userId)}/sessions/revoke-others`, {
+        await withAdminStepUp(() => request(`/api/admin/users/${encodeURIComponent(state.userId)}/sessions/revoke-others`, {
             method: 'POST',
             body: {}
-        });
+        }));
         setStatus('Other sessions revoked');
         await loadAccount();
     }
@@ -440,6 +532,20 @@
         });
         nodes.logoutButton.addEventListener('click', () => {
             logout().catch((error) => setStatus(error.message, 'error'));
+        });
+        nodes.adminStepUpForm.addEventListener('submit', (event) => {
+            submitAdminStepUp(event).catch((error) => setStatus(error.message, 'error'));
+        });
+        nodes.adminStepUpCancel.addEventListener('click', () => closeAdminStepUp(false));
+        nodes.adminStepUpDialog.addEventListener('click', (event) => {
+            if (event.target === nodes.adminStepUpDialog) {
+                closeAdminStepUp(false);
+            }
+        });
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && !nodes.adminStepUpDialog.hidden) {
+                closeAdminStepUp(false);
+            }
         });
         await loadAccount();
     }

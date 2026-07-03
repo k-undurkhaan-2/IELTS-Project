@@ -619,6 +619,13 @@ tr.is-selected {
     line-height: 1.5;
 }
 
+.dialog .dialog-error {
+    min-height: 20px;
+    margin: 0;
+    color: var(--danger);
+    font-size: 13px;
+}
+
 .dialog-heading {
     display: flex;
     align-items: center;

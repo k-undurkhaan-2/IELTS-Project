@@ -25,7 +25,9 @@
             loading: false,
             content: null
         },
-        confirmResolver: null
+        confirmResolver: null,
+        adminStepUpResolver: null,
+        adminStepUpExpiresAt: 0
     };
 
     const nodes = {
@@ -80,7 +82,13 @@
         confirmTitle: document.getElementById('confirm-title'),
         confirmMessage: document.getElementById('confirm-message'),
         confirmCancel: document.getElementById('confirm-cancel'),
-        confirmSubmit: document.getElementById('confirm-submit')
+        confirmSubmit: document.getElementById('confirm-submit'),
+        adminStepUpDialog: document.getElementById('admin-step-up-dialog'),
+        adminStepUpForm: document.getElementById('admin-step-up-form'),
+        adminStepUpPassword: document.getElementById('admin-step-up-password'),
+        adminStepUpCancel: document.getElementById('admin-step-up-cancel'),
+        adminStepUpSubmit: document.getElementById('admin-step-up-submit'),
+        adminStepUpError: document.getElementById('admin-step-up-error')
     };
 
     function truncateAdminText(value, maxLength, suffix = '') {
@@ -203,6 +211,17 @@
         const text = await response.text();
         const payload = parseAdminResponseJson(text);
         storeCsrfTokenFromPayload(payload);
+        if (response.status === 403 && payload && payload.requiresAdminStepUp) {
+            const error = new Error(payload.error || 'Admin step-up required');
+            error.requiresAdminStepUp = true;
+            throw error;
+        }
+        if ((response.status === 401 || response.status === 403) && options.authErrorMode === 'throw') {
+            const error = new Error(formatRequestError(response, payload));
+            error.status = response.status;
+            error.payload = payload;
+            throw error;
+        }
         if (response.status === 401 || response.status === 403) {
             window.location.href = '/auth/admin/start?return_to=/admin';
             throw new Error('Admin session expired');
@@ -422,10 +441,10 @@
     async function saveSiteContent() {
         const body = collectSiteContent();
         await withButtonBusy(nodes.contentSaveButton, 'Saving...', async () => {
-            const payload = await request('/api/admin/site-content', {
+            const payload = await withAdminStepUp(() => request('/api/admin/site-content', {
                 method: 'PATCH',
                 body
-            });
+            }));
             state.siteContent.content = payload.content || {};
             renderSiteContent(state.siteContent.content);
             setStatus('Business content updated');
@@ -543,6 +562,79 @@
         });
     }
 
+    function closeAdminStepUp(value) {
+        if (!state.adminStepUpResolver) return;
+        const resolve = state.adminStepUpResolver;
+        state.adminStepUpResolver = null;
+        nodes.adminStepUpDialog.hidden = true;
+        nodes.adminStepUpPassword.value = '';
+        nodes.adminStepUpError.textContent = '';
+        resolve(value);
+    }
+
+    function promptAdminStepUp() {
+        if (state.adminStepUpResolver) {
+            return Promise.resolve(false);
+        }
+        nodes.adminStepUpPassword.value = '';
+        nodes.adminStepUpError.textContent = '';
+        nodes.adminStepUpDialog.hidden = false;
+        nodes.adminStepUpPassword.focus();
+        return new Promise((resolve) => {
+            state.adminStepUpResolver = resolve;
+        });
+    }
+
+    async function submitAdminStepUp(event) {
+        event.preventDefault();
+        const password = nodes.adminStepUpPassword.value;
+        nodes.adminStepUpPassword.value = '';
+        nodes.adminStepUpError.textContent = '';
+        nodes.adminStepUpSubmit.disabled = true;
+        try {
+            const payload = await request('/api/admin/action-step-up', {
+                method: 'POST',
+                body: { password },
+                authErrorMode: 'throw'
+            });
+            const expiresAt = Date.parse(payload.expiresAt || '');
+            state.adminStepUpExpiresAt = Number.isFinite(expiresAt) ? expiresAt : 0;
+            closeAdminStepUp(true);
+        } catch (error) {
+            state.adminStepUpExpiresAt = 0;
+            nodes.adminStepUpError.textContent = sanitizeStatusMessage(
+                error.message || 'Admin confirmation failed'
+            );
+            nodes.adminStepUpPassword.focus();
+        } finally {
+            nodes.adminStepUpSubmit.disabled = false;
+        }
+    }
+
+    async function ensureAdminStepUp() {
+        if (state.adminStepUpExpiresAt && Date.now() < state.adminStepUpExpiresAt - 5000) {
+            return;
+        }
+        const confirmed = await promptAdminStepUp();
+        if (!confirmed) {
+            throw new Error('Admin confirmation cancelled');
+        }
+    }
+
+    async function withAdminStepUp(action) {
+        await ensureAdminStepUp();
+        try {
+            return await action();
+        } catch (error) {
+            if (!error.requiresAdminStepUp) {
+                throw error;
+            }
+            state.adminStepUpExpiresAt = 0;
+            await ensureAdminStepUp();
+            return action();
+        }
+    }
+
     async function withButtonBusy(button, label, action) {
         const previous = button.textContent;
         button.disabled = true;
@@ -563,10 +655,10 @@
             role: nodes.createRole.value
         };
         await withButtonBusy(nodes.createUserSubmit, 'Creating...', async () => {
-            const payload = await request('/api/admin/users', {
+            const payload = await withAdminStepUp(() => request('/api/admin/users', {
                 method: 'POST',
                 body
-            });
+            }));
             closeUserDialog();
             setStatus(`Created ${payload.user.username}`);
             state.users.offset = 0;
@@ -594,10 +686,10 @@
         }
 
         await withButtonBusy(nodes.saveUserButton, 'Saving...', async () => {
-            const payload = await request(`/api/admin/users/${encodeURIComponent(user.id)}`, {
+            const payload = await withAdminStepUp(() => request(`/api/admin/users/${encodeURIComponent(user.id)}`, {
                 method: 'PATCH',
                 body
-            });
+            }));
             const nextUser = payload.user;
             setStatus(`Updated ${nextUser.username}`);
             state.selectedUser = nextUser;
@@ -620,9 +712,9 @@
             return;
         }
         await withButtonBusy(nodes.deleteUserButton, 'Deleting...', async () => {
-            await request(`/api/admin/users/${encodeURIComponent(user.id)}`, {
+            await withAdminStepUp(() => request(`/api/admin/users/${encodeURIComponent(user.id)}`, {
                 method: 'DELETE'
-            });
+            }));
             setStatus(`Deleted ${user.username}`);
             clearSelection();
             if (state.users.offset >= state.users.total - 1 && state.users.offset > 0) {
@@ -693,9 +785,20 @@
                 closeConfirm(false);
             }
         });
+        nodes.adminStepUpForm.addEventListener('submit', (event) => {
+            submitAdminStepUp(event).catch((error) => setStatus(error.message, 'error'));
+        });
+        nodes.adminStepUpCancel.addEventListener('click', () => closeAdminStepUp(false));
+        nodes.adminStepUpDialog.addEventListener('click', (event) => {
+            if (event.target === nodes.adminStepUpDialog) {
+                closeAdminStepUp(false);
+            }
+        });
         document.addEventListener('keydown', (event) => {
             if (event.key !== 'Escape') return;
-            if (!nodes.confirmDialog.hidden) {
+            if (!nodes.adminStepUpDialog.hidden) {
+                closeAdminStepUp(false);
+            } else if (!nodes.confirmDialog.hidden) {
                 closeConfirm(false);
             } else if (!nodes.userDialog.hidden) {
                 closeUserDialog();
@@ -736,6 +839,8 @@
             downloadExport,
             confirmAction,
             closeConfirm,
+            ensureAdminStepUp,
+            withAdminStepUp,
             state
         };
     } else {

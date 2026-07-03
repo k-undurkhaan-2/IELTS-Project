@@ -377,6 +377,7 @@ async function createClient(options = {}) {
         totpEnabled: options.totpEnabled,
         totpEncryptionKey: options.totpEncryptionKey || 'test-totp-key',
         totpVerificationMaxAgeMs: options.totpVerificationMaxAgeMs,
+        adminActionStepUpMaxAgeMs: options.adminActionStepUpMaxAgeMs,
         authHandoffTicketTtlMs: options.authHandoffTicketTtlMs,
         authHandoffSecret: options.authHandoffSecret,
         authPublicUrl: options.authPublicUrl,
@@ -903,6 +904,10 @@ async function enableTotpForCurrentSession(client) {
     };
 }
 
+async function adminActionStepUp(client, password = 'StrongPass1') {
+    return client.request('POST', '/api/admin/action-step-up', { password });
+}
+
 function createFullCookieReplay(client, sourceSession = client) {
     const replay = client.createSession();
     replay.setCookie('ielts.sid', sourceSession.getCookie('ielts.sid'));
@@ -1202,6 +1207,8 @@ test('admin session API lists target sessions and revokes copied user sessions',
         });
         assert.equal(adminLogin.response.status, 200);
         await enableTotpForCurrentSession(client);
+        const stepUp = await adminActionStepUp(client);
+        assert.equal(stepUp.response.status, 200);
 
         const target = client.createSession();
         const targetCreated = await register(target, 'session_target', 'StrongPass1');
@@ -2924,6 +2931,15 @@ test('site content API requires admin TOTP for writes and publishes sanitized pu
         }, { csrf: false });
         assert.equal(blockedWithoutCsrf.response.status, 403);
 
+        const blockedWithoutStepUp = await client.request('PATCH', '/api/admin/site-content', {
+            homeBanner: { enabled: true }
+        });
+        assert.equal(blockedWithoutStepUp.response.status, 403);
+        assert.equal(blockedWithoutStepUp.json.requiresAdminStepUp, true);
+
+        const stepUp = await adminActionStepUp(client);
+        assert.equal(stepUp.response.status, 200);
+
         const invalidShape = await client.request('PATCH', '/api/admin/site-content', {
             homeBanner: { enabled: true, html: '<img src=x onerror=alert(1)>' }
         });
@@ -2986,8 +3002,11 @@ test('site content UI renders with text nodes and admin edit controls', () => {
     assert(scriptSource.includes("^\\/(?:api|admin|auth\\/admin)(?:\\/|$)"));
     assert(adminIndex.includes('id="content-panel"'));
     assert(adminIndex.includes('id="content-save-button"'));
+    assert(adminIndex.includes('id="admin-step-up-dialog"'));
     assert(adminScript.includes("request('/api/admin/site-content'"));
     assert(adminScript.includes("request('/api/admin/site-content',"));
+    assert(adminScript.includes("request('/api/admin/action-step-up'"));
+    assert(adminScript.includes('requiresAdminStepUp'));
 });
 
 test('admin dashboard redirects anonymous users through auth handoff', async () => {
@@ -4735,6 +4754,8 @@ test('admin can list users, inspect records, and delete one record', async () =>
 
         const enabledAdminTotp = await enableTotpForCurrentSession(client);
         assert.equal(enabledAdminTotp.user.role, 'admin');
+        const stepUp = await adminActionStepUp(client);
+        assert.equal(stepUp.response.status, 200);
 
         const adminPage = await client.request('GET', '/admin');
         assert.equal(adminPage.response.status, 200);
@@ -4754,11 +4775,14 @@ test('admin can list users, inspect records, and delete one record', async () =>
         assert.match(accountScript.text, /practice-records\?limit=/);
         assert.match(accountScript.text, /\/sessions\/revoke-others/);
         assert.match(accountScript.text, /Revoke session/);
+        assert.match(accountScript.text, /\/api\/admin\/action-step-up/);
+        assert.match(accountScript.text, /requiresAdminStepUp/);
 
         const accountStyles = await client.request('GET', '/admin/account.css');
         assert.equal(accountStyles.response.status, 200);
         assert.match(accountStyles.text, /account-shell/);
         assert.match(accountStyles.text, /session-card/);
+        assert.match(accountStyles.text, /dialog-backdrop/);
 
         const summary = await client.request('GET', '/api/admin/summary');
         assert.equal(summary.response.status, 200);
@@ -4831,6 +4855,8 @@ test('admin sensitive mutations are rate limited', async () => {
         assert.equal(login.response.status, 200);
         assert.equal(login.json.requiresTotpSetup, true);
         await enableTotpForCurrentSession(client);
+        const stepUp = await adminActionStepUp(client);
+        assert.equal(stepUp.response.status, 200);
 
         const created = await client.request('POST', '/api/admin/users', {
             username: 'limited_admin_target',
@@ -4869,6 +4895,8 @@ test('admin mutation rate limits ignore X-Forwarded-For from untrusted clients',
         assert.equal(login.response.status, 200);
         assert.equal(login.json.requiresTotpSetup, true);
         await enableTotpForCurrentSession(client);
+        const stepUp = await adminActionStepUp(client);
+        assert.equal(stepUp.response.status, 200);
 
         const created = await client.request('POST', '/api/admin/users', {
             username: 'xff_limited_admin_target',
@@ -4902,6 +4930,8 @@ test('admin API does not expose internal error messages', async () => {
         });
         assert.equal(login.response.status, 200);
         await enableTotpForCurrentSession(client);
+        const stepUp = await adminActionStepUp(client);
+        assert.equal(stepUp.response.status, 200);
 
         const originalCreateUser = client.adminStore.createUser.bind(client.adminStore);
         client.adminStore.createUser = async () => {
@@ -4994,6 +5024,51 @@ test('admin TOTP verification expires and can be renewed in-session', async () =
     }
 });
 
+test('admin sensitive mutations require recent password step-up', async () => {
+    const client = await createClient({ adminActionStepUpMaxAgeMs: 1000 });
+    try {
+        await seedAdmin(client, 'step_up_admin', 'StrongPass1');
+        await client.csrf();
+        const login = await client.request('POST', '/api/auth/login', {
+            username: 'step_up_admin',
+            password: 'StrongPass1'
+        });
+        assert.equal(login.response.status, 200);
+        assert.equal(login.json.requiresTotpSetup, true);
+        await enableTotpForCurrentSession(client);
+
+        const blocked = await client.request('PATCH', '/api/admin/site-content', {
+            homeBanner: { enabled: true }
+        });
+        assert.equal(blocked.response.status, 403);
+        assert.equal(blocked.json.error, 'Admin step-up required');
+        assert.equal(blocked.json.requiresAdminStepUp, true);
+
+        const wrongPassword = await adminActionStepUp(client, 'WrongPass1');
+        assert.equal(wrongPassword.response.status, 401);
+        assert.equal(wrongPassword.json.error, 'Admin re-authentication failed');
+
+        const confirmed = await adminActionStepUp(client, 'StrongPass1');
+        assert.equal(confirmed.response.status, 200);
+        assert.equal(confirmed.json.ok, true);
+        assert.match(confirmed.json.expiresAt, /^\d{4}-\d{2}-\d{2}T/);
+
+        const updated = await client.request('PATCH', '/api/admin/site-content', {
+            homeBanner: { enabled: true, title: 'Step-up gated' }
+        });
+        assert.equal(updated.response.status, 200);
+        assert.equal(updated.json.content.homeBanner.title, 'Step-up gated');
+
+        const expired = await withDateNowOffset(2000, () => client.request('PATCH', '/api/admin/site-content', {
+            homeBanner: { enabled: false }
+        }));
+        assert.equal(expired.response.status, 403);
+        assert.equal(expired.json.requiresAdminStepUp, true);
+    } finally {
+        await client.close();
+    }
+});
+
 test('admin mutations rotate the session verifier for copied cookie jars', async () => {
     const client = await createClient();
     try {
@@ -5007,6 +5082,8 @@ test('admin mutations rotate the session verifier for copied cookie jars', async
         assert.equal(login.json.requiresTotpSetup, true);
         await enableTotpForCurrentSession(client);
 
+        const stepUp = await adminActionStepUp(client);
+        assert.equal(stepUp.response.status, 200);
         const staleReplay = createFullCookieReplay(client);
         const staleBefore = await staleReplay.request('GET', '/api/admin/summary');
         assert.equal(staleBefore.response.status, 200);
@@ -5078,6 +5155,8 @@ test('admin can manage users and inspect learning and traffic stats', async () =
         assert.equal(login.response.status, 200);
         assert.equal(login.json.requiresTotpSetup, true);
         await enableTotpForCurrentSession(client);
+        const stepUp = await adminActionStepUp(client);
+        assert.equal(stepUp.response.status, 200);
 
         const weak = await client.request('POST', '/api/admin/users', {
             username: 'weak_created',
@@ -5423,6 +5502,8 @@ test('admin user deletion clears target TOTP state in memory store', async () =>
         assert.equal(login.response.status, 200);
         assert.equal(login.json.requiresTotpSetup, true);
         await enableTotpForCurrentSession(adminSession);
+        const stepUp = await adminActionStepUp(adminSession);
+        assert.equal(stepUp.response.status, 200);
 
         const deleted = await adminSession.request('DELETE', `/api/admin/users/${targetUserId}`);
         assert.equal(deleted.response.status, 200);
@@ -5670,6 +5751,8 @@ test('admin user changes invalidate target sessions and stale admin roles', asyn
         assert.equal(ownerLogin.response.status, 200);
         assert.equal(ownerLogin.json.requiresTotpSetup, true);
         await enableTotpForCurrentSession(adminSession);
+        const stepUp = await adminActionStepUp(adminSession);
+        assert.equal(stepUp.response.status, 200);
 
         const userSession = client.createSession();
         const createdUser = await register(userSession, 'reset_target', 'StrongPass1');
@@ -5733,6 +5816,8 @@ test('admin web routes reject self password changes', async () => {
         const enabled = await enableTotpForCurrentSession(adminSession);
         assert(enabled.sessionCookie);
         assert(enabled.csrfToken);
+        const stepUp = await adminActionStepUp(adminSession);
+        assert.equal(stepUp.response.status, 200);
 
         const selfUpdateViaAdmin = await adminSession.request('PATCH', `/api/admin/users/${enabled.user.id}`, {
             password: 'StrongerPass2'

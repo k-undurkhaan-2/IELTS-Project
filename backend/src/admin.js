@@ -7,6 +7,8 @@ const {
     ensureCsrfToken,
     createRateLimiter,
     getCanonicalClientIp,
+    getUserSecurityEpoch,
+    isPasswordWithinBcryptByteLimit,
     normalizeUsername,
     publicUser,
     requireAdmin,
@@ -44,6 +46,10 @@ const updateUserSchema = z.object({
     password: z.string().min(8).max(128).optional()
 }).refine((value) => value.role !== undefined || value.password !== undefined, {
     message: 'No changes supplied'
+});
+
+const adminActionStepUpSchema = z.object({
+    password: z.string().min(1).max(128)
 });
 
 const trafficQuerySchema = z.object({
@@ -87,6 +93,7 @@ const ADMIN_RECORD_MAX_DEPTH_VALUE = '[max-depth]';
 const ADMIN_RECORD_ACCESSOR_VALUE = '[accessor]';
 const ADMIN_RECORD_UNSAFE_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 const SITE_CONTENT_KEYS = ['loginNotice', 'homeBanner'];
+const DEFAULT_ADMIN_ACTION_STEP_UP_MAX_AGE_MS = 5 * 60 * 1000;
 const SITE_CONTENT_DB_KEYS = {
     loginNotice: 'login_notice',
     homeBanner: 'home_banner'
@@ -2151,12 +2158,16 @@ function createAdminRouter(options = {}) {
     const express = require('express');
     const router = express.Router();
     const store = options.store || new PostgresAdminStore(options.db);
+    const authStore = options.authStore || null;
     const authSessionStore = options.authSessionStore || null;
     const requireAdminTotp = options.requireAdminTotp || ((req, res, next) => next());
     const checkRateLimit = options.checkRateLimit || createRateLimiter(options.rateLimit);
     const totpVerificationMaxAgeMs = resolveTotpVerificationMaxAgeMs({
         verificationMaxAgeMs: options.totpVerificationMaxAgeMs
     });
+    const adminActionStepUpMaxAgeMs = Number.isFinite(Number(options.adminActionStepUpMaxAgeMs))
+        ? Math.max(1, Number(options.adminActionStepUpMaxAgeMs))
+        : DEFAULT_ADMIN_ACTION_STEP_UP_MAX_AGE_MS;
 
     function checkAdminMutationRateLimit(req, action) {
         const adminId = req.session?.user?.id || 'unknown';
@@ -2166,9 +2177,70 @@ function createAdminRouter(options = {}) {
         checkRateLimit(`admin-mutation-action:${action}:${ip}:${adminId}`);
     }
 
+    function checkAdminStepUpRateLimit(req) {
+        const adminId = req.session?.user?.id || 'unknown';
+        const ip = getCanonicalClientIp(req);
+        checkRateLimit(`admin-step-up-ip:${ip}`);
+        checkRateLimit(`admin-step-up-user:${adminId}`);
+    }
+
     function rotateSessionVerifier(req) {
         if (typeof req.rotateSessionVerifier === 'function') {
             req.rotateSessionVerifier();
+        }
+    }
+
+    function clearAdminActionStepUp(req) {
+        if (req.session) {
+            delete req.session.adminActionStepUp;
+        }
+    }
+
+    async function getCurrentAuthUser(req) {
+        if (!req.session?.user?.id || !authStore || typeof authStore.findById !== 'function') {
+            return null;
+        }
+        return authStore.findById(req.session.user.id);
+    }
+
+    function sendAdminActionStepUpRequired(res) {
+        return res.status(403).json({
+            error: 'Admin step-up required',
+            requiresAdminStepUp: true
+        });
+    }
+
+    function isAdminActionStepUpFresh(req, currentUser) {
+        const marker = req.session?.adminActionStepUp;
+        if (!marker || !currentUser) {
+            return false;
+        }
+        if (marker.userId !== currentUser.id) {
+            return false;
+        }
+        if (Number(marker.securityEpoch) !== getUserSecurityEpoch(currentUser)) {
+            return false;
+        }
+        const verifiedAt = Number(marker.verifiedAt || 0);
+        return Number.isFinite(verifiedAt)
+            && verifiedAt > 0
+            && Date.now() - verifiedAt <= adminActionStepUpMaxAgeMs;
+    }
+
+    async function requireAdminActionStepUp(req, res, next) {
+        try {
+            const currentUser = await getCurrentAuthUser(req);
+            if (!currentUser || currentUser.role !== 'admin') {
+                clearAdminActionStepUp(req);
+                return res.status(401).json({ error: 'Authentication required' });
+            }
+            if (!isAdminActionStepUpFresh(req, currentUser)) {
+                clearAdminActionStepUp(req);
+                return sendAdminActionStepUpRequired(res);
+            }
+            return next();
+        } catch (error) {
+            return next(error);
         }
     }
 
@@ -2190,6 +2262,46 @@ function createAdminRouter(options = {}) {
     });
     router.use(requireAdmin);
     router.use(requireAdminTotp);
+
+    router.post('/action-step-up', verifyCsrfToken, async (req, res, next) => {
+        try {
+            checkAdminStepUpRateLimit(req);
+            const parsed = adminActionStepUpSchema.safeParse(req.body || {});
+            if (!parsed.success) {
+                clearAdminActionStepUp(req);
+                return res.status(400).json({ error: 'Invalid admin step-up payload' });
+            }
+            const currentUser = await getCurrentAuthUser(req);
+            if (!currentUser || currentUser.role !== 'admin' || !currentUser.password_hash) {
+                clearAdminActionStepUp(req);
+                return res.status(401).json({ error: 'Admin re-authentication failed' });
+            }
+            if (!isPasswordWithinBcryptByteLimit(parsed.data.password)) {
+                clearAdminActionStepUp(req);
+                return res.status(401).json({ error: 'Admin re-authentication failed' });
+            }
+            const passwordOk = await bcrypt.compare(parsed.data.password, currentUser.password_hash);
+            if (!passwordOk) {
+                clearAdminActionStepUp(req);
+                return res.status(401).json({ error: 'Admin re-authentication failed' });
+            }
+            const verifiedAt = Date.now();
+            req.session.adminActionStepUp = {
+                userId: currentUser.id,
+                securityEpoch: getUserSecurityEpoch(currentUser),
+                verifiedAt
+            };
+            rotateSessionVerifier(req);
+            return res.json({
+                ok: true,
+                expiresAt: new Date(verifiedAt + adminActionStepUpMaxAgeMs).toISOString(),
+                csrfToken: ensureCsrfToken(req)
+            });
+        } catch (error) {
+            if (error.status) return sendError(res, error);
+            return next(error);
+        }
+    });
 
     router.get('/summary', async (req, res, next) => {
         try {
@@ -2234,7 +2346,7 @@ function createAdminRouter(options = {}) {
         }
     });
 
-    router.patch('/site-content', verifyCsrfToken, async (req, res, next) => {
+    router.patch('/site-content', verifyCsrfToken, requireAdminActionStepUp, async (req, res, next) => {
         try {
             checkAdminMutationRateLimit(req, 'update-site-content');
             const parsed = siteContentUpdateSchema.safeParse(req.body || {});
@@ -2278,7 +2390,7 @@ function createAdminRouter(options = {}) {
         }
     });
 
-    router.post('/users', verifyCsrfToken, async (req, res, next) => {
+    router.post('/users', verifyCsrfToken, requireAdminActionStepUp, async (req, res, next) => {
         try {
             checkAdminMutationRateLimit(req, 'create-user');
             const parsed = createUserSchema.safeParse(req.body || {});
@@ -2336,7 +2448,7 @@ function createAdminRouter(options = {}) {
         }
     });
 
-    router.post('/users/:userId/sessions/revoke-others', verifyCsrfToken, async (req, res, next) => {
+    router.post('/users/:userId/sessions/revoke-others', verifyCsrfToken, requireAdminActionStepUp, async (req, res, next) => {
         try {
             const userId = parseUserIdParam(req.params.userId);
             const user = await store.getUser(userId);
@@ -2354,7 +2466,7 @@ function createAdminRouter(options = {}) {
         }
     });
 
-    router.delete('/users/:userId/sessions/:sessionId', verifyCsrfToken, async (req, res, next) => {
+    router.delete('/users/:userId/sessions/:sessionId', verifyCsrfToken, requireAdminActionStepUp, async (req, res, next) => {
         try {
             const userId = parseUserIdParam(req.params.userId);
             const sessionId = String(req.params.sessionId || '').trim();
@@ -2381,7 +2493,7 @@ function createAdminRouter(options = {}) {
         }
     });
 
-    router.patch('/users/:userId', verifyCsrfToken, async (req, res, next) => {
+    router.patch('/users/:userId', verifyCsrfToken, requireAdminActionStepUp, async (req, res, next) => {
         try {
             const userId = parseUserIdParam(req.params.userId);
             checkAdminMutationRateLimit(req, 'update-user');
@@ -2438,7 +2550,7 @@ function createAdminRouter(options = {}) {
         }
     });
 
-    router.delete('/users/:userId', verifyCsrfToken, async (req, res, next) => {
+    router.delete('/users/:userId', verifyCsrfToken, requireAdminActionStepUp, async (req, res, next) => {
         try {
             const userId = parseUserIdParam(req.params.userId);
             checkAdminMutationRateLimit(req, 'delete-user');
@@ -2477,7 +2589,7 @@ function createAdminRouter(options = {}) {
         }
     });
 
-    router.delete('/users/:userId/practice-records/:recordId', verifyCsrfToken, async (req, res, next) => {
+    router.delete('/users/:userId/practice-records/:recordId', verifyCsrfToken, requireAdminActionStepUp, async (req, res, next) => {
         try {
             const userId = parseUserIdParam(req.params.userId);
             const recordId = parseRecordIdParam(req.params.recordId);
