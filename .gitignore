@@ -75,6 +75,8 @@
 !/ListeningPractice/vip special/scripts/build-bundles.mjs
 /assets/generated/listening-exams/*
 !/assets/generated/listening-exams/listening-practice-unified.html
+!/assets/generated/listening-exams/manifest.js
+!/assets/generated/listening-exams/listening-index.compat.js
 /睡着过项目组(9.4)[134篇]/
 /IELTS/
 /.claude/

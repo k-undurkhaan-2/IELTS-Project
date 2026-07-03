@@ -46,11 +46,20 @@ test('docker image hardening excludes secrets and runs app as non-root', () => {
     assert.match(dockerfile, /^FROM node:24-alpine/m);
     assert.doesNotMatch(dockerfile, /^FROM node:20-alpine/m);
     assert.match(dockerfile, /\nUSER node\s*\n/);
-    for (const pattern of ['.git', 'backend/.env', 'backend/.env.*', 'backend/logs', 'backend/node_modules', 'backend/tor/bridges.local.txt', 'backend/tor/bridges.age', 'backend/tor/bridge-age-identity.txt', 'backend/tor/bridge.identity', 'backend/tor/bridge.pub', 'backend/tor/*.identity', 'backend/tor/*.pub', 'backend/tor/*.agekey', 'ListeningPractice']) {
+    for (const pattern of ['.git', 'backend/.env', 'backend/.env.*', 'backend/logs', 'backend/node_modules', 'backend/tor/bridges.local.txt', 'backend/tor/bridges.age', 'backend/tor/bridge-age-identity.txt', 'backend/tor/bridge.identity', 'backend/tor/bridge.pub', 'backend/tor/*.identity', 'backend/tor/*.pub', 'backend/tor/*.agekey']) {
         assert(
             dockerignore.split(/\r?\n/).includes(pattern),
             `.dockerignore must exclude ${pattern}`
         );
+    }
+    assert(!dockerignore.split(/\r?\n/).includes('ListeningPractice'));
+    assert(dockerfile.includes('COPY ListeningPractice ./ListeningPractice'));
+    for (const listeningAssetPath of [
+        'assets/generated/listening-exams/manifest.js',
+        'assets/generated/listening-exams/listening-index.compat.js',
+        'assets/generated/listening-exams/listening-practice-unified.html'
+    ]) {
+        assert(fs.existsSync(path.join(repoRoot, listeningAssetPath)), `${listeningAssetPath} must exist for app image builds`);
     }
     assert(dockerignore.split(/\r?\n/).includes('!backend/migrations/*.sql'));
     assert(dockerignore.split(/\r?\n/).includes('backend/tor/bridges.age.tmp-*'));
@@ -82,6 +91,9 @@ test('docker image hardening excludes secrets and runs app as non-root', () => {
     assert(gitignore.split(/\r?\n/).includes('*admin_tor_hidden_service*'));
     assert(gitignore.split(/\r?\n/).includes('*auth_tor_hidden_service*'));
     assert(gitignore.split(/\r?\n/).includes('!backend/migrations/*.sql'));
+    assert(gitignore.split(/\r?\n/).includes('!/assets/generated/listening-exams/manifest.js'));
+    assert(gitignore.split(/\r?\n/).includes('!/assets/generated/listening-exams/listening-index.compat.js'));
+    assert(gitignore.split(/\r?\n/).includes('!/assets/generated/listening-exams/listening-practice-unified.html'));
     assert(torDockerfile.includes('apt-get install -y --no-install-recommends age ca-certificates obfs4proxy tor'));
     assert(torDockerfile.includes('COPY torrc /etc/tor/torrc'));
     assert(torDockerfile.includes('COPY bridges.txt /etc/tor/bridges.txt'));
@@ -141,6 +153,10 @@ test('docker image hardening excludes secrets and runs app as non-root', () => {
     assert(!composeProfileCheck.includes("'up'"));
     assert(deploymentRunbook.includes('Recreate only `app` with `--no-build`.'));
     assert(deploymentRunbook.includes('omitting `--no-build` can make the target host attempt'));
+    assert(deploymentRunbook.includes('Listening Runtime Assets'));
+    assert(deploymentRunbook.includes('assets/generated/listening-exams/manifest.js'));
+    assert(deploymentRunbook.includes('assets/generated/listening-exams/listening-index.compat.js'));
+    assert(deploymentRunbook.includes('test -d /app/ListeningPractice'));
     assert(deploymentRunbook.includes('Admin Password Maintenance Rotation'));
     assert(deploymentRunbook.includes('Do not overwrite the long-lived target `backend/.env`'));
     assert(deploymentRunbook.includes('Do not commit the temporary file'));

@@ -10,6 +10,7 @@ WORKDIR /app
 COPY assets ./assets
 COPY css ./css
 COPY js ./js
+COPY ListeningPractice ./ListeningPractice
 COPY templates ./templates
 COPY index.html ./index.html
 COPY backend ./backend

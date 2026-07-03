@@ -37,5 +37,4 @@ backend/tor/volume-backups/
 *.sql.gz
 *.tar
 *.tar.gz
-ListeningPractice
 node_modules

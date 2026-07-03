@@ -56,6 +56,44 @@ Use `--no-build` for target-host app recreates after loading an exported
 for development, and omitting `--no-build` can make the target host attempt a
 slow or failing rebuild instead of using the already loaded image.
 
+## Listening Runtime Assets
+
+The business UI depends on generated Listening runtime assets at:
+
+- `assets/generated/listening-exams/manifest.js`
+- `assets/generated/listening-exams/listening-index.compat.js`
+- `assets/generated/listening-exams/listening-practice-unified.html`
+- `ListeningPractice/`
+
+Production app-image builds must include those files and directories. Do not
+stage deployment sources from Git-tracked files only unless the generated
+Listening index files are present in that staged source. If they are omitted,
+the app can remain healthy while the business Listening entry disappears.
+
+Before recreating `app`, verify the app image contains the generated Listening
+index files:
+
+```sh
+docker run --rm --entrypoint sh backend-app:latest -lc '
+  test -s /app/assets/generated/listening-exams/manifest.js
+  test -s /app/assets/generated/listening-exams/listening-index.compat.js
+  test -s /app/assets/generated/listening-exams/listening-practice-unified.html
+  test -d /app/ListeningPractice
+'
+```
+
+After recreating `app`, verify the public generated index endpoints return
+`200` and that protected Listening practice content still requires auth:
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' \
+  http://127.0.0.1:3000/assets/generated/listening-exams/manifest.js
+curl -s -o /dev/null -w '%{http_code}\n' \
+  http://127.0.0.1:3000/assets/generated/listening-exams/listening-index.compat.js
+curl -s -o /dev/null -w '%{http_code}\n' \
+  http://127.0.0.1:3000/practice/listening/test
+```
+
 ## Admin Password Maintenance Rotation
 
 Admin accounts must not change their own password through the Web UI or Web
