@@ -141,6 +141,13 @@ test('docker image hardening excludes secrets and runs app as non-root', () => {
     assert(!composeProfileCheck.includes("'up'"));
     assert(deploymentRunbook.includes('Recreate only `app` with `--no-build`.'));
     assert(deploymentRunbook.includes('omitting `--no-build` can make the target host attempt'));
+    assert(deploymentRunbook.includes('Admin Password Maintenance Rotation'));
+    assert(deploymentRunbook.includes('Do not overwrite the long-lived target `backend/.env`'));
+    assert(deploymentRunbook.includes('Do not commit the temporary file'));
+    assert(deploymentRunbook.includes('run --rm --no-deps'));
+    assert(deploymentRunbook.includes('-e ADMIN_PASSWORD'));
+    assert(deploymentRunbook.includes('rm -f "$ADMIN_BOOTSTRAP_ENV"'));
+    assert(deploymentRunbook.includes('It must not print `ADMIN_PASSWORD`.'));
     assert(!composeProfileCheck.includes("'run'"));
     assert(!/obfs4\s+\S+\s+[A-Fa-f0-9]{40}\s+cert=/.test(bridgesTemplate));
     assert(bridgesTemplate.includes('encrypt the private bridge'));

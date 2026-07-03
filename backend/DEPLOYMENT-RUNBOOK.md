@@ -56,6 +56,89 @@ Use `--no-build` for target-host app recreates after loading an exported
 for development, and omitting `--no-build` can make the target host attempt a
 slow or failing rebuild instead of using the already loaded image.
 
+## Admin Password Maintenance Rotation
+
+Admin accounts must not change their own password through the Web UI or Web
+APIs. Rotate an admin password only through the server maintenance channel with
+`backend/scripts/bootstrap-admin.mjs`.
+
+Do not overwrite the long-lived target `backend/.env` for a one-time password
+rotation. Do not commit the temporary file. Do not paste the password into a
+shell command line, because command history or process listings can retain it.
+
+Recommended flow:
+
+1. On the local maintenance workstation, create a temporary POSIX-shell
+   compatible env file, for example `admin-bootstrap.local.env`:
+
+   ```sh
+   ADMIN_USERNAME='admin'
+   ADMIN_PASSWORD='replace-with-the-new-strong-admin-password'
+   ADMIN_RESET_TOTP='false'
+   ```
+
+   Set `ADMIN_RESET_TOTP='true'` only when intentionally forcing the admin to
+   re-enroll TOTP. Keep this file outside Git-tracked commit scope.
+
+2. Copy the temporary file to the target user's home directory:
+
+   ```sh
+   scp admin-bootstrap.local.env \
+     ieltsadmin@10.2.202.119:/home/ieltsadmin/.admin-bootstrap.env
+   ```
+
+3. On the target host, load the temporary values into the shell environment and
+   run a one-off app container. This updates the admin account using the same
+   app image and database settings as the deployed service, without recreating
+   app, proxy, Tor, or database containers:
+
+   ```sh
+   cd /home/ieltsadmin/apps/IELTS-practice
+   set +x
+   ADMIN_BOOTSTRAP_ENV="$HOME/.admin-bootstrap.env"
+   chmod 600 "$ADMIN_BOOTSTRAP_ENV"
+   set -a
+   . "$ADMIN_BOOTSTRAP_ENV"
+   set +a
+
+   docker compose --env-file backend/.env \
+     -f backend/docker-compose.yml \
+     -f backend/docker-compose.prod.override.yml \
+     -f backend/docker-compose.business-onion.override.yml \
+     -f backend/docker-compose.admin-onion.override.yml \
+     -f backend/docker-compose.auth-onion.override.yml \
+     --profile business-onion \
+     --profile admin-onion \
+     --profile auth-onion \
+     run --rm --no-deps \
+       -e ADMIN_USERNAME \
+       -e ADMIN_PASSWORD \
+       -e ADMIN_RESET_TOTP \
+       app node scripts/bootstrap-admin.mjs
+
+   rm -f "$ADMIN_BOOTSTRAP_ENV"
+   unset ADMIN_USERNAME ADMIN_PASSWORD ADMIN_RESET_TOTP ADMIN_BOOTSTRAP_ENV
+   ```
+
+4. Confirm the command output reports only non-secret status and the expected
+   admin username/role. It must not print `ADMIN_PASSWORD`.
+
+5. Verify the old admin password no longer works and the new admin password
+   starts the normal admin login flow. If `ADMIN_RESET_TOTP='false'`, the
+   existing admin TOTP enrollment should still be required. If it was set to
+   `true`, re-enroll TOTP from the admin auth flow.
+
+6. Confirm no service topology changed:
+
+   ```sh
+   docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+   curl -s http://127.0.0.1:3000/api/health
+   ss -ltnp | grep -E ':3000|:5432|:55432|:9050|:9051|:80|:443' || true
+   ```
+
+   Expected host listeners remain limited to `127.0.0.1:3000`, plus any
+   explicitly accepted local-only postgres maintenance mapping.
+
 ## Legacy Base Tor Service
 
 The base `tor` service in `backend/docker-compose.yml` is not part of the
