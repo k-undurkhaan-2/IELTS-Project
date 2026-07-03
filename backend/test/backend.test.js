@@ -3188,6 +3188,8 @@ test('admin shell and business account menu do not link back through the busines
     assert(adminScript.includes('/api/admin/summary'));
     assert(adminScript.includes('/api/admin/export?dataset='));
     assert(adminScript.includes('/admin/account?userId='));
+    assert(adminScript.includes('Use the server maintenance channel'));
+    assert(adminScript.includes('nodes.selectedUserPassword.disabled = user.id === state.currentUserId'));
     assert(adminScript.includes("headers['X-CSRF-Token']"));
     assert(adminIndex.includes('metric-registered-users'));
     assert(adminIndex.includes('data-export-dataset="practice-records"'));

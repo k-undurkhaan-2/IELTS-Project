@@ -480,7 +480,10 @@
         nodes.selectedUserRole.value = user.role;
         nodes.selectedUserRole.disabled = false;
         nodes.selectedUserPassword.value = '';
-        nodes.selectedUserPassword.disabled = false;
+        nodes.selectedUserPassword.disabled = user.id === state.currentUserId;
+        nodes.selectedUserPassword.placeholder = user.id === state.currentUserId
+            ? 'Use the server maintenance channel'
+            : 'Leave empty';
         nodes.saveUserButton.disabled = false;
         nodes.deleteUserButton.disabled = user.id === state.currentUserId;
         Array.from(nodes.usersBody.querySelectorAll('tr')).forEach((row) => {
@@ -501,6 +504,7 @@
         nodes.selectedUserRole.disabled = true;
         nodes.selectedUserPassword.value = '';
         nodes.selectedUserPassword.disabled = true;
+        nodes.selectedUserPassword.placeholder = 'Leave empty';
         nodes.saveUserButton.disabled = true;
         nodes.deleteUserButton.disabled = true;
         Array.from(nodes.usersBody.querySelectorAll('tr')).forEach((row) => row.classList.remove('is-selected'));
