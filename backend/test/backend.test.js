@@ -5709,7 +5709,7 @@ test('admin user changes invalidate target sessions and stale admin roles', asyn
     }
 });
 
-test('admin self password update rotates the current session', async () => {
+test('admin web routes reject self password changes', async () => {
     const client = await createClient();
     try {
         await seedAdmin(client, 'self_admin', 'StrongPass1');
@@ -5725,37 +5725,36 @@ test('admin self password update rotates the current session', async () => {
         assert(enabled.sessionCookie);
         assert(enabled.csrfToken);
 
-        const selfUpdate = await adminSession.request('PATCH', `/api/admin/users/${enabled.user.id}`, {
+        const selfUpdateViaAdmin = await adminSession.request('PATCH', `/api/admin/users/${enabled.user.id}`, {
             password: 'StrongerPass2'
         });
-        assert.equal(selfUpdate.response.status, 200);
-        assert.equal(selfUpdate.json.user.id, enabled.user.id);
-        assert.equal(selfUpdate.json.user.role, 'admin');
-        assert(selfUpdate.json.csrfToken);
-        assert.notEqual(selfUpdate.json.csrfToken, enabled.csrfToken);
-        const rotatedCookie = getResponseSessionCookie(selfUpdate);
-        assert(rotatedCookie);
-        assert.notEqual(rotatedCookie, enabled.sessionCookie);
+        assert.equal(selfUpdateViaAdmin.response.status, 403);
+        assert.equal(
+            selfUpdateViaAdmin.json.error,
+            'Admin password changes must be performed through the server maintenance channel'
+        );
+
+        const selfUpdateViaAccount = await adminSession.request('PATCH', '/api/auth/account/password', {
+            currentPassword: 'StrongPass1',
+            newPassword: 'StrongerPass2'
+        });
+        assert.equal(selfUpdateViaAccount.response.status, 403);
+        assert.equal(
+            selfUpdateViaAccount.json.error,
+            'Admin password changes must be performed through the server maintenance channel'
+        );
 
         const currentSummary = await adminSession.request('GET', '/api/admin/summary');
         assert.equal(currentSummary.response.status, 200);
 
-        const oldPasswordSession = client.createSession();
-        await oldPasswordSession.csrf();
-        const oldPasswordLogin = await oldPasswordSession.request('POST', '/api/auth/login', {
+        const unchangedPasswordSession = client.createSession();
+        await unchangedPasswordSession.csrf();
+        const unchangedPasswordLogin = await unchangedPasswordSession.request('POST', '/api/auth/login', {
             username: 'self_admin',
             password: 'StrongPass1'
         });
-        assert.equal(oldPasswordLogin.response.status, 401);
-
-        const newPasswordSession = client.createSession();
-        await newPasswordSession.csrf();
-        const newPasswordLogin = await newPasswordSession.request('POST', '/api/auth/login', {
-            username: 'self_admin',
-            password: 'StrongerPass2'
-        });
-        assert.equal(newPasswordLogin.response.status, 200);
-        assert.equal(newPasswordLogin.json.requiresTotp, true);
+        assert.equal(unchangedPasswordLogin.response.status, 200);
+        assert.equal(unchangedPasswordLogin.json.requiresTotp, true);
     } finally {
         await client.close();
     }
@@ -5792,8 +5791,11 @@ test('admin account settings updates preserve current TOTP verification', async 
             currentPassword: 'StrongPass1',
             newPassword: 'StrongerPass2'
         });
-        assert.equal(passwordUpdate.response.status, 200);
-        assert.equal(passwordUpdate.json.user.role, 'admin');
+        assert.equal(passwordUpdate.response.status, 403);
+        assert.equal(
+            passwordUpdate.json.error,
+            'Admin password changes must be performed through the server maintenance channel'
+        );
 
         const afterPasswordUpdate = await adminSession.request('GET', '/api/admin/summary');
         assert.equal(afterPasswordUpdate.response.status, 200);

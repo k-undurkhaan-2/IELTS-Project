@@ -2393,6 +2393,11 @@ function createAdminRouter(options = {}) {
             if (!current) {
                 return res.status(404).json({ error: 'User not found' });
             }
+            if (current.id === req.session.user.id && parsed.data.password !== undefined) {
+                return res.status(403).json({
+                    error: 'Admin password changes must be performed through the server maintenance channel'
+                });
+            }
             if (parsed.data.password !== undefined) {
                 validateNewPassword(parsed.data.password);
             }

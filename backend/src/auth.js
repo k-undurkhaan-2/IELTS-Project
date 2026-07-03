@@ -1022,6 +1022,11 @@ function createAuthRouter(options = {}) {
             if (!currentUser) {
                 return res.status(401).json({ error: 'Authentication required' });
             }
+            if (publicUser(currentUser).role === 'admin') {
+                return res.status(403).json({
+                    error: 'Admin password changes must be performed through the server maintenance channel'
+                });
+            }
             if (!isPasswordWithinBcryptByteLimit(parsed.data.currentPassword)) {
                 return res.status(401).json({ error: 'Current password is incorrect' });
             }
