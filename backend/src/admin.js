@@ -69,6 +69,10 @@ const exportQuerySchema = z.object({
     limit: z.coerce.number().int().min(1).max(10000).optional().default(1000)
 });
 
+const exportTokenQuerySchema = z.object({
+    token: z.string().min(32).max(160)
+});
+
 const userIdParamSchema = z.string().uuid();
 const TRAFFIC_METHOD_MAX_LENGTH = 16;
 const TRAFFIC_PATH_MAX_LENGTH = 300;
@@ -93,6 +97,8 @@ const ADMIN_RECORD_MAX_DEPTH_VALUE = '[max-depth]';
 const ADMIN_RECORD_ACCESSOR_VALUE = '[accessor]';
 const ADMIN_RECORD_UNSAFE_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 const SITE_CONTENT_KEYS = ['loginNotice', 'homeBanner'];
+const DEFAULT_ADMIN_EXPORT_TOKEN_TTL_MS = 60 * 1000;
+const MAX_ADMIN_EXPORT_TOKENS_PER_SESSION = 8;
 const DEFAULT_ADMIN_ACTION_STEP_UP_MAX_AGE_MS = 5 * 60 * 1000;
 const SITE_CONTENT_DB_KEYS = {
     loginNotice: 'login_notice',
@@ -2110,8 +2116,16 @@ function parseExportQuery(query) {
     return parseQuery(exportQuerySchema, query, 'Invalid export query');
 }
 
+function parseExportTokenQuery(query) {
+    return parseQuery(exportTokenQuerySchema, query, 'Invalid export token');
+}
+
 function parseUserIdParam(value) {
     return parseParam(userIdParamSchema, value, 'Invalid user id');
+}
+
+function hashAdminExportToken(token) {
+    return crypto.createHash('sha256').update(String(token || ''), 'utf8').digest('hex');
 }
 
 function parseRecordIdParam(value) {
@@ -2168,6 +2182,9 @@ function createAdminRouter(options = {}) {
     const adminActionStepUpMaxAgeMs = Number.isFinite(Number(options.adminActionStepUpMaxAgeMs))
         ? Math.max(1, Number(options.adminActionStepUpMaxAgeMs))
         : DEFAULT_ADMIN_ACTION_STEP_UP_MAX_AGE_MS;
+    const adminExportTokenTtlMs = Number.isFinite(Number(options.adminExportTokenTtlMs))
+        ? Math.max(1, Number(options.adminExportTokenTtlMs))
+        : DEFAULT_ADMIN_EXPORT_TOKEN_TTL_MS;
 
     function checkAdminMutationRateLimit(req, action) {
         const adminId = req.session?.user?.id || 'unknown';
@@ -2194,6 +2211,105 @@ function createAdminRouter(options = {}) {
         if (req.session) {
             delete req.session.adminActionStepUp;
         }
+    }
+
+    function getAdminExportTokens(req) {
+        if (!req.session) {
+            return null;
+        }
+        if (
+            !req.session.adminExportTokens
+            || typeof req.session.adminExportTokens !== 'object'
+            || Array.isArray(req.session.adminExportTokens)
+        ) {
+            req.session.adminExportTokens = {};
+        }
+        return req.session.adminExportTokens;
+    }
+
+    function pruneAdminExportTokens(req) {
+        const tokens = getAdminExportTokens(req);
+        if (!tokens) {
+            return null;
+        }
+        const now = Date.now();
+        Object.entries(tokens).forEach(([hash, value]) => {
+            if (!value || typeof value !== 'object' || Number(value.expiresAt || 0) <= now) {
+                delete tokens[hash];
+            }
+        });
+        const entries = Object.entries(tokens)
+            .sort(([, left], [, right]) => Number(left.createdAt || 0) - Number(right.createdAt || 0));
+        while (entries.length > MAX_ADMIN_EXPORT_TOKENS_PER_SESSION) {
+            const [hash] = entries.shift();
+            delete tokens[hash];
+        }
+        return tokens;
+    }
+
+    function issueAdminExportToken(req, currentUser, query) {
+        const tokens = pruneAdminExportTokens(req);
+        if (!tokens) {
+            return null;
+        }
+        const token = crypto.randomBytes(32).toString('base64url');
+        const now = Date.now();
+        const expiresAt = now + adminExportTokenTtlMs;
+        tokens[hashAdminExportToken(token)] = {
+            userId: currentUser.id,
+            securityEpoch: getUserSecurityEpoch(currentUser),
+            createdAt: now,
+            expiresAt,
+            query
+        };
+        return {
+            token,
+            expiresAt: new Date(expiresAt).toISOString()
+        };
+    }
+
+    function sendAdminExportAuthorizationRequired(res) {
+        return res.status(403).json({
+            error: 'Admin export authorization required',
+            requiresAdminStepUp: true
+        });
+    }
+
+    async function consumeAdminExportToken(req, res) {
+        let parsed;
+        try {
+            parsed = parseExportTokenQuery(req.query);
+        } catch (error) {
+            sendAdminExportAuthorizationRequired(res);
+            return null;
+        }
+        const currentUser = await getCurrentAuthUser(req);
+        if (!currentUser || currentUser.role !== 'admin') {
+            clearAdminActionStepUp(req);
+            res.status(401).json({ error: 'Authentication required' });
+            return null;
+        }
+        const tokens = pruneAdminExportTokens(req);
+        const tokenHash = hashAdminExportToken(parsed.token);
+        const stored = tokens?.[tokenHash];
+        if (!stored) {
+            sendAdminExportAuthorizationRequired(res);
+            return null;
+        }
+        delete tokens[tokenHash];
+        if (Number(stored.expiresAt || 0) <= Date.now()) {
+            sendAdminExportAuthorizationRequired(res);
+            return null;
+        }
+        if (
+            stored.userId !== currentUser.id
+            || Number(stored.securityEpoch) !== getUserSecurityEpoch(currentUser)
+            || !stored.query
+        ) {
+            sendAdminExportAuthorizationRequired(res);
+            return null;
+        }
+        return stored.query;
     }
 
     async function getCurrentAuthUser(req) {
@@ -2365,9 +2481,38 @@ function createAdminRouter(options = {}) {
         }
     });
 
+    router.post('/export-token', verifyCsrfToken, requireAdminActionStepUp, async (req, res, next) => {
+        try {
+            checkAdminMutationRateLimit(req, 'create-export-token');
+            const query = parseExportQuery(req.body || {});
+            const currentUser = await getCurrentAuthUser(req);
+            if (!currentUser || currentUser.role !== 'admin') {
+                clearAdminActionStepUp(req);
+                return res.status(401).json({ error: 'Authentication required' });
+            }
+            const issued = issueAdminExportToken(req, currentUser, query);
+            if (!issued) {
+                return res.status(500).json({ error: 'Export authorization failed' });
+            }
+            rotateSessionVerifier(req);
+            return res.json({
+                ok: true,
+                token: issued.token,
+                expiresAt: issued.expiresAt,
+                csrfToken: ensureCsrfToken(req)
+            });
+        } catch (error) {
+            if (error.status) return sendError(res, error);
+            return next(error);
+        }
+    });
+
     router.get('/export', async (req, res, next) => {
         try {
-            const query = parseExportQuery(req.query);
+            const query = await consumeAdminExportToken(req, res);
+            if (!query) {
+                return undefined;
+            }
             const payload = await store.exportData(query);
             if (query.format === 'csv') {
                 const filename = buildExportFilename(query.dataset, 'csv');

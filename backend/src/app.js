@@ -1426,6 +1426,7 @@ function createApp(options = {}) {
         requireAdminTotp,
         rateLimit: options.adminRateLimit || options.rateLimit,
         adminActionStepUpMaxAgeMs: options.adminActionStepUpMaxAgeMs,
+        adminExportTokenTtlMs: options.adminExportTokenTtlMs,
         totpVerificationMaxAgeMs
     }));
 

@@ -460,16 +460,38 @@
         return fallback;
     }
 
+    function exportDownloadPath(token) {
+        const query = new URLSearchParams({ token });
+        return `/api/admin/export?${query}`;
+    }
+
+    async function createExportToken(dataset) {
+        return withAdminStepUp(() => request('/api/admin/export-token', {
+            method: 'POST',
+            body: {
+                dataset,
+                format: 'csv'
+            }
+        }));
+    }
+
     async function downloadExport(dataset, button) {
         const safeDataset = String(dataset || '').replace(/[^a-z-]/g, '');
         if (!safeDataset) return;
         await withButtonBusy(button, 'Exporting...', async () => {
-            const response = await fetch(`/api/admin/export?dataset=${encodeURIComponent(safeDataset)}&format=csv`, {
+            const authorization = await createExportToken(safeDataset);
+            if (!authorization || typeof authorization.token !== 'string' || !authorization.token) {
+                throw new Error('Export authorization failed');
+            }
+            const response = await fetch(exportDownloadPath(authorization.token), {
                 credentials: 'same-origin'
             });
-            if (response.status === 401 || response.status === 403) {
+            if (response.status === 401) {
                 window.location.href = '/auth/admin/start?return_to=/admin';
                 throw new Error('Admin session expired');
+            }
+            if (response.status === 403) {
+                throw new Error('Export authorization expired. Please retry.');
             }
             if (!response.ok) {
                 throw new Error(`Export failed with ${response.status}`);

@@ -394,6 +394,7 @@ async function createClient(options = {}) {
         totpEncryptionKey: options.totpEncryptionKey || 'test-totp-key',
         totpVerificationMaxAgeMs: options.totpVerificationMaxAgeMs,
         adminActionStepUpMaxAgeMs: options.adminActionStepUpMaxAgeMs,
+        adminExportTokenTtlMs: options.adminExportTokenTtlMs,
         authHandoffTicketTtlMs: options.authHandoffTicketTtlMs,
         authHandoffSecret: options.authHandoffSecret,
         authPublicUrl: options.authPublicUrl,
@@ -922,6 +923,10 @@ async function enableTotpForCurrentSession(client) {
 
 async function adminActionStepUp(client, password = 'StrongPass1') {
     return client.request('POST', '/api/admin/action-step-up', { password });
+}
+
+async function adminExportToken(client, query = {}) {
+    return client.request('POST', '/api/admin/export-token', query);
 }
 
 function createFullCookieReplay(client, sourceSession = client) {
@@ -3228,7 +3233,8 @@ test('admin shell and business account menu do not link back through the busines
     assert(adminScript.includes("window.location.href = '/auth/admin/logout?return_to=/admin'"));
     assert(adminScript.includes("fetch('/api/auth/me'"));
     assert(adminScript.includes('/api/admin/summary'));
-    assert(adminScript.includes('/api/admin/export?dataset='));
+    assert(adminScript.includes('/api/admin/export-token'));
+    assert(adminScript.includes('/api/admin/export?'));
     assert(adminScript.includes('/admin/account?userId='));
     assert(adminScript.includes('Use the server maintenance channel'));
     assert(adminScript.includes('nodes.selectedUserPassword.disabled = user.id === state.currentUserId'));
@@ -5085,6 +5091,61 @@ test('admin sensitive mutations require recent password step-up', async () => {
     }
 });
 
+test('admin exports require one-time password step-up tokens', async () => {
+    const client = await createClient({
+        adminActionStepUpMaxAgeMs: 1000,
+        adminExportTokenTtlMs: 1000
+    });
+    try {
+        await seedAdmin(client, 'export_step_up_admin', 'StrongPass1');
+        await client.csrf();
+        const login = await client.request('POST', '/api/auth/login', {
+            username: 'export_step_up_admin',
+            password: 'StrongPass1'
+        });
+        assert.equal(login.response.status, 200);
+        assert.equal(login.json.requiresTotpSetup, true);
+        await enableTotpForCurrentSession(client);
+
+        const blockedDirect = await client.request('GET', '/api/admin/export?dataset=users&format=csv');
+        assert.equal(blockedDirect.response.status, 403);
+        assert.equal(blockedDirect.json.error, 'Admin export authorization required');
+        assert.equal(blockedDirect.json.requiresAdminStepUp, true);
+
+        const blockedToken = await adminExportToken(client, { dataset: 'users', format: 'csv' });
+        assert.equal(blockedToken.response.status, 403);
+        assert.equal(blockedToken.json.error, 'Admin step-up required');
+        assert.equal(blockedToken.json.requiresAdminStepUp, true);
+
+        const stepUp = await adminActionStepUp(client);
+        assert.equal(stepUp.response.status, 200);
+
+        const issued = await adminExportToken(client, { dataset: 'users', format: 'csv' });
+        assert.equal(issued.response.status, 200);
+        assert.equal(issued.json.ok, true);
+        assert.match(issued.json.token, /^[A-Za-z0-9_-]{32,}$/);
+
+        const exportPath = `/api/admin/export?token=${encodeURIComponent(issued.json.token)}`;
+        const exported = await client.request('GET', exportPath);
+        assert.equal(exported.response.status, 200);
+        assert.match(exported.response.headers.get('content-type'), /text\/csv/);
+        assert.match(exported.text, /^id,username,role,createdAt/m);
+
+        const reused = await client.request('GET', exportPath);
+        assert.equal(reused.response.status, 403);
+        assert.equal(reused.json.error, 'Admin export authorization required');
+
+        const expiring = await adminExportToken(client, { dataset: 'summary', format: 'json' });
+        assert.equal(expiring.response.status, 200);
+        const expiredPath = `/api/admin/export?token=${encodeURIComponent(expiring.json.token)}`;
+        const expired = await withDateNowOffset(2000, () => client.request('GET', expiredPath));
+        assert.equal(expired.response.status, 403);
+        assert.equal(expired.json.error, 'Admin export authorization required');
+    } finally {
+        await client.close();
+    }
+});
+
 test('admin mutations rotate the session verifier for copied cookie jars', async () => {
     const client = await createClient();
     try {
@@ -5264,7 +5325,21 @@ test('admin can manage users and inspect learning and traffic stats', async () =
         assert(summaryWithAuth.json.traffic.loginSuccesses >= 1);
         assert(summaryWithAuth.json.traffic.registerSuccesses >= 1);
 
-        const practiceExport = await client.request('GET', '/api/admin/export?dataset=practice-records&format=json&limit=10');
+        const directPracticeExport = await client.request('GET', '/api/admin/export?dataset=practice-records&format=json&limit=10');
+        assert.equal(directPracticeExport.response.status, 403);
+        assert.equal(directPracticeExport.json.error, 'Admin export authorization required');
+        assert.equal(directPracticeExport.json.requiresAdminStepUp, true);
+
+        const practiceExportToken = await adminExportToken(client, {
+            dataset: 'practice-records',
+            format: 'json',
+            limit: 10
+        });
+        assert.equal(practiceExportToken.response.status, 200);
+        const practiceExport = await client.request(
+            'GET',
+            `/api/admin/export?token=${encodeURIComponent(practiceExportToken.json.token)}`
+        );
         assert.equal(practiceExport.response.status, 200);
         assert.equal(practiceExport.json.dataset, 'practice-records');
         const exportedRecord = practiceExport.json.rows.find((row) => row.recordId === 'stats-record-1');
@@ -5274,14 +5349,23 @@ test('admin can manage users and inspect learning and traffic stats', async () =
         assert.equal(exportedRecord.duration, 12);
         assert.equal(exportedRecord.accuracy, 80);
 
-        const usersCsv = await client.request('GET', '/api/admin/export?dataset=users&format=csv&limit=10');
+        const usersCsvToken = await adminExportToken(client, {
+            dataset: 'users',
+            format: 'csv',
+            limit: 10
+        });
+        assert.equal(usersCsvToken.response.status, 200);
+        const usersCsv = await client.request(
+            'GET',
+            `/api/admin/export?token=${encodeURIComponent(usersCsvToken.json.token)}`
+        );
         assert.equal(usersCsv.response.status, 200);
         assert.match(usersCsv.response.headers.get('content-type'), /text\/csv/);
         assert.match(usersCsv.response.headers.get('content-disposition'), /ielts-users-/);
         assert.match(usersCsv.text, /^id,username,role,createdAt/m);
         assert.match(usersCsv.text, /stats_user/);
 
-        const invalidExportQuery = await client.request('GET', '/api/admin/export?dataset=secrets');
+        const invalidExportQuery = await adminExportToken(client, { dataset: 'secrets' });
         assert.equal(invalidExportQuery.response.status, 400);
         assert.equal(invalidExportQuery.json.error, 'Invalid export query');
 
