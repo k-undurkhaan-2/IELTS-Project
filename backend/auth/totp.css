@@ -1,8 +1,8 @@
 :root {
     color-scheme: light dark;
     font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    background: #f5f7fb;
-    color: #111827;
+    background: var(--background);
+    color: var(--text-primary);
 }
 
 * {
@@ -15,9 +15,7 @@ body {
     display: grid;
     place-items: center;
     padding: 24px;
-    background:
-        radial-gradient(circle at 20% 20%, rgba(37, 99, 235, 0.12), transparent 28%),
-        linear-gradient(135deg, #f8fafc 0%, #eef2ff 100%);
+    background: var(--surface);
 }
 
 .totp-shell {
@@ -28,15 +26,15 @@ body {
     display: grid;
     gap: 18px;
     padding: 28px;
-    border: 1px solid rgba(148, 163, 184, 0.28);
+    border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
     border-radius: 8px;
-    background: rgba(255, 255, 255, 0.94);
-    box-shadow: 0 20px 55px rgba(15, 23, 42, 0.12);
+    background: color-mix(in srgb, var(--surface) 94%, transparent);
+    box-shadow: var(--elevation-1);
 }
 
 .totp-heading p {
     margin: 0 0 6px;
-    color: #2563eb;
+    color: var(--accent);
     font-size: 0.82rem;
     font-weight: 700;
     letter-spacing: 0.08em;
@@ -51,7 +49,7 @@ body {
 
 .totp-status,
 .totp-summary {
-    color: #475569;
+    color: var(--text-secondary);
     font-size: 0.94rem;
     line-height: 1.5;
 }
@@ -61,11 +59,11 @@ body {
 }
 
 .totp-status.is-error {
-    color: #b91c1c;
+    color: var(--danger);
 }
 
 .totp-status.is-success {
-    color: #047857;
+    color: var(--success);
 }
 
 .totp-form,
@@ -80,16 +78,16 @@ body {
     gap: 7px;
     font-size: 0.88rem;
     font-weight: 650;
-    color: #334155;
+    color: var(--text-primary);
 }
 
 .totp-form input {
     width: 100%;
-    border: 1px solid #cbd5e1;
+    border: 1px solid var(--border-strong);
     border-radius: 8px;
     padding: 11px 12px;
-    background: #ffffff;
-    color: #111827;
+    background: var(--surface);
+    color: var(--text-primary);
     font: inherit;
 }
 
@@ -101,9 +99,9 @@ body {
     aspect-ratio: 1 / 1;
     object-fit: contain;
     padding: 8px;
-    border: 1px solid #cbd5e1;
+    border: 1px solid var(--border-strong);
     border-radius: 8px;
-    background: #ffffff;
+    background: var(--surface);
     image-rendering: pixelated;
 }
 
@@ -112,12 +110,12 @@ body {
     overflow-wrap: anywhere;
     padding: 10px 12px;
     border-radius: 8px;
-    background: #f1f5f9;
-    color: #0f172a;
+    background: var(--surface-subtle);
+    color: var(--text-primary);
 }
 
 .totp-otpauth-link {
-    color: #2563eb;
+    color: var(--accent);
     font-size: 0.9rem;
     font-weight: 700;
     text-decoration: none;
@@ -126,7 +124,7 @@ body {
 .totp-recovery-codes {
     margin: 0;
     padding-left: 22px;
-    color: #0f172a;
+    color: var(--text-primary);
 }
 
 .totp-form button,
@@ -140,8 +138,8 @@ body {
 .totp-form button,
 .totp-actions button {
     border: 0;
-    background: #2563eb;
-    color: #ffffff;
+    background: var(--accent);
+    color: var(--surface);
     cursor: pointer;
 }
 
@@ -154,52 +152,50 @@ body {
 .totp-secondary-link {
     display: inline-grid;
     place-items: center;
-    color: #2563eb;
+    color: var(--accent);
     text-decoration: none;
 }
 
 @media (prefers-color-scheme: dark) {
     :root {
-        background: #0f172a;
-        color: #e5e7eb;
+        background: var(--text-primary);
+        color: var(--border);
     }
 
     body {
-        background:
-            radial-gradient(circle at 20% 20%, rgba(96, 165, 250, 0.18), transparent 30%),
-            linear-gradient(135deg, #020617 0%, #111827 100%);
+        background: var(--surface);
     }
 
     .totp-panel {
-        border-color: rgba(148, 163, 184, 0.25);
-        background: rgba(15, 23, 42, 0.94);
-        box-shadow: 0 20px 55px rgba(0, 0, 0, 0.35);
+        border-color: color-mix(in srgb, var(--accent) 25%, transparent);
+        background: color-mix(in srgb, var(--text-primary) 94%, transparent);
+        box-shadow: var(--elevation-1);
     }
 
     .totp-heading p,
     .totp-secondary-link,
     .totp-otpauth-link {
-        color: #93c5fd;
+        color: var(--accent);
     }
 
     .totp-status,
     .totp-summary {
-        color: #cbd5e1;
+        color: var(--border-strong);
     }
 
     .totp-form label {
-        color: #d1d5db;
+        color: var(--border);
     }
 
     .totp-form input {
-        border-color: #475569;
-        background: #0f172a;
-        color: #e5e7eb;
+        border-color: var(--text-secondary);
+        background: var(--text-primary);
+        color: var(--border);
     }
 
     .totp-setup code,
     .totp-recovery-codes {
-        background: #111827;
-        color: #e5e7eb;
+        background: var(--text-primary);
+        color: var(--border);
     }
 }

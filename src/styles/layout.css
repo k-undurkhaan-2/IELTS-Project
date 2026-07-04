@@ -1,0 +1,305 @@
+html {
+    background: var(--background);
+}
+
+body.ds-learning,
+body.ds-admin,
+body.ds-auth {
+    min-height: 100vh;
+    background: var(--background);
+    color: var(--text-primary);
+    font-family: var(--font-family-base);
+    letter-spacing: 0;
+}
+
+body.ds-learning.hero-body {
+    background: var(--background);
+}
+
+body.ds-learning::before,
+body.ds-learning::after {
+    display: none;
+}
+
+.ds-page,
+.ds-layout-page {
+    display: grid;
+    gap: var(--space-6);
+    min-width: 0;
+}
+
+.ds-page-header,
+.ds-learning .hero-panel__header,
+.ds-admin .admin-topbar,
+.ds-admin .account-topbar {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-4);
+    min-width: 0;
+}
+
+.ds-page-title,
+.ds-learning .hero-panel__title,
+.ds-admin h1 {
+    margin: 0;
+    color: var(--text-primary);
+    font-size: clamp(1.35rem, 2.2vw, 1.75rem);
+    font-weight: 700;
+    line-height: var(--line-height-tight);
+}
+
+.ds-page-subtitle,
+.ds-learning .hero-panel__muted,
+.ds-admin .admin-kicker + h1 + p {
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    line-height: var(--line-height-normal);
+}
+
+.ds-command-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--space-2);
+}
+
+.ds-grid {
+    display: grid;
+    gap: var(--space-4);
+}
+
+.ds-grid--two {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.ds-grid--three {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.ds-grid--four {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.ds-stack {
+    display: grid;
+    gap: var(--space-4);
+}
+
+.ds-inline {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.ds-learning .hero-shell {
+    max-width: var(--page-max-width);
+    margin: 0 auto;
+    padding: clamp(var(--space-4), 2.4vw, var(--space-7)) clamp(var(--space-4), 4vw, var(--space-8)) var(--space-10);
+    gap: var(--space-5);
+}
+
+.ds-learning .app-topbar {
+    position: static;
+    top: auto;
+    z-index: auto;
+    grid-template-columns: minmax(220px, 1fr) auto minmax(220px, 1fr);
+    align-items: center;
+    gap: var(--space-3);
+    min-height: 64px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    box-shadow: var(--elevation-1);
+    padding: var(--space-2) var(--space-3);
+}
+
+.ds-learning .app-topbar__brand {
+    display: flex;
+    align-items: center;
+    justify-self: start;
+    color: var(--text-primary);
+    min-height: var(--control-height-lg);
+    padding: 0 var(--space-3);
+}
+
+.ds-learning .app-topbar__brand-name {
+    font-size: var(--font-size-md);
+    font-weight: 700;
+}
+
+.ds-learning .app-topbar__brand-meta {
+    color: var(--accent);
+    font-size: var(--font-size-xs);
+    font-weight: 700;
+}
+
+.ds-learning .app-topbar__actions,
+.ds-learning .hero-header {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    justify-self: end;
+    min-width: 0;
+}
+
+.ds-learning .app-topbar .remote-auth-account__trigger {
+    min-height: var(--control-height-lg);
+}
+
+.ds-learning .hero-panel {
+    display: grid;
+    gap: var(--space-5);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-xl);
+    background: var(--surface);
+    box-shadow: var(--elevation-1);
+    padding: clamp(var(--space-5), 3vw, var(--space-7));
+}
+
+.ds-learning .hero-section {
+    min-width: 0;
+}
+
+.ds-learning .hero-panel__header {
+    margin: 0;
+}
+
+.ds-learning .overview-workbench {
+    grid-template-columns: minmax(0, 1.45fr) minmax(260px, 0.7fr);
+    gap: var(--space-4);
+    margin: 0;
+}
+
+.ds-learning .overview-workbench__side {
+    align-content: start;
+    align-items: start;
+    gap: var(--space-3);
+}
+
+.ds-learning .overview-library-heading {
+    margin: 0;
+}
+
+.ds-learning .category-grid,
+.ds-learning .exam-list,
+.ds-learning .practice-stats,
+.ds-admin .metric-grid {
+    gap: var(--space-4);
+}
+
+.ds-admin .admin-shell {
+    grid-template-columns: 232px minmax(0, 1fr);
+    background: var(--background);
+}
+
+.ds-admin .admin-sidebar {
+    border-right: 1px solid var(--border);
+    background: var(--surface);
+    padding: var(--space-5) var(--space-4);
+}
+
+.ds-admin .admin-main,
+.ds-admin .account-main {
+    width: min(var(--page-max-width), calc(100vw - 280px));
+    margin: var(--space-5) auto var(--space-9);
+    gap: var(--space-4);
+}
+
+.ds-admin .admin-topbar,
+.ds-admin .account-topbar {
+    align-items: center;
+    min-height: 72px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    padding: var(--space-4) var(--space-6);
+}
+
+.ds-auth .auth-shell,
+.ds-auth .admin-login-shell,
+.ds-auth .password-shell,
+.ds-auth .totp-shell {
+    width: min(100%, 460px);
+}
+
+body.ds-auth {
+    display: grid;
+    place-items: center;
+    padding: var(--space-6);
+}
+
+body.ds-auth .auth-shell,
+body.ds-auth .admin-login-shell {
+    min-height: auto;
+    padding: 0;
+}
+
+@media (max-width: 1100px) {
+    .ds-learning .app-topbar {
+        grid-template-columns: 1fr;
+        position: static;
+    }
+
+    .ds-learning .app-topbar__brand,
+    .ds-learning .hero-header,
+    .ds-learning .hero-nav {
+        justify-self: stretch;
+    }
+
+    .ds-learning .hero-header__actions {
+        justify-content: flex-start;
+    }
+
+    .ds-admin .admin-shell {
+        grid-template-columns: 1fr;
+    }
+
+    .ds-admin .admin-main,
+    .ds-admin .account-main {
+        width: min(960px, calc(100vw - 32px));
+    }
+}
+
+@media (max-width: 860px) {
+    .ds-grid--two,
+    .ds-grid--three,
+    .ds-grid--four,
+    .ds-learning .overview-workbench,
+    .ds-learning .account-view__forms {
+        grid-template-columns: 1fr;
+    }
+
+    .ds-learning .overview-workbench__side,
+    .ds-learning .account-view__stats {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 640px) {
+    .ds-learning .hero-shell {
+        padding: var(--space-3) var(--space-3) var(--space-8);
+    }
+
+    .ds-learning .hero-panel {
+        padding: var(--space-4);
+    }
+
+    .ds-learning .hero-panel__header,
+    .ds-admin .admin-topbar,
+    .ds-admin .account-topbar,
+    .ds-page-header {
+        display: grid;
+    }
+
+    .ds-learning .overview-workbench__side,
+    .ds-learning .account-view__stats {
+        grid-template-columns: 1fr;
+    }
+
+    body.ds-auth {
+        align-items: stretch;
+        padding: var(--space-3);
+    }
+}

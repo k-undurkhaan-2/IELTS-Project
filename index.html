@@ -14,7 +14,7 @@
         <link rel="stylesheet" href="css/onboarding.css" />
     </head>
 
-    <body class="hero-body boot-active" data-theme="heroui">
+    <body class="hero-body boot-active ds-learning" data-theme="heroui">
         <div id="boot-overlay" role="status" aria-live="polite">
             <div class="boot-panel">
                 <div class="boot-logo">SHUI · IELTS</div>
@@ -77,8 +77,8 @@
             </div>
 
             <!-- 总览页面 -->
-            <div id="overview-view" class="view active hero-panel hero-section">
-                <div class="hero-panel__header overview-view__header">
+            <div id="overview-view" class="view active hero-panel hero-section ds-page learning-page">
+                <div class="hero-panel__header overview-view__header ds-page-header">
                     <div>
                         <p class="hero-panel__eyebrow">IELTS Practice</p>
                         <h2 class="hero-panel__title">学习工作台</h2>
@@ -91,7 +91,7 @@
                 <div id="site-announcement-host" class="site-announcement-host" hidden></div>
 
                 <div class="overview-workbench" aria-label="学习工作台">
-                    <section class="overview-workbench__primary hero-surface">
+                    <section class="overview-workbench__primary hero-surface ui-card">
                         <span class="overview-workbench__kicker">今日入口</span>
                         <h3>先完成一组可控练习</h3>
                         <p>
@@ -99,14 +99,14 @@
                         </p>
                         <div class="overview-workbench__actions">
                             <button
-                                class="overview-workbench__action overview-workbench__action--primary"
+                                class="overview-workbench__action overview-workbench__action--primary ui-button ui-button--primary"
                                 type="button"
                                 data-lane-action="instant-start"
                             >
                                 开始随机练习
                             </button>
                             <button
-                                class="overview-workbench__action"
+                                class="overview-workbench__action ui-button"
                                 type="button"
                                 data-lane-action="browse"
                                 data-lane-category="all"
@@ -119,7 +119,7 @@
 
                     <aside class="overview-workbench__side">
                         <button
-                            class="overview-shortcut"
+                            class="overview-shortcut ui-card ui-card--interactive"
                             type="button"
                             data-lane-action="browse"
                             data-lane-category="P1"
@@ -129,7 +129,7 @@
                             <strong>从短篇阅读开始</strong>
                         </button>
                         <button
-                            class="overview-shortcut"
+                            class="overview-shortcut ui-card ui-card--interactive"
                             type="button"
                             data-index-action="open-view"
                             data-action-value="account"

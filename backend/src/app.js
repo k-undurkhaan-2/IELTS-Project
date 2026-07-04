@@ -1693,6 +1693,12 @@ function createApp(options = {}) {
     });
 
 
+    const designSystemStylesRoot = path.join(repoRoot, 'src', 'styles');
+    app.use('/src/styles', createStaticBoundaryMiddleware(designSystemStylesRoot), express.static(designSystemStylesRoot, {
+        dotfiles: 'deny',
+        index: false
+    }));
+
     for (const directory of ['assets', 'css', 'js', 'templates', 'ListeningPractice']) {
         const staticDirectory = path.join(repoRoot, directory);
         const staticBoundaryOptions = directory === 'templates'

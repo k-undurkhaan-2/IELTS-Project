@@ -1,0 +1,1231 @@
+button,
+input,
+select,
+textarea {
+    font: inherit;
+}
+
+.ui-button,
+.ds-learning .btn,
+.ds-learning .hero-btn,
+.ds-learning .shui-filter-btn,
+.ds-learning .shui-segmented-btn,
+.ds-learning .browse-frequency-chip,
+.ds-learning .shui-glass-btn,
+.ds-learning .overview-workbench button,
+.ds-learning .overview-workbench__action,
+.ds-learning .exam-item-action-btn,
+.ds-learning .exam-list-empty-action,
+.ds-admin button,
+.ds-admin .secondary-link-button,
+.ds-auth button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    min-height: var(--control-height);
+    border: 1px solid var(--control-border);
+    border-radius: var(--radius-md);
+    background: var(--control-surface);
+    color: var(--text-primary);
+    box-shadow: none;
+    cursor: pointer;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    line-height: 1;
+    padding: 0 var(--space-3);
+    text-decoration: none;
+    transition:
+        background-color var(--motion-duration) var(--motion-ease),
+        border-color var(--motion-duration) var(--motion-ease),
+        color var(--motion-duration) var(--motion-ease),
+        box-shadow var(--motion-duration) var(--motion-ease),
+        transform var(--motion-duration-fast) var(--motion-ease);
+}
+
+.ui-button:hover,
+.ds-learning .btn:hover:not(:disabled),
+.ds-learning .hero-btn:hover:not(:disabled),
+.ds-learning .shui-filter-btn:hover,
+.ds-learning .shui-segmented-btn:hover,
+.ds-learning .browse-frequency-chip:hover,
+.ds-learning .shui-glass-btn:hover,
+.ds-learning .overview-workbench button:hover:not(:disabled),
+.ds-learning .overview-workbench__action:hover,
+.ds-learning .exam-item-action-btn:hover:not(:disabled),
+.ds-admin button:hover:not(:disabled),
+.ds-admin .secondary-link-button:hover,
+.ds-auth button:hover:not(:disabled) {
+    border-color: var(--control-border-hover);
+    background: var(--control-surface-hover);
+    color: var(--text-primary);
+    box-shadow: var(--elevation-1);
+    transform: none;
+}
+
+.ui-button:active,
+.ds-learning .btn:active,
+.ds-learning .hero-btn:active,
+.ds-learning .shui-filter-btn:active,
+.ds-learning .shui-segmented-btn:active,
+.ds-learning .browse-frequency-chip:active,
+.ds-learning .shui-glass-btn:active,
+.ds-learning .overview-workbench button:active,
+.ds-learning .overview-workbench__action:active,
+.ds-learning .exam-item-action-btn:active,
+.ds-admin button:active,
+.ds-auth button:active {
+    background: var(--control-surface-active);
+    transform: translateY(1px);
+}
+
+.ui-button:focus-visible,
+.ds-learning button:focus-visible,
+.ds-learning a:focus-visible,
+.ds-learning input:focus-visible,
+.ds-learning select:focus-visible,
+.ds-learning textarea:focus-visible,
+.ds-admin button:focus-visible,
+.ds-admin a:focus-visible,
+.ds-admin input:focus-visible,
+.ds-admin select:focus-visible,
+.ds-admin textarea:focus-visible,
+.ds-auth button:focus-visible,
+.ds-auth a:focus-visible,
+.ds-auth input:focus-visible,
+.ds-auth select:focus-visible,
+.ds-auth textarea:focus-visible {
+    outline: var(--focus-outline);
+    outline-offset: 2px;
+    box-shadow: var(--focus-ring);
+}
+
+.ui-button:disabled,
+.ui-button[aria-disabled="true"],
+.ds-learning button:disabled,
+.ds-learning button[aria-disabled="true"],
+.ds-admin button:disabled,
+.ds-admin button[aria-disabled="true"],
+.ds-auth button:disabled,
+.ds-auth button[aria-disabled="true"] {
+    cursor: not-allowed;
+    opacity: 0.55;
+    transform: none;
+    box-shadow: none;
+}
+
+.ui-button.is-loading,
+.ui-button[aria-busy="true"],
+.ds-learning button.is-loading,
+.ds-learning button[aria-busy="true"],
+.ds-admin button.is-loading,
+.ds-admin button[aria-busy="true"],
+.ds-auth button.is-loading,
+.ds-auth button[aria-busy="true"] {
+    cursor: progress;
+    opacity: 0.82;
+}
+
+.ui-button.is-loading::after,
+.ui-button[aria-busy="true"]::after,
+.ds-learning button.is-loading::after,
+.ds-learning button[aria-busy="true"]::after,
+.ds-admin button.is-loading::after,
+.ds-admin button[aria-busy="true"]::after,
+.ds-auth button.is-loading::after,
+.ds-auth button[aria-busy="true"]::after {
+    content: "";
+    width: 0.9em;
+    height: 0.9em;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    animation: ds-spin 680ms linear infinite;
+}
+
+.ui-button--primary,
+.ds-learning .btn-primary,
+.ds-learning .overview-workbench button.overview-workbench__action--primary,
+.ds-learning .overview-workbench__action.ui-button--primary,
+.ds-learning .overview-workbench__action--primary,
+.ds-learning .category-card .btn:not(.btn-secondary),
+.ds-learning .exam-item-action-btn:not(.btn-secondary),
+.ds-admin #new-user-button,
+.ds-admin #save-user-button,
+.ds-admin #create-user-submit,
+.ds-admin #content-save-button,
+.ds-auth button[type="submit"],
+.ds-auth .auth-tabs button.is-active {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: var(--surface);
+}
+
+.ui-button--primary:hover,
+.ds-learning .btn-primary:hover:not(:disabled),
+.ds-learning .overview-workbench button.overview-workbench__action--primary:hover:not(:disabled),
+.ds-learning .overview-workbench__action.ui-button--primary:hover,
+.ds-learning .overview-workbench__action--primary:hover,
+.ds-learning .category-card .btn:not(.btn-secondary):hover,
+.ds-learning .exam-item-action-btn:not(.btn-secondary):hover:not(:disabled),
+.ds-admin #new-user-button:hover,
+.ds-admin #save-user-button:hover,
+.ds-admin #create-user-submit:hover,
+.ds-admin #content-save-button:hover,
+.ds-auth button[type="submit"]:hover:not(:disabled),
+.ds-auth .auth-tabs button.is-active:hover {
+    border-color: var(--accent-strong);
+    background: var(--accent-strong);
+    color: var(--surface);
+}
+
+.ui-button--secondary,
+.ds-learning .btn-secondary,
+.ds-learning .overview-workbench__action:not(.overview-workbench__action--primary),
+.ds-learning .exam-item-action-btn.btn-secondary,
+.ds-learning .shui-filter-btn[data-tone="ghost"],
+.ds-learning .browse-frequency-chip,
+.ds-learning .shui-glass-btn,
+.ds-auth .auth-secondary-button,
+.ds-auth .password-secondary-link,
+.ds-auth .totp-secondary-link {
+    border-color: var(--control-secondary-border);
+    background: var(--control-secondary-surface);
+    color: var(--text-primary);
+    box-shadow: none;
+}
+
+.ui-button--secondary:hover,
+.ds-learning .btn-secondary:hover:not(:disabled),
+.ds-learning .overview-workbench__action:not(.overview-workbench__action--primary):hover,
+.ds-learning .exam-item-action-btn.btn-secondary:hover:not(:disabled),
+.ds-learning .shui-filter-btn[data-tone="ghost"]:hover,
+.ds-learning .browse-frequency-chip:hover,
+.ds-learning .shui-glass-btn:hover,
+.ds-auth .auth-secondary-button:hover:not(:disabled),
+.ds-auth .password-secondary-link:hover,
+.ds-auth .totp-secondary-link:hover {
+    border-color: var(--control-selected-border);
+    background: var(--control-secondary-surface-hover);
+    color: var(--text-primary);
+    box-shadow: var(--elevation-1);
+}
+
+.ds-learning .btn-success {
+    border-color: var(--success);
+    background: var(--success);
+    color: var(--surface);
+}
+
+.ds-learning .btn-info {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: var(--surface);
+}
+
+.ds-learning .btn-warning,
+.ds-learning .hero-btn--warn {
+    border-color: color-mix(in srgb, var(--warning) 42%, var(--border));
+    background: var(--warning-subtle);
+    color: var(--warning-strong);
+}
+
+.ds-learning .btn-success:hover:not(:disabled) {
+    border-color: var(--success-strong);
+    background: var(--success-strong);
+    color: var(--surface);
+}
+
+.ds-learning .btn-info:hover:not(:disabled) {
+    border-color: var(--accent-strong);
+    background: var(--accent-strong);
+    color: var(--surface);
+}
+
+.ds-learning .btn-warning:hover:not(:disabled),
+.ds-learning .hero-btn--warn:hover:not(:disabled) {
+    border-color: var(--warning);
+    background: color-mix(in srgb, var(--warning-subtle) 70%, var(--surface));
+    color: var(--warning-strong);
+}
+
+.ds-learning .btn-sm {
+    min-height: var(--control-height-sm);
+    padding-inline: var(--space-2);
+    font-size: var(--font-size-xs);
+}
+
+.ds-learning .btn-lg {
+    min-height: var(--control-height-lg);
+    padding-inline: var(--space-4);
+    font-size: var(--font-size-md);
+}
+
+.ds-learning .practice-trend-option,
+.ds-learning .practice-custom-card__icon-btn,
+.ds-learning .practice-custom-option,
+.ds-learning #settings-view .hero-settings-actions button,
+.ds-learning #settings-view .practice-timer-save {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    min-height: var(--control-height);
+    border: 1px solid var(--control-secondary-border);
+    border-radius: var(--radius-md);
+    background: var(--control-secondary-surface);
+    color: var(--text-primary);
+    box-shadow: none;
+    cursor: pointer;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    line-height: 1;
+    padding: 0 var(--space-3);
+    text-decoration: none;
+    transition:
+        background-color var(--motion-duration) var(--motion-ease),
+        border-color var(--motion-duration) var(--motion-ease),
+        color var(--motion-duration) var(--motion-ease),
+        box-shadow var(--motion-duration) var(--motion-ease);
+}
+
+.ds-learning .practice-trend-option:hover,
+.ds-learning .practice-custom-card__icon-btn:hover,
+.ds-learning .practice-custom-option:hover,
+.ds-learning #settings-view .hero-settings-actions button:hover:not(:disabled),
+.ds-learning #settings-view .practice-timer-save:hover:not(:disabled) {
+    border-color: var(--control-selected-border);
+    background: var(--control-secondary-surface-hover);
+    color: var(--text-primary);
+    box-shadow: var(--elevation-1);
+}
+
+.ds-learning .practice-trend-option:active,
+.ds-learning .practice-custom-card__icon-btn:active,
+.ds-learning .practice-custom-option:active,
+.ds-learning #settings-view .hero-settings-actions button:active,
+.ds-learning #settings-view .practice-timer-save:active {
+    background: var(--control-surface-active);
+    transform: translateY(1px);
+}
+
+.ds-learning .practice-trend-option.active,
+.ds-learning .practice-trend-option[aria-pressed="true"],
+.ds-learning .practice-custom-option.active,
+.ds-learning .practice-custom-option[aria-pressed="true"] {
+    border-color: var(--control-selected-border);
+    background: var(--control-selected-surface);
+    color: var(--control-selected-text);
+    box-shadow: none;
+}
+
+.ds-learning .practice-trend-option {
+    min-height: var(--control-height-sm);
+    padding-inline: var(--space-3);
+}
+
+.ds-learning .practice-custom-card__icon-btn {
+    flex: 0 0 var(--control-height);
+    width: var(--control-height);
+    min-width: var(--control-height);
+    padding: 0;
+}
+
+.ds-learning .practice-custom-option {
+    justify-content: flex-start;
+    min-height: 52px;
+    width: 100%;
+    line-height: var(--line-height-normal);
+    padding: var(--space-3);
+    text-align: left;
+}
+
+.ds-learning #settings-view .hero-settings-actions button {
+    min-width: 136px;
+}
+
+.ds-learning #settings-view .hero-settings-actions .btn-warning,
+.ds-learning #settings-view .hero-settings-actions .hero-btn--warn {
+    border-color: var(--control-secondary-border);
+    background: var(--control-secondary-surface);
+    color: var(--text-primary);
+}
+
+.ds-learning #settings-view .hero-settings-actions .btn-warning:hover:not(:disabled),
+.ds-learning #settings-view .hero-settings-actions .hero-btn--warn:hover:not(:disabled) {
+    border-color: var(--control-selected-border);
+    background: var(--control-secondary-surface-hover);
+    color: var(--text-primary);
+}
+
+.ui-button--danger,
+.ds-admin .danger-button,
+.ds-admin #delete-user-button,
+.ds-auth .danger-button {
+    border-color: color-mix(in srgb, var(--danger) 36%, var(--border));
+    background: var(--danger-subtle);
+    color: var(--danger);
+}
+
+.ui-button--danger:hover,
+.ds-admin .danger-button:hover:not(:disabled),
+.ds-admin #delete-user-button:hover:not(:disabled) {
+    border-color: var(--danger);
+    background: color-mix(in srgb, var(--danger-subtle) 72%, var(--surface));
+    color: var(--danger-strong);
+}
+
+.ui-svg-icon,
+.ui-emoji-icon {
+    display: inline-flex;
+    width: 1em;
+    height: 1em;
+    color: currentColor;
+    flex: 0 0 auto;
+}
+
+.ui-svg-icon svg,
+.ui-emoji-icon svg {
+    width: 100%;
+    height: 100%;
+}
+
+.ui-card,
+.ds-learning .hero-surface,
+.ds-learning .hero-card,
+.ds-learning .category-card,
+.ds-learning .exam-item,
+.ds-learning .account-view__profile,
+.ds-learning .account-view__stat,
+.ds-learning .account-view__form,
+.ds-learning .practice-trend-card__face,
+.ds-learning .practice-custom-card__face,
+.ds-learning .practice-trend-reserved-card,
+.ds-admin .users-panel,
+.ds-admin .details-panel,
+.ds-admin .analytics-panel,
+.ds-admin .content-panel,
+.ds-admin .content-card,
+.ds-admin .metric-grid article,
+.ds-admin .profile-panel,
+.ds-admin .sessions-panel,
+.ds-admin .records-panel,
+.ds-auth .auth-panel,
+.ds-auth .admin-login-panel,
+.ds-auth .password-panel,
+.ds-auth .totp-panel {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    background-image: none;
+    box-shadow: var(--elevation-1);
+}
+
+.ui-card--subtle,
+.ds-admin .content-card,
+.ds-admin .metric-grid article,
+.ds-learning .account-view__stat {
+    background: var(--surface-subtle);
+}
+
+.ui-card--interactive,
+.ds-learning .overview-shortcut,
+.ds-learning .category-card,
+.ds-learning .exam-item {
+    transition:
+        border-color var(--motion-duration) var(--motion-ease),
+        box-shadow var(--motion-duration) var(--motion-ease),
+        background-color var(--motion-duration) var(--motion-ease);
+}
+
+.ui-card--interactive:hover,
+.ui-card--interactive:focus-visible,
+.ds-learning .overview-shortcut:hover,
+.ds-learning .overview-shortcut:focus-visible,
+.ds-learning .category-card:hover,
+.ds-learning .exam-item:hover {
+    border-color: color-mix(in srgb, var(--accent) 36%, var(--control-border-hover));
+    background: color-mix(in srgb, var(--accent-subtle) 34%, var(--surface));
+    box-shadow: var(--elevation-2);
+    transform: none;
+}
+
+.ds-learning .overview-workbench button.overview-shortcut:hover,
+.ds-learning .overview-workbench button.overview-shortcut:focus-visible {
+    border-color: color-mix(in srgb, var(--accent) 42%, var(--control-border-hover));
+    background: color-mix(in srgb, var(--accent-subtle) 62%, var(--surface));
+    box-shadow: var(--elevation-2);
+}
+
+.ds-learning .hero-card::after,
+.ds-learning .category-card::before,
+.ds-learning .category-card::after,
+.ds-learning .practice-trend-card__face::before,
+.ds-learning .hero-nav::before,
+.ds-learning .hero-nav__liquid-indicator {
+    display: none;
+}
+
+.ds-learning .overview-workbench__primary {
+    min-height: 220px;
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--accent);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    box-shadow: var(--elevation-1);
+    padding: clamp(var(--space-5), 3vw, var(--space-7));
+}
+
+.ds-learning .overview-workbench__primary h3 {
+    max-width: 760px;
+    color: var(--text-primary);
+    font-size: clamp(1.45rem, 3vw, 2.15rem);
+    font-weight: 700;
+    line-height: var(--line-height-tight);
+}
+
+.ds-learning .overview-workbench__primary p {
+    color: var(--text-secondary);
+    font-size: var(--font-size-md);
+    font-weight: 500;
+}
+
+.ds-learning .hero-panel__eyebrow,
+.ds-learning .overview-workbench__kicker,
+.ds-learning .overview-shortcut span,
+.ds-admin .admin-kicker,
+.ds-admin .account-kicker,
+.ds-auth .auth-heading p,
+.ds-auth .admin-login-heading p,
+.ds-auth .password-heading p,
+.ds-auth .totp-heading p {
+    color: var(--accent);
+    font-size: var(--font-size-xs);
+    font-weight: 700;
+    letter-spacing: 0;
+    text-transform: uppercase;
+}
+
+.ds-learning .overview-shortcut {
+    display: grid;
+    align-content: start;
+    align-items: start;
+    justify-items: start;
+    gap: var(--space-2);
+    min-height: 124px;
+    border: 1px solid color-mix(in srgb, var(--control-border-hover) 76%, var(--accent));
+    border-radius: var(--radius-lg);
+    background: color-mix(in srgb, var(--accent-subtle) 28%, var(--surface));
+    box-shadow: var(--elevation-1);
+    color: var(--text-primary);
+    cursor: pointer;
+    padding: var(--space-4) var(--space-4) var(--space-5);
+}
+
+.ds-learning .overview-workbench button.overview-shortcut {
+    display: grid;
+    grid-template-rows: auto auto;
+    align-self: start;
+    align-content: start;
+    align-items: start;
+    justify-items: start;
+    gap: var(--space-2);
+    min-height: 124px;
+    border-color: color-mix(in srgb, var(--control-border-hover) 76%, var(--accent));
+    background: color-mix(in srgb, var(--accent-subtle) 28%, var(--surface));
+    box-shadow: var(--elevation-1);
+    padding: var(--space-4);
+    text-align: left;
+}
+
+.ds-learning .overview-shortcut span {
+    display: block;
+    margin: 0;
+}
+
+.ds-learning .overview-shortcut strong {
+    display: block;
+    margin: 0;
+    line-height: var(--line-height-tight);
+}
+
+.ds-learning .overview-shortcut strong,
+.ds-learning .category-title,
+.ds-learning .exam-info h4,
+.ds-admin h2,
+.ds-admin h3 {
+    color: var(--text-primary);
+    font-weight: 700;
+}
+
+.ds-learning .overview-library-heading h3 {
+    color: var(--text-primary);
+    font-size: var(--font-size-lg);
+}
+
+.ds-learning .overview-library-heading p,
+.ds-learning .category-meta,
+.ds-learning .exam-meta,
+.ds-learning .hero-card__label,
+.ds-learning .hero-card__meta,
+.ds-admin .content-card__heading p,
+.ds-admin .metric-grid span,
+.ds-admin .empty-cell {
+    color: var(--text-secondary);
+}
+
+.ds-learning .category-card {
+    display: grid;
+    gap: var(--space-5);
+    border-color: var(--control-border);
+    background: var(--surface);
+    padding: var(--space-5);
+}
+
+.ds-learning .category-header {
+    align-items: flex-start;
+    gap: var(--space-3);
+    margin: 0;
+}
+
+.ds-learning .category-icon {
+    display: inline-grid;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    margin: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--accent-subtle);
+    color: var(--accent);
+    font-size: var(--font-size-sm);
+    font-weight: 700;
+    opacity: 1;
+}
+
+.ds-learning .category-actions,
+.ds-learning .category-card .category-actions {
+    gap: var(--space-2) !important;
+    margin-top: 0 !important;
+    flex-wrap: wrap !important;
+}
+
+.ds-learning .exam-list {
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    max-height: 70vh;
+    padding: 0 var(--space-1) var(--space-1) 0;
+}
+
+.ds-learning .exam-item {
+    border-color: var(--control-border);
+    background: var(--surface);
+    padding: var(--space-4);
+}
+
+.ds-learning .exam-meta {
+    display: inline-flex;
+    align-items: center;
+    width: max-content;
+    max-width: 100%;
+    border: 1px solid color-mix(in srgb, var(--border) 72%, var(--surface-subtle));
+    background: var(--surface-subtle);
+    border-radius: var(--radius-md);
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    line-height: 1.4;
+    padding: var(--space-1) var(--space-2);
+}
+
+.ds-learning .category-meta {
+    display: inline-flex;
+    align-items: center;
+    width: max-content;
+    max-width: 100%;
+    border: 1px solid color-mix(in srgb, var(--border) 72%, var(--surface-subtle));
+    border-radius: var(--radius-md);
+    background: var(--surface-subtle);
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    line-height: 1.4;
+    padding: var(--space-1) var(--space-2);
+}
+
+.ui-field,
+.ds-admin label,
+.ds-auth label,
+.ds-learning .remote-auth-field,
+.ds-learning .account-view__form label {
+    display: grid;
+    gap: var(--space-2);
+    min-width: 0;
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+}
+
+.ui-text-field,
+.ui-select,
+.ds-learning input:not([type="checkbox"]):not([type="radio"]),
+.ds-learning select,
+.ds-learning textarea,
+.ds-admin input:not([type="checkbox"]):not([type="radio"]),
+.ds-admin select,
+.ds-admin textarea,
+.ds-auth input:not([type="checkbox"]):not([type="radio"]),
+.ds-auth select,
+.ds-auth textarea {
+    width: 100%;
+    min-height: var(--control-height-lg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface);
+    color: var(--text-primary);
+    box-shadow: none;
+    font: inherit;
+    padding: 0 var(--space-3);
+}
+
+.ds-learning textarea,
+.ds-admin textarea,
+.ds-auth textarea {
+    min-height: 96px;
+    padding-top: var(--space-3);
+    padding-bottom: var(--space-3);
+    resize: vertical;
+}
+
+.ui-text-field:hover,
+.ui-select:hover,
+.ds-learning input:not([type="checkbox"]):not([type="radio"]):hover,
+.ds-learning select:hover,
+.ds-admin input:not([type="checkbox"]):not([type="radio"]):hover,
+.ds-admin select:hover,
+.ds-auth input:not([type="checkbox"]):not([type="radio"]):hover,
+.ds-auth select:hover {
+    border-color: var(--border-strong);
+}
+
+.ui-text-field:disabled,
+.ui-select:disabled,
+.ds-learning input:disabled,
+.ds-learning select:disabled,
+.ds-learning textarea:disabled,
+.ds-admin input:disabled,
+.ds-admin select:disabled,
+.ds-admin textarea:disabled,
+.ds-auth input:disabled,
+.ds-auth select:disabled,
+.ds-auth textarea:disabled {
+    background: var(--surface-subtle);
+    color: var(--text-tertiary);
+    cursor: not-allowed;
+}
+
+.ui-field__helper,
+.ds-auth .auth-foot,
+.ds-auth .auth-setup p,
+.ds-auth .auth-recovery p,
+.ds-auth .totp-summary,
+.ds-auth .totp-setup p,
+.ds-auth .password-status,
+.ds-auth .totp-status,
+.ds-auth .auth-status {
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    line-height: var(--line-height-normal);
+}
+
+.ui-field__error,
+.ds-auth .is-error,
+.ds-admin .status[data-kind="error"],
+.ds-learning .account-view__form-status.is-error {
+    color: var(--danger);
+}
+
+.ui-navigation,
+.ds-learning .hero-nav,
+.ds-admin .sidebar-nav {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+}
+
+.ds-learning .hero-nav {
+    width: max-content;
+    max-width: min(100%, 420px);
+    margin: 0;
+    border: 1px solid transparent;
+    border-radius: var(--radius-lg);
+    background: transparent;
+    box-shadow: none;
+    padding: 0;
+    justify-self: center;
+}
+
+.ds-learning .hero-nav__btn {
+    min-height: var(--control-height);
+    min-width: 100px;
+    border: 1px solid var(--control-border);
+    border-radius: var(--radius-md);
+    background: var(--control-secondary-surface);
+    color: var(--text-secondary);
+    font-weight: 600;
+}
+
+.ds-learning .hero-nav__btn:hover {
+    border-color: var(--control-secondary-border);
+    background: var(--control-secondary-surface-hover);
+    color: var(--text-primary);
+    box-shadow: none;
+}
+
+.ds-learning .hero-nav__btn.active,
+.ds-learning .hero-nav__btn[aria-current="page"],
+.ds-learning .shui-segmented-btn.active,
+.ds-learning .shui-segmented-btn[aria-pressed="true"],
+.ds-learning .browse-frequency-chip.active,
+.ds-learning .browse-frequency-chip[aria-pressed="true"],
+.ds-learning .shui-filter-btn.active,
+.ds-learning .shui-filter-btn[aria-pressed="true"],
+.ds-learning .shui-glass-btn.active,
+.ds-learning .shui-glass-btn[aria-pressed="true"] {
+    border-color: var(--control-selected-border);
+    background: var(--control-selected-surface);
+    color: var(--control-selected-text);
+    box-shadow: var(--elevation-1);
+    text-shadow: none;
+}
+
+.ds-learning .hero-nav__btn.active:hover,
+.ds-learning .hero-nav__btn[aria-current="page"]:hover,
+.ds-learning .shui-segmented-btn.active:hover,
+.ds-learning .shui-segmented-btn[aria-pressed="true"]:hover,
+.ds-learning .browse-frequency-chip.active:hover,
+.ds-learning .browse-frequency-chip[aria-pressed="true"]:hover,
+.ds-learning .shui-filter-btn.active:hover,
+.ds-learning .shui-filter-btn[aria-pressed="true"]:hover,
+.ds-learning .shui-glass-btn.active:hover,
+.ds-learning .shui-glass-btn[aria-pressed="true"]:hover {
+    border-color: var(--control-selected-border);
+    background: var(--control-selected-surface-hover);
+    color: var(--control-selected-text);
+}
+
+.ds-learning .shui-segmented-control {
+    gap: var(--space-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface-subtle);
+    padding: var(--space-1);
+}
+
+.ds-learning .shui-segmented-indicator {
+    display: none;
+}
+
+.ds-learning .browse-title-trigger.active,
+.ds-learning .browse-title-trigger.active:hover,
+.ds-learning .browse-title-trigger.active:focus {
+    color: var(--accent);
+}
+
+.ds-learning .browse-title-trigger .ui-emoji-icon,
+.ds-learning .browse-title-trigger svg {
+    color: currentColor;
+    stroke: currentColor;
+}
+
+.ds-learning .browse-title-dot {
+    border-color: var(--surface);
+    background: var(--control-selected-border);
+    box-shadow: none;
+    opacity: 0.72;
+}
+
+.ds-learning .browse-title-trigger.active .browse-title-dot {
+    opacity: 0.72;
+}
+
+.ds-learning a {
+    color: var(--accent);
+    text-decoration-color: color-mix(in srgb, var(--accent) 36%, transparent);
+    text-underline-offset: 3px;
+}
+
+.ds-learning a:hover {
+    color: var(--accent-strong);
+    text-decoration-color: currentColor;
+}
+
+.ds-learning a:active {
+    color: var(--control-selected-text);
+}
+
+.ds-learning .tool-card {
+    border-color: var(--control-border);
+    background: var(--surface);
+    color: var(--text-primary);
+    box-shadow: var(--elevation-1);
+    cursor: pointer;
+    transition:
+        background-color var(--motion-duration) var(--motion-ease),
+        border-color var(--motion-duration) var(--motion-ease),
+        box-shadow var(--motion-duration) var(--motion-ease);
+}
+
+.ds-learning .tool-card:hover,
+.ds-learning .tool-card:focus-visible {
+    border-color: var(--control-selected-border);
+    background: color-mix(in srgb, var(--control-selected-surface) 58%, var(--surface));
+    color: var(--text-primary);
+    box-shadow: var(--elevation-2);
+}
+
+.ds-learning .tool-card-arrow {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: var(--control-height-sm);
+    border: 1px solid var(--control-secondary-border);
+    border-radius: var(--radius-md);
+    background: var(--control-secondary-surface);
+    color: var(--accent);
+    font-weight: 700;
+    line-height: 1;
+    padding: 0 var(--space-3);
+}
+
+.ds-learning .tool-card:hover .tool-card-arrow,
+.ds-learning .tool-card:focus-visible .tool-card-arrow {
+    border-color: var(--control-selected-border);
+    background: var(--control-secondary-surface-hover);
+    color: var(--accent-strong);
+}
+
+.ds-learning .browse-sort-select {
+    border-color: var(--control-secondary-border);
+    background: var(--surface);
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+.ds-learning .browse-sort-select:hover {
+    border-color: var(--control-selected-border);
+    background: color-mix(in srgb, var(--surface) 82%, var(--accent-subtle));
+}
+
+.ui-data-table,
+.ds-admin table,
+.ds-learning .answer-table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+    background: var(--surface);
+}
+
+.ui-data-table th,
+.ui-data-table td,
+.ds-admin th,
+.ds-admin td,
+.ds-learning .answer-table th,
+.ds-learning .answer-table td {
+    border-bottom: 1px solid var(--border);
+    color: var(--text-primary);
+    font-size: var(--font-size-sm);
+    padding: var(--space-3) var(--space-4);
+    text-align: left;
+    vertical-align: middle;
+}
+
+.ui-data-table td,
+.ds-admin td,
+.ds-learning .answer-table td {
+    overflow-wrap: anywhere;
+}
+
+.ui-data-table th,
+.ds-admin th,
+.ds-learning .answer-table th {
+    background: var(--surface-subtle);
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.ds-admin tbody tr:hover,
+.ds-admin tr.is-selected {
+    background: var(--accent-subtle);
+}
+
+.ui-data-table__state,
+.ui-table-state,
+.ui-empty-state,
+.ds-admin .empty-cell,
+.ds-learning .exam-list-empty,
+.ds-learning .practice-history-empty {
+    padding: var(--space-7);
+    border: 1px dashed var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface-subtle);
+    color: var(--text-secondary);
+    text-align: center;
+}
+
+.ui-data-table__state[data-state="loading"],
+.ui-empty-state[data-state="loading"] {
+    color: var(--text-secondary);
+}
+
+.ui-data-table__state[data-state="error"],
+.ui-empty-state[data-state="error"] {
+    border-color: color-mix(in srgb, var(--danger) 32%, var(--border));
+    background: var(--danger-subtle);
+    color: var(--danger);
+}
+
+.ds-learning .exam-list-empty-icon,
+.ds-learning .practice-history-empty-icon {
+    display: none;
+}
+
+.ds-learning .category-icon {
+    display: none;
+}
+
+.ds-learning #practice-view .hero-panel__title::first-letter,
+.ds-learning #settings-view .hero-panel__title::first-letter,
+.ds-learning #more-view .hero-panel__title::first-letter,
+.ds-learning #settings-view h3::first-letter,
+.ds-learning #show-onboarding-btn::first-letter,
+.ds-learning #force-refresh-btn::first-letter,
+.ds-learning .category-card .btn::first-letter,
+.ds-learning .fallback-actions .btn::first-letter {
+    font-size: 0;
+}
+
+.ui-status-badge,
+.ds-admin .role-pill,
+.ds-learning .suite-custom-selection-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 24px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-pill);
+    background: var(--surface-subtle);
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 700;
+    line-height: 1;
+    padding: 0 var(--space-2);
+}
+
+.ui-status-badge[data-tone="success"],
+.ds-admin .role-pill.is-admin {
+    border-color: color-mix(in srgb, var(--success) 26%, var(--border));
+    background: var(--success-subtle);
+    color: var(--success);
+}
+
+.ui-alert,
+.ui-toast,
+.ds-learning .message,
+.ds-admin .status,
+.ds-auth .auth-status,
+.ds-auth .admin-login-status,
+.ds-auth .password-status,
+.ds-auth .totp-status {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    color: var(--text-secondary);
+    box-shadow: var(--elevation-2);
+    padding: var(--space-3) var(--space-4);
+}
+
+.ds-learning .message {
+    min-height: 44px;
+    clip-path: none;
+    will-change: transform, opacity;
+}
+
+.ds-learning .message::before {
+    display: none;
+}
+
+.ds-learning .message.success,
+.ds-auth .is-success,
+.ds-learning .account-view__form-status.is-success {
+    border-color: color-mix(in srgb, var(--success) 28%, var(--border));
+    background: var(--success-subtle);
+    color: var(--success);
+}
+
+.ds-learning .message.error,
+.ds-auth .is-error,
+.ds-admin .status[data-kind="error"] {
+    border-color: color-mix(in srgb, var(--danger) 32%, var(--border));
+    background: var(--danger-subtle);
+    color: var(--danger);
+}
+
+.ds-learning .message.warning {
+    border-color: color-mix(in srgb, var(--warning) 32%, var(--border));
+    background: var(--warning-subtle);
+    color: var(--warning);
+}
+
+.ds-learning #settings-view .settings-sidebar__item {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    width: 100%;
+    min-height: 40px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-md);
+    background: transparent;
+    color: var(--text-secondary);
+    box-shadow: none;
+    line-height: var(--line-height-normal);
+    padding: 0 var(--space-3);
+    text-align: left;
+}
+
+.ds-learning #settings-view .settings-sidebar__item:hover {
+    border-color: var(--control-border-hover);
+    background: var(--control-surface-hover);
+    color: var(--text-primary);
+}
+
+.ds-learning #settings-view .settings-sidebar__item.is-active,
+.ds-learning #settings-view .settings-sidebar__item.is-active:hover {
+    border-color: var(--control-selected-border);
+    background: var(--control-selected-surface);
+    color: var(--control-selected-text) !important;
+    box-shadow: none;
+}
+
+.ds-learning #settings-view .settings-sidebar__item::before,
+.ds-learning #settings-view .settings-sidebar__item::after {
+    display: none;
+}
+
+.ds-learning #settings-view .settings-sidebar__item:focus-visible {
+    outline: var(--focus-outline);
+    outline-offset: -2px;
+    box-shadow: none;
+}
+
+.ui-dialog,
+.ds-admin .dialog,
+.ds-learning .modal-container {
+    width: min(720px, calc(100vw - 32px));
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    color: var(--text-primary);
+    box-shadow: var(--elevation-3);
+}
+
+.ds-admin .dialog-backdrop,
+.ds-learning .modal-overlay {
+    background: color-mix(in srgb, var(--text-primary) 42%, transparent);
+}
+
+.ds-learning .modal-header,
+.ds-learning .modal-footer {
+    border-color: var(--border);
+    background: var(--surface-subtle);
+}
+
+.ds-learning .modal-title {
+    color: var(--text-primary);
+}
+
+.ds-learning .spinner {
+    border-color: var(--border);
+    border-top-color: var(--accent);
+}
+
+.ds-learning .loading {
+    color: var(--text-secondary);
+}
+
+.ds-auth .auth-panel,
+.ds-auth .admin-login-panel,
+.ds-auth .password-panel,
+.ds-auth .totp-panel {
+    width: 100%;
+    padding: var(--space-7);
+}
+
+.ds-auth .auth-tabs {
+    gap: var(--space-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface-subtle);
+    padding: var(--space-1);
+}
+
+.ds-auth .auth-tabs button {
+    border-color: color-mix(in srgb, var(--control-border) 66%, transparent);
+    background: color-mix(in srgb, var(--surface) 62%, var(--surface-subtle));
+    color: var(--text-secondary);
+}
+
+.ds-auth .auth-tabs button:hover:not(:disabled) {
+    border-color: var(--control-border-hover);
+    background: var(--control-surface-hover);
+    color: var(--text-primary);
+}
+
+@keyframes ds-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+@media (max-width: 640px) {
+    .ds-learning .hero-nav {
+        width: 100%;
+        max-width: 100%;
+        flex-direction: row;
+    }
+
+    .ds-learning .hero-nav__btn {
+        flex: 1 1 0;
+        width: auto;
+        min-width: 0;
+    }
+
+    .ds-learning .category-actions,
+    .ds-learning .category-card .category-actions,
+    .ds-learning .exam-actions,
+    .ds-admin .topbar-actions,
+    .ds-admin .form-actions,
+    .ds-admin .pagination-bar > div,
+    .ds-admin .export-actions {
+        display: grid !important;
+        grid-template-columns: 1fr;
+        width: 100%;
+    }
+
+    .ui-button,
+    .ds-learning .btn,
+    .ds-learning .overview-workbench__action,
+    .ds-learning .exam-item-action-btn,
+    .ds-admin button,
+    .ds-auth button {
+        width: 100%;
+    }
+
+    .ds-learning .message-container {
+        top: auto;
+        bottom: var(--space-4);
+        width: min(320px, calc(100vw - 48px));
+    }
+}

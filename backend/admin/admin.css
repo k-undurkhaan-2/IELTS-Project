@@ -1,18 +1,15 @@
 :root {
     color-scheme: light;
-    --bg: #f6f7f9;
-    --panel: #ffffff;
-    --text: #111827;
-    --muted: #667085;
-    --border: #d7dce3;
-    --soft: #f9fafb;
-    --accent: #2563eb;
-    --accent-soft: #eff6ff;
-    --accent-text: #1d4ed8;
-    --danger: #b42318;
-    --danger-bg: #fff1f0;
-    --shadow: 0 10px 30px rgba(17, 24, 39, 0.07);
-    --focus: 0 0 0 3px rgba(37, 99, 235, 0.18);
+    --bg: var(--background);
+    --panel: var(--surface);
+    --text: var(--text-primary);
+    --muted: var(--text-secondary);
+    --soft: var(--surface-subtle);
+    --accent-soft: var(--accent-subtle);
+    --accent-text: var(--accent-strong);
+    --danger-bg: var(--danger-subtle);
+    --shadow: var(--elevation-1);
+    --focus: var(--focus-ring);
 }
 
 * {
@@ -42,7 +39,7 @@ a {
 
 button {
     border: 1px solid var(--border);
-    background: #fff;
+    background: var(--surface);
     color: var(--text);
     cursor: pointer;
 }
@@ -83,7 +80,7 @@ p {
     top: 0;
     height: 100vh;
     border-right: 1px solid var(--border);
-    background: #fff;
+    background: var(--surface);
     padding: 18px 14px;
 }
 
@@ -115,7 +112,7 @@ p {
     display: flex;
     align-items: center;
     border: 1px solid transparent;
-    color: #475467;
+    color: var(--text-secondary);
     font-size: 14px;
     font-weight: 700;
     padding: 0 12px;
@@ -123,7 +120,7 @@ p {
 }
 
 .sidebar-nav a.is-active {
-    border-color: #bfdbfe;
+    border-color: var(--accent-subtle);
     background: var(--accent-soft);
     color: var(--accent-text);
 }
@@ -149,9 +146,8 @@ p {
     gap: 16px;
     min-height: 76px;
     border-bottom: 1px solid var(--border);
-    background: rgba(255, 255, 255, 0.94);
+    background: color-mix(in srgb, var(--surface) 94%, transparent);
     padding: 14px 24px;
-    backdrop-filter: blur(16px);
 }
 
 .admin-kicker {
@@ -192,7 +188,7 @@ h2 {
 #create-user-submit {
     border-color: var(--accent);
     background: var(--accent);
-    color: #fff;
+    color: var(--surface);
 }
 
 .users-layout {
@@ -204,9 +200,7 @@ h2 {
 .users-panel,
 .details-panel,
 .analytics-panel,
-.content-panel,
-.dialog,
-.status {
+.content-panel {
     border: 1px solid var(--border);
     border-radius: 8px;
     background: var(--panel);
@@ -250,7 +244,7 @@ h2 {
 #content-save-button {
     border-color: var(--accent);
     background: var(--accent);
-    color: #fff;
+    color: var(--surface);
     font-weight: 800;
     padding: 0 14px;
 }
@@ -306,7 +300,7 @@ h2 {
     width: 100%;
     border: 1px solid var(--border);
     border-radius: 6px;
-    background: #fff;
+    background: var(--surface);
     color: var(--text);
     padding: 9px 10px;
     resize: vertical;
@@ -393,7 +387,7 @@ h2 {
     min-height: 38px;
     border: 1px solid var(--border);
     border-radius: 6px;
-    background: #fff;
+    background: var(--surface);
     color: var(--text);
     padding: 0 10px;
 }
@@ -402,46 +396,12 @@ h2 {
     overflow: auto;
 }
 
-table {
-    width: 100%;
-    border-collapse: collapse;
-    table-layout: fixed;
-}
-
-th,
-td {
-    border-bottom: 1px solid var(--border);
-    padding: 12px 14px;
-    text-align: left;
-    vertical-align: middle;
-    font-size: 14px;
-}
-
-th {
-    position: sticky;
-    top: 0;
-    z-index: 1;
-    background: #fff;
-    color: var(--muted);
-    font-size: 12px;
-    font-weight: 800;
-}
-
-td {
-    overflow-wrap: anywhere;
-}
-
-tbody tr:hover,
-tr.is-selected {
-    background: var(--accent-soft);
-}
-
 .user-row {
     cursor: pointer;
 }
 
 .user-row:focus-visible {
-    outline: 2px solid rgba(37, 99, 235, 0.35);
+    outline: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
     outline-offset: -2px;
 }
 
@@ -449,9 +409,9 @@ tr.is-selected {
     display: inline-flex;
     align-items: center;
     min-height: 24px;
-    border-radius: 999px;
-    background: #eef2f6;
-    color: #475467;
+    border-radius: var(--radius-pill);
+    background: var(--surface-subtle);
+    color: var(--text-secondary);
     font-size: 12px;
     font-weight: 800;
     padding: 0 8px;
@@ -515,7 +475,7 @@ tr.is-selected {
     min-height: 34px;
     border: 1px solid var(--border);
     border-radius: 6px;
-    background: #fff;
+    background: var(--surface);
     color: var(--accent-text);
     font-size: 13px;
     font-weight: 800;
@@ -570,7 +530,7 @@ tr.is-selected {
 }
 
 .danger-button {
-    border-color: #f4b4ae;
+    border-color: var(--danger);
     background: var(--danger-bg);
     color: var(--danger);
 }
@@ -588,12 +548,6 @@ tr.is-selected {
     display: none;
 }
 
-.status[data-kind="error"] {
-    border-color: #f4b4ae;
-    background: var(--danger-bg);
-    color: var(--danger);
-}
-
 .dialog-backdrop {
     position: fixed;
     inset: 0;
@@ -601,7 +555,7 @@ tr.is-selected {
     display: grid;
     place-items: center;
     padding: 18px;
-    background: rgba(17, 24, 39, 0.44);
+    background: color-mix(in srgb, var(--text-primary) 44%, transparent);
 }
 
 .dialog-backdrop[hidden] {

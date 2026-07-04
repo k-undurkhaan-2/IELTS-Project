@@ -1,18 +1,15 @@
 :root {
     color-scheme: light;
-    --bg: #f6f7f9;
-    --panel: #ffffff;
-    --text: #111827;
-    --muted: #667085;
-    --border: #d7dce3;
-    --soft: #f9fafb;
-    --accent: #2563eb;
-    --accent-soft: #eff6ff;
-    --accent-text: #1d4ed8;
-    --danger: #b42318;
-    --danger-bg: #fff1f0;
-    --shadow: 0 10px 30px rgba(17, 24, 39, 0.07);
-    --focus: 0 0 0 3px rgba(37, 99, 235, 0.18);
+    --bg: var(--background);
+    --panel: var(--surface);
+    --text: var(--text-primary);
+    --muted: var(--text-secondary);
+    --soft: var(--surface-subtle);
+    --accent-soft: var(--accent-subtle);
+    --accent-text: var(--accent-strong);
+    --danger-bg: var(--danger-subtle);
+    --shadow: var(--elevation-1);
+    --focus: var(--focus-ring);
 }
 
 * {
@@ -37,7 +34,7 @@ a {
 
 button {
     border: 1px solid var(--border);
-    background: #fff;
+    background: var(--surface);
     color: var(--text);
     cursor: pointer;
 }
@@ -90,9 +87,8 @@ p {
     gap: 16px;
     min-height: 76px;
     border-bottom: 1px solid var(--border);
-    background: rgba(255, 255, 255, 0.94);
+    background: color-mix(in srgb, var(--surface) 94%, transparent);
     padding: 14px 24px;
-    backdrop-filter: blur(16px);
 }
 
 .account-actions {
@@ -133,8 +129,7 @@ h2 {
 .profile-panel,
 .metric-grid article,
 .sessions-panel,
-.records-panel,
-.status {
+.records-panel {
     border: 1px solid var(--border);
     border-radius: 8px;
     background: var(--panel);
@@ -154,7 +149,7 @@ h2 {
     place-items: center;
     width: 72px;
     height: 72px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: var(--accent-soft);
     color: var(--accent-text);
     font-size: 28px;
@@ -184,9 +179,9 @@ h2 {
     align-items: center;
     min-height: 28px;
     border: 1px solid var(--border);
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: var(--soft);
-    color: #475467;
+    color: var(--text-secondary);
     font-size: 12px;
     font-weight: 800;
     padding: 0 10px;
@@ -290,15 +285,15 @@ h2 {
     align-items: center;
     min-height: 24px;
     border: 1px solid var(--border);
-    border-radius: 999px;
-    background: #fff;
+    border-radius: var(--radius-pill);
+    background: var(--surface);
     padding: 0 8px;
 }
 
 .session-card__current {
-    border-color: #bbf7d0 !important;
-    background: #f0fdf4 !important;
-    color: #166534;
+    border-color: var(--success-subtle) !important;
+    background: var(--success-subtle) !important;
+    color: var(--success);
 }
 
 .session-card__revoke {
@@ -314,39 +309,6 @@ h2 {
 
 .records-table-wrap {
     overflow: auto;
-}
-
-table {
-    width: 100%;
-    border-collapse: collapse;
-    table-layout: fixed;
-}
-
-th,
-td {
-    border-bottom: 1px solid var(--border);
-    padding: 12px 14px;
-    text-align: left;
-    vertical-align: middle;
-    font-size: 14px;
-}
-
-th {
-    position: sticky;
-    top: 0;
-    z-index: 1;
-    background: #fff;
-    color: var(--muted);
-    font-size: 12px;
-    font-weight: 800;
-}
-
-td {
-    overflow-wrap: anywhere;
-}
-
-tbody tr:hover {
-    background: var(--accent-soft);
 }
 
 td strong,
@@ -381,12 +343,6 @@ td span {
     display: none;
 }
 
-.status[data-kind="error"] {
-    border-color: #f4b4ae;
-    background: var(--danger-bg);
-    color: var(--danger);
-}
-
 .dialog-backdrop {
     position: fixed;
     inset: 0;
@@ -394,7 +350,7 @@ td span {
     display: grid;
     place-items: center;
     padding: 18px;
-    background: rgba(17, 24, 39, 0.44);
+    background: color-mix(in srgb, var(--text-primary) 44%, transparent);
 }
 
 .dialog-backdrop[hidden] {
@@ -403,10 +359,6 @@ td span {
 
 .dialog {
     width: min(460px, 100%);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--panel);
-    box-shadow: var(--shadow);
     padding: 18px;
 }
 

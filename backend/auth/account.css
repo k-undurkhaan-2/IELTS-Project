@@ -1,14 +1,15 @@
+@import url("/src/styles/tokens.css");
+@import url("/src/styles/layout.css");
+@import url("/src/styles/components.css");
+
 :root {
     color-scheme: light;
-    --bg: #eef2f0;
-    --panel: #ffffff;
-    --text: #111827;
-    --muted: #667085;
-    --border: #d8e0da;
-    --accent: #2f6f4e;
-    --accent-dark: #245b40;
-    --danger: #b42318;
-    --danger-bg: #fff1f0;
+    --bg: var(--background);
+    --panel: var(--surface);
+    --text: var(--text-primary);
+    --muted: var(--text-secondary);
+    --accent-dark: var(--accent-strong);
+    --danger-bg: var(--danger-subtle);
 }
 
 * {
@@ -34,7 +35,7 @@ button {
     border: 1px solid var(--accent);
     border-radius: 6px;
     background: var(--accent);
-    color: #fff;
+    color: var(--surface);
     cursor: pointer;
     font-weight: 700;
 }
@@ -113,13 +114,13 @@ input {
     padding: 9px 11px;
     border: 1px solid var(--border);
     border-radius: 6px;
-    background: #fff;
+    background: var(--surface);
     color: var(--text);
 }
 
 input:focus {
     border-color: var(--accent);
-    outline: 3px solid rgba(47, 111, 78, 0.16);
+    outline: 3px solid color-mix(in srgb, var(--success) 16%, transparent);
 }
 
 .status {
@@ -148,7 +149,7 @@ input:focus {
     padding: 14px;
     border: 1px solid var(--border);
     border-radius: 6px;
-    background: #f8faf7;
+    background: var(--surface);
 }
 
 .totp-box img {
@@ -156,7 +157,7 @@ input:focus {
     height: 180px;
     border: 1px solid var(--border);
     border-radius: 6px;
-    background: #fff;
+    background: var(--surface);
 }
 
 .totp-box code {

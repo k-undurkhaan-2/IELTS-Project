@@ -1,0 +1,30 @@
+services:
+  postgres:
+    container_name: ielts-local-browser-postgres
+    ports: !override []
+
+  app:
+    container_name: ielts-local-browser-app
+    ports: !override
+      - "127.0.0.1:3300:3000"
+    volumes:
+      - type: bind
+        source: ../src
+        target: /app/src
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      HOST: 0.0.0.0
+      COOKIE_SECURE: "false"
+      TRUST_PROXY: "false"
+      TRUSTED_PROXY_IPS: ""
+      AUTH_PUBLIC_URL: http://127.0.0.1:3300
+      BUSINESS_PUBLIC_URL: http://127.0.0.1:3300
+      ADMIN_PUBLIC_URL: http://127.0.0.1:3300
+
+  tor:
+    profiles:
+      - disabled-local-browser
