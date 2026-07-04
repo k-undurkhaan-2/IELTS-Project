@@ -883,25 +883,43 @@ textarea {
     box-shadow: var(--elevation-2);
 }
 
-.ds-learning .tool-card-arrow {
+.ds-learning #more-view .tool-card-arrow {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    min-height: var(--control-height-sm);
-    border: 1px solid var(--control-secondary-border);
-    border-radius: var(--radius-md);
-    background: var(--control-secondary-surface);
+    min-height: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
     color: var(--accent);
     font-weight: 700;
-    line-height: 1;
-    padding: 0 var(--space-3);
+    line-height: var(--line-height-tight);
+    padding: 0;
+    text-decoration: none;
+    text-decoration-color: transparent;
+    text-underline-offset: 3px;
+    transition:
+        color var(--motion-duration) var(--motion-ease),
+        text-decoration-color var(--motion-duration) var(--motion-ease);
 }
 
-.ds-learning .tool-card:hover .tool-card-arrow,
-.ds-learning .tool-card:focus-visible .tool-card-arrow {
-    border-color: var(--control-selected-border);
-    background: var(--control-secondary-surface-hover);
+.ds-learning #more-view .tool-card:hover .tool-card-arrow,
+.ds-learning #more-view .tool-card:focus-visible .tool-card-arrow {
+    border-color: transparent;
+    background: transparent;
     color: var(--accent-strong);
+    text-decoration-line: underline;
+    text-decoration-color: color-mix(in srgb, var(--accent-strong) 58%, transparent);
+}
+
+.ds-learning #more-view .tool-card.is-reading-memorize-active .tool-card-arrow {
+    color: var(--danger);
+}
+
+.ds-learning #more-view .tool-card.is-reading-memorize-active:hover .tool-card-arrow,
+.ds-learning #more-view .tool-card.is-reading-memorize-active:focus-visible .tool-card-arrow {
+    color: var(--danger-strong);
+    text-decoration-color: color-mix(in srgb, var(--danger-strong) 58%, transparent);
 }
 
 .ds-learning .browse-sort-select {
