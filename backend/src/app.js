@@ -9,7 +9,7 @@ const helmet = require('helmet');
 
 const db = require('./db');
 const { PostgresAuthStore, createAuthRouter, getUserSecurityEpoch, publicUser, requireAuth, requireAdmin, verifyCsrfToken } = require('./auth');
-const { PostgresAuthHandoffStore, createAuthHandoffRouter, verifySignedAuthState } = require('./authHandoff');
+const { PostgresAuthHandoffStore, createAuthHandoffRouter, createSignedAuthState, verifySignedAuthState } = require('./authHandoff');
 const {
     PostgresAuthSessionStore,
     createAuthSessionHandle,
@@ -36,6 +36,8 @@ const SESSION_VERIFIER_ROTATE_KEY = Symbol('sessionVerifierRotate');
 const CONTENT_AUTH_VERIFIED_KEY = Symbol('contentAuthVerified');
 const SESSION_VERIFIER_PROTECTED_PATHS = ['/api/auth', '/api/account', '/api/practice-records', '/api/admin', '/admin', '/auth'];
 const AUTH_SESSION_KEY = 'authSession';
+const ACCOUNT_SESSION_MANAGE_STEP_UP_KEY = 'accountSessionManageStepUp';
+const ACCOUNT_SESSION_MANAGE_STEP_UP_MAX_AGE_MS = 5 * 60 * 1000;
 const ROOT_QUERY_VIEW_ALLOWLIST = new Set(['overview', 'browse', 'practice', 'settings', 'more']);
 
 function parseBoolean(value, fallback = false) {
@@ -1282,6 +1284,33 @@ function createApp(options = {}) {
 
         router.use(requireAuth);
 
+        function hasFreshSessionManageStepUp(req) {
+            const marker = req.session?.[ACCOUNT_SESSION_MANAGE_STEP_UP_KEY];
+            const verifiedAt = Number(marker?.verifiedAt);
+            const markerAge = Date.now() - verifiedAt;
+            const securityEpoch = Number.isInteger(req.currentUserSecurityEpoch)
+                ? req.currentUserSecurityEpoch
+                : getUserSecurityEpoch(req.session?.user);
+            return marker?.userId === req.session?.user?.id
+                && marker?.intent === 'session-manage'
+                && marker?.securityEpoch === securityEpoch
+                && Number.isFinite(verifiedAt)
+                && verifiedAt > 0
+                && markerAge >= 0
+                && markerAge <= ACCOUNT_SESSION_MANAGE_STEP_UP_MAX_AGE_MS;
+        }
+
+        function requireSessionManageStepUp(req, res, next) {
+            if (hasFreshSessionManageStepUp(req)) {
+                return next();
+            }
+            return res.status(403).json({
+                error: 'Recent authentication required',
+                requiresSessionManageStepUp: true,
+                authActionStart: '/auth/business/session/start'
+            });
+        }
+
         router.get('/sessions', async (req, res, next) => {
             try {
                 const records = authSessionStore && typeof authSessionStore.listSessionsForUser === 'function'
@@ -1297,7 +1326,7 @@ function createApp(options = {}) {
             }
         });
 
-        router.post('/sessions/revoke-others', verifyCsrfToken, async (req, res, next) => {
+        router.post('/sessions/revoke-others', verifyCsrfToken, requireSessionManageStepUp, async (req, res, next) => {
             try {
                 const currentId = req.session[AUTH_SESSION_KEY]?.id || null;
                 const revoked = authSessionStore && typeof authSessionStore.revokeSessionsForUser === 'function'
@@ -1312,7 +1341,7 @@ function createApp(options = {}) {
             }
         });
 
-        router.delete('/sessions/:sessionId', verifyCsrfToken, async (req, res, next) => {
+        router.delete('/sessions/:sessionId', verifyCsrfToken, requireSessionManageStepUp, async (req, res, next) => {
             try {
                 const sessionId = String(req.params.sessionId || '').trim();
                 if (!isAuthSessionId(sessionId)) {
@@ -1424,6 +1453,7 @@ function createApp(options = {}) {
         csrfRateLimit: options.csrfRateLimit,
         totpEnabled,
         resolveAuthState: (state) => verifySignedAuthState(authHandoffSecret, state),
+        signAuthActionProof: (payload) => createSignedAuthState(authHandoffSecret, payload),
         onDeleteUser: async (userId) => {
             if (practiceStore && typeof practiceStore.clear === 'function') {
                 await practiceStore.clear(userId);
@@ -1655,6 +1685,18 @@ function createApp(options = {}) {
     });
     app.get('/auth/password.css', (req, res) => {
         res.sendFile(path.join(authRoot, 'password.css'));
+    });
+    app.get(['/auth/session', '/auth/session/'], async (req, res, next) => {
+        try {
+            const state = await requireBusinessAuthActionState(req, res, 'session-manage');
+            if (!state) return;
+            res.sendFile(path.join(authRoot, 'session.html'));
+        } catch (error) {
+            next(error);
+        }
+    });
+    app.get('/auth/session.js', (req, res) => {
+        res.sendFile(path.join(authRoot, 'session.js'));
     });
     app.get(['/auth/totp', '/auth/totp/'], async (req, res, next) => {
         try {

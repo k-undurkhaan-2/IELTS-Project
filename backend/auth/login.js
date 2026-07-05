@@ -112,11 +112,15 @@
 
     function isBusinessActionFlow() {
         return handoff?.audience === 'business'
-            && (handoff.intent === 'password-change' || handoff.intent === 'totp-manage');
+            && (handoff.intent === 'password-change'
+                || handoff.intent === 'totp-manage'
+                || handoff.intent === 'session-manage');
     }
 
     function getBusinessActionPath() {
-        const path = handoff?.intent === 'totp-manage' ? '/auth/totp' : '/auth/password';
+        const path = handoff?.intent === 'totp-manage'
+            ? '/auth/totp'
+            : (handoff?.intent === 'session-manage' ? '/auth/session' : '/auth/password');
         return `${path}?state=${encodeURIComponent(handoffState)}`;
     }
 

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>IELTS Atlas Session Security</title>
+        <link rel="stylesheet" href="/auth/password.css" />
+        <link rel="stylesheet" href="/src/styles/tokens.css" />
+        <link rel="stylesheet" href="/src/styles/layout.css" />
+        <link rel="stylesheet" href="/src/styles/components.css" />
+    </head>
+    <body class="ds-auth">
+        <main class="password-shell">
+            <section class="password-panel" aria-labelledby="session-title">
+                <div class="password-heading">
+                    <p>IELTS Atlas</p>
+                    <h1 id="session-title">Confirm session management</h1>
+                </div>
+
+                <div id="session-status" class="password-status" role="status" aria-live="polite">Checking session...</div>
+
+                <form id="session-form" class="password-form" hidden>
+                    <label>
+                        <span>Current password</span>
+                        <input id="session-password" name="currentPassword" type="password" autocomplete="current-password" required />
+                    </label>
+                    <button id="session-submit" type="submit">Continue</button>
+                </form>
+
+                <a id="session-back-link" class="password-secondary-link" href="/">Back to app</a>
+            </section>
+        </main>
+        <script src="/auth/session.js"></script>
+    </body>
+</html>

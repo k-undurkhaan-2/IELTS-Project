@@ -5291,9 +5291,20 @@ storageManager.ready
         }
 
         function startBusinessAuthAction(action) {
-            const normalizedAction = action === 'totp' ? 'totp' : 'password';
+            const normalizedAction = action === 'totp'
+                ? 'totp'
+                : (action === 'session' ? 'session' : 'password');
             const returnTo = getCurrentReturnTo();
             window.location.href = `/auth/business/${normalizedAction}/start?return_to=${encodeURIComponent(returnTo)}`;
+        }
+
+        function redirectToSessionManageStepUp(error) {
+            if (!error || error.status !== 403 || !error.payload?.requiresSessionManageStepUp) {
+                return false;
+            }
+            setSessionManagerStatus('Confirm your password before managing sessions.');
+            startBusinessAuthAction('session');
+            return true;
         }
 
         function hide() {
@@ -5552,9 +5563,16 @@ storageManager.ready
                 return;
             }
             setSessionManagerStatus('Signing out selected session...');
-            await apiClient.request(`/api/account/sessions/${encodeURIComponent(normalizedId)}`, {
-                method: 'DELETE'
-            });
+            try {
+                await apiClient.request(`/api/account/sessions/${encodeURIComponent(normalizedId)}`, {
+                    method: 'DELETE'
+                });
+            } catch (requestError) {
+                if (redirectToSessionManageStepUp(requestError)) {
+                    return;
+                }
+                throw requestError;
+            }
             sessionListLoadedForUserId = '';
             await loadAccountSessions({ force: true, silent: true });
             setSessionManagerStatus('Selected session signed out.', 'success');
@@ -5565,10 +5583,17 @@ storageManager.ready
                 return;
             }
             setSessionManagerStatus('Signing out other sessions...');
-            await apiClient.request('/api/account/sessions/revoke-others', {
-                method: 'POST',
-                body: {}
-            });
+            try {
+                await apiClient.request('/api/account/sessions/revoke-others', {
+                    method: 'POST',
+                    body: {}
+                });
+            } catch (requestError) {
+                if (redirectToSessionManageStepUp(requestError)) {
+                    return;
+                }
+                throw requestError;
+            }
             sessionListLoadedForUserId = '';
             await loadAccountSessions({ force: true, silent: true });
             setSessionManagerStatus('Other sessions signed out.', 'success');

@@ -10,7 +10,7 @@ const MAX_MEMORY_SESSION_JSON_LENGTH = 256 * 1024;
 const MAX_BCRYPT_PASSWORD_BYTES = 72;
 const MAX_RATE_LIMIT_KEY_LENGTH = 256;
 const AUTH_ACTION_STEP_UP_MAX_AGE_MS = 5 * 60 * 1000;
-const AUTH_ACTION_STEP_UP_ALLOWED_INTENTS = new Set(['password-change', 'totp-manage']);
+const AUTH_ACTION_STEP_UP_ALLOWED_INTENTS = new Set(['password-change', 'totp-manage', 'session-manage']);
 
 const credentialsSchema = z.object({
     username: z.string().trim().min(3).max(32).regex(USERNAME_PATTERN),
@@ -740,6 +740,9 @@ function createAuthRouter(options = {}) {
     const resolveAuthState = typeof options.resolveAuthState === 'function'
         ? options.resolveAuthState
         : null;
+    const signAuthActionProof = typeof options.signAuthActionProof === 'function'
+        ? options.signAuthActionProof
+        : null;
     const totpEnabled = options.totpEnabled !== undefined
         ? Boolean(options.totpEnabled)
         : parseBoolean(process.env.TOTP_ENABLED, true);
@@ -941,12 +944,25 @@ function createAuthRouter(options = {}) {
                 return;
             }
             const marker = markAuthActionStepUp(req, currentUser, context.state, parsed.data.authState);
-            return res.json({
+            const responsePayload = {
                 ok: true,
                 intent: context.state.intent,
                 expiresAt: marker.verifiedAt + AUTH_ACTION_STEP_UP_MAX_AGE_MS,
                 csrfToken: ensureCsrfToken(req)
-            });
+            };
+            if (context.state.intent === 'session-manage' && signAuthActionProof) {
+                responsePayload.actionProof = signAuthActionProof({
+                    audience: 'business',
+                    intent: context.state.intent,
+                    userId: currentUser.id,
+                    securityEpoch: getUserSecurityEpoch(currentUser),
+                    stateHash: hashAuthActionState(parsed.data.authState),
+                    verifiedAt: marker.verifiedAt,
+                    issuedAt: Date.now(),
+                    nonce: crypto.randomBytes(16).toString('base64url')
+                });
+            }
+            return res.json(responsePayload);
         } catch (error) {
             return next(error);
         }

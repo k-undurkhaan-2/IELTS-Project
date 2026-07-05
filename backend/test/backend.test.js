@@ -1174,6 +1174,18 @@ test('authenticated APIs require an active server-side auth session registry ent
 
 test('business account session API lists safe metadata and revokes other sessions', async () => {
     const client = await createClient();
+    const businessHeaders = {
+        host: 'business.local',
+        'x-forwarded-host': 'business.local',
+        'x-forwarded-proto': 'http',
+        'x-ielts-onion-audience': 'business'
+    };
+    const authHeaders = {
+        host: 'auth.local',
+        'x-forwarded-host': 'auth.local',
+        'x-forwarded-proto': 'http',
+        'x-ielts-onion-audience': 'auth'
+    };
     try {
         const created = await register(client, 'session_owner', 'StrongPass1');
         assert.equal(created.response.status, 201);
@@ -1199,6 +1211,63 @@ test('business account session API lists safe metadata and revokes other session
             assert(['business', 'admin', 'auth'].includes(record.audience));
             assert.equal(typeof record.deviceLabel, 'string');
         }
+
+        const revokeWithoutStepUp = await client.request('POST', '/api/account/sessions/revoke-others', {});
+        assert.equal(revokeWithoutStepUp.response.status, 403);
+        assert.equal(revokeWithoutStepUp.json.requiresSessionManageStepUp, true);
+
+        const sessionStart = await client.request('GET', '/auth/business/session/start?return_to=/?view=settings', undefined, {
+            redirect: 'manual',
+            headers: businessHeaders
+        });
+        assert.equal(sessionStart.response.status, 302);
+        const sessionStartLocation = sessionStart.response.headers.get('location');
+        const sessionState = getRedirectParam(sessionStartLocation, 'state');
+        assert(sessionState);
+
+        const authSession = client.createSession();
+        await authSession.csrf();
+        const authLogin = await authSession.request('POST', '/api/auth/login', {
+            username: 'session_owner',
+            password: 'StrongPass1'
+        }, { headers: authHeaders });
+        assert.equal(authLogin.response.status, 200);
+
+        const sessionPage = await authSession.request('GET', `/auth/session?state=${encodeURIComponent(sessionState)}`, undefined, {
+            redirect: 'manual',
+            headers: authHeaders
+        });
+        assert.equal(sessionPage.response.status, 200);
+        assert.match(sessionPage.text, /Confirm session management/);
+
+        const sessionStepUp = await authSession.request('POST', '/api/auth/action-step-up', {
+            authState: sessionState,
+            password: 'StrongPass1'
+        }, { headers: authHeaders });
+        assert.equal(sessionStepUp.response.status, 200);
+        assert.equal(sessionStepUp.json.intent, 'session-manage');
+        assert(sessionStepUp.json.actionProof);
+
+        const unrelatedBusinessSession = client.createSession();
+        await unrelatedBusinessSession.csrf();
+        const unrelatedLogin = await unrelatedBusinessSession.request('POST', '/api/auth/login', {
+            username: 'session_owner',
+            password: 'StrongPass1'
+        }, { headers: businessHeaders });
+        assert.equal(unrelatedLogin.response.status, 200);
+        const crossBrowserCallback = await unrelatedBusinessSession.request('GET', `/auth/business/session/callback?state=${encodeURIComponent(sessionState)}&proof=${encodeURIComponent(sessionStepUp.json.actionProof)}`, undefined, {
+            redirect: 'manual',
+            headers: businessHeaders
+        });
+        assert.equal(crossBrowserCallback.response.status, 403);
+
+        const sessionCallback = await client.request('GET', `/auth/business/session/callback?state=${encodeURIComponent(sessionState)}&proof=${encodeURIComponent(sessionStepUp.json.actionProof)}`, undefined, {
+            redirect: 'manual',
+            headers: businessHeaders
+        });
+        assert.equal(sessionCallback.response.status, 302);
+        assert.equal(parseRedirectLocation(sessionCallback.response.headers.get('location')).pathname, '/');
+        assert.equal(parseRedirectLocation(sessionCallback.response.headers.get('location')).search, '?view=settings');
 
         const revokeOthers = await client.request('POST', '/api/account/sessions/revoke-others', {});
         assert.equal(revokeOthers.response.status, 200);
@@ -3080,6 +3149,8 @@ test('admin dashboard redirects anonymous users through auth handoff', async () 
         assert.match(authLoginScript.text, /\/api\/auth\/login/);
         assert.match(authLoginScript.text, /isBusinessActionFlow/);
         assert.match(authLoginScript.text, /getBusinessActionPath/);
+        assert.match(authLoginScript.text, /session-manage/);
+        assert.match(authLoginScript.text, /\/auth\/session/);
         assert.match(authLoginScript.text, /Sign in with the account that started this security action/);
         assert.doesNotMatch(authLoginScript.text, /window\.location\.assign\(['"]\/auth\/account['"]\)|\/auth\/account/);
 
@@ -3092,6 +3163,14 @@ test('admin dashboard redirects anonymous users through auth handoff', async () 
 
         const anonymousAuthTotpPage = await client.request('GET', '/auth/totp', undefined, { redirect: 'manual' });
         assert.equal(anonymousAuthTotpPage.response.status, 401);
+
+        assert.equal(anonymousAuthSessionPage.response.status, 401);
+
+        assert.equal(authSessionScript.response.status, 200);
+        assert.match(authSessionScript.text, /\/api\/auth\/action-step-up/);
+        assert.match(authSessionScript.text, /actionProof/);
+        assert.match(authSessionScript.text, /\/auth\/business\/session\/callback/);
+        assert.doesNotMatch(authSessionScript.text, /\/api\/auth\/password-change|\/api\/auth\/totp\/disable/);
 
         const authPasswordScript = await client.request('GET', '/auth/password.js');
         assert.equal(authPasswordScript.response.status, 200);
@@ -3511,8 +3590,9 @@ test('admin shell and business account menu do not link back through the busines
     assert(mainIndex.includes('id="settings-session-manager"'));
     assert(mainIndex.includes('id="settings-sessions-revoke-others-btn"'));
     assert(mainIndex.includes('Sign out all other sessions'));
-    assert(authOverlay.includes("const normalizedAction = action === 'totp' ? 'totp' : 'password';"));
+    assert(authOverlay.includes("action === 'session' ? 'session' : 'password'"));
     assert(authOverlay.includes('/auth/business/${normalizedAction}/start?return_to='));
+    assert(authOverlay.includes('requiresSessionManageStepUp'));
     assert(authOverlay.includes('/auth/business/logout?return_to='));
     assert(authOverlay.includes("apiClient.request('/api/account/sessions'"));
     assert(authOverlay.includes("apiClient.request('/api/account/sessions/revoke-others'"));
@@ -6667,10 +6747,8 @@ test('static hosting serves index and denies dotfiles with security headers', as
         });
         assert.equal(publicSessionLogin.response.status, 200);
 
-        await client.csrf();
-        const revokeContentSessions = await client.request('POST', '/api/account/sessions/revoke-others', {});
-        assert.equal(revokeContentSessions.response.status, 200);
-        assert(revokeContentSessions.json.revoked >= revokedContentSessions.length + 1);
+        const revokeContentSessions = await client.authSessionStore.revokeSessionsForUser(created.json.user.id, null);
+        assert(revokeContentSessions >= revokedContentSessions.length + 2);
 
         for (const { contentSession, protectedPath } of revokedContentSessions) {
             const afterRevoke = await contentSession.request('GET', protectedPath);
@@ -6680,6 +6758,15 @@ test('static hosting serves index and denies dotfiles with security headers', as
         const publicManifestAfterRevoke = await revokedPublicSession.request('GET', '/assets/generated/listening-exams/manifest.js');
         assert.equal(publicManifestAfterRevoke.response.status, 200);
         assert.match(publicManifestAfterRevoke.text, /__LISTENING_EXAM_MANIFEST__/);
+
+        client.setCookie('ielts.sid', '');
+        client.setCookie('ielts.sv', '');
+        await client.csrf();
+        const reloginAfterRevoke = await client.request('POST', '/api/auth/login', {
+            username: 'static_content_user',
+            password: 'StrongPass1'
+        });
+        assert.equal(reloginAfterRevoke.response.status, 200);
 
         const prettyReading = await client.request('GET', '/practice/reading/p1-high-01');
         assert.equal(prettyReading.response.status, 200);
