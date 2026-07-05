@@ -4254,16 +4254,6 @@ storageManager.ready
             });
         }
 
-        async disableTotp(password, token) {
-            const payload = await this.request('/api/auth/totp/disable', {
-                method: 'POST',
-                body: { password, token }
-            });
-            this.user = payload.user || this.user;
-            this.storeCsrfTokenFromPayload(payload);
-            return payload.status || { enabled: false, recoveryCodesRemaining: 0 };
-        }
-
         async logout() {
             let payload;
             try {
@@ -4720,8 +4710,7 @@ storageManager.ready
 
     function isAuthSurface(element) {
         return element.id === 'remote-auth-overlay'
-            || element.classList.contains('remote-auth-account')
-            || element.classList.contains('remote-auth-totp');
+            || element.classList.contains('remote-auth-account');
     }
 
     function setRemoteAuthGate(active) {
@@ -4848,7 +4837,6 @@ storageManager.ready
         const showMessage = options.showMessage || window.showMessage || function() {};
         let overlay = null;
         let account = null;
-        let totpPanel = null;
         let mode = 'login';
         let importPromptedInSession = false;
         let pendingRecoveryUser = null;
@@ -5002,10 +4990,6 @@ storageManager.ready
             account.append(accountToggle, accountMenu);
             const accountHost = window.document.querySelector('.hero-header__actions') || window.document.body;
             accountHost.appendChild(account);
-
-            totpPanel = createElement('section', 'remote-auth-totp');
-            totpPanel.hidden = true;
-            window.document.body.appendChild(totpPanel);
 
             function setError(message) {
                 error.textContent = message || '';
@@ -5184,7 +5168,6 @@ storageManager.ready
                     setAccountMenuOpen(false);
                     await apiClient.logout();
                     updateAccount(null);
-                    hideTotpPanel();
                     window.dispatchEvent(new CustomEvent('remote-auth-changed', { detail: { user: null } }));
                     const returnTo = getCurrentReturnTo();
                     window.location.href = `/auth/business/logout?return_to=${encodeURIComponent(returnTo)}`;
@@ -5314,13 +5297,6 @@ storageManager.ready
             }
             overlay.hidden = true;
             setRemoteAuthGate(false);
-        }
-
-        function hideTotpPanel() {
-            if (totpPanel) {
-                totpPanel.hidden = true;
-                totpPanel.textContent = '';
-            }
         }
 
         function getAccountInitial(username) {
@@ -5703,208 +5679,6 @@ storageManager.ready
             }
         }
 
-        function renderRecoveryCodes(container, codes) {
-            const list = createElement('ol', 'remote-auth-recovery__list');
-            codes.forEach((code) => list.append(createElement('li', null, code)));
-            container.append(
-                createElement('p', 'remote-auth-totp__note', '请保存这些恢复码。它们只会显示一次。'),
-                list
-            );
-        }
-
-        function renderTotpActionForm(statusNode, body, options = {}) {
-            body.textContent = '';
-            const form = createElement('form', 'remote-auth-totp__form');
-            const note = createElement('p', 'remote-auth-totp__note', options.note || '');
-            const error = createElement('div', 'remote-auth-error');
-            error.hidden = true;
-
-            form.append(note);
-            let passwordInput = null;
-            if (options.requirePassword) {
-                const passwordLabel = createElement('label', 'remote-auth-field');
-                passwordInput = createElement('input');
-                passwordInput.type = 'password';
-                passwordInput.autocomplete = 'current-password';
-                passwordInput.required = true;
-                passwordLabel.append(createElement('span', null, '当前密码'), passwordInput);
-                form.append(passwordLabel);
-            }
-
-            const tokenLabel = createElement('label', 'remote-auth-field');
-            const tokenInput = createElement('input');
-            tokenInput.type = 'text';
-            tokenInput.inputMode = 'numeric';
-            tokenInput.autocomplete = 'one-time-code';
-            tokenInput.maxLength = 64;
-            tokenInput.required = true;
-            tokenLabel.append(createElement('span', null, 'TOTP 验证码或恢复码'), tokenInput);
-
-            const actions = createElement('div', 'remote-auth-totp__actions');
-            const submit = createElement('button', 'remote-auth-totp__primary', options.submitLabel || '确认');
-            submit.type = 'submit';
-            const cancel = createElement('button', 'remote-auth-totp__secondary', '取消');
-            cancel.type = 'button';
-            cancel.addEventListener('click', () => {
-                if (typeof options.onCancel === 'function') {
-                    options.onCancel();
-                }
-            });
-            actions.append(submit, cancel);
-
-            form.append(tokenLabel, error, actions);
-            form.addEventListener('submit', async (event) => {
-                event.preventDefault();
-                const token = normalizeCode(tokenInput.value);
-                const password = passwordInput ? passwordInput.value : '';
-                if (options.requirePassword && !password) {
-                    error.textContent = '请输入当前密码。';
-                    error.hidden = false;
-                    passwordInput.focus();
-                    return;
-                }
-                if (!token) {
-                    error.textContent = '请输入 TOTP 验证码或恢复码。';
-                    error.hidden = false;
-                    tokenInput.focus();
-                    return;
-                }
-                error.hidden = true;
-                submit.disabled = true;
-                cancel.disabled = true;
-                try {
-                    await options.onSubmit({ password, token });
-                } catch (requestError) {
-                    const message = formatRemoteAuthError(requestError);
-                    error.textContent = message;
-                    error.hidden = false;
-                    statusNode.textContent = message;
-                } finally {
-                    submit.disabled = false;
-                    cancel.disabled = false;
-                }
-            });
-
-            body.append(form);
-            window.setTimeout(() => {
-                const firstInput = passwordInput || tokenInput;
-                firstInput.focus({ preventScroll: true });
-            }, 0);
-        }
-
-        async function loadTotpPanel() {
-            if (!totpPanel) {
-                return;
-            }
-            totpPanel.textContent = '';
-            const head = createElement('div', 'remote-auth-totp__head');
-            head.append(createElement('h3', null, 'TOTP 二次验证'));
-            const close = createElement('button', 'remote-auth-totp__close', '×');
-            close.type = 'button';
-            close.setAttribute('aria-label', '关闭');
-            close.addEventListener('click', hideTotpPanel);
-            head.append(close);
-            const status = createElement('div', 'remote-auth-totp__status', '正在加载...');
-            const body = createElement('div', 'remote-auth-totp__body');
-            totpPanel.append(head, status, body);
-            try {
-                const payload = await apiClient.getTotpStatus();
-                renderTotpStatus(payload, status, body);
-            } catch (requestError) {
-                status.textContent = formatRemoteAuthError(requestError);
-            }
-        }
-
-        function renderTotpStatus(status, statusNode, body) {
-            body.textContent = '';
-            if (status.enabled) {
-                statusNode.textContent = `已启用，剩余恢复码 ${status.recoveryCodesRemaining || 0} 个，上次使用：${formatTotpTime(status.lastUsedAt)}`;
-                const regenerate = createElement('button', 'remote-auth-totp__primary', '重新生成恢复码');
-                const disable = createElement('button', 'remote-auth-totp__danger', '关闭 TOTP');
-                regenerate.type = 'button';
-                disable.type = 'button';
-                regenerate.addEventListener('click', () => {
-                    renderTotpActionForm(statusNode, body, {
-                        note: '输入验证器验证码或恢复码后，将生成一组新的恢复码。旧恢复码会立即失效。',
-                        submitLabel: '重新生成恢复码',
-                        onCancel: () => renderTotpStatus(status, statusNode, body),
-                        onSubmit: async ({ token }) => {
-                            const result = await apiClient.regenerateTotpRecoveryCodes(token);
-                            body.textContent = '';
-                            renderRecoveryCodes(body, result.recoveryCodes || []);
-                            statusNode.textContent = `已重新生成恢复码，剩余 ${result.status?.recoveryCodesRemaining || 0} 个。`;
-                        }
-                    });
-                });
-                disable.addEventListener('click', () => {
-                    if (apiClient.user?.role === 'admin') {
-                        statusNode.textContent = '管理员不能在这里关闭 TOTP。';
-                        return;
-                    }
-                    renderTotpActionForm(statusNode, body, {
-                        requirePassword: true,
-                        note: '关闭 TOTP 需要同时确认当前密码和验证码。',
-                        submitLabel: '关闭 TOTP',
-                        onCancel: () => renderTotpStatus(status, statusNode, body),
-                        onSubmit: async ({ password, token }) => {
-                            const result = await apiClient.disableTotp(password, token);
-                            renderTotpStatus(result, statusNode, body);
-                            showMessage('TOTP 已关闭', 'success');
-                        }
-                    });
-                });
-                body.append(regenerate, disable);
-                return;
-            }
-
-            statusNode.textContent = '未启用。启用后，登录需要输入认证器验证码。';
-            const enable = createElement('button', 'remote-auth-totp__primary', '启用 TOTP');
-            enable.type = 'button';
-            enable.addEventListener('click', async () => {
-                enable.disabled = true;
-                try {
-                    const setup = await apiClient.startTotpSetup();
-                    renderAccountTotpSetup(setup, statusNode, body);
-                } catch (requestError) {
-                    statusNode.textContent = formatRemoteAuthError(requestError);
-                } finally {
-                    enable.disabled = false;
-                }
-            });
-            body.append(enable);
-        }
-
-        function renderAccountTotpSetup(setup, statusNode, body) {
-            body.textContent = '';
-            statusNode.textContent = '扫描二维码后输入 6 位验证码完成绑定。';
-            const qr = createElement('img', 'remote-auth-totp__qr');
-            qr.alt = 'TOTP QR code';
-            qr.src = normalizeTotpQrDataUrl(setup.qrCodeDataUrl);
-            const secret = createElement('code', 'remote-auth-totp__secret', setup.secret || '');
-            const token = createElement('input', 'remote-auth-totp__input');
-            token.inputMode = 'numeric';
-            token.autocomplete = 'one-time-code';
-            token.placeholder = '验证码';
-            const verify = createElement('button', 'remote-auth-totp__primary', '验证并启用');
-            verify.type = 'button';
-            verify.addEventListener('click', async () => {
-                verify.disabled = true;
-                try {
-                    const result = await apiClient.verifyTotpSetup(token.value);
-                    body.textContent = '';
-                    renderRecoveryCodes(body, result.recoveryCodes || []);
-                    statusNode.textContent = 'TOTP 已启用。';
-                    updateAccount(result.user || apiClient.user);
-                } catch (requestError) {
-                    statusNode.textContent = formatRemoteAuthError(requestError);
-                } finally {
-                    verify.disabled = false;
-                }
-            });
-            body.append(qr, secret, token, verify);
-            window.setTimeout(() => token.focus({ preventScroll: true }), 0);
-        }
-
         async function maybeImportLocalRecords(user) {
             if (!user || !user.id || importPromptedInSession) {
                 return;
@@ -5940,8 +5714,7 @@ storageManager.ready
             show,
             hide,
             updateAccount,
-            handleAuthenticated,
-            loadTotpPanel
+            handleAuthenticated
         };
     }
 

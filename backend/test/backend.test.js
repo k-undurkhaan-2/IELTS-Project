@@ -3385,6 +3385,7 @@ test('admin shell and business account menu do not link back through the busines
     const businessProxyConfig = fs.readFileSync(path.join(repoRoot, 'backend', 'business-proxy', 'nginx.conf'), 'utf8');
     const authProxyConfig = fs.readFileSync(path.join(repoRoot, 'backend', 'auth-proxy', 'nginx.conf'), 'utf8');
     const authOverlay = fs.readFileSync(path.join(repoRoot, 'js', 'data', 'authOverlay.js'), 'utf8');
+    const remoteApiClient = fs.readFileSync(path.join(repoRoot, 'js', 'data', 'remoteApiClient.js'), 'utf8');
     const mainIndex = fs.readFileSync(path.join(repoRoot, 'index.html'), 'utf8');
 
     assert(adminScript.includes("window.location.href = '/auth/admin/start?return_to=/admin'"));
@@ -3724,8 +3725,13 @@ test('admin shell and business account menu do not link back through the busines
     assert.doesNotMatch(authOverlay, /remote-auth-account__admin/);
     assert.doesNotMatch(authOverlay, /href\s*=\s*['"]\/admin['"]/);
     assert.doesNotMatch(authOverlay, /\/auth\/business\/account|Open auth account center/);
+    assert.doesNotMatch(authOverlay, /loadTotpPanel|remote-auth-totp|disableTotp|\/api\/auth\/totp\/disable|\/api\/auth\/account/);
+    assert.doesNotMatch(remoteApiClient, /disableTotp|\/api\/auth\/totp\/disable|\/api\/auth\/account/);
     assert.doesNotMatch(mainIndex, /\/auth\/business\/account|Open auth account center|account-username-form|account-password-form|account-delete-form/);
     assert.doesNotMatch(mainIndex, /Account Management/);
+    assert(!fs.existsSync(path.join(repoRoot, 'backend', 'auth', 'account.html')));
+    assert(!fs.existsSync(path.join(repoRoot, 'backend', 'auth', 'account.js')));
+    assert(!fs.existsSync(path.join(repoRoot, 'backend', 'auth', 'account.css')));
     assert(mainIndex.includes('id="settings-password-btn"'));
     assert(mainIndex.includes('id="settings-session-manager"'));
     assert(mainIndex.includes('id="settings-sessions-revoke-others-btn"'));

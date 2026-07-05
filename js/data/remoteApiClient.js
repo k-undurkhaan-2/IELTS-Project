@@ -160,16 +160,6 @@
             });
         }
 
-        async disableTotp(password, token) {
-            const payload = await this.request('/api/auth/totp/disable', {
-                method: 'POST',
-                body: { password, token }
-            });
-            this.user = payload.user || this.user;
-            this.storeCsrfTokenFromPayload(payload);
-            return payload.status || { enabled: false, recoveryCodesRemaining: 0 };
-        }
-
         async logout() {
             let payload;
             try {
