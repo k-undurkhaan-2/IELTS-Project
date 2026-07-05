@@ -33,6 +33,7 @@ const SESSION_VERIFIER_COOKIE_NAME = 'ielts.sv';
 const SESSION_VERIFIER_HASH_KEY = 'sessionVerifierHash';
 const SESSION_VERIFIER_ISSUED_AT_KEY = 'sessionVerifierIssuedAt';
 const SESSION_VERIFIER_ROTATE_KEY = Symbol('sessionVerifierRotate');
+const CONTENT_AUTH_VERIFIED_KEY = Symbol('contentAuthVerified');
 const SESSION_VERIFIER_PROTECTED_PATHS = ['/api/auth', '/api/account', '/api/practice-records', '/api/admin', '/admin', '/auth'];
 const AUTH_SESSION_KEY = 'authSession';
 const ROOT_QUERY_VIEW_ALLOWLIST = new Set(['overview', 'browse', 'practice', 'settings', 'more']);
@@ -1206,6 +1207,35 @@ function createApp(options = {}) {
         }
     }
 
+    function requireVerifiedContentAuth(req, res, next) {
+        if (req[CONTENT_AUTH_VERIFIED_KEY]) {
+            return requireContentAuth(req, res, next);
+        }
+        const stack = [
+            attachSessionVerifierControls,
+            requireSessionVerifier,
+            requireAuthSessionRegistry,
+            attachSessionVerifierIssuer,
+            (stackReq, stackRes, stackNext) => {
+                stackReq[CONTENT_AUTH_VERIFIED_KEY] = true;
+                return requireContentAuth(stackReq, stackRes, stackNext);
+            }
+        ];
+        let index = -1;
+        function run(error) {
+            if (error) {
+                return next(error);
+            }
+            index += 1;
+            const layer = stack[index];
+            if (!layer) {
+                return next();
+            }
+            return layer(req, res, run);
+        }
+        return run();
+    }
+
     async function refreshSessionUser(req, res, next) {
         try {
             if (!req.session || typeof authStore.findById !== 'function') {
@@ -1679,8 +1709,8 @@ function createApp(options = {}) {
         });
     });
 
-    app.use(createCanonicalProtectedContentMiddleware(requireContentAuth));
-    app.use(PROTECTED_CONTENT_ROUTES, requireContentAuth);
+    app.use(createCanonicalProtectedContentMiddleware(requireVerifiedContentAuth));
+    app.use(PROTECTED_CONTENT_ROUTES, requireVerifiedContentAuth);
 
     app.get([
         '/practice/reading/:examId',

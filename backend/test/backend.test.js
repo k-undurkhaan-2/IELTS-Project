@@ -6570,6 +6570,45 @@ test('static hosting serves index and denies dotfiles with security headers', as
         assert.match(lowerCaseListeningCsp, /base-uri 'self'/);
         assert.match(lowerCaseListeningCsp, /sandbox allow-scripts allow-downloads allow-same-origin/);
 
+        const revokedContentSessions = [];
+        for (const protectedPath of [
+            '/ListeningPractice/P1/sample.html',
+            '/assets/generated/reading-exams/p1-high-01.js',
+            '/practice/listening/listening-p1-sample'
+        ]) {
+            const contentSession = client.createSession();
+            await contentSession.csrf();
+            const contentLogin = await contentSession.request('POST', '/api/auth/login', {
+                username: 'static_content_user',
+                password: 'StrongPass1'
+            });
+            assert.equal(contentLogin.response.status, 200);
+            const beforeRevoke = await contentSession.request('GET', protectedPath);
+            assert.equal(beforeRevoke.response.status, 200, `${protectedPath} should load before revocation`);
+            revokedContentSessions.push({ contentSession, protectedPath });
+        }
+        const revokedPublicSession = client.createSession();
+        await revokedPublicSession.csrf();
+        const publicSessionLogin = await revokedPublicSession.request('POST', '/api/auth/login', {
+            username: 'static_content_user',
+            password: 'StrongPass1'
+        });
+        assert.equal(publicSessionLogin.response.status, 200);
+
+        await client.csrf();
+        const revokeContentSessions = await client.request('POST', '/api/account/sessions/revoke-others', {});
+        assert.equal(revokeContentSessions.response.status, 200);
+        assert(revokeContentSessions.json.revoked >= revokedContentSessions.length + 1);
+
+        for (const { contentSession, protectedPath } of revokedContentSessions) {
+            const afterRevoke = await contentSession.request('GET', protectedPath);
+            assert.equal(afterRevoke.response.status, 401, `${protectedPath} should reject revoked sessions`);
+            assert.doesNotMatch(afterRevoke.text, /Listening Sample|__READING_EXAM_DATA__|Unified Listening/);
+        }
+        const publicManifestAfterRevoke = await revokedPublicSession.request('GET', '/assets/generated/listening-exams/manifest.js');
+        assert.equal(publicManifestAfterRevoke.response.status, 200);
+        assert.match(publicManifestAfterRevoke.text, /__LISTENING_EXAM_MANIFEST__/);
+
         const prettyReading = await client.request('GET', '/practice/reading/p1-high-01');
         assert.equal(prettyReading.response.status, 200);
         assert.match(prettyReading.text, /Unified Reading/);
