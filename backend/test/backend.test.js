@@ -3237,6 +3237,7 @@ test('admin shell and business account menu do not link back through the busines
     assert(adminScript.includes("window.location.href = '/auth/admin/logout?return_to=/admin'"));
     assert(adminScript.includes("fetch('/api/auth/me'"));
     assert(adminScript.includes('/api/admin/summary'));
+    assert(adminScript.includes('withAdminStepUp(() => request(`/api/admin/users?${query}`'));
     assert(adminScript.includes('/api/admin/export-token'));
     assert(adminScript.includes('/api/admin/export?'));
     assert(adminScript.includes('/admin/account?userId='));
@@ -5260,7 +5261,7 @@ test('admin sensitive mutations require recent password step-up', async () => {
     }
 });
 
-test('admin account center sensitive reads require recent password step-up', async () => {
+test('admin account center and user-list sensitive reads require recent password step-up', async () => {
     const client = await createClient({ adminActionStepUpMaxAgeMs: 1000 });
     try {
         await seedAdmin(client, 'account_read_admin', 'StrongPass1');
@@ -5292,6 +5293,7 @@ test('admin account center sensitive reads require recent password step-up', asy
         await enableTotpForCurrentSession(client);
 
         const sensitiveReadPaths = [
+            '/api/admin/users?q=account_read_target',
             `/api/admin/users/${managedUserId}/stats`,
             `/api/admin/users/${managedUserId}/sessions`,
             `/api/admin/users/${managedUserId}/practice-records`
@@ -5299,9 +5301,6 @@ test('admin account center sensitive reads require recent password step-up', asy
 
         const summary = await client.request('GET', '/api/admin/summary');
         assert.equal(summary.response.status, 200);
-        const users = await client.request('GET', '/api/admin/users?q=account_read_target');
-        assert.equal(users.response.status, 200);
-        assert.equal(users.json.users.length, 1);
 
         for (const requestPath of sensitiveReadPaths) {
             const blocked = await client.request('GET', requestPath, undefined, { csrf: false });
@@ -5313,17 +5312,22 @@ test('admin account center sensitive reads require recent password step-up', asy
         const confirmed = await adminActionStepUp(client);
         assert.equal(confirmed.response.status, 200);
 
-        const stats = await client.request('GET', sensitiveReadPaths[0], undefined, { csrf: false });
+        const users = await client.request('GET', sensitiveReadPaths[0], undefined, { csrf: false });
+        assert.equal(users.response.status, 200);
+        assert.equal(users.json.users.length, 1);
+        assert.equal(users.json.users[0].id, managedUserId);
+
+        const stats = await client.request('GET', sensitiveReadPaths[1], undefined, { csrf: false });
         assert.equal(stats.response.status, 200);
         assert.equal(stats.json.user.id, managedUserId);
         assert.equal(stats.json.recordCount, 1);
 
-        const sessions = await client.request('GET', sensitiveReadPaths[1], undefined, { csrf: false });
+        const sessions = await client.request('GET', sensitiveReadPaths[2], undefined, { csrf: false });
         assert.equal(sessions.response.status, 200);
         assert.equal(sessions.json.user.id, managedUserId);
         assert(Array.isArray(sessions.json.sessions));
 
-        const records = await client.request('GET', sensitiveReadPaths[2], undefined, { csrf: false });
+        const records = await client.request('GET', sensitiveReadPaths[3], undefined, { csrf: false });
         assert.equal(records.response.status, 200);
         assert.equal(records.json.records[0].id, 'account-read-record');
 

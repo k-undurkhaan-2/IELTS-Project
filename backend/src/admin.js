@@ -2526,7 +2526,7 @@ function createAdminRouter(options = {}) {
         }
     });
 
-    router.get('/users', async (req, res, next) => {
+    router.get('/users', requireAdminActionStepUp, async (req, res, next) => {
         try {
             const query = parseListQuery(req.query);
             return res.json(await store.listUsers(query));

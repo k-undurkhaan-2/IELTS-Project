@@ -330,7 +330,7 @@
                 limit: String(state.users.limit),
                 offset: String(state.users.offset)
             });
-            const payload = await request(`/api/admin/users?${query}`, { csrf: false });
+            const payload = await withAdminStepUp(() => request(`/api/admin/users?${query}`, { csrf: false }));
             if (state.users.requestId !== requestId) {
                 return;
             }
