@@ -16,6 +16,10 @@ admin, and auth onion deployment.
 - Production split-onion deployment must not start the base `tor` service from
   `backend/docker-compose.yml`. That service is legacy/dev only and must require
   the explicit `--profile legacy-onion` profile.
+- Production split-onion deployment must keep
+  `ALLOW_LEGACY_DIRECT_ACCOUNT_APIS=false`. Legacy direct-app account and TOTP
+  disable APIs are loopback/dev compatibility surfaces, not public production
+  account-management paths.
 
 ## Proxy And Tor Recreate Rule
 

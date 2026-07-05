@@ -132,6 +132,8 @@ test('docker image hardening excludes secrets and runs app as non-root', () => {
     assert(envExample.includes('TOR_BRIDGES_AGE_IDENTITY_LOCAL_FILE=./tor/bridge-age-identity.txt'));
     assert(envExample.includes('TRAFFIC_SECRET='));
     assert(compose.includes('TRAFFIC_SECRET: ${TRAFFIC_SECRET:-}'));
+    assert(envExample.includes('ALLOW_LEGACY_DIRECT_ACCOUNT_APIS=false'));
+    assert(compose.includes('ALLOW_LEGACY_DIRECT_ACCOUNT_APIS: ${ALLOW_LEGACY_DIRECT_ACCOUNT_APIS:-false}'));
     assert(envExample.includes('AUTH_HANDOFF_STATE_SECRET='));
     assert(envExample.includes('TRUSTED_PROXY_IPS='));
     assert(compose.includes('TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-}'));
@@ -160,6 +162,8 @@ test('docker image hardening excludes secrets and runs app as non-root', () => {
     assert(deploymentRunbook.includes('Admin Password Maintenance Rotation'));
     assert(deploymentRunbook.includes('Do not overwrite the long-lived target `backend/.env`'));
     assert(deploymentRunbook.includes('Do not commit the temporary file'));
+    assert(deploymentRunbook.includes('ALLOW_LEGACY_DIRECT_ACCOUNT_APIS=false'));
+    assert(deploymentRunbook.includes('Legacy direct-app account and TOTP'));
     assert(deploymentRunbook.includes('run --rm --no-deps'));
     assert(deploymentRunbook.includes('-e ADMIN_PASSWORD'));
     assert(deploymentRunbook.includes('rm -f "$ADMIN_BOOTSTRAP_ENV"'));
