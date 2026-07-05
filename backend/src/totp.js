@@ -11,6 +11,7 @@ const {
     isPasswordWithinBcryptByteLimit,
     publicUser,
     requireAuth,
+    resolveAllowLegacyDirectAccountApis,
     resolveBusinessAccountActionContext,
     verifyCsrfToken
 } = require('./auth');
@@ -515,9 +516,17 @@ function createTotpRouter(options = {}) {
     const bcryptImpl = options.bcrypt || bcrypt;
     const config = getTotpConfig(options);
     const checkRateLimit = options.checkRateLimit || createRateLimiter(options.rateLimit);
+    const allowLegacyDirectAccountApis = resolveAllowLegacyDirectAccountApis(options);
     const resolveAuthState = typeof options.resolveAuthState === 'function'
         ? options.resolveAuthState
         : null;
+
+    function requireLegacyDirectAccountApi(req, res, next) {
+        if (!allowLegacyDirectAccountApis) {
+            return res.status(404).json({ error: 'Not found' });
+        }
+        return next();
+    }
 
     function assertEnabled() {
         if (!config.enabled) {
@@ -831,7 +840,7 @@ function createTotpRouter(options = {}) {
 
     // Legacy direct-app TOTP disable endpoint is retained for loopback/dev compatibility.
     // Public split-onion proxies must keep /api/auth/totp/disable blocked.
-    router.post('/disable', requireAuth, verifyCsrfToken, async (req, res, next) => {
+    router.post('/disable', requireLegacyDirectAccountApi, requireAuth, verifyCsrfToken, async (req, res, next) => {
         try {
             assertEnabled();
             const user = publicUser(req.session.user);

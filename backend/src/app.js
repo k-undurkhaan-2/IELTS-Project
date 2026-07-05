@@ -1452,6 +1452,8 @@ function createApp(options = {}) {
         rateLimit: options.rateLimit,
         csrfRateLimit: options.csrfRateLimit,
         totpEnabled,
+        nodeEnv: options.nodeEnv,
+        allowLegacyDirectAccountApis: options.allowLegacyDirectAccountApis,
         resolveAuthState: (state) => verifySignedAuthState(authHandoffSecret, state),
         signAuthActionProof: (payload) => createSignedAuthState(authHandoffSecret, payload),
         onDeleteUser: async (userId) => {
@@ -1473,6 +1475,7 @@ function createApp(options = {}) {
         encryptionKey: options.totpEncryptionKey,
         verificationMaxAgeMs: totpVerificationMaxAgeMs,
         nodeEnv: options.nodeEnv,
+        allowLegacyDirectAccountApis: options.allowLegacyDirectAccountApis,
         recoveryHashRounds: options.totpRecoveryHashRounds,
         resolveAuthState: (state) => verifySignedAuthState(authHandoffSecret, state)
     }));

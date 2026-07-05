@@ -99,6 +99,16 @@ function parseBoolean(value, fallback = false) {
     return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
 }
 
+function resolveAllowLegacyDirectAccountApis(options = {}) {
+    const configured = Object.prototype.hasOwnProperty.call(options, 'allowLegacyDirectAccountApis')
+        ? options.allowLegacyDirectAccountApis
+        : process.env.ALLOW_LEGACY_DIRECT_ACCOUNT_APIS;
+    if (configured !== undefined && configured !== null && configured !== '') {
+        return parseBoolean(configured, false);
+    }
+    return (options.nodeEnv || process.env.NODE_ENV) !== 'production';
+}
+
 function parseMemorySessionValue(raw) {
     if (!raw) return null;
     if (typeof raw !== 'string') return raw;
@@ -750,6 +760,14 @@ function createAuthRouter(options = {}) {
     const clearCookieOptions = options.clearCookieOptions || {};
     const sessionVerifierCookieName = options.sessionVerifierCookieName || '';
     const clearSessionVerifierCookieOptions = options.clearSessionVerifierCookieOptions || clearCookieOptions;
+    const allowLegacyDirectAccountApis = resolveAllowLegacyDirectAccountApis(options);
+
+    function requireLegacyDirectAccountApi(req, res, next) {
+        if (!allowLegacyDirectAccountApis) {
+            return res.status(404).json({ error: 'Not found' });
+        }
+        return next();
+    }
 
     function clearSessionCookies(res) {
         res.clearCookie(sessionCookieName, clearCookieOptions);
@@ -971,7 +989,7 @@ function createAuthRouter(options = {}) {
     // Legacy direct-app account endpoints are retained for loopback/dev compatibility.
     // Public split-onion proxies must keep /api/auth/account* blocked; production
     // self-service account changes should use the signed auth-action flows.
-    router.patch('/account/username', requireAuth, verifyCsrfToken, async (req, res, next) => {
+    router.patch('/account/username', requireLegacyDirectAccountApi, requireAuth, verifyCsrfToken, async (req, res, next) => {
         try {
             const parsed = updateUsernameSchema.safeParse(req.body || {});
             if (!parsed.success) {
@@ -1029,7 +1047,7 @@ function createAuthRouter(options = {}) {
         }
     });
 
-    router.patch('/account/password', requireAuth, verifyCsrfToken, async (req, res, next) => {
+    router.patch('/account/password', requireLegacyDirectAccountApi, requireAuth, verifyCsrfToken, async (req, res, next) => {
         try {
             const parsed = updatePasswordSchema.safeParse(req.body || {});
             if (!parsed.success) {
@@ -1147,7 +1165,7 @@ function createAuthRouter(options = {}) {
         }
     });
 
-    router.delete('/account', requireAuth, verifyCsrfToken, async (req, res, next) => {
+    router.delete('/account', requireLegacyDirectAccountApi, requireAuth, verifyCsrfToken, async (req, res, next) => {
         try {
             const parsed = deleteAccountSchema.safeParse(req.body || {});
             if (!parsed.success) {
@@ -1210,6 +1228,7 @@ module.exports = {
     publicUser,
     requireAdmin,
     requireAuth,
+    resolveAllowLegacyDirectAccountApis,
     resolveBusinessAccountActionContext,
     validatePasswordStrength,
     verifyCsrfToken

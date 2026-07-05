@@ -400,6 +400,7 @@ async function createClient(options = {}) {
         authPublicUrl: options.authPublicUrl,
         businessPublicUrl: options.businessPublicUrl,
         adminPublicUrl: options.adminPublicUrl,
+        allowLegacyDirectAccountApis: options.allowLegacyDirectAccountApis,
         totpRecoveryHashRounds: 4
     });
     const server = await new Promise((resolve, reject) => {
@@ -1607,6 +1608,68 @@ test('production public URL policy controls session and handoff cookie Secure at
         assert.doesNotMatch(handoffCookie, /Secure/);
     } finally {
         await onionClient.close();
+    }
+});
+
+test('production direct app hides legacy account APIs unless explicitly enabled', async () => {
+    const strongSecret = '0123456789abcdef0123456789abcdef';
+    const productionOptions = {
+        nodeEnv: 'production',
+        sessionSecret: strongSecret,
+        totpEncryptionKey: strongSecret,
+        authPublicUrl: `http://${VALID_ONION_HOSTS.auth}`,
+        businessPublicUrl: `http://${VALID_ONION_HOSTS.business}`,
+        adminPublicUrl: `http://${VALID_ONION_HOSTS.admin}`
+    };
+    const client = await createClient(productionOptions);
+    try {
+        const legacyRequests = [
+            () => client.request('PATCH', '/api/auth/account/username', {
+                username: 'renamed_user',
+                password: 'StrongPass1'
+            }),
+            () => client.request('PATCH', '/api/auth/account/password', {
+                currentPassword: 'StrongPass1',
+                newPassword: 'StrongerPass2'
+            }),
+            () => client.request('DELETE', '/api/auth/account', {
+                password: 'StrongPass1',
+                confirm: 'legacy_user'
+            }),
+            () => client.request('POST', '/api/auth/totp/disable', {
+                password: 'StrongPass1',
+                token: '000000'
+            })
+        ];
+        for (const requestLegacyApi of legacyRequests) {
+            const result = await requestLegacyApi();
+            assert.equal(result.response.status, 404);
+            assert.equal(result.json.error, 'Not found');
+        }
+    } finally {
+        await client.close();
+    }
+
+    const optInClient = await createClient({
+        ...productionOptions,
+        allowLegacyDirectAccountApis: true
+    });
+    try {
+        const accountPassword = await optInClient.request('PATCH', '/api/auth/account/password', {
+            currentPassword: 'StrongPass1',
+            newPassword: 'StrongerPass2'
+        });
+        assert.equal(accountPassword.response.status, 401);
+        assert.equal(accountPassword.json.error, 'Authentication required');
+
+        const totpDisable = await optInClient.request('POST', '/api/auth/totp/disable', {
+            password: 'StrongPass1',
+            token: '000000'
+        });
+        assert.equal(totpDisable.response.status, 401);
+        assert.equal(totpDisable.json.error, 'Authentication required');
+    } finally {
+        await optInClient.close();
     }
 });
 
