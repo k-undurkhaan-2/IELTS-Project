@@ -163,7 +163,8 @@ test('docker image hardening excludes secrets and runs app as non-root', () => {
     assert(deploymentRunbook.includes('Do not overwrite the long-lived target `backend/.env`'));
     assert(deploymentRunbook.includes('Do not commit the temporary file'));
     assert(deploymentRunbook.includes('ALLOW_LEGACY_DIRECT_ACCOUNT_APIS=false'));
-    assert(deploymentRunbook.includes('Legacy direct-app account and TOTP'));
+    assert(deploymentRunbook.includes('short-lived local maintenance task explicitly opts in'));
+    assert(deploymentRunbook.includes('disabled by default'));
     assert(deploymentRunbook.includes('run --rm --no-deps'));
     assert(deploymentRunbook.includes('-e ADMIN_PASSWORD'));
     assert(deploymentRunbook.includes('rm -f "$ADMIN_BOOTSTRAP_ENV"'));
