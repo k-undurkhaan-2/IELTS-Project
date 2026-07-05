@@ -968,6 +968,9 @@ function createAuthRouter(options = {}) {
         }
     });
 
+    // Legacy direct-app account endpoints are retained for loopback/dev compatibility.
+    // Public split-onion proxies must keep /api/auth/account* blocked; production
+    // self-service account changes should use the signed auth-action flows.
     router.patch('/account/username', requireAuth, verifyCsrfToken, async (req, res, next) => {
         try {
             const parsed = updateUsernameSchema.safeParse(req.body || {});
