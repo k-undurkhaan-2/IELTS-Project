@@ -7,9 +7,11 @@ const {
     ensureCsrfToken,
     createRateLimiter,
     getCanonicalClientIp,
+    getFreshAuthActionStepUp,
     isPasswordWithinBcryptByteLimit,
     publicUser,
     requireAuth,
+    resolveBusinessAccountActionContext,
     verifyCsrfToken
 } = require('./auth');
 
@@ -29,6 +31,10 @@ const tokenSchema = z.object({
 const disableSchema = z.object({
     password: z.string().min(1).max(128),
     token: z.string().trim().min(1).max(64)
+});
+
+const authStateSchema = z.object({
+    authState: z.string().trim().min(1).max(4096)
 });
 
 function parseBoolean(value, fallback = false) {
@@ -509,6 +515,9 @@ function createTotpRouter(options = {}) {
     const bcryptImpl = options.bcrypt || bcrypt;
     const config = getTotpConfig(options);
     const checkRateLimit = options.checkRateLimit || createRateLimiter(options.rateLimit);
+    const resolveAuthState = typeof options.resolveAuthState === 'function'
+        ? options.resolveAuthState
+        : null;
 
     function assertEnabled() {
         if (!config.enabled) {
@@ -581,6 +590,32 @@ function createTotpRouter(options = {}) {
         }
     }
 
+    function isAuthAudienceRequest(req) {
+        return String(req.get('x-ielts-onion-audience') || '').toLowerCase() === 'auth';
+    }
+
+    async function requireTotpManageActionState(req, res, rawState) {
+        if (!isAuthAudienceRequest(req) || !req.session?.user) {
+            return true;
+        }
+        const context = await resolveBusinessAccountActionContext(
+            req,
+            res,
+            authStore,
+            resolveAuthState,
+            rawState,
+            'totp-manage'
+        );
+        if (!context) {
+            return false;
+        }
+        if (!getFreshAuthActionStepUp(req, context.user, context.state, rawState)) {
+            res.status(403).json({ error: 'Recent authentication required' });
+            return false;
+        }
+        return true;
+    }
+
     router.get('/status', requireAuth, async (req, res, next) => {
         try {
             return res.json({ status: await store.getStatus(req.session.user.id) });
@@ -592,6 +627,10 @@ function createTotpRouter(options = {}) {
     router.post('/setup', verifyCsrfToken, async (req, res, next) => {
         try {
             assertEnabled();
+            const authState = authStateSchema.safeParse(req.body || {});
+            if (!await requireTotpManageActionState(req, res, authState.success ? authState.data.authState : '')) {
+                return;
+            }
             const hadPendingSetup = Boolean(req.session?.pendingTotpSetup);
             if (hadPendingSetup && isPendingExpired(req.session.pendingTotpSetup, config)) {
                 delete req.session.pendingTotpSetup;
@@ -640,6 +679,10 @@ function createTotpRouter(options = {}) {
     router.post('/verify-setup', verifyCsrfToken, async (req, res, next) => {
         try {
             assertEnabled();
+            const authState = authStateSchema.safeParse(req.body || {});
+            if (!await requireTotpManageActionState(req, res, authState.success ? authState.data.authState : '')) {
+                return;
+            }
             const setup = req.session?.pendingTotpSetup;
             const user = setup?.user ? publicUser(setup.user) : getSetupUser(req);
             if (!user || !setup) {
@@ -748,6 +791,10 @@ function createTotpRouter(options = {}) {
     router.post('/recovery-codes', requireAuth, verifyCsrfToken, async (req, res, next) => {
         try {
             assertEnabled();
+            const authState = authStateSchema.safeParse(req.body || {});
+            if (!await requireTotpManageActionState(req, res, authState.success ? authState.data.authState : '')) {
+                return;
+            }
             const status = await store.getStatus(req.session.user.id);
             if (!status.enabled) {
                 return res.status(400).json({ error: 'TOTP is not enabled' });

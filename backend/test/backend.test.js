@@ -10,8 +10,8 @@ const otp = require('otplib');
 const session = require('express-session');
 
 const { createApp } = require('../src/app');
-const { MemoryAuthStore, PostgresAuthStore, createRateLimiter, normalizeRateLimitKey } = require('../src/auth');
-const { MemoryAuthHandoffStore } = require('../src/authHandoff');
+const { MemoryAuthStore, PostgresAuthStore, createRateLimiter, getUserSecurityEpoch, normalizeRateLimitKey } = require('../src/auth');
+const { MemoryAuthHandoffStore, createSignedAuthState } = require('../src/authHandoff');
 const { MemoryAuthSessionStore } = require('../src/authSessions');
 const { MemoryAdminStore, PostgresAdminStore, createTrafficMiddleware, normalizeAdminSearchQuery, normalizeTrafficEvent, serializeRecord } = require('../src/admin');
 const { bootstrapAdmin } = require('../src/bootstrapAdmin');
@@ -3078,6 +3078,9 @@ test('admin dashboard redirects anonymous users through auth handoff', async () 
         const authLoginScript = await client.request('GET', '/auth/login.js');
         assert.equal(authLoginScript.response.status, 200);
         assert.match(authLoginScript.text, /\/api\/auth\/login/);
+        assert.match(authLoginScript.text, /isBusinessActionFlow/);
+        assert.match(authLoginScript.text, /getBusinessActionPath/);
+        assert.match(authLoginScript.text, /Sign in with the account that started this security action/);
         assert.doesNotMatch(authLoginScript.text, /window\.location\.assign\(['"]\/auth\/account['"]\)|\/auth\/account/);
 
         const authLoginStyles = await client.request('GET', '/auth/login.css');
@@ -3108,6 +3111,7 @@ test('admin dashboard redirects anonymous users through auth handoff', async () 
         assert.equal(authTotpScript.response.status, 200);
         assert.match(authTotpScript.text, /\/api\/auth\/totp\/status/);
         assert.match(authTotpScript.text, /\/api\/auth\/action-step-up/);
+        assert.match(authTotpScript.text, /authState,\s*token/);
         assert.match(authTotpScript.text, /replace\(\/\\s\+\/g/);
         assert.match(authTotpScript.text, /Confirm your current password before managing two-factor authentication/);
         assert.doesNotMatch(authTotpScript.text, /if \(!status\.enabled\)\s*\{\s*await startSetup\(\)/);
@@ -3615,7 +3619,9 @@ test('business settings password and TOTP actions require scoped auth state', as
             redirect: 'manual',
             headers: authHeaders
         });
-        assert.equal(wrongUserPasswordPage.response.status, 403);
+        assert.equal(wrongUserPasswordPage.response.status, 302);
+        assert.equal(parseRedirectLocation(wrongUserPasswordPage.response.headers.get('location')).pathname, '/auth/business/login');
+        assert.equal(getRedirectParam(wrongUserPasswordPage.response.headers.get('location'), 'state'), passwordState);
 
         const crossUserStepUp = await otherAuthSession.request('POST', '/api/auth/action-step-up', {
             authState: passwordState,
@@ -3647,6 +3653,14 @@ test('business settings password and TOTP actions require scoped auth state', as
         assert.equal(parseRedirectLocation(totpLocation).pathname, '/auth/totp');
         const totpState = getRedirectParam(totpLocation, 'state');
         assert(totpState);
+
+        const totpPageWithoutAuthSession = await client.createSession().request('GET', `/auth/totp?state=${encodeURIComponent(totpState)}`, undefined, {
+            redirect: 'manual',
+            headers: authHeaders
+        });
+        assert.equal(totpPageWithoutAuthSession.response.status, 302);
+        assert.equal(parseRedirectLocation(totpPageWithoutAuthSession.response.headers.get('location')).pathname, '/auth/business/login');
+        assert.equal(getRedirectParam(totpPageWithoutAuthSession.response.headers.get('location'), 'state'), totpState);
 
         const totpPage = await authSession.request('GET', `/auth/totp?state=${encodeURIComponent(totpState)}`, undefined, {
             redirect: 'manual',
@@ -3736,12 +3750,97 @@ test('business settings password and TOTP actions require scoped auth state', as
         assert.equal(freshTotpPage.response.status, 200);
         assert.match(freshTotpPage.text, /Two-factor authentication/);
 
-        const freshTotpSetup = await freshAuthSession.request('POST', '/api/auth/totp/setup', {}, {
+        const missingTotpStateSetup = await freshAuthSession.request('POST', '/api/auth/totp/setup', {}, {
+            headers: authHeaders
+        });
+        assert.equal(missingTotpStateSetup.response.status, 403);
+        assert.equal(missingTotpStateSetup.json.error, 'Valid auth action state is required');
+
+        const notSteppedUpTotpSetup = await freshAuthSession.request('POST', '/api/auth/totp/setup', {
+            authState: freshTotpState
+        }, {
+            headers: authHeaders
+        });
+        assert.equal(notSteppedUpTotpSetup.response.status, 403);
+        assert.equal(notSteppedUpTotpSetup.json.error, 'Recent authentication required');
+
+        const freshTotpStepUp = await freshAuthSession.request('POST', '/api/auth/action-step-up', {
+            authState: freshTotpState,
+            password: 'StrongerPass2'
+        }, { headers: authHeaders });
+        assert.equal(freshTotpStepUp.response.status, 200);
+        assert.equal(freshTotpStepUp.json.intent, 'totp-manage');
+
+        const freshTotpSetup = await freshAuthSession.request('POST', '/api/auth/totp/setup', {
+            authState: freshTotpState
+        }, {
             headers: authHeaders
         });
         assert.equal(freshTotpSetup.response.status, 200);
         assert.match(freshTotpSetup.json.qrCodeDataUrl, /^data:image\/png;base64,/);
         assert.match(freshTotpSetup.json.otpauthUrl, /^otpauth:\/\/totp\//);
+
+        const missingStateVerifySetup = await freshAuthSession.request('POST', '/api/auth/totp/verify-setup', {
+            token: generateTotpToken(freshTotpSetup.json.secret)
+        }, {
+            headers: authHeaders
+        });
+        assert.equal(missingStateVerifySetup.response.status, 403);
+        assert.equal(missingStateVerifySetup.json.error, 'Valid auth action state is required');
+
+        const freshTotpVerifySetup = await freshAuthSession.request('POST', '/api/auth/totp/verify-setup', {
+            authState: freshTotpState,
+            token: generateTotpToken(freshTotpSetup.json.secret)
+        }, {
+            headers: authHeaders
+        });
+        assert.equal(freshTotpVerifySetup.response.status, 200);
+        assert.equal(freshTotpVerifySetup.json.status.enabled, true);
+
+        const freshStoredUser = await client.authStore.findByUsernameLower('settings_user');
+        const recoveryState = createSignedAuthState('test-session-secret-0123456789abcdef', {
+            audience: 'business',
+            intent: 'totp-manage',
+            userId: freshStoredUser.id,
+            securityEpoch: getUserSecurityEpoch(freshStoredUser),
+            returnTo: '/settings',
+            targetBaseUrl: 'http://business.local',
+            issuedAt: Date.now(),
+            nonce: 'totp-recovery-test'
+        });
+
+        const missingRecoveryState = await withDateNowOffset(31_000, () => freshAuthSession.request('POST', '/api/auth/totp/recovery-codes', {
+            token: generateTotpToken(freshTotpSetup.json.secret)
+        }, {
+            headers: authHeaders
+        }));
+        assert.equal(missingRecoveryState.response.status, 403);
+        assert.equal(missingRecoveryState.json.error, 'Valid auth action state is required');
+
+        const recoveryWithoutStepUp = await withDateNowOffset(31_000, () => freshAuthSession.request('POST', '/api/auth/totp/recovery-codes', {
+            authState: recoveryState,
+            token: generateTotpToken(freshTotpSetup.json.secret)
+        }, {
+            headers: authHeaders
+        }));
+        assert.equal(recoveryWithoutStepUp.response.status, 403);
+        assert.equal(recoveryWithoutStepUp.json.error, 'Recent authentication required');
+
+        const recoveryStepUp = await freshAuthSession.request('POST', '/api/auth/action-step-up', {
+            authState: recoveryState,
+            password: 'StrongerPass2'
+        }, { headers: authHeaders });
+        assert.equal(recoveryStepUp.response.status, 200);
+        assert.equal(recoveryStepUp.json.intent, 'totp-manage');
+
+        const freshRecoveryCodes = await withDateNowOffset(31_000, () => freshAuthSession.request('POST', '/api/auth/totp/recovery-codes', {
+            authState: recoveryState,
+            token: generateTotpToken(freshTotpSetup.json.secret)
+        }, {
+            headers: authHeaders
+        }));
+        assert.equal(freshRecoveryCodes.response.status, 200);
+        assert.equal(freshRecoveryCodes.json.recoveryCodes.length, 10);
     } finally {
         await client.close();
     }

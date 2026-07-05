@@ -63,6 +63,8 @@
             const payload = JSON.parse(atob(padded));
             return {
                 audience: payload?.audience === 'admin' ? 'admin' : 'business',
+                intent: typeof payload?.intent === 'string' ? payload.intent : '',
+                userId: typeof payload?.userId === 'string' ? payload.userId : '',
                 returnTo: typeof payload?.returnTo === 'string' ? payload.returnTo : ''
             };
         } catch (_) {
@@ -108,12 +110,28 @@
         return expectedAudience || handoff?.audience || '';
     }
 
+    function isBusinessActionFlow() {
+        return handoff?.audience === 'business'
+            && (handoff.intent === 'password-change' || handoff.intent === 'totp-manage');
+    }
+
+    function getBusinessActionPath() {
+        const path = handoff?.intent === 'totp-manage' ? '/auth/totp' : '/auth/password';
+        return `${path}?state=${encodeURIComponent(handoffState)}`;
+    }
+
     function getAudienceConflict(user) {
         const audience = getFlowAudience();
         if (audience === 'business' && user?.role === 'admin') {
             return {
                 message: 'A learner account is required for this business login flow.',
                 detail: 'The current auth session is an administrator account. Sign in below with a learner account, or sign out of the current auth session first.'
+            };
+        }
+        if (isBusinessActionFlow() && handoff.userId && user?.id !== handoff.userId) {
+            return {
+                message: 'Sign in with the account that started this security action.',
+                detail: 'The current auth session belongs to a different learner account. Sign out of the current auth session, then sign in with the account that opened this settings action.'
             };
         }
         if (audience === 'admin' && user?.role !== 'admin') {
@@ -154,11 +172,11 @@
     }
 
     function setMode(mode, message) {
-        if (isAdminFlow() && mode === 'register') {
+        if ((isAdminFlow() || isBusinessActionFlow()) && mode === 'register') {
             mode = 'login';
         }
         state.mode = mode;
-        setVisible(nodes.tabs, (mode === 'login' || mode === 'register') && !isAdminFlow());
+        setVisible(nodes.tabs, (mode === 'login' || mode === 'register') && !isAdminFlow() && !isBusinessActionFlow());
         setVisible(nodes.passwordForm, mode === 'login' || mode === 'register');
         setVisible(nodes.totpForm, mode === 'totp-login');
         setVisible(nodes.setupPanel, mode === 'setup');
@@ -245,6 +263,10 @@
     }
 
     async function completeHandoff() {
+        if (isBusinessActionFlow()) {
+            window.location.assign(getBusinessActionPath());
+            return;
+        }
         if (handoffState) {
             const completeParams = new URLSearchParams({
                 state: handoffState,

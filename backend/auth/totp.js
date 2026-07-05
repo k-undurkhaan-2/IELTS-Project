@@ -156,7 +156,10 @@
         nodes.startSetup.disabled = true;
         setStatus('Preparing TOTP setup...');
         try {
-            const payload = await request('/api/auth/totp/setup', { method: 'POST' });
+            const payload = await request('/api/auth/totp/setup', {
+                method: 'POST',
+                body: { authState }
+            });
             const qrSrc = normalizeQrDataUrl(payload.qrCodeDataUrl || payload.qrCode || payload.qr);
             if (qrSrc) {
                 nodes.setupQr.src = qrSrc;
@@ -192,7 +195,10 @@
         try {
             const payload = await request('/api/auth/totp/verify-setup', {
                 method: 'POST',
-                body: { token: nodes.setupToken.value.trim() }
+                body: {
+                    authState,
+                    token: nodes.setupToken.value.trim()
+                }
             });
             nodes.setupForm.reset();
             renderRecoveryCodes(payload.recoveryCodes || []);
@@ -218,7 +224,10 @@
         try {
             const payload = await request('/api/auth/totp/recovery-codes', {
                 method: 'POST',
-                body: { token: nodes.recoveryToken.value.trim() }
+                body: {
+                    authState,
+                    token: nodes.recoveryToken.value.trim()
+                }
             });
             nodes.recoveryForm.reset();
             renderRecoveryCodes(payload.recoveryCodes || []);

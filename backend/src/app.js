@@ -1413,7 +1413,8 @@ function createApp(options = {}) {
         encryptionKey: options.totpEncryptionKey,
         verificationMaxAgeMs: totpVerificationMaxAgeMs,
         nodeEnv: options.nodeEnv,
-        recoveryHashRounds: options.totpRecoveryHashRounds
+        recoveryHashRounds: options.totpRecoveryHashRounds,
+        resolveAuthState: (state) => verifySignedAuthState(authHandoffSecret, state)
     }));
     app.use('/api/practice-records', createPracticeRecordsRouter({
         store: practiceStore
@@ -1563,27 +1564,34 @@ function createApp(options = {}) {
     }
 
     async function requireBusinessAuthActionState(req, res, expectedIntent) {
-        if (!req.session?.user) {
-            sendAuthActionStateError(res, 401, 'Sign in from the business settings page before using this auth action.');
-            return null;
-        }
         const stateParam = typeof req.query.state === 'string' ? req.query.state.trim() : '';
         if (!stateParam) {
-            sendAuthActionStateError(res, 403, 'Open this page from the business settings page so the request includes a valid action state.');
+            sendAuthActionStateError(
+                res,
+                req.session?.user ? 403 : 401,
+                req.session?.user
+                    ? 'Open this page from the business settings page so the request includes a valid action state.'
+                    : 'Sign in from the business settings page before using this auth action.'
+            );
             return null;
         }
         const state = verifySignedAuthState(authHandoffSecret, stateParam);
         if (!state
             || state.audience !== 'business'
-            || state.intent !== expectedIntent
-            || state.userId !== req.session.user.id) {
-            sendAuthActionStateError(res, 403, 'Open this page from the business settings page so the request includes a valid action state.');
+            || state.intent !== expectedIntent) {
+            sendAuthActionStateError(
+                res,
+                req.session?.user ? 403 : 401,
+                req.session?.user
+                    ? 'Open this page from the business settings page so the request includes a valid action state.'
+                    : 'Sign in from the business settings page before using this auth action.'
+            );
             return null;
         }
         const currentUser = typeof authStore.findById === 'function'
-            ? await authStore.findById(req.session.user.id)
+            ? await authStore.findById(state.userId)
             : null;
-        const safeUser = publicUser(currentUser || req.session.user);
+        const safeUser = publicUser(currentUser || req.session?.user);
         if (!safeUser?.id) {
             sendAuthActionStateError(res, 401, 'Sign in from the business settings page before using this auth action.');
             return null;
@@ -1592,8 +1600,18 @@ function createApp(options = {}) {
             sendAuthActionStateError(res, 403, 'This auth action is only available for business user accounts.');
             return null;
         }
-        if (getUserSecurityEpoch(currentUser || req.session.user) !== getUserSecurityEpoch(state)) {
-            sendAuthActionStateError(res, 403, 'Open this page from the business settings page so the request includes a valid action state.');
+        if (getUserSecurityEpoch(currentUser || req.session?.user) !== getUserSecurityEpoch(state)) {
+            sendAuthActionStateError(
+                res,
+                req.session?.user ? 403 : 401,
+                req.session?.user
+                    ? 'Open this page from the business settings page so the request includes a valid action state.'
+                    : 'Sign in from the business settings page before using this auth action.'
+            );
+            return null;
+        }
+        if (!req.session?.user || state.userId !== req.session.user.id) {
+            res.redirect(`/auth/business/login?state=${encodeURIComponent(stateParam)}`);
             return null;
         }
         return state;

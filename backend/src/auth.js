@@ -1183,6 +1183,7 @@ module.exports = {
     createRateLimiter,
     ensureCsrfToken,
     getCanonicalClientIp,
+    getFreshAuthActionStepUp,
     getUserSecurityEpoch,
     isPasswordWithinBcryptByteLimit,
     normalizeRateLimitKey,
@@ -1190,6 +1191,7 @@ module.exports = {
     publicUser,
     requireAdmin,
     requireAuth,
+    resolveBusinessAccountActionContext,
     validatePasswordStrength,
     verifyCsrfToken
 };
