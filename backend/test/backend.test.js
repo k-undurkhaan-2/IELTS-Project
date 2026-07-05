@@ -1215,6 +1215,7 @@ test('business account session API lists safe metadata and revokes other session
         const revokeWithoutStepUp = await client.request('POST', '/api/account/sessions/revoke-others', {});
         assert.equal(revokeWithoutStepUp.response.status, 403);
         assert.equal(revokeWithoutStepUp.json.requiresSessionManageStepUp, true);
+        assert.equal(revokeWithoutStepUp.json.authActionStart, '/auth/business/session/start');
 
         const sessionStart = await client.request('GET', '/auth/business/session/start?return_to=/?view=settings', undefined, {
             redirect: 'manual',
@@ -1222,6 +1223,7 @@ test('business account session API lists safe metadata and revokes other session
         });
         assert.equal(sessionStart.response.status, 302);
         const sessionStartLocation = sessionStart.response.headers.get('location');
+        assert.equal(parseRedirectLocation(sessionStartLocation).pathname, '/auth/session');
         const sessionState = getRedirectParam(sessionStartLocation, 'state');
         assert(sessionState);
 
@@ -3164,8 +3166,10 @@ test('admin dashboard redirects anonymous users through auth handoff', async () 
         const anonymousAuthTotpPage = await client.request('GET', '/auth/totp', undefined, { redirect: 'manual' });
         assert.equal(anonymousAuthTotpPage.response.status, 401);
 
+        const anonymousAuthSessionPage = await client.request('GET', '/auth/session', undefined, { redirect: 'manual' });
         assert.equal(anonymousAuthSessionPage.response.status, 401);
 
+        const authSessionScript = await client.request('GET', '/auth/session.js');
         assert.equal(authSessionScript.response.status, 200);
         assert.match(authSessionScript.text, /\/api\/auth\/action-step-up/);
         assert.match(authSessionScript.text, /actionProof/);
@@ -3365,6 +3369,8 @@ test('admin shell and business account menu do not link back through the busines
     assert(businessProxyConfig.includes('location = /auth/business/start'));
     assert(businessProxyConfig.includes('location = /auth/business/password/start'));
     assert(businessProxyConfig.includes('location = /auth/business/totp/start'));
+    assert(businessProxyConfig.includes('location = /auth/business/session/start'));
+    assert(businessProxyConfig.includes('location = /auth/business/session/callback'));
     assert(businessProxyConfig.includes('location = /auth/business/callback'));
     assert(businessProxyConfig.includes('location = /auth/business/logout'));
     assert(businessProxyConfig.includes('location = /auth/admin/callback'));
@@ -3381,7 +3387,7 @@ test('admin shell and business account menu do not link back through the busines
     assert(!businessProxyConfig.includes('location = /auth/business/account'));
     assert(businessProxyConfig.includes('location ~* ^/(api/admin|admin|internal|debug|metrics)(/|$) { return 404; }'));
     assert(businessProxyConfig.includes('location ~* ^/api/auth/(login|register|totp|account)(/|$) { return 404; }'));
-    assert(businessProxyConfig.includes('location ~* ^/auth/(admin|password|totp|account)(/|$) { return 404; }'));
+    assert(businessProxyConfig.includes('location ~* ^/auth/(admin|password|totp|session|account)(/|$) { return 404; }'));
     assert(businessProxyConfig.includes('location = /auth/login { return 302 /auth/business/start?return_to=/; }'));
     assert(businessProxyConfig.includes('location = /api/auth/csrf { proxy_pass http://ielts_app; }'));
     assert(businessProxyConfig.includes('location = /api/auth/me { proxy_pass http://ielts_app; }'));
@@ -3394,7 +3400,7 @@ test('admin shell and business account menu do not link back through the busines
     const businessProxyDenyRules = [
         /^\/(api\/admin|admin|internal|debug|metrics)(\/|$)/i,
         /^\/api\/auth\/(login|register|totp|account)(\/|$)/i,
-        /^\/auth\/(admin|password|totp|account)(\/|$)/i
+        /^\/auth\/(admin|password|totp|session|account)(\/|$)/i
     ];
     const businessProxyBypassPaths = [
         '/API/ADMIN',
@@ -3415,6 +3421,8 @@ test('admin shell and business account menu do not link back through the busines
     assert(authProxyConfig.includes('location = /auth/password'));
     assert(authProxyConfig.includes('location = /auth/password.js'));
     assert(authProxyConfig.includes('location = /auth/password.css'));
+    assert(authProxyConfig.includes('location = /auth/session'));
+    assert(authProxyConfig.includes('location = /auth/session.js'));
     assert(authProxyConfig.includes('location = /auth/totp'));
     assert(authProxyConfig.includes('location = /auth/totp.js'));
     assert(authProxyConfig.includes('location = /auth/totp.css'));
@@ -3465,6 +3473,8 @@ test('admin shell and business account menu do not link back through the busines
             '/auth/business/start',
             '/auth/business/password/start',
             '/auth/business/totp/start',
+            '/auth/business/session/start',
+            '/auth/business/session/callback',
             '/auth/business/callback',
             '/auth/business/logout',
             '/auth/login',
@@ -3483,6 +3493,7 @@ test('admin shell and business account menu do not link back through the busines
             '/auth/admin/start',
             '/AUTH/ADMIN/START',
             '/auth/password',
+            '/auth/session',
             '/auth/totp',
             '/api/auth/login',
             '/api/auth/login/',
@@ -3505,6 +3516,8 @@ test('admin shell and business account menu do not link back through the busines
             '/auth/login.css',
             '/auth/password',
             '/auth/password.js',
+            '/auth/session',
+            '/auth/session.js',
             '/auth/totp',
             '/auth/totp.js',
             '/auth/complete',
