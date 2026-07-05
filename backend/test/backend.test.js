@@ -3235,7 +3235,7 @@ test('admin dashboard redirects anonymous users through auth handoff', async () 
 
 function parseNginxLocations(config) {
     const locations = [];
-    const pattern = /location\s+(?:(=|\^~|~\*)\s+)?([^\s{]+)\s*\{\s*([^{}]*)\}/g;
+    const pattern = /location\s+(?:(=|\^~|~\*|~)\s+)?([^\s{]+)\s*\{\s*([^{}]*)\}/g;
     let match;
     while ((match = pattern.exec(config)) !== null) {
         locations.push({
@@ -3277,7 +3277,11 @@ function classifyNginxPath(config, requestPath) {
     }
 
     for (const location of locations) {
-        if (location.modifier === '~*' && new RegExp(location.pattern, 'i').test(requestPath)) {
+        if (location.modifier === '~*' || location.modifier === '~') {
+            const flags = location.modifier === '~*' ? 'i' : '';
+            if (!new RegExp(location.pattern, flags).test(requestPath)) {
+                continue;
+            }
             return getNginxLocationAction(location);
         }
     }
@@ -3392,6 +3396,8 @@ test('admin shell and business account menu do not link back through the busines
     assert(businessProxyConfig.includes('location = /api/auth/csrf { proxy_pass http://ielts_app; }'));
     assert(businessProxyConfig.includes('location = /api/auth/me { proxy_pass http://ielts_app; }'));
     assert(businessProxyConfig.includes('location = /api/auth/logout { proxy_pass http://ielts_app; }'));
+    assert(businessProxyConfig.includes('location ~ ^/api/account/sessions/[0-9a-fA-F-]+$'));
+    assert(!businessProxyConfig.includes('location ^~ /api/account/sessions/ { proxy_pass http://ielts_app; }'));
     assert(businessProxyConfig.includes('location ^~ /api/practice-records { proxy_pass http://ielts_app; }'));
     assert(businessProxyConfig.includes('location ^~ /assets/generated/ { proxy_pass http://ielts_app; }'));
     assert(businessProxyConfig.includes('location ^~ /practice/ { proxy_pass http://ielts_app; }'));
@@ -3490,11 +3496,21 @@ test('admin shell and business account menu do not link back through the busines
             '/API/ADMIN',
             '/api/admin/users',
             '/api/account',
+            '/api/account/sessions/',
+            '/API/ACCOUNT/SESSIONS',
+            '/api/account/sessions/revoke-others/',
+            '/API/ACCOUNT/SESSIONS/REVOKE-OTHERS',
             '/auth/admin/start',
             '/AUTH/ADMIN/START',
             '/auth/password',
             '/auth/session',
+            '/auth/session/',
+            '/AUTH/SESSION',
             '/auth/totp',
+            '/auth/business/session/start/',
+            '/AUTH/BUSINESS/SESSION/START',
+            '/auth/business/session/callback/',
+            '/AUTH/BUSINESS/SESSION/CALLBACK',
             '/api/auth/login',
             '/api/auth/login/',
             '/API/AUTH/LOGIN',
@@ -3536,11 +3552,21 @@ test('admin shell and business account menu do not link back through the busines
             '/API/ADMIN',
             '/api/admin/users',
             '/api/account/sessions',
+            '/api/account/sessions/',
+            '/api/account/sessions/revoke-others',
+            '/API/ACCOUNT/SESSIONS',
             '/api/practice-records',
             '/api/site-content',
             '/api/export',
+            '/auth/business/session/start',
+            '/auth/business/session/start/',
+            '/AUTH/BUSINESS/SESSION/START',
+            '/auth/business/session/callback',
+            '/auth/business/session/callback/',
+            '/AUTH/BUSINESS/SESSION/CALLBACK',
             '/auth/account',
             '/auth/account.js',
+            '/AUTH/SESSION',
             '/api/auth/account',
             '/api/auth/account/password',
             '/api/auth/totp/disable',
@@ -3576,10 +3602,16 @@ test('admin shell and business account menu do not link back through the busines
             '/ADMIN',
             '/api/admin',
             '/auth/business/start',
+            '/auth/business/session/start',
+            '/auth/business/session/callback',
             '/auth/login',
+            '/auth/session',
             '/api/auth/login',
             '/api/auth/totp/setup',
             '/api/account/sessions',
+            '/api/account/sessions/',
+            '/api/account/sessions/revoke-others',
+            '/API/ACCOUNT/SESSIONS',
             '/api/practice-records',
             '/api/site-content',
             '/practice/listening/example',
