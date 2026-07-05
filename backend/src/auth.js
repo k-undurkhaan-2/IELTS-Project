@@ -103,10 +103,7 @@ function resolveAllowLegacyDirectAccountApis(options = {}) {
     const configured = Object.prototype.hasOwnProperty.call(options, 'allowLegacyDirectAccountApis')
         ? options.allowLegacyDirectAccountApis
         : process.env.ALLOW_LEGACY_DIRECT_ACCOUNT_APIS;
-    if (configured !== undefined && configured !== null && configured !== '') {
-        return parseBoolean(configured, false);
-    }
-    return (options.nodeEnv || process.env.NODE_ENV) !== 'production';
+    return parseBoolean(configured, false);
 }
 
 function parseMemorySessionValue(raw) {

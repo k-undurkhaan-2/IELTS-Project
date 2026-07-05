@@ -537,6 +537,13 @@ async function createClient(options = {}) {
     };
 }
 
+function createLegacyDirectAccountClient(options = {}) {
+    return createClient({
+        ...options,
+        allowLegacyDirectAccountApis: true
+    });
+}
+
 function rawHttpRequest(baseUrl, method, requestPath, options = {}) {
     const target = new URL(requestPath, baseUrl);
     return new Promise((resolve, reject) => {
@@ -1615,7 +1622,7 @@ test('production public URL policy controls session and handoff cookie Secure at
     }
 });
 
-test('production direct app hides legacy account APIs unless explicitly enabled', async () => {
+test('direct app hides legacy account APIs unless explicitly enabled', async () => {
     const strongSecret = '0123456789abcdef0123456789abcdef';
     const productionOptions = {
         nodeEnv: 'production',
@@ -1625,8 +1632,8 @@ test('production direct app hides legacy account APIs unless explicitly enabled'
         businessPublicUrl: `http://${VALID_ONION_HOSTS.business}`,
         adminPublicUrl: `http://${VALID_ONION_HOSTS.admin}`
     };
-    const client = await createClient(productionOptions);
-    try {
+
+    async function assertLegacyApisHidden(client) {
         const legacyRequests = [
             () => client.request('PATCH', '/api/auth/account/username', {
                 username: 'renamed_user',
@@ -1650,6 +1657,18 @@ test('production direct app hides legacy account APIs unless explicitly enabled'
             assert.equal(result.response.status, 404);
             assert.equal(result.json.error, 'Not found');
         }
+    }
+
+    const defaultClient = await createClient();
+    try {
+        await assertLegacyApisHidden(defaultClient);
+    } finally {
+        await defaultClient.close();
+    }
+
+    const client = await createClient(productionOptions);
+    try {
+        await assertLegacyApisHidden(client);
     } finally {
         await client.close();
     }
@@ -1706,7 +1725,7 @@ test('login performs a dummy password check for unknown users', async () => {
 });
 
 test('password comparisons reject input beyond bcrypt byte limit', async () => {
-    const client = await createClient();
+    const client = await createLegacyDirectAccountClient();
     const passwordAtLimit = `Aa1${'x'.repeat(69)}`;
     const extendedPassword = `${passwordAtLimit}Z`;
     assert.equal(Buffer.byteLength(passwordAtLimit, 'utf8'), 72);
@@ -1758,7 +1777,7 @@ test('password comparisons reject input beyond bcrypt byte limit', async () => {
 });
 
 test('users can update their own username and password', async () => {
-    const client = await createClient();
+    const client = await createLegacyDirectAccountClient();
     try {
         const created = await register(client, 'account_user', 'StrongPass1');
         assert.equal(created.response.status, 201);
@@ -1855,7 +1874,7 @@ test('users can update their own username and password', async () => {
 });
 
 test('account username and password changes revoke other sessions', async () => {
-    const client = await createClient();
+    const client = await createLegacyDirectAccountClient();
     try {
         const created = await register(client, 'session_user', 'StrongPass1');
         assert.equal(created.response.status, 201);
@@ -1911,7 +1930,7 @@ test('account username and password changes revoke other sessions', async () => 
 });
 
 test('sensitive account password checks are rate limited', async () => {
-    const client = await createClient({
+    const client = await createLegacyDirectAccountClient({
         rateLimit: { maxAttempts: 1, windowMs: 60_000 }
     });
     try {
@@ -2030,7 +2049,7 @@ test('pending TOTP sessions refresh stale users before trusting them', async () 
 });
 
 test('users can delete their own account and associated records', async () => {
-    const client = await createClient();
+    const client = await createLegacyDirectAccountClient();
     try {
         const created = await register(client, 'delete_user', 'StrongPass1');
         assert.equal(created.response.status, 201);
@@ -2078,7 +2097,7 @@ test('users can delete their own account and associated records', async () => {
 });
 
 test('the last admin account cannot delete itself', async () => {
-    const client = await createClient();
+    const client = await createLegacyDirectAccountClient();
     try {
         await client.csrf();
         await seedAdmin(client, 'sole_admin', 'StrongPass1');
@@ -2838,7 +2857,7 @@ test('Postgres TOTP time-step consumption rejects stale updates', async () => {
 });
 
 test('ordinary users can disable TOTP with password and current code', async () => {
-    const client = await createClient();
+    const client = await createLegacyDirectAccountClient();
     try {
         const passwordAtLimit = `Aa1${'x'.repeat(69)}`;
         const extendedPassword = `${passwordAtLimit}Z`;
@@ -2881,7 +2900,7 @@ test('ordinary users can disable TOTP with password and current code', async () 
 });
 
 test('disabling TOTP revokes other active sessions for the same user', async () => {
-    const client = await createClient();
+    const client = await createLegacyDirectAccountClient();
     try {
         await register(client, 'totp_disable_revokes', 'StrongPass1');
         const { secret } = await enableTotpForCurrentSession(client);
@@ -6376,7 +6395,7 @@ test('admin user changes invalidate target sessions and stale admin roles', asyn
 });
 
 test('admin web routes reject self password changes', async () => {
-    const client = await createClient();
+    const client = await createLegacyDirectAccountClient();
     try {
         await seedAdmin(client, 'self_admin', 'StrongPass1');
         const adminSession = client.createSession();
@@ -6429,7 +6448,7 @@ test('admin web routes reject self password changes', async () => {
 });
 
 test('admin account settings updates preserve current TOTP verification', async () => {
-    const client = await createClient();
+    const client = await createLegacyDirectAccountClient();
     try {
         await seedAdmin(client, 'account_admin', 'StrongPass1');
         const adminSession = client.createSession();
