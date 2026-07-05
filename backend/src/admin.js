@@ -2559,7 +2559,7 @@ function createAdminRouter(options = {}) {
         }
     });
 
-    router.get('/users/:userId/stats', async (req, res, next) => {
+    router.get('/users/:userId/stats', requireAdminActionStepUp, async (req, res, next) => {
         try {
             const userId = parseUserIdParam(req.params.userId);
             const stats = await store.userStats(userId);
@@ -2572,7 +2572,7 @@ function createAdminRouter(options = {}) {
         }
     });
 
-    router.get('/users/:userId/sessions', async (req, res, next) => {
+    router.get('/users/:userId/sessions', requireAdminActionStepUp, async (req, res, next) => {
         try {
             const userId = parseUserIdParam(req.params.userId);
             const user = await store.getUser(userId);
@@ -2720,7 +2720,7 @@ function createAdminRouter(options = {}) {
         }
     });
 
-    router.get('/users/:userId/practice-records', async (req, res, next) => {
+    router.get('/users/:userId/practice-records', requireAdminActionStepUp, async (req, res, next) => {
         try {
             const userId = parseUserIdParam(req.params.userId);
             const query = parseListQuery(req.query);

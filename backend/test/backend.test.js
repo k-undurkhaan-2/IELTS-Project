@@ -3250,6 +3250,8 @@ test('admin shell and business account menu do not link back through the busines
     assert.doesNotMatch(adminAccountPage, /js\/bundles\//);
     assert(adminAccountScript.includes('/api/admin/users/'));
     assert(adminAccountScript.includes('/practice-records?limit='));
+    assert(adminAccountScript.includes('withAdminStepUp(loadSensitiveAccountData)'));
+    assert(adminAccountScript.includes('refreshAccountIfStepUpFresh'));
     assert(adminAccountScript.includes('/sessions/revoke-others'));
     assert(adminAccountScript.includes('/sessions/${encodeURIComponent(normalizedId)}'));
     assert(adminAccountScript.includes('Authentication session'));
@@ -5084,6 +5086,81 @@ test('admin sensitive mutations require recent password step-up', async () => {
         const expired = await withDateNowOffset(2000, () => client.request('PATCH', '/api/admin/site-content', {
             homeBanner: { enabled: false }
         }));
+        assert.equal(expired.response.status, 403);
+        assert.equal(expired.json.requiresAdminStepUp, true);
+    } finally {
+        await client.close();
+    }
+});
+
+test('admin account center sensitive reads require recent password step-up', async () => {
+    const client = await createClient({ adminActionStepUpMaxAgeMs: 1000 });
+    try {
+        await seedAdmin(client, 'account_read_admin', 'StrongPass1');
+        await client.csrf();
+        const created = await register(client, 'account_read_target', 'StrongPass1');
+        assert.equal(created.response.status, 201);
+        const managedUserId = created.json.user.id;
+
+        const replaced = await client.request('PUT', '/api/practice-records', {
+            records: [{
+                id: 'account-read-record',
+                sessionId: 'account-read-session',
+                type: 'reading',
+                title: 'Account Read',
+                score: 85
+            }]
+        });
+        assert.equal(replaced.response.status, 200);
+
+        const logout = await client.request('POST', '/api/auth/logout');
+        assert.equal(logout.response.status, 200);
+        await client.csrf();
+        const login = await client.request('POST', '/api/auth/login', {
+            username: 'account_read_admin',
+            password: 'StrongPass1'
+        });
+        assert.equal(login.response.status, 200);
+        assert.equal(login.json.requiresTotpSetup, true);
+        await enableTotpForCurrentSession(client);
+
+        const sensitiveReadPaths = [
+            `/api/admin/users/${managedUserId}/stats`,
+            `/api/admin/users/${managedUserId}/sessions`,
+            `/api/admin/users/${managedUserId}/practice-records`
+        ];
+
+        const summary = await client.request('GET', '/api/admin/summary');
+        assert.equal(summary.response.status, 200);
+        const users = await client.request('GET', '/api/admin/users?q=account_read_target');
+        assert.equal(users.response.status, 200);
+        assert.equal(users.json.users.length, 1);
+
+        for (const requestPath of sensitiveReadPaths) {
+            const blocked = await client.request('GET', requestPath, undefined, { csrf: false });
+            assert.equal(blocked.response.status, 403);
+            assert.equal(blocked.json.error, 'Admin step-up required');
+            assert.equal(blocked.json.requiresAdminStepUp, true);
+        }
+
+        const confirmed = await adminActionStepUp(client);
+        assert.equal(confirmed.response.status, 200);
+
+        const stats = await client.request('GET', sensitiveReadPaths[0], undefined, { csrf: false });
+        assert.equal(stats.response.status, 200);
+        assert.equal(stats.json.user.id, managedUserId);
+        assert.equal(stats.json.recordCount, 1);
+
+        const sessions = await client.request('GET', sensitiveReadPaths[1], undefined, { csrf: false });
+        assert.equal(sessions.response.status, 200);
+        assert.equal(sessions.json.user.id, managedUserId);
+        assert(Array.isArray(sessions.json.sessions));
+
+        const records = await client.request('GET', sensitiveReadPaths[2], undefined, { csrf: false });
+        assert.equal(records.response.status, 200);
+        assert.equal(records.json.records[0].id, 'account-read-record');
+
+        const expired = await withDateNowOffset(2000, () => client.request('GET', sensitiveReadPaths[0], undefined, { csrf: false }));
         assert.equal(expired.response.status, 403);
         assert.equal(expired.json.requiresAdminStepUp, true);
     } finally {

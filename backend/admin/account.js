@@ -276,13 +276,17 @@
     }
 
     async function ensureAdminStepUp() {
-        if (state.adminStepUpExpiresAt && Date.now() < state.adminStepUpExpiresAt - 5000) {
+        if (hasFreshAdminStepUp()) {
             return;
         }
         const confirmed = await promptAdminStepUp();
         if (!confirmed) {
             throw new Error('Admin confirmation cancelled');
         }
+    }
+
+    function hasFreshAdminStepUp() {
+        return Boolean(state.adminStepUpExpiresAt && Date.now() < state.adminStepUpExpiresAt - 5000);
     }
 
     async function withAdminStepUp(action) {
@@ -456,7 +460,8 @@
         await loadAccount();
     }
 
-    async function loadAccount() {
+    async function loadAccount(options = {}) {
+        const requireStepUp = options.requireStepUp !== false;
         if (!state.userId) {
             setRecordsMessage('Select a user from the admin user list first.');
             setSessionsMessage('Select a user from the admin user list first.');
@@ -470,11 +475,14 @@
         setRecordsMessage('Loading practice records...');
         setSessionsMessage('Loading active sessions...');
         try {
-            const [stats, records, sessions] = await Promise.all([
+            const loadSensitiveAccountData = () => Promise.all([
                 request(`/api/admin/users/${encodeURIComponent(state.userId)}/stats`, { csrf: false }),
                 request(`/api/admin/users/${encodeURIComponent(state.userId)}/practice-records?limit=${RECORD_LIMIT}&offset=0`, { csrf: false }),
                 request(`/api/admin/users/${encodeURIComponent(state.userId)}/sessions`, { csrf: false })
             ]);
+            const [stats, records, sessions] = requireStepUp
+                ? await withAdminStepUp(loadSensitiveAccountData)
+                : await loadSensitiveAccountData();
             renderUser(stats);
             renderRecords(records);
             renderSessions(sessions);
@@ -486,6 +494,17 @@
             nodes.refreshButton.disabled = false;
             setSessionControlsDisabled(false);
         }
+    }
+
+    function refreshAccountIfStepUpFresh() {
+        if (state.loading || document.visibilityState !== 'visible') {
+            return;
+        }
+        if (!hasFreshAdminStepUp()) {
+            setStatus('Admin confirmation required to refresh account data');
+            return;
+        }
+        loadAccount({ requireStepUp: false });
     }
 
     async function logout() {
@@ -521,14 +540,10 @@
             });
         }
         window.setInterval(() => {
-            if (!state.loading && document.visibilityState === 'visible') {
-                loadAccount();
-            }
+            refreshAccountIfStepUpFresh();
         }, ACCOUNT_REFRESH_INTERVAL_MS);
         document.addEventListener('visibilitychange', () => {
-            if (!state.loading && document.visibilityState === 'visible') {
-                loadAccount();
-            }
+            refreshAccountIfStepUpFresh();
         });
         nodes.logoutButton.addEventListener('click', () => {
             logout().catch((error) => setStatus(error.message, 'error'));
