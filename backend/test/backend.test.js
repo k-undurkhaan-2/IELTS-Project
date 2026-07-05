@@ -3547,6 +3547,7 @@ test('business settings password and TOTP actions require scoped auth state', as
         assert.equal(created.response.status, 201);
         const other = await register(otherAuthSession, 'settings_other', 'StrongPass1');
         assert.equal(other.response.status, 201);
+        const adminActionUser = await seedAdmin(client, 'settings_admin', 'StrongPass1');
         await otherAuthSession.request('POST', '/api/auth/logout');
         const otherLoginTarget = client.createSession();
         const otherLoginStart = await otherLoginTarget.request('GET', '/auth/business/start?return_to=/', undefined, {
@@ -3583,12 +3584,40 @@ test('business settings password and TOTP actions require scoped auth state', as
         assert.equal(passwordNoSession.response.status, 401);
         assert.match(passwordNoSession.text, /401 Authentication required/);
 
+        const totpNoSession = await client.createSession().request('GET', '/auth/totp', undefined, {
+            redirect: 'manual',
+            headers: authHeaders
+        });
+        assert.equal(totpNoSession.response.status, 401);
+        assert.match(totpNoSession.text, /401 Authentication required/);
+
         const passwordNoState = await authSession.request('GET', '/auth/password', undefined, {
             redirect: 'manual',
             headers: authHeaders
         });
         assert.equal(passwordNoState.response.status, 403);
         assert.match(passwordNoState.text, /403 Valid auth action state required/);
+
+        const totpNoState = await authSession.request('GET', '/auth/totp', undefined, {
+            redirect: 'manual',
+            headers: authHeaders
+        });
+        assert.equal(totpNoState.response.status, 403);
+        assert.match(totpNoState.text, /403 Valid auth action state required/);
+
+        const invalidActionStateWithoutSession = await client.createSession().request('GET', '/auth/password?state=invalid', undefined, {
+            redirect: 'manual',
+            headers: authHeaders
+        });
+        assert.equal(invalidActionStateWithoutSession.response.status, 401);
+        assert.match(invalidActionStateWithoutSession.text, /401 Authentication required/);
+
+        const invalidActionStateWithSession = await authSession.request('GET', '/auth/totp?state=invalid', undefined, {
+            redirect: 'manual',
+            headers: authHeaders
+        });
+        assert.equal(invalidActionStateWithSession.response.status, 403);
+        assert.match(invalidActionStateWithSession.text, /403 Valid auth action state required/);
 
         const anonymousPasswordStart = await client.request('GET', '/auth/business/password/start?return_to=/settings', undefined, {
             redirect: 'manual',
@@ -3606,6 +3635,14 @@ test('business settings password and TOTP actions require scoped auth state', as
         const passwordState = getRedirectParam(passwordLocation, 'state');
         assert(passwordState);
 
+        const passwordPageWithoutAuthSession = await client.createSession().request('GET', `/auth/password?state=${encodeURIComponent(passwordState)}`, undefined, {
+            redirect: 'manual',
+            headers: authHeaders
+        });
+        assert.equal(passwordPageWithoutAuthSession.response.status, 302);
+        assert.equal(parseRedirectLocation(passwordPageWithoutAuthSession.response.headers.get('location')).pathname, '/auth/business/login');
+        assert.equal(getRedirectParam(passwordPageWithoutAuthSession.response.headers.get('location'), 'state'), passwordState);
+
         const passwordPage = await authSession.request('GET', `/auth/password?state=${encodeURIComponent(passwordState)}`, undefined, {
             redirect: 'manual',
             headers: authHeaders
@@ -3622,6 +3659,23 @@ test('business settings password and TOTP actions require scoped auth state', as
         assert.equal(wrongUserPasswordPage.response.status, 302);
         assert.equal(parseRedirectLocation(wrongUserPasswordPage.response.headers.get('location')).pathname, '/auth/business/login');
         assert.equal(getRedirectParam(wrongUserPasswordPage.response.headers.get('location'), 'state'), passwordState);
+
+        const adminPasswordState = createSignedAuthState('test-session-secret-0123456789abcdef', {
+            audience: 'business',
+            intent: 'password-change',
+            userId: adminActionUser.id,
+            securityEpoch: getUserSecurityEpoch(adminActionUser),
+            returnTo: '/settings',
+            targetBaseUrl: 'http://business.local',
+            issuedAt: Date.now(),
+            nonce: 'admin-password-action-test'
+        });
+        const adminPasswordPage = await client.createSession().request('GET', `/auth/password?state=${encodeURIComponent(adminPasswordState)}`, undefined, {
+            redirect: 'manual',
+            headers: authHeaders
+        });
+        assert.equal(adminPasswordPage.response.status, 403);
+        assert.match(adminPasswordPage.text, /only available for business user accounts/);
 
         const crossUserStepUp = await otherAuthSession.request('POST', '/api/auth/action-step-up', {
             authState: passwordState,
@@ -3661,6 +3715,14 @@ test('business settings password and TOTP actions require scoped auth state', as
         assert.equal(totpPageWithoutAuthSession.response.status, 302);
         assert.equal(parseRedirectLocation(totpPageWithoutAuthSession.response.headers.get('location')).pathname, '/auth/business/login');
         assert.equal(getRedirectParam(totpPageWithoutAuthSession.response.headers.get('location'), 'state'), totpState);
+
+        const wrongUserTotpPage = await otherAuthSession.request('GET', `/auth/totp?state=${encodeURIComponent(totpState)}`, undefined, {
+            redirect: 'manual',
+            headers: authHeaders
+        });
+        assert.equal(wrongUserTotpPage.response.status, 302);
+        assert.equal(parseRedirectLocation(wrongUserTotpPage.response.headers.get('location')).pathname, '/auth/business/login');
+        assert.equal(getRedirectParam(wrongUserTotpPage.response.headers.get('location'), 'state'), totpState);
 
         const totpPage = await authSession.request('GET', `/auth/totp?state=${encodeURIComponent(totpState)}`, undefined, {
             redirect: 'manual',
@@ -3718,6 +3780,12 @@ test('business settings password and TOTP actions require scoped auth state', as
             password: 'StrongerPass2'
         });
         assert.equal(newLogin.response.status, 200);
+
+        const stalePasswordPage = await authSession.request('GET', `/auth/password?state=${encodeURIComponent(passwordState)}`, undefined, {
+            redirect: 'manual',
+            headers: authHeaders
+        });
+        assert.equal(stalePasswordPage.response.status, 401);
 
         const staleTotpPage = await authSession.request('GET', `/auth/totp?state=${encodeURIComponent(totpState)}`, undefined, {
             redirect: 'manual',

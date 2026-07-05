@@ -1593,30 +1593,32 @@ function createApp(options = {}) {
 </html>`);
     }
 
+    function sendBusinessAuthActionStateError(req, res) {
+        sendAuthActionStateError(
+            res,
+            req.session?.user ? 403 : 401,
+            req.session?.user
+                ? 'Open this page from the business settings page so the request includes a valid action state.'
+                : 'Sign in from the business settings page before using this auth action.'
+        );
+        return null;
+    }
+
+    function redirectBusinessAuthActionLogin(res, stateParam) {
+        res.redirect(`/auth/business/login?state=${encodeURIComponent(stateParam)}`);
+        return null;
+    }
+
     async function requireBusinessAuthActionState(req, res, expectedIntent) {
         const stateParam = typeof req.query.state === 'string' ? req.query.state.trim() : '';
         if (!stateParam) {
-            sendAuthActionStateError(
-                res,
-                req.session?.user ? 403 : 401,
-                req.session?.user
-                    ? 'Open this page from the business settings page so the request includes a valid action state.'
-                    : 'Sign in from the business settings page before using this auth action.'
-            );
-            return null;
+            return sendBusinessAuthActionStateError(req, res);
         }
         const state = verifySignedAuthState(authHandoffSecret, stateParam);
         if (!state
             || state.audience !== 'business'
             || state.intent !== expectedIntent) {
-            sendAuthActionStateError(
-                res,
-                req.session?.user ? 403 : 401,
-                req.session?.user
-                    ? 'Open this page from the business settings page so the request includes a valid action state.'
-                    : 'Sign in from the business settings page before using this auth action.'
-            );
-            return null;
+            return sendBusinessAuthActionStateError(req, res);
         }
         const currentUser = typeof authStore.findById === 'function'
             ? await authStore.findById(state.userId)
@@ -1631,18 +1633,10 @@ function createApp(options = {}) {
             return null;
         }
         if (getUserSecurityEpoch(currentUser || req.session?.user) !== getUserSecurityEpoch(state)) {
-            sendAuthActionStateError(
-                res,
-                req.session?.user ? 403 : 401,
-                req.session?.user
-                    ? 'Open this page from the business settings page so the request includes a valid action state.'
-                    : 'Sign in from the business settings page before using this auth action.'
-            );
-            return null;
+            return sendBusinessAuthActionStateError(req, res);
         }
         if (!req.session?.user || state.userId !== req.session.user.id) {
-            res.redirect(`/auth/business/login?state=${encodeURIComponent(stateParam)}`);
-            return null;
+            return redirectBusinessAuthActionLogin(res, stateParam);
         }
         return state;
     }
