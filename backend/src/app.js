@@ -38,6 +38,8 @@ const SESSION_VERIFIER_PROTECTED_PATHS = ['/api/auth', '/api/account', '/api/pra
 const AUTH_SESSION_KEY = 'authSession';
 const ACCOUNT_SESSION_MANAGE_STEP_UP_KEY = 'accountSessionManageStepUp';
 const ACCOUNT_SESSION_MANAGE_STEP_UP_MAX_AGE_MS = 5 * 60 * 1000;
+const ACCOUNT_DATA_MANAGE_STEP_UP_KEY = 'accountDataManageStepUp';
+const ACCOUNT_DATA_MANAGE_STEP_UP_MAX_AGE_MS = 5 * 60 * 1000;
 const ROOT_QUERY_VIEW_ALLOWLIST = new Set(['overview', 'browse', 'practice', 'settings', 'more']);
 
 function parseBoolean(value, fallback = false) {
@@ -1368,6 +1370,33 @@ function createApp(options = {}) {
         return router;
     }
 
+    function hasFreshDataManageStepUp(req) {
+        const marker = req.session?.[ACCOUNT_DATA_MANAGE_STEP_UP_KEY];
+        const verifiedAt = Number(marker?.verifiedAt);
+        const markerAge = Date.now() - verifiedAt;
+        const securityEpoch = Number.isInteger(req.currentUserSecurityEpoch)
+            ? req.currentUserSecurityEpoch
+            : getUserSecurityEpoch(req.session?.user);
+        return marker?.userId === req.session?.user?.id
+            && marker?.intent === 'data-manage'
+            && marker?.securityEpoch === securityEpoch
+            && Number.isFinite(verifiedAt)
+            && verifiedAt > 0
+            && markerAge >= 0
+            && markerAge <= ACCOUNT_DATA_MANAGE_STEP_UP_MAX_AGE_MS;
+    }
+
+    function requireDataManageStepUp(req, res, next) {
+        if (hasFreshDataManageStepUp(req)) {
+            return next();
+        }
+        return res.status(403).json({
+            error: 'Recent authentication required',
+            requiresDataManageStepUp: true,
+            authActionStart: '/auth/business/data/start'
+        });
+    }
+
     app.use(['/api/auth', '/api/account', '/api/practice-records', '/api/admin', '/admin', '/auth'], noStoreSensitiveApiMiddleware);
     app.use(attachAuthSessionControls);
     app.use(['/api/auth', '/api/account', '/api/practice-records', '/api/admin', '/admin', '/auth'], refreshSessionUser);
@@ -1478,7 +1507,9 @@ function createApp(options = {}) {
         resolveAuthState: (state) => verifySignedAuthState(authHandoffSecret, state)
     }));
     app.use('/api/practice-records', createPracticeRecordsRouter({
-        store: practiceStore
+        store: practiceStore,
+        hasFreshDataManageStepUp,
+        requireDataManageStepUp
     }));
     app.use('/api/account', createAccountSessionRouter());
     app.use('/api/admin', createAdminRouter({
@@ -1686,7 +1717,10 @@ function createApp(options = {}) {
     });
     app.get(['/auth/session', '/auth/session/'], async (req, res, next) => {
         try {
-            const state = await requireBusinessAuthActionState(req, res, 'session-manage');
+            const stateParam = String(req.query.state || '').trim();
+            const decodedState = verifySignedAuthState(authHandoffSecret, stateParam);
+            const expectedIntent = decodedState?.intent === 'data-manage' ? 'data-manage' : 'session-manage';
+            const state = await requireBusinessAuthActionState(req, res, expectedIntent);
             if (!state) return;
             res.sendFile(path.join(authRoot, 'session.html'));
         } catch (error) {

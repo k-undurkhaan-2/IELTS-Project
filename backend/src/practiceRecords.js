@@ -565,8 +565,19 @@ function createPracticeRecordsRouter(options = {}) {
     const router = express.Router();
     const store = options.store || new PostgresPracticeRecordStore(options.db);
     const service = options.service || createPracticeRecordService(store);
+    const requireDataManageStepUp = typeof options.requireDataManageStepUp === 'function'
+        ? options.requireDataManageStepUp
+        : ((_req, _res, next) => next());
+    const hasFreshDataManageStepUp = typeof options.hasFreshDataManageStepUp === 'function'
+        ? options.hasFreshDataManageStepUp
+        : (() => false);
 
     router.use(requireAuth);
+
+    router.get('/data-manage/status', (req, res) => res.json({
+        fresh: Boolean(hasFreshDataManageStepUp(req)),
+        authActionStart: '/auth/business/data/start'
+    }));
 
     router.get('/', async (req, res, next) => {
         try {
@@ -590,7 +601,7 @@ function createPracticeRecordsRouter(options = {}) {
         }
     });
 
-    router.post('/import', verifyCsrfToken, async (req, res, next) => {
+    router.post('/import', verifyCsrfToken, requireDataManageStepUp, async (req, res, next) => {
         try {
             const records = getRecordsFromBody(req.body);
             if (!records) {
@@ -603,7 +614,7 @@ function createPracticeRecordsRouter(options = {}) {
         }
     });
 
-    router.delete('/:id', verifyCsrfToken, async (req, res, next) => {
+    router.delete('/:id', verifyCsrfToken, requireDataManageStepUp, async (req, res, next) => {
         try {
             const removed = await service.deleteById(req.session.user.id, req.params.id);
             return res.json({ removed });
@@ -612,7 +623,7 @@ function createPracticeRecordsRouter(options = {}) {
         }
     });
 
-    router.delete('/', verifyCsrfToken, async (req, res, next) => {
+    router.delete('/', verifyCsrfToken, requireDataManageStepUp, async (req, res, next) => {
         try {
             await service.clear(req.session.user.id);
             return res.json({ ok: true, records: [] });

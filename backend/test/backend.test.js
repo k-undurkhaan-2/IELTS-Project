@@ -733,6 +733,55 @@ async function register(client, username = 'alice', password = 'StrongPass1') {
     return client.request('POST', '/api/auth/register', { username, password });
 }
 
+async function completeBusinessDataManageStepUp(client, username, password, returnTo = '/?view=settings') {
+    const businessHeaders = {
+        host: 'business.local',
+        'x-forwarded-host': 'business.local',
+        'x-forwarded-proto': 'http',
+        'x-ielts-onion-audience': 'business'
+    };
+    const authHeaders = {
+        host: 'auth.local',
+        'x-forwarded-host': 'auth.local',
+        'x-forwarded-proto': 'http',
+        'x-ielts-onion-audience': 'auth'
+    };
+    const dataStart = await client.request('GET', `/auth/business/data/start?return_to=${encodeURIComponent(returnTo)}`, undefined, {
+        redirect: 'manual',
+        headers: businessHeaders
+    });
+    assert.equal(dataStart.response.status, 302);
+    const dataStartLocation = dataStart.response.headers.get('location');
+    assert.equal(parseRedirectLocation(dataStartLocation).pathname, '/auth/session');
+    const dataState = getRedirectParam(dataStartLocation, 'state');
+    assert(dataState);
+
+    const authSession = client.createSession();
+    await authSession.csrf();
+    const authLogin = await authSession.request('POST', '/api/auth/login', {
+        username,
+        password,
+        authState: dataState
+    }, { headers: authHeaders });
+    assert.equal(authLogin.response.status, 200);
+
+    const stepUp = await authSession.request('POST', '/api/auth/action-step-up', {
+        authState: dataState,
+        password
+    }, { headers: authHeaders });
+    assert.equal(stepUp.response.status, 200);
+    assert.equal(stepUp.json.intent, 'data-manage');
+    assert(stepUp.json.actionProof);
+
+    const callback = await client.request('GET', `/auth/business/data/callback?state=${encodeURIComponent(dataState)}&proof=${encodeURIComponent(stepUp.json.actionProof)}`, undefined, {
+        redirect: 'manual',
+        headers: businessHeaders
+    });
+    assert.equal(callback.response.status, 302);
+    assert.equal(parseRedirectLocation(callback.response.headers.get('location')).pathname, '/');
+    return { dataState, actionProof: stepUp.json.actionProof };
+}
+
 async function seedAdmin(client, username = 'admin_user', password = 'StrongPass1') {
     const passwordHash = await bcrypt.hash(password, 4);
     const user = await client.authStore.createUser({
@@ -3028,11 +3077,132 @@ test('practice API requires authentication', async () => {
     }
 });
 
+test('practice destructive data management requires data step-up bound to the business browser', async () => {
+    const client = await createClient();
+    const businessHeaders = {
+        host: 'business.local',
+        'x-forwarded-host': 'business.local',
+        'x-forwarded-proto': 'http',
+        'x-ielts-onion-audience': 'business'
+    };
+    const authHeaders = {
+        host: 'auth.local',
+        'x-forwarded-host': 'auth.local',
+        'x-forwarded-proto': 'http',
+        'x-ielts-onion-audience': 'auth'
+    };
+    try {
+        const created = await register(client, 'data_manage_user', 'StrongPass1');
+        assert.equal(created.response.status, 201);
+
+        const replaced = await client.request('PUT', '/api/practice-records', {
+            records: [{ id: 'record-a', sessionId: 'session-a', type: 'reading', score: 60, date: '2026-03-01T00:00:00.000Z' }]
+        });
+        assert.equal(replaced.response.status, 200);
+
+        const statusWithoutStepUp = await client.request('GET', '/api/practice-records/data-manage/status');
+        assert.equal(statusWithoutStepUp.response.status, 200);
+        assert.equal(statusWithoutStepUp.json.fresh, false);
+        assert.equal(statusWithoutStepUp.json.authActionStart, '/auth/business/data/start');
+
+        const importWithoutStepUp = await client.request('POST', '/api/practice-records/import', {
+            records: [{ id: 'record-b', sessionId: 'session-b', type: 'listening', score: 70, date: '2026-03-02T00:00:00.000Z' }]
+        });
+        assert.equal(importWithoutStepUp.response.status, 403);
+        assert.equal(importWithoutStepUp.json.requiresDataManageStepUp, true);
+        assert.equal(importWithoutStepUp.json.authActionStart, '/auth/business/data/start');
+
+        const deleteWithoutStepUp = await client.request('DELETE', '/api/practice-records/record-a');
+        assert.equal(deleteWithoutStepUp.response.status, 403);
+        assert.equal(deleteWithoutStepUp.json.requiresDataManageStepUp, true);
+
+        const clearWithoutStepUp = await client.request('DELETE', '/api/practice-records');
+        assert.equal(clearWithoutStepUp.response.status, 403);
+        assert.equal(clearWithoutStepUp.json.requiresDataManageStepUp, true);
+
+        const dataStart = await client.request('GET', '/auth/business/data/start?return_to=/?view=settings', undefined, {
+            redirect: 'manual',
+            headers: businessHeaders
+        });
+        assert.equal(dataStart.response.status, 302);
+        const dataStartLocation = dataStart.response.headers.get('location');
+        assert.equal(parseRedirectLocation(dataStartLocation).pathname, '/auth/session');
+        const dataState = getRedirectParam(dataStartLocation, 'state');
+        assert(dataState);
+
+        const authSession = client.createSession();
+        await authSession.csrf();
+        const authLogin = await authSession.request('POST', '/api/auth/login', {
+            username: 'data_manage_user',
+            password: 'StrongPass1',
+            authState: dataState
+        }, { headers: authHeaders });
+        assert.equal(authLogin.response.status, 200);
+
+        const sessionPage = await authSession.request('GET', `/auth/session?state=${encodeURIComponent(dataState)}`, undefined, {
+            redirect: 'manual',
+            headers: authHeaders
+        });
+        assert.equal(sessionPage.response.status, 200);
+        assert.match(sessionPage.text, /Confirm session management/);
+
+        const dataStepUp = await authSession.request('POST', '/api/auth/action-step-up', {
+            authState: dataState,
+            password: 'StrongPass1'
+        }, { headers: authHeaders });
+        assert.equal(dataStepUp.response.status, 200);
+        assert.equal(dataStepUp.json.intent, 'data-manage');
+        assert(dataStepUp.json.actionProof);
+
+        const unrelatedBusinessSession = client.createSession();
+        await unrelatedBusinessSession.csrf();
+        const unrelatedLogin = await unrelatedBusinessSession.request('POST', '/api/auth/login', {
+            username: 'data_manage_user',
+            password: 'StrongPass1'
+        }, { headers: businessHeaders });
+        assert.equal(unrelatedLogin.response.status, 200);
+        const crossBrowserCallback = await unrelatedBusinessSession.request('GET', `/auth/business/data/callback?state=${encodeURIComponent(dataState)}&proof=${encodeURIComponent(dataStepUp.json.actionProof)}`, undefined, {
+            redirect: 'manual',
+            headers: businessHeaders
+        });
+        assert.equal(crossBrowserCallback.response.status, 403);
+
+        const dataCallback = await client.request('GET', `/auth/business/data/callback?state=${encodeURIComponent(dataState)}&proof=${encodeURIComponent(dataStepUp.json.actionProof)}`, undefined, {
+            redirect: 'manual',
+            headers: businessHeaders
+        });
+        assert.equal(dataCallback.response.status, 302);
+        assert.equal(parseRedirectLocation(dataCallback.response.headers.get('location')).pathname, '/');
+        assert.equal(parseRedirectLocation(dataCallback.response.headers.get('location')).search, '?view=settings');
+
+        const statusAfterStepUp = await client.request('GET', '/api/practice-records/data-manage/status');
+        assert.equal(statusAfterStepUp.response.status, 200);
+        assert.equal(statusAfterStepUp.json.fresh, true);
+        assert.equal(statusAfterStepUp.json.authActionStart, '/auth/business/data/start');
+
+        const imported = await client.request('POST', '/api/practice-records/import', {
+            records: [{ id: 'record-b', sessionId: 'session-b', type: 'listening', score: 70, date: '2026-03-02T00:00:00.000Z' }]
+        });
+        assert.equal(imported.response.status, 201);
+
+        const removed = await client.request('DELETE', '/api/practice-records/record-a');
+        assert.equal(removed.response.status, 200);
+        assert.equal(removed.json.removed, 1);
+
+        const cleared = await client.request('DELETE', '/api/practice-records');
+        assert.equal(cleared.response.status, 200);
+        assert.deepEqual(cleared.json.records, []);
+    } finally {
+        await client.close();
+    }
+});
+
 test('practice import deduplicates by id and non-empty sessionId', async () => {
     const client = await createClient();
     try {
         const created = await register(client, 'import_user', 'StrongPass1');
         assert.equal(created.response.status, 201);
+        await completeBusinessDataManageStepUp(client, 'import_user', 'StrongPass1');
 
         const imported = await client.request('POST', '/api/practice-records/import', {
             records: [
@@ -3312,6 +3482,7 @@ test('admin dashboard redirects anonymous users through auth handoff', async () 
         assert.match(authLoginScript.text, /isBusinessActionFlow/);
         assert.match(authLoginScript.text, /getBusinessActionPath/);
         assert.match(authLoginScript.text, /session-manage/);
+        assert.match(authLoginScript.text, /data-manage/);
         assert.match(authLoginScript.text, /\/auth\/session/);
         assert.match(authLoginScript.text, /Sign in with the account that started this security action/);
         assert.doesNotMatch(authLoginScript.text, /window\.location\.assign\(['"]\/auth\/account['"]\)|\/auth\/account/);
@@ -3573,6 +3744,8 @@ test('admin shell and business account menu do not link back through the busines
     assert(businessProxyConfig.includes('location = /auth/business/totp/start'));
     assert(businessProxyConfig.includes('location = /auth/business/session/start'));
     assert(businessProxyConfig.includes('location = /auth/business/session/callback'));
+    assert(businessProxyConfig.includes('location = /auth/business/data/start'));
+    assert(businessProxyConfig.includes('location = /auth/business/data/callback'));
     assert(businessProxyConfig.includes('location = /auth/business/callback'));
     assert(businessProxyConfig.includes('location = /auth/business/logout'));
     assert(businessProxyConfig.includes('location = /auth/admin/callback'));
@@ -3589,7 +3762,7 @@ test('admin shell and business account menu do not link back through the busines
     assert(!businessProxyConfig.includes('location = /auth/business/account'));
     assert(businessProxyConfig.includes('location ~* ^/(api/admin|admin|internal|debug|metrics)(/|$) { return 404; }'));
     assert(businessProxyConfig.includes('location ~* ^/api/auth/(login|register|totp|account)(/|$) { return 404; }'));
-    assert(businessProxyConfig.includes('location ~* ^/auth/(admin|password|totp|session|account)(/|$) { return 404; }'));
+    assert(businessProxyConfig.includes('location ~* ^/auth/(admin|password|totp|session|data|account)(/|$) { return 404; }'));
     assert(businessProxyConfig.includes('location = /auth/login { return 302 /auth/business/start?return_to=/; }'));
     assert(businessProxyConfig.includes('location = /api/auth/csrf { proxy_pass http://ielts_app; }'));
     assert(businessProxyConfig.includes('location = /api/auth/me { proxy_pass http://ielts_app; }'));
@@ -3604,7 +3777,7 @@ test('admin shell and business account menu do not link back through the busines
     const businessProxyDenyRules = [
         /^\/(api\/admin|admin|internal|debug|metrics)(\/|$)/i,
         /^\/api\/auth\/(login|register|totp|account)(\/|$)/i,
-        /^\/auth\/(admin|password|totp|session|account)(\/|$)/i
+        /^\/auth\/(admin|password|totp|session|data|account)(\/|$)/i
     ];
     const businessProxyBypassPaths = [
         '/API/ADMIN',
@@ -3688,6 +3861,8 @@ test('admin shell and business account menu do not link back through the busines
             '/auth/business/totp/start',
             '/auth/business/session/start',
             '/auth/business/session/callback',
+            '/auth/business/data/start',
+            '/auth/business/data/callback',
             '/auth/business/callback',
             '/auth/business/logout',
             '/auth/login',
@@ -3713,6 +3888,8 @@ test('admin shell and business account menu do not link back through the busines
             '/auth/session',
             '/auth/session/',
             '/AUTH/SESSION',
+            '/auth/data',
+            '/AUTH/DATA',
             '/auth/totp',
             '/auth/account',
             '/auth/account.js',
@@ -3721,6 +3898,10 @@ test('admin shell and business account menu do not link back through the busines
             '/AUTH/BUSINESS/SESSION/START',
             '/auth/business/session/callback/',
             '/AUTH/BUSINESS/SESSION/CALLBACK',
+            '/auth/business/data/start/',
+            '/AUTH/BUSINESS/DATA/START',
+            '/auth/business/data/callback/',
+            '/AUTH/BUSINESS/DATA/CALLBACK',
             '/api/auth/login',
             '/api/auth/login/',
             '/API/AUTH/LOGIN',
@@ -3784,6 +3965,12 @@ test('admin shell and business account menu do not link back through the busines
             '/auth/business/session/callback',
             '/auth/business/session/callback/',
             '/AUTH/BUSINESS/SESSION/CALLBACK',
+            '/auth/business/data/start',
+            '/auth/business/data/start/',
+            '/AUTH/BUSINESS/DATA/START',
+            '/auth/business/data/callback',
+            '/auth/business/data/callback/',
+            '/AUTH/BUSINESS/DATA/CALLBACK',
             '/auth/account',
             '/auth/account.js',
             '/AUTH/SESSION',
@@ -3828,6 +4015,8 @@ test('admin shell and business account menu do not link back through the busines
             '/auth/business/start',
             '/auth/business/session/start',
             '/auth/business/session/callback',
+            '/auth/business/data/start',
+            '/auth/business/data/callback',
             '/auth/login',
             '/auth/session',
             '/api/auth/login',
@@ -5093,6 +5282,7 @@ test('practice API rejects unsafe record identifiers and oversized batches', asy
     const client = await createClient();
     try {
         await register(client, 'practice_bounds', 'StrongPass1');
+        await completeBusinessDataManageStepUp(client, 'practice_bounds', 'StrongPass1');
 
         const longId = await client.request('PUT', '/api/practice-records', {
             records: [{ id: 'x'.repeat(513), title: 'Too long' }]

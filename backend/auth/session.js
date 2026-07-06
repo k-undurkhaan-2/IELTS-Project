@@ -4,6 +4,8 @@
     const state = {
         csrfToken: ''
     };
+    const actionPayload = parseState(authState);
+    const isDataManageAction = actionPayload?.intent === 'data-manage';
 
     const nodes = {
         status: document.getElementById('session-status'),
@@ -47,16 +49,14 @@
     }
 
     function configureBackLink() {
-        const payload = parseState(authState);
-        nodes.backLink.href = getReturnUrl(payload);
+        nodes.backLink.href = getReturnUrl(actionPayload);
         return nodes.backLink.href;
     }
 
     function getCallbackUrl(actionProof) {
-        const payload = parseState(authState);
-        const base = typeof payload?.targetBaseUrl === 'string' ? payload.targetBaseUrl.replace(/\/+$/g, '') : '';
-        const callbackPath = typeof payload?.actionCallbackPath === 'string' && payload.actionCallbackPath.startsWith('/auth/business/')
-            ? payload.actionCallbackPath
+        const base = typeof actionPayload?.targetBaseUrl === 'string' ? actionPayload.targetBaseUrl.replace(/\/+$/g, '') : '';
+        const callbackPath = typeof actionPayload?.actionCallbackPath === 'string' && actionPayload.actionCallbackPath.startsWith('/auth/business/')
+            ? actionPayload.actionCallbackPath
             : '/auth/business/session/callback';
         const target = base ? `${base}${callbackPath}` : callbackPath;
         const query = new URLSearchParams({
@@ -114,7 +114,9 @@
         await loadCsrf();
         await request('/api/auth/me');
         nodes.form.hidden = false;
-        setStatus('Confirm your password before managing active sessions.');
+        setStatus(isDataManageAction
+            ? 'Confirm your password before managing practice data.'
+            : 'Confirm your password before managing active sessions.');
 
         nodes.form.addEventListener('submit', async (event) => {
             event.preventDefault();
@@ -129,7 +131,9 @@
                     }
                 });
                 if (!payload.actionProof) {
-                    throw new Error('Session management confirmation failed.');
+                    throw new Error(isDataManageAction
+                        ? 'Practice data confirmation failed.'
+                        : 'Session management confirmation failed.');
                 }
                 nodes.form.reset();
                 nodes.form.hidden = true;

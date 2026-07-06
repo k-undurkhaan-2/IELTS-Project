@@ -10,7 +10,7 @@ const MAX_MEMORY_SESSION_JSON_LENGTH = 256 * 1024;
 const MAX_BCRYPT_PASSWORD_BYTES = 72;
 const MAX_RATE_LIMIT_KEY_LENGTH = 256;
 const AUTH_ACTION_STEP_UP_MAX_AGE_MS = 5 * 60 * 1000;
-const AUTH_ACTION_STEP_UP_ALLOWED_INTENTS = new Set(['password-change', 'totp-manage', 'session-manage']);
+const AUTH_ACTION_STEP_UP_ALLOWED_INTENTS = new Set(['password-change', 'totp-manage', 'session-manage', 'data-manage']);
 
 const credentialsSchema = z.object({
     username: z.string().trim().min(3).max(32).regex(USERNAME_PATTERN),
@@ -955,7 +955,7 @@ function createAuthRouter(options = {}) {
                 expiresAt: marker.verifiedAt + AUTH_ACTION_STEP_UP_MAX_AGE_MS,
                 csrfToken: ensureCsrfToken(req)
             };
-            if (context.state.intent === 'session-manage' && signAuthActionProof) {
+            if (['session-manage', 'data-manage'].includes(context.state.intent) && signAuthActionProof) {
                 responsePayload.actionProof = signAuthActionProof({
                     audience: 'business',
                     intent: context.state.intent,

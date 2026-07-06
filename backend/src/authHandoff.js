@@ -8,6 +8,17 @@ const MAX_STATE_AGE_MS = 10 * 60_000;
 const AUTH_ACTION_STEP_UP_MAX_AGE_MS = 5 * 60_000;
 const PENDING_BUSINESS_AUTH_ACTION_KEY = 'pendingBusinessAuthAction';
 const ACCOUNT_SESSION_MANAGE_STEP_UP_KEY = 'accountSessionManageStepUp';
+const ACCOUNT_DATA_MANAGE_STEP_UP_KEY = 'accountDataManageStepUp';
+const BUSINESS_ACTION_PROOF_CALLBACKS = {
+    'session-manage': {
+        path: '/auth/business/session/callback',
+        markerKey: ACCOUNT_SESSION_MANAGE_STEP_UP_KEY
+    },
+    'data-manage': {
+        path: '/auth/business/data/callback',
+        markerKey: ACCOUNT_DATA_MANAGE_STEP_UP_KEY
+    }
+};
 const AUDIENCES = new Set(['business', 'admin']);
 const CANONICAL_PROXY_HOSTS = {
     business: 'business.local',
@@ -471,7 +482,8 @@ function createAuthHandoffRouter(options = {}) {
                 }
                 const returnTo = sanitizeReturnTo(req.query.return_to, 'business');
                 const securityEpoch = getUserSecurityEpoch(currentUser || sessionUser);
-                const actionNonce = intent === 'session-manage'
+                const actionProofCallback = BUSINESS_ACTION_PROOF_CALLBACKS[intent];
+                const actionNonce = actionProofCallback
                     ? crypto.randomBytes(16).toString('base64url')
                     : '';
                 if (actionNonce && req.session) {
@@ -490,7 +502,7 @@ function createAuthHandoffRouter(options = {}) {
                     securityEpoch,
                     returnTo,
                     targetBaseUrl: configuredTargetUrls.business,
-                    actionCallbackPath: actionNonce ? '/auth/business/session/callback' : undefined,
+                    actionCallbackPath: actionProofCallback?.path,
                     actionNonce: actionNonce || undefined,
                     issuedAt: Date.now(),
                     nonce: crypto.randomBytes(16).toString('base64url')
@@ -505,81 +517,87 @@ function createAuthHandoffRouter(options = {}) {
     router.get('/business/password/start', createBusinessAccountActionStartHandler('password-change', '/auth/password'));
     router.get('/business/totp/start', createBusinessAccountActionStartHandler('totp-manage', '/auth/totp'));
     router.get('/business/session/start', createBusinessAccountActionStartHandler('session-manage', '/auth/session'));
+    router.get('/business/data/start', createBusinessAccountActionStartHandler('data-manage', '/auth/session'));
 
-    router.get('/business/session/callback', async (req, res, next) => {
-        try {
-            if (!requireConfig(res)) {
-                return;
+    function createBusinessActionCallbackHandler(intent, markerKey) {
+        return async (req, res, next) => {
+            try {
+                if (!requireConfig(res)) {
+                    return;
+                }
+                if ((configuredTargetUrls.business || !localDevelopment) && !validateExactAllowedHost(req, 'business', configuredTargetUrls, {
+                    allowLocalLoopbackHost: localDevelopment
+                })) {
+                    return rejectInvalidHost(res);
+                }
+                const rawState = String(req.query.state || '').trim();
+                const rawProof = String(req.query.proof || '').trim();
+                const state = verifySignedAuthState(stateSecret, rawState);
+                const proof = verifySignedAuthState(stateSecret, rawProof);
+                const stateHash = hashAuthActionState(rawState);
+                const verifiedAt = Number(proof?.verifiedAt);
+                const verifiedAge = Date.now() - verifiedAt;
+                if (!state
+                    || !proof
+                    || state.audience !== 'business'
+                    || state.intent !== intent
+                    || proof.audience !== 'business'
+                    || proof.intent !== intent
+                    || proof.userId !== state.userId
+                    || proof.securityEpoch !== state.securityEpoch
+                    || proof.stateHash !== stateHash
+                    || !Number.isFinite(verifiedAt)
+                    || verifiedAt <= 0
+                    || verifiedAge < 0
+                    || verifiedAge > AUTH_ACTION_STEP_UP_MAX_AGE_MS) {
+                    return res.status(403).type('text/plain').send('Valid auth action proof is required');
+                }
+                const sessionUser = publicUser(req.session?.user);
+                if (!sessionUser?.id || sessionUser.id !== state.userId) {
+                    return res.status(401).type('text/plain').send('Authentication required');
+                }
+                const currentUser = typeof authStore.findById === 'function'
+                    ? await authStore.findById(sessionUser.id)
+                    : null;
+                const safeUser = publicUser(currentUser || sessionUser);
+                if (!safeUser?.id) {
+                    return res.status(401).type('text/plain').send('Authentication required');
+                }
+                if (safeUser.role === 'admin') {
+                    return res.status(403).type('text/plain').send('Business account required');
+                }
+                if (getUserSecurityEpoch(currentUser || sessionUser) !== getUserSecurityEpoch(state)) {
+                    return res.status(403).type('text/plain').send('Valid auth action state is required');
+                }
+                const pending = req.session?.[PENDING_BUSINESS_AUTH_ACTION_KEY];
+                const pendingAge = Date.now() - Number(pending?.issuedAt);
+                if (!pending
+                    || pending.intent !== intent
+                    || pending.userId !== state.userId
+                    || pending.securityEpoch !== state.securityEpoch
+                    || pending.actionNonce !== state.actionNonce
+                    || !Number.isFinite(pendingAge)
+                    || pendingAge < 0
+                    || pendingAge > MAX_STATE_AGE_MS) {
+                    return res.status(403).type('text/plain').send('Valid auth action state is required');
+                }
+                req.session[markerKey] = {
+                    userId: safeUser.id,
+                    intent,
+                    securityEpoch: getUserSecurityEpoch(currentUser || sessionUser),
+                    stateHash,
+                    verifiedAt
+                };
+                delete req.session[PENDING_BUSINESS_AUTH_ACTION_KEY];
+                return res.redirect(sanitizeReturnTo(state.returnTo, 'business'));
+            } catch (error) {
+                return next(error);
             }
-            if ((configuredTargetUrls.business || !localDevelopment) && !validateExactAllowedHost(req, 'business', configuredTargetUrls, {
-                allowLocalLoopbackHost: localDevelopment
-            })) {
-                return rejectInvalidHost(res);
-            }
-            const rawState = String(req.query.state || '').trim();
-            const rawProof = String(req.query.proof || '').trim();
-            const state = verifySignedAuthState(stateSecret, rawState);
-            const proof = verifySignedAuthState(stateSecret, rawProof);
-            const stateHash = hashAuthActionState(rawState);
-            const verifiedAt = Number(proof?.verifiedAt);
-            const verifiedAge = Date.now() - verifiedAt;
-            if (!state
-                || !proof
-                || state.audience !== 'business'
-                || state.intent !== 'session-manage'
-                || proof.audience !== 'business'
-                || proof.intent !== 'session-manage'
-                || proof.userId !== state.userId
-                || proof.securityEpoch !== state.securityEpoch
-                || proof.stateHash !== stateHash
-                || !Number.isFinite(verifiedAt)
-                || verifiedAt <= 0
-                || verifiedAge < 0
-                || verifiedAge > AUTH_ACTION_STEP_UP_MAX_AGE_MS) {
-                return res.status(403).type('text/plain').send('Valid auth action proof is required');
-            }
-            const sessionUser = publicUser(req.session?.user);
-            if (!sessionUser?.id || sessionUser.id !== state.userId) {
-                return res.status(401).type('text/plain').send('Authentication required');
-            }
-            const currentUser = typeof authStore.findById === 'function'
-                ? await authStore.findById(sessionUser.id)
-                : null;
-            const safeUser = publicUser(currentUser || sessionUser);
-            if (!safeUser?.id) {
-                return res.status(401).type('text/plain').send('Authentication required');
-            }
-            if (safeUser.role === 'admin') {
-                return res.status(403).type('text/plain').send('Business account required');
-            }
-            if (getUserSecurityEpoch(currentUser || sessionUser) !== getUserSecurityEpoch(state)) {
-                return res.status(403).type('text/plain').send('Valid auth action state is required');
-            }
-            const pending = req.session?.[PENDING_BUSINESS_AUTH_ACTION_KEY];
-            const pendingAge = Date.now() - Number(pending?.issuedAt);
-            if (!pending
-                || pending.intent !== 'session-manage'
-                || pending.userId !== state.userId
-                || pending.securityEpoch !== state.securityEpoch
-                || pending.actionNonce !== state.actionNonce
-                || !Number.isFinite(pendingAge)
-                || pendingAge < 0
-                || pendingAge > MAX_STATE_AGE_MS) {
-                return res.status(403).type('text/plain').send('Valid auth action state is required');
-            }
-            req.session[ACCOUNT_SESSION_MANAGE_STEP_UP_KEY] = {
-                userId: safeUser.id,
-                intent: 'session-manage',
-                securityEpoch: getUserSecurityEpoch(currentUser || sessionUser),
-                stateHash,
-                verifiedAt
-            };
-            delete req.session[PENDING_BUSINESS_AUTH_ACTION_KEY];
-            return res.redirect(sanitizeReturnTo(state.returnTo, 'business'));
-        } catch (error) {
-            return next(error);
-        }
-    });
+        };
+    }
+
+    router.get('/business/session/callback', createBusinessActionCallbackHandler('session-manage', ACCOUNT_SESSION_MANAGE_STEP_UP_KEY));
+    router.get('/business/data/callback', createBusinessActionCallbackHandler('data-manage', ACCOUNT_DATA_MANAGE_STEP_UP_KEY));
 
     function createLogoutHandler(audience) {
         return async (req, res, next) => {
