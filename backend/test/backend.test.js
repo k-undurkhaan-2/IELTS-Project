@@ -3264,6 +3264,9 @@ test('admin dashboard redirects anonymous users through auth handoff', async () 
         const legacyLoginPage = await client.request('GET', '/admin/login', undefined, { redirect: 'manual' });
         assert.equal(legacyLoginPage.response.status, 302);
         assertAuthStartRedirect(legacyLoginPage.response.headers.get('location'), 'admin', '/admin');
+        const legacyLoginHtml = await client.request('GET', '/admin/login.html', undefined, { redirect: 'manual' });
+        assert.equal(legacyLoginHtml.response.status, 404);
+        assert.equal(legacyLoginHtml.text, 'Not found');
 
         const authLoginPage = await client.request('GET', '/auth/login');
         assert.equal(authLoginPage.response.status, 200);
@@ -3376,6 +3379,29 @@ test('admin dashboard redirects anonymous users through auth handoff', async () 
 
         const api = await client.request('GET', '/api/admin/summary');
         assert.equal(api.response.status, 401);
+    } finally {
+        await client.close();
+    }
+});
+
+test('retired legacy admin login html is hidden from authenticated admin static access', async () => {
+    const client = await createClient({ totpEnabled: false });
+    try {
+        await seedAdmin(client, 'legacy_login_html_admin', 'StrongPass1');
+        await client.csrf();
+        const login = await client.request('POST', '/api/auth/login', {
+            username: 'legacy_login_html_admin',
+            password: 'StrongPass1'
+        });
+        assert.equal(login.response.status, 200);
+
+        const dashboard = await client.request('GET', '/admin', undefined, { redirect: 'manual' });
+        assert.equal(dashboard.response.status, 200);
+
+        const legacyLoginHtml = await client.request('GET', '/admin/login.html', undefined, { redirect: 'manual' });
+        assert.equal(legacyLoginHtml.response.status, 404);
+        assert.equal(legacyLoginHtml.text, 'Not found');
+        assert.doesNotMatch(legacyLoginHtml.text, /admin-login|\/admin\/login\.js|\/api\/auth\/login/);
     } finally {
         await client.close();
     }

@@ -1515,10 +1515,7 @@ function createApp(options = {}) {
             return next(error);
         }
     });
-    app.get('/admin/login.js', (req, res) => {
-        res.status(404).type('text/plain').send('Not found');
-    });
-    app.get('/admin/login.css', (req, res) => {
+    app.get(['/admin/login.html', '/admin/login.js', '/admin/login.css'], (req, res) => {
         res.status(404).type('text/plain').send('Not found');
     });
 
