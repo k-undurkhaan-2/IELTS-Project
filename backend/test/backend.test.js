@@ -405,7 +405,6 @@ async function createClient(options = {}) {
         authPublicUrl: options.authPublicUrl,
         businessPublicUrl: options.businessPublicUrl,
         adminPublicUrl: options.adminPublicUrl,
-        allowLegacyDirectAccountApis: options.allowLegacyDirectAccountApis,
         totpRecoveryHashRounds: 4
     });
     const server = await new Promise((resolve, reject) => {
@@ -536,13 +535,6 @@ async function createClient(options = {}) {
             });
         }
     };
-}
-
-function createLegacyDirectAccountClient(options = {}) {
-    return createClient({
-        ...options,
-        allowLegacyDirectAccountApis: true
-    });
 }
 
 function rawHttpRequest(baseUrl, method, requestPath, options = {}) {
@@ -1623,7 +1615,7 @@ test('production public URL policy controls session and handoff cookie Secure at
     }
 });
 
-test('direct app hides legacy account APIs unless explicitly enabled', async () => {
+test('direct app always hides retired legacy account APIs', async () => {
     const strongSecret = '0123456789abcdef0123456789abcdef';
     const productionOptions = {
         nodeEnv: 'production',
@@ -1674,41 +1666,6 @@ test('direct app hides legacy account APIs unless explicitly enabled', async () 
         await client.close();
     }
 
-    const optInClient = await createClient({
-        ...productionOptions,
-        allowLegacyDirectAccountApis: true
-    });
-    try {
-        const accountUsername = await optInClient.request('PATCH', '/api/auth/account/username', {
-            username: 'renamed_user',
-            password: 'StrongPass1'
-        });
-        assert.equal(accountUsername.response.status, 404);
-        assert.equal(accountUsername.json.error, 'Not found');
-
-        const accountPassword = await optInClient.request('PATCH', '/api/auth/account/password', {
-            currentPassword: 'StrongPass1',
-            newPassword: 'StrongerPass2'
-        });
-        assert.equal(accountPassword.response.status, 404);
-        assert.equal(accountPassword.json.error, 'Not found');
-
-        const accountDelete = await optInClient.request('DELETE', '/api/auth/account', {
-            password: 'StrongPass1',
-            confirm: 'legacy_user'
-        });
-        assert.equal(accountDelete.response.status, 404);
-        assert.equal(accountDelete.json.error, 'Not found');
-
-        const totpDisable = await optInClient.request('POST', '/api/auth/totp/disable', {
-            password: 'StrongPass1',
-            token: '000000'
-        });
-        assert.equal(totpDisable.response.status, 404);
-        assert.equal(totpDisable.json.error, 'Not found');
-    } finally {
-        await optInClient.close();
-    }
 });
 
 test('login performs a dummy password check for unknown users', async () => {
@@ -1740,7 +1697,7 @@ test('login performs a dummy password check for unknown users', async () => {
 });
 
 test('password comparisons reject input beyond bcrypt byte limit', async () => {
-    const client = await createLegacyDirectAccountClient();
+    const client = await createClient();
     const passwordAtLimit = `Aa1${'x'.repeat(69)}`;
     const extendedPassword = `${passwordAtLimit}Z`;
     assert.equal(Buffer.byteLength(passwordAtLimit, 'utf8'), 72);
@@ -1791,8 +1748,8 @@ test('password comparisons reject input beyond bcrypt byte limit', async () => {
     }
 });
 
-test('legacy direct account mutations stay retired even when explicitly enabled', async () => {
-    const client = await createLegacyDirectAccountClient();
+test('legacy direct account mutations stay retired', async () => {
+    const client = await createClient();
     try {
         const created = await register(client, 'account_user', 'StrongPass1');
         assert.equal(created.response.status, 201);
@@ -1829,7 +1786,7 @@ test('legacy direct account mutations stay retired even when explicitly enabled'
 });
 
 test('retired legacy account mutation routes do not revoke active sessions', async () => {
-    const client = await createLegacyDirectAccountClient();
+    const client = await createClient();
     try {
         const created = await register(client, 'session_user', 'StrongPass1');
         assert.equal(created.response.status, 201);
@@ -1878,7 +1835,7 @@ test('retired legacy account mutation routes do not revoke active sessions', asy
 });
 
 test('retired legacy account routes are hidden before sensitive checks run', async () => {
-    const client = await createLegacyDirectAccountClient({
+    const client = await createClient({
         rateLimit: { maxAttempts: 1, windowMs: 60_000 }
     });
     try {
@@ -1997,7 +1954,7 @@ test('pending TOTP sessions refresh stale users before trusting them', async () 
 });
 
 test('legacy self-delete route is retired and preserves account data', async () => {
-    const client = await createLegacyDirectAccountClient();
+    const client = await createClient();
     try {
         const created = await register(client, 'delete_user', 'StrongPass1');
         assert.equal(created.response.status, 201);
@@ -2045,7 +2002,7 @@ test('legacy self-delete route is retired and preserves account data', async () 
 });
 
 test('legacy admin self-delete route is retired before last-admin checks', async () => {
-    const client = await createLegacyDirectAccountClient();
+    const client = await createClient();
     try {
         await client.csrf();
         await seedAdmin(client, 'sole_admin', 'StrongPass1');
@@ -6531,7 +6488,7 @@ test('admin user changes invalidate target sessions and stale admin roles', asyn
 });
 
 test('admin web routes reject self password changes', async () => {
-    const client = await createLegacyDirectAccountClient();
+    const client = await createClient();
     try {
         await seedAdmin(client, 'self_admin', 'StrongPass1');
         const adminSession = client.createSession();
@@ -6581,7 +6538,7 @@ test('admin web routes reject self password changes', async () => {
 });
 
 test('retired legacy admin account mutations preserve current TOTP verification', async () => {
-    const client = await createLegacyDirectAccountClient();
+    const client = await createClient();
     try {
         await seedAdmin(client, 'account_admin', 'StrongPass1');
         const adminSession = client.createSession();

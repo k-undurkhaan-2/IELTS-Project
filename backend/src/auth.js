@@ -89,13 +89,6 @@ function parseBoolean(value, fallback = false) {
     return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
 }
 
-function resolveAllowLegacyDirectAccountApis(options = {}) {
-    const configured = Object.prototype.hasOwnProperty.call(options, 'allowLegacyDirectAccountApis')
-        ? options.allowLegacyDirectAccountApis
-        : process.env.ALLOW_LEGACY_DIRECT_ACCOUNT_APIS;
-    return parseBoolean(configured, false);
-}
-
 function parseMemorySessionValue(raw) {
     if (!raw) return null;
     if (typeof raw !== 'string') return raw;
@@ -744,14 +737,6 @@ function createAuthRouter(options = {}) {
     const clearCookieOptions = options.clearCookieOptions || {};
     const sessionVerifierCookieName = options.sessionVerifierCookieName || '';
     const clearSessionVerifierCookieOptions = options.clearSessionVerifierCookieOptions || clearCookieOptions;
-    const allowLegacyDirectAccountApis = resolveAllowLegacyDirectAccountApis(options);
-
-    function requireLegacyDirectAccountApi(req, res, next) {
-        if (!allowLegacyDirectAccountApis) {
-            return res.status(404).json({ error: 'Not found' });
-        }
-        return next();
-    }
 
     function clearSessionCookies(res) {
         res.clearCookie(sessionCookieName, clearCookieOptions);
@@ -1065,7 +1050,6 @@ module.exports = {
     publicUser,
     requireAdmin,
     requireAuth,
-    resolveAllowLegacyDirectAccountApis,
     resolveBusinessAccountActionContext,
     validatePasswordStrength,
     verifyCsrfToken
