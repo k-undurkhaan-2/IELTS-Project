@@ -113,6 +113,83 @@
     }
   }
 
+  function getFallbackDataManageReturnTo() {
+    var path = window.location && window.location.pathname ? window.location.pathname : '/';
+    var search = window.location && window.location.search ? window.location.search : '';
+    return (path + search) || '/';
+  }
+
+  function getFallbackRemoteApiClient() {
+    if (window.remoteApiClient && typeof window.remoteApiClient.request === 'function') {
+      return window.remoteApiClient;
+    }
+    if (window.ExamData && window.ExamData.remoteApiClient && typeof window.ExamData.remoteApiClient.request === 'function') {
+      return window.ExamData.remoteApiClient;
+    }
+    return null;
+  }
+
+  function redirectFallbackDataManageStepUp(startPath) {
+    var safeStartPath = typeof startPath === 'string' && startPath.indexOf('/auth/business/data/start') === 0
+      ? startPath
+      : '/auth/business/data/start';
+    window.location.href = safeStartPath + '?return_to=' + encodeURIComponent(getFallbackDataManageReturnTo());
+  }
+
+  async function requestFallbackDataManageStatus() {
+    var apiClient = getFallbackRemoteApiClient();
+    if (apiClient) {
+      return apiClient.request('/api/practice-records/data-manage/status', { method: 'GET', csrf: false });
+    }
+    if (typeof window.fetch !== 'function') {
+      throw new Error('Remote API client is unavailable');
+    }
+    var response = await window.fetch('/api/practice-records/data-manage/status', {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: {
+        Accept: 'application/json'
+      }
+    });
+    var payload = null;
+    try {
+      payload = await response.json();
+    } catch (_) { }
+    if (!response.ok) {
+      var error = new Error(payload && payload.error ? payload.error : 'Data management step-up check failed');
+      error.status = response.status;
+      error.payload = payload;
+      throw error;
+    }
+    return payload || {};
+  }
+
+  async function ensureFallbackDataManageStepUp() {
+    try {
+      var payload = await requestFallbackDataManageStatus();
+      if (payload && payload.fresh === true) {
+        return true;
+      }
+      window.showMessage && window.showMessage('Confirm your password before importing or clearing practice data.', 'info');
+      redirectFallbackDataManageStepUp(payload && payload.authActionStart);
+      return false;
+    } catch (error) {
+      if (error && error.status === 401) {
+        window.showMessage && window.showMessage('Please sign in before managing practice data.', 'warning');
+        window.location.href = '/auth/business/start?return_to=' + encodeURIComponent(getFallbackDataManageReturnTo());
+        return false;
+      }
+      if (error && error.status === 403 && error.payload && error.payload.authActionStart) {
+        window.showMessage && window.showMessage('Confirm your password before importing or clearing practice data.', 'info');
+        redirectFallbackDataManageStepUp(error.payload.authActionStart);
+        return false;
+      }
+      console.error('[importData] data management step-up check failed', summarizeBootFallbackErrorForLog(error));
+      window.showMessage && window.showMessage('Unable to confirm data management access. Please sign in again.', 'error');
+      return false;
+    }
+  }
+
   function isFallbackUnsafeAttributeName(name) {
     var key = String(name || '').toLowerCase();
     return key.indexOf('on') === 0 || key === 'srcdoc';
@@ -770,7 +847,10 @@
     document.body.appendChild(overlay);
   }
 
-  function processImportPayload(file, mode) {
+  async function processImportPayload(file, mode) {
+    if (!(await ensureFallbackDataManageStepUp())) {
+      return;
+    }
     const inputFile = file;
     if (!inputFile) {
       window.showMessage && window.showMessage('请选择要导入的文件', 'warning');
@@ -832,15 +912,23 @@
 
   if (typeof window.importData !== 'function') {
     window.importData = function () {
-      showImportModeModal((mode) => {
-        const input = document.createElement('input');
-        input.type = 'file';
-        input.accept = '.json,application/json';
-        input.onchange = (event) => {
-          const file = event.target.files && event.target.files[0];
-          processImportPayload(file, mode);
-        };
-        input.click();
+      ensureFallbackDataManageStepUp().then((allowed) => {
+        if (!allowed) {
+          return;
+        }
+        showImportModeModal((mode) => {
+          const input = document.createElement('input');
+          input.type = 'file';
+          input.accept = '.json,application/json';
+          input.onchange = (event) => {
+            const file = event.target.files && event.target.files[0];
+            processImportPayload(file, mode);
+          };
+          input.click();
+        });
+      }).catch((error) => {
+        console.error('[importData] data management step-up check failed', summarizeBootFallbackErrorForLog(error));
+        window.showMessage && window.showMessage('Unable to confirm data management access. Please sign in again.', 'error');
       });
     };
   }

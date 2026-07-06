@@ -248,6 +248,22 @@ function getFileFromInput(fileInput) {
     return fileInput.files[0] || null;
 }
 
+function getDataManageReturnTo() {
+    const path = window.location && window.location.pathname ? window.location.pathname : '/';
+    const search = window.location && window.location.search ? window.location.search : '';
+    return `${path}${search}` || '/';
+}
+
+function getDataManageRemoteApiClient() {
+    if (window.remoteApiClient && typeof window.remoteApiClient.request === 'function') {
+        return window.remoteApiClient;
+    }
+    if (window.ExamData && window.ExamData.remoteApiClient && typeof window.ExamData.remoteApiClient.request === 'function') {
+        return window.ExamData.remoteApiClient;
+    }
+    return null;
+}
+
 class DataManagementPanel {
     constructor(container) {
         this.container = container;
@@ -270,6 +286,65 @@ class DataManagementPanel {
         await this.loadHistory();
 
         dataManagementDebugLog('DataManagementPanel initialized');
+    }
+
+    redirectToDataManageStepUp(startPath = '/auth/business/data/start') {
+        const safeStartPath = typeof startPath === 'string' && startPath.startsWith('/auth/business/data/start')
+            ? startPath
+            : '/auth/business/data/start';
+        window.location.href = `${safeStartPath}?return_to=${encodeURIComponent(getDataManageReturnTo())}`;
+    }
+
+    async requestDataManageStatus() {
+        const apiClient = getDataManageRemoteApiClient();
+        if (apiClient) {
+            return apiClient.request('/api/practice-records/data-manage/status', { method: 'GET', csrf: false });
+        }
+        if (typeof window.fetch !== 'function') {
+            throw new Error('Remote API client is unavailable');
+        }
+        const response = await window.fetch('/api/practice-records/data-manage/status', {
+            method: 'GET',
+            credentials: 'same-origin',
+            headers: { Accept: 'application/json' }
+        });
+        let payload = null;
+        try {
+            payload = await response.json();
+        } catch (_) { }
+        if (!response.ok) {
+            const error = new Error((payload && payload.error) || 'Data management step-up check failed');
+            error.status = response.status;
+            error.payload = payload;
+            throw error;
+        }
+        return payload || {};
+    }
+
+    async ensureDataManageStepUp() {
+        try {
+            const payload = await this.requestDataManageStatus();
+            if (payload && payload.fresh === true) {
+                return true;
+            }
+            this.showMessage('Confirm your password before importing or clearing practice data.', 'info');
+            this.redirectToDataManageStepUp(payload && payload.authActionStart);
+            return false;
+        } catch (error) {
+            if (error && error.status === 401) {
+                this.showMessage('Please sign in before managing practice data.', 'warning');
+                window.location.href = `/auth/business/start?return_to=${encodeURIComponent(getDataManageReturnTo())}`;
+                return false;
+            }
+            if (error && error.status === 403 && error.payload && error.payload.authActionStart) {
+                this.showMessage('Confirm your password before importing or clearing practice data.', 'info');
+                this.redirectToDataManageStepUp(error.payload.authActionStart);
+                return false;
+            }
+            console.error('[DataManagementPanel] data management step-up check failed:', summarizeDataManagementErrorForLog(error));
+            this.showMessage('Unable to confirm data management access. Please sign in again.', 'error');
+            return false;
+        }
     }
 
     /**
@@ -585,7 +660,10 @@ class DataManagementPanel {
                     this.handleExport();
                     break;
                 case 'selectFile':
-                    panel.querySelector('#importFile').click();
+                    this.openImportFilePicker(panel).catch((error) => {
+                        console.error('[DataManagementPanel] open import file picker failed:', summarizeDataManagementErrorForLog(error));
+                        this.showMessage('Unable to confirm data management access. Please sign in again.', 'error');
+                    });
                     break;
                 case 'import':
                     this.showImportModeModal();
@@ -624,9 +702,29 @@ class DataManagementPanel {
         if (settingsImportBtn) {
             settingsImportBtn.addEventListener('click', (event) => {
                 event.preventDefault();
-                this.show();
-                this.showImportModeModal();
+                this.openImportFromSettings().catch((error) => {
+                    console.error('[DataManagementPanel] open import from settings failed:', summarizeDataManagementErrorForLog(error));
+                    this.showMessage('Unable to confirm data management access. Please sign in again.', 'error');
+                });
             });
+        }
+    }
+
+    async openImportFromSettings() {
+        if (!(await this.ensureDataManageStepUp())) {
+            return;
+        }
+        this.show();
+        this.showImportModeModal();
+    }
+
+    async openImportFilePicker(panel) {
+        if (!(await this.ensureDataManageStepUp())) {
+            return;
+        }
+        const importFileInput = panel.querySelector('#importFile');
+        if (importFileInput) {
+            importFileInput.click();
         }
     }
 
@@ -898,6 +996,11 @@ class DataManagementPanel {
                 return;
             }
 
+            if (!(await this.ensureDataManageStepUp())) {
+                this.hideProgress();
+                return;
+            }
+
             const createBackupInput = document.getElementById('createBackupBeforeImport');
             const createBackup = Boolean(createBackupInput && createBackupInput.checked);
 
@@ -976,6 +1079,10 @@ class DataManagementPanel {
                 clearSettings && '• 系统设置'
             ].filter(Boolean).join('\n')
         }\n\n此操作不可撤销！`;
+
+        if (!(await this.ensureDataManageStepUp())) {
+            return;
+        }
 
         if (!confirm(confirmMessage)) {
             return;

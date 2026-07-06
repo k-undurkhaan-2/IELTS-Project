@@ -3687,6 +3687,8 @@ test('admin shell and business account menu do not link back through the busines
     const authProxyConfig = fs.readFileSync(path.join(repoRoot, 'backend', 'auth-proxy', 'nginx.conf'), 'utf8');
     const authOverlay = fs.readFileSync(path.join(repoRoot, 'js', 'data', 'authOverlay.js'), 'utf8');
     const remoteApiClient = fs.readFileSync(path.join(repoRoot, 'js', 'data', 'remoteApiClient.js'), 'utf8');
+    const bootFallbacks = fs.readFileSync(path.join(repoRoot, 'js', 'boot-fallbacks.js'), 'utf8');
+    const dataManagementPanel = fs.readFileSync(path.join(repoRoot, 'js', 'components', 'dataManagementPanel.js'), 'utf8');
     const mainIndex = fs.readFileSync(path.join(repoRoot, 'index.html'), 'utf8');
 
     assert(adminScript.includes("window.location.href = '/auth/admin/start?return_to=/admin'"));
@@ -4061,9 +4063,18 @@ test('admin shell and business account menu do not link back through the busines
     assert(mainIndex.includes('id="settings-session-manager"'));
     assert(mainIndex.includes('id="settings-sessions-revoke-others-btn"'));
     assert(mainIndex.includes('Sign out all other sessions'));
-    assert(authOverlay.includes("action === 'session' ? 'session' : 'password'"));
+    assert(authOverlay.includes("action === 'session' ? 'session' : (action === 'data' ? 'data' : 'password')"));
     assert(authOverlay.includes('/auth/business/${normalizedAction}/start?return_to='));
     assert(authOverlay.includes('requiresSessionManageStepUp'));
+    assert(authOverlay.includes('requiresDataManageStepUp'));
+    assert(bootFallbacks.includes('/api/practice-records/data-manage/status'));
+    assert(bootFallbacks.includes('/auth/business/data/start'));
+    assert(bootFallbacks.includes('ensureFallbackDataManageStepUp().then((allowed) =>'));
+    assert(bootFallbacks.indexOf('ensureFallbackDataManageStepUp().then((allowed) =>') < bootFallbacks.indexOf('showImportModeModal((mode) =>'));
+    assert(dataManagementPanel.includes('/api/practice-records/data-manage/status'));
+    assert(dataManagementPanel.includes('/auth/business/data/start'));
+    assert(dataManagementPanel.includes('async ensureDataManageStepUp()'));
+    assert(dataManagementPanel.includes('async openImportFromSettings()'));
     assert(authOverlay.includes('/auth/business/logout?return_to='));
     assert(authOverlay.includes("apiClient.request('/api/account/sessions'"));
     assert(authOverlay.includes("apiClient.request('/api/account/sessions/revoke-others'"));

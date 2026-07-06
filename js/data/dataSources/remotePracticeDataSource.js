@@ -96,6 +96,16 @@
         return error && error.status === 401;
     }
 
+    function redirectToDataManageStepUp(error) {
+        const startPath = error?.payload?.authActionStart;
+        if (!error || error.status !== 403 || !error.payload?.requiresDataManageStepUp || typeof startPath !== 'string' || !startPath.startsWith('/auth/business/data/start')) {
+            return false;
+        }
+        const returnTo = `${window.location.pathname || '/'}${window.location.search || ''}`;
+        window.location.href = `${startPath}?return_to=${encodeURIComponent(returnTo || '/')}`;
+        return true;
+    }
+
     function summarizeRemotePracticeErrorForLog(error) {
         if (!error || typeof error !== 'object') {
             return { name: typeof error };
@@ -226,6 +236,9 @@
                     await this.localDataSource.write(key, cloneValue(records));
                     return true;
                 } catch (error) {
+                    if (redirectToDataManageStepUp(error)) {
+                        return false;
+                    }
                     if (isUnauthorized(error)) {
                         clearApiAuthState(this.apiClient);
                     }

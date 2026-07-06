@@ -4476,6 +4476,16 @@ storageManager.ready
         return error && error.status === 401;
     }
 
+    function redirectToDataManageStepUp(error) {
+        const startPath = error?.payload?.authActionStart;
+        if (!error || error.status !== 403 || !error.payload?.requiresDataManageStepUp || typeof startPath !== 'string' || !startPath.startsWith('/auth/business/data/start')) {
+            return false;
+        }
+        const returnTo = `${window.location.pathname || '/'}${window.location.search || ''}`;
+        window.location.href = `${startPath}?return_to=${encodeURIComponent(returnTo || '/')}`;
+        return true;
+    }
+
     function summarizeRemotePracticeErrorForLog(error) {
         if (!error || typeof error !== 'object') {
             return { name: typeof error };
@@ -4606,6 +4616,9 @@ storageManager.ready
                     await this.localDataSource.write(key, cloneValue(records));
                     return true;
                 } catch (error) {
+                    if (redirectToDataManageStepUp(error)) {
+                        return false;
+                    }
                     if (isUnauthorized(error)) {
                         clearApiAuthState(this.apiClient);
                     }
@@ -5276,7 +5289,7 @@ storageManager.ready
         function startBusinessAuthAction(action) {
             const normalizedAction = action === 'totp'
                 ? 'totp'
-                : (action === 'session' ? 'session' : 'password');
+                : (action === 'session' ? 'session' : (action === 'data' ? 'data' : 'password'));
             const returnTo = getCurrentReturnTo();
             window.location.href = `/auth/business/${normalizedAction}/start?return_to=${encodeURIComponent(returnTo)}`;
         }
@@ -5287,6 +5300,14 @@ storageManager.ready
             }
             setSessionManagerStatus('Confirm your password before managing sessions.');
             startBusinessAuthAction('session');
+            return true;
+        }
+
+        function redirectToDataManageStepUp(error) {
+            if (!error || error.status !== 403 || !error.payload?.requiresDataManageStepUp) {
+                return false;
+            }
+            startBusinessAuthAction('data');
             return true;
         }
 
@@ -5695,7 +5716,15 @@ storageManager.ready
             if (!confirmImport(localRecords.length)) {
                 return;
             }
-            const records = await apiClient.importPracticeRecords(localRecords);
+            let records;
+            try {
+                records = await apiClient.importPracticeRecords(localRecords);
+            } catch (error) {
+                if (redirectToDataManageStepUp(error)) {
+                    return;
+                }
+                throw error;
+            }
             if (typeof localDataSource.write === 'function') {
                 await localDataSource.write('practice_records', records);
             }

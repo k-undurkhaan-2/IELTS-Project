@@ -628,7 +628,7 @@
         function startBusinessAuthAction(action) {
             const normalizedAction = action === 'totp'
                 ? 'totp'
-                : (action === 'session' ? 'session' : 'password');
+                : (action === 'session' ? 'session' : (action === 'data' ? 'data' : 'password'));
             const returnTo = getCurrentReturnTo();
             window.location.href = `/auth/business/${normalizedAction}/start?return_to=${encodeURIComponent(returnTo)}`;
         }
@@ -639,6 +639,14 @@
             }
             setSessionManagerStatus('Confirm your password before managing sessions.');
             startBusinessAuthAction('session');
+            return true;
+        }
+
+        function redirectToDataManageStepUp(error) {
+            if (!error || error.status !== 403 || !error.payload?.requiresDataManageStepUp) {
+                return false;
+            }
+            startBusinessAuthAction('data');
             return true;
         }
 
@@ -1047,7 +1055,15 @@
             if (!confirmImport(localRecords.length)) {
                 return;
             }
-            const records = await apiClient.importPracticeRecords(localRecords);
+            let records;
+            try {
+                records = await apiClient.importPracticeRecords(localRecords);
+            } catch (error) {
+                if (redirectToDataManageStepUp(error)) {
+                    return;
+                }
+                throw error;
+            }
             if (typeof localDataSource.write === 'function') {
                 await localDataSource.write('practice_records', records);
             }
