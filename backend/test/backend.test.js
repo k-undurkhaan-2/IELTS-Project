@@ -1679,12 +1679,26 @@ test('direct app hides legacy account APIs unless explicitly enabled', async () 
         allowLegacyDirectAccountApis: true
     });
     try {
+        const accountUsername = await optInClient.request('PATCH', '/api/auth/account/username', {
+            username: 'renamed_user',
+            password: 'StrongPass1'
+        });
+        assert.equal(accountUsername.response.status, 404);
+        assert.equal(accountUsername.json.error, 'Not found');
+
         const accountPassword = await optInClient.request('PATCH', '/api/auth/account/password', {
             currentPassword: 'StrongPass1',
             newPassword: 'StrongerPass2'
         });
         assert.equal(accountPassword.response.status, 404);
         assert.equal(accountPassword.json.error, 'Not found');
+
+        const accountDelete = await optInClient.request('DELETE', '/api/auth/account', {
+            password: 'StrongPass1',
+            confirm: 'legacy_user'
+        });
+        assert.equal(accountDelete.response.status, 404);
+        assert.equal(accountDelete.json.error, 'Not found');
 
         const totpDisable = await optInClient.request('POST', '/api/auth/totp/disable', {
             password: 'StrongPass1',
@@ -1756,8 +1770,8 @@ test('password comparisons reject input beyond bcrypt byte limit', async () => {
             username: 'bcrypt_limit_renamed',
             password: extendedPassword
         });
-        assert.equal(rename.response.status, 401);
-        assert.equal(rename.json.error, 'Current password is incorrect');
+        assert.equal(rename.response.status, 404);
+        assert.equal(rename.json.error, 'Not found');
 
         const passwordChange = await client.request('PATCH', '/api/auth/account/password', {
             currentPassword: extendedPassword,
@@ -1770,47 +1784,29 @@ test('password comparisons reject input beyond bcrypt byte limit', async () => {
             password: extendedPassword,
             confirm: 'bcrypt_limit_user'
         });
-        assert.equal(deleteAttempt.response.status, 401);
-        assert.equal(deleteAttempt.json.error, 'Current password is incorrect');
+        assert.equal(deleteAttempt.response.status, 404);
+        assert.equal(deleteAttempt.json.error, 'Not found');
     } finally {
         await client.close();
     }
 });
 
-test('users can update their own username while legacy password updates stay retired', async () => {
+test('legacy direct account mutations stay retired even when explicitly enabled', async () => {
     const client = await createLegacyDirectAccountClient();
     try {
         const created = await register(client, 'account_user', 'StrongPass1');
         assert.equal(created.response.status, 201);
 
-        await client.authStore.createUser({
-            username: 'taken_user',
-            usernameLower: 'taken_user',
-            passwordHash: await bcrypt.hash('StrongPass1', 4)
-        });
-
-        const wrongPasswordRename = await client.request('PATCH', '/api/auth/account/username', {
-            username: 'renamed_user',
-            password: 'WrongPass1'
-        });
-        assert.equal(wrongPasswordRename.response.status, 401);
-
-        const duplicateRename = await client.request('PATCH', '/api/auth/account/username', {
-            username: 'taken_user',
-            password: 'StrongPass1'
-        });
-        assert.equal(duplicateRename.response.status, 409);
-
-        const renamed = await client.request('PATCH', '/api/auth/account/username', {
+        const usernameChange = await client.request('PATCH', '/api/auth/account/username', {
             username: 'renamed_user',
             password: 'StrongPass1'
         });
-        assert.equal(renamed.response.status, 200);
-        assert.equal(renamed.json.user.username, 'renamed_user');
+        assert.equal(usernameChange.response.status, 404);
+        assert.equal(usernameChange.json.error, 'Not found');
 
         const me = await client.request('GET', '/api/auth/me');
         assert.equal(me.response.status, 200);
-        assert.equal(me.json.user.username, 'renamed_user');
+        assert.equal(me.json.user.username, 'account_user');
 
         const legacyPasswordChange = await client.request('PATCH', '/api/auth/account/password', {
             currentPassword: 'StrongPass1',
@@ -1819,28 +1815,20 @@ test('users can update their own username while legacy password updates stay ret
         assert.equal(legacyPasswordChange.response.status, 404);
         assert.equal(legacyPasswordChange.json.error, 'Not found');
 
-        const logout = await client.request('POST', '/api/auth/logout');
-        assert.equal(logout.response.status, 200);
-
-        await client.csrf();
-        const oldUsernameLogin = await client.request('POST', '/api/auth/login', {
-            username: 'account_user',
-            password: 'StrongPass1'
+        const accountDelete = await client.request('DELETE', '/api/auth/account', {
+            password: 'StrongPass1',
+            confirm: 'account_user'
         });
-        assert.equal(oldUsernameLogin.response.status, 401);
+        assert.equal(accountDelete.response.status, 404);
+        assert.equal(accountDelete.json.error, 'Not found');
 
-        const renamedLogin = await client.request('POST', '/api/auth/login', {
-            username: 'renamed_user',
-            password: 'StrongPass1'
-        });
-        assert.equal(renamedLogin.response.status, 200);
-        assert.equal(renamedLogin.json.user.username, 'renamed_user');
+        assert(await client.authStore.findByUsernameLower('account_user'));
     } finally {
         await client.close();
     }
 });
 
-test('account username changes revoke other sessions', async () => {
+test('retired legacy account mutation routes do not revoke active sessions', async () => {
     const client = await createLegacyDirectAccountClient();
     try {
         const created = await register(client, 'session_user', 'StrongPass1');
@@ -1856,17 +1844,15 @@ test('account username changes revoke other sessions', async () => {
         });
         assert.equal(otherLogin.response.status, 200);
 
-        const renamed = await client.request('PATCH', '/api/auth/account/username', {
+        const retiredRename = await client.request('PATCH', '/api/auth/account/username', {
             username: 'session_user_renamed',
             password: 'StrongPass1'
         });
-        assert.equal(renamed.response.status, 200);
-        const renamedSessionCookie = getResponseSessionCookie(renamed);
-        assert(renamedSessionCookie);
-        assert.notEqual(renamedSessionCookie, initialSessionCookie);
+        assert.equal(retiredRename.response.status, 404);
+        assert.equal(retiredRename.json.error, 'Not found');
 
         const otherAfterRename = await otherSession.request('GET', '/api/auth/me');
-        assert.equal(otherAfterRename.response.status, 401);
+        assert.equal(otherAfterRename.response.status, 200);
 
         const retiredPasswordChange = await client.request('PATCH', '/api/auth/account/password', {
             currentPassword: 'StrongPass1',
@@ -1875,15 +1861,23 @@ test('account username changes revoke other sessions', async () => {
         assert.equal(retiredPasswordChange.response.status, 404);
         assert.equal(retiredPasswordChange.json.error, 'Not found');
 
+        const retiredDelete = await client.request('DELETE', '/api/auth/account', {
+            password: 'StrongPass1',
+            confirm: 'session_user'
+        });
+        assert.equal(retiredDelete.response.status, 404);
+        assert.equal(retiredDelete.json.error, 'Not found');
+
         const currentSession = await client.request('GET', '/api/auth/me');
         assert.equal(currentSession.response.status, 200);
-        assert.equal(currentSession.json.user.username, 'session_user_renamed');
+        assert.equal(currentSession.json.user.username, 'session_user');
+        assert.equal(getResponseSessionCookie(retiredRename), '');
     } finally {
         await client.close();
     }
 });
 
-test('sensitive account username and delete checks are rate limited while retired password route is hidden', async () => {
+test('retired legacy account routes are hidden before sensitive checks run', async () => {
     const client = await createLegacyDirectAccountClient({
         rateLimit: { maxAttempts: 1, windowMs: 60_000 }
     });
@@ -1895,13 +1889,13 @@ test('sensitive account username and delete checks are rate limited while retire
             username: 'account_limited_new',
             password: 'WrongPass1'
         });
-        assert.equal(wrongRename.response.status, 401);
+        assert.equal(wrongRename.response.status, 404);
 
         const limitedRename = await client.request('PATCH', '/api/auth/account/username', {
             username: 'account_limited_new',
             password: 'WrongPass1'
         });
-        assert.equal(limitedRename.response.status, 429);
+        assert.equal(limitedRename.response.status, 404);
 
         const wrongPassword = await client.request('PATCH', '/api/auth/account/password', {
             currentPassword: 'WrongPass1',
@@ -1919,13 +1913,13 @@ test('sensitive account username and delete checks are rate limited while retire
             password: 'WrongPass1',
             confirm: 'account_limited'
         });
-        assert.equal(wrongDelete.response.status, 401);
+        assert.equal(wrongDelete.response.status, 404);
 
         const limitedDelete = await client.request('DELETE', '/api/auth/account', {
             password: 'WrongPass1',
             confirm: 'account_limited'
         });
-        assert.equal(limitedDelete.response.status, 429);
+        assert.equal(limitedDelete.response.status, 404);
     } finally {
         await client.close();
     }
@@ -2002,7 +1996,7 @@ test('pending TOTP sessions refresh stale users before trusting them', async () 
     }
 });
 
-test('users can delete their own account and associated records', async () => {
+test('legacy self-delete route is retired and preserves account data', async () => {
     const client = await createLegacyDirectAccountClient();
     try {
         const created = await register(client, 'delete_user', 'StrongPass1');
@@ -2019,38 +2013,38 @@ test('users can delete their own account and associated records', async () => {
             password: 'StrongPass1',
             confirm: 'wrong_user'
         });
-        assert.equal(wrongConfirm.response.status, 400);
+        assert.equal(wrongConfirm.response.status, 404);
 
         const wrongPassword = await client.request('DELETE', '/api/auth/account', {
             password: 'WrongPass1',
             confirm: 'delete_user'
         });
-        assert.equal(wrongPassword.response.status, 401);
+        assert.equal(wrongPassword.response.status, 404);
 
         const deleted = await client.request('DELETE', '/api/auth/account', {
             password: 'StrongPass1',
             confirm: 'delete_user'
         });
-        assert.equal(deleted.response.status, 200);
-        assert.equal(deleted.json.deleted, true);
+        assert.equal(deleted.response.status, 404);
+        assert.equal(deleted.json.error, 'Not found');
 
         const me = await client.request('GET', '/api/auth/me');
-        assert.equal(me.response.status, 401);
-        assert.equal(await client.authStore.findByUsernameLower('delete_user'), null);
-        assert.deepEqual(await client.practiceStore.list(userId), []);
+        assert.equal(me.response.status, 200);
+        assert(await client.authStore.findByUsernameLower('delete_user'));
+        assert.equal((await client.practiceStore.list(userId)).length, 1);
 
         await client.csrf();
         const login = await client.request('POST', '/api/auth/login', {
             username: 'delete_user',
             password: 'StrongPass1'
         });
-        assert.equal(login.response.status, 401);
+        assert.equal(login.response.status, 200);
     } finally {
         await client.close();
     }
 });
 
-test('the last admin account cannot delete itself', async () => {
+test('legacy admin self-delete route is retired before last-admin checks', async () => {
     const client = await createLegacyDirectAccountClient();
     try {
         await client.csrf();
@@ -2067,7 +2061,8 @@ test('the last admin account cannot delete itself', async () => {
             password: 'StrongPass1',
             confirm: 'sole_admin'
         });
-        assert.equal(blocked.response.status, 409);
+        assert.equal(blocked.response.status, 404);
+        assert.equal(blocked.json.error, 'Not found');
         assert(await client.authStore.findByUsernameLower('sole_admin'));
     } finally {
         await client.close();
@@ -6425,7 +6420,7 @@ test('admin web routes reject self password changes', async () => {
     }
 });
 
-test('admin account settings updates preserve current TOTP verification', async () => {
+test('retired legacy admin account mutations preserve current TOTP verification', async () => {
     const client = await createLegacyDirectAccountClient();
     try {
         await seedAdmin(client, 'account_admin', 'StrongPass1');
@@ -6446,8 +6441,8 @@ test('admin account settings updates preserve current TOTP verification', async 
             username: 'account_admin_renamed',
             password: 'StrongPass1'
         });
-        assert.equal(rename.response.status, 200);
-        assert.equal(rename.json.user.username, 'account_admin_renamed');
+        assert.equal(rename.response.status, 404);
+        assert.equal(rename.json.error, 'Not found');
 
         const afterRename = await adminSession.request('GET', '/api/admin/summary');
         assert.equal(afterRename.response.status, 200);

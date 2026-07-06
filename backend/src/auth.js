@@ -21,11 +21,6 @@ const credentialsWithAuthStateSchema = credentialsSchema.extend({
     authState: z.string().trim().min(1).max(4096).optional()
 });
 
-const updateUsernameSchema = z.object({
-    username: z.string().trim().min(3).max(32).regex(USERNAME_PATTERN),
-    password: z.string().min(1).max(128)
-});
-
 const updatePasswordSchema = z.object({
     currentPassword: z.string().min(1).max(128),
     newPassword: z.string().min(1).max(128)
@@ -38,11 +33,6 @@ const passwordChangeSchema = updatePasswordSchema.extend({
 const authActionStepUpSchema = z.object({
     authState: z.string().trim().min(1).max(4096),
     password: z.string().min(1).max(128)
-});
-
-const deleteAccountSchema = z.object({
-    password: z.string().min(1).max(128),
-    confirm: z.string().trim().min(1).max(64)
 });
 
 function publicUser(user) {
@@ -741,9 +731,6 @@ function createAuthRouter(options = {}) {
     });
     const bcryptImpl = options.bcrypt || bcrypt;
     const totpStore = options.totpStore || null;
-    const onDeleteUser = typeof options.onDeleteUser === 'function'
-        ? options.onDeleteUser
-        : async () => {};
     const resolveAuthState = typeof options.resolveAuthState === 'function'
         ? options.resolveAuthState
         : null;
@@ -983,65 +970,10 @@ function createAuthRouter(options = {}) {
         }
     });
 
-    // Legacy direct-app account endpoints are retained for loopback/dev compatibility.
-    // Public split-onion proxies must keep /api/auth/account* blocked; production
-    // self-service account changes should use the signed auth-action flows.
-    router.patch('/account/username', requireLegacyDirectAccountApi, requireAuth, verifyCsrfToken, async (req, res, next) => {
-        try {
-            const parsed = updateUsernameSchema.safeParse(req.body || {});
-            if (!parsed.success) {
-                return sendValidationError(res, parsed, 'Invalid account update payload');
-            }
-            const clientIp = getCanonicalClientIp(req);
-            checkRateLimit(`account-username:${clientIp}:${req.session.user.id}`);
-            const currentUser = await getCurrentStoredUser(store, req.session.user);
-            if (!currentUser) {
-                return res.status(401).json({ error: 'Authentication required' });
-            }
-            if (!isPasswordWithinBcryptByteLimit(parsed.data.password)) {
-                return res.status(401).json({ error: 'Current password is incorrect' });
-            }
-            const passwordOk = await bcryptImpl.compare(parsed.data.password, currentUser.password_hash);
-            if (!passwordOk) {
-                return res.status(401).json({ error: 'Current password is incorrect' });
-            }
-            const username = normalizeUsername(parsed.data.username);
-            const usernameLower = username.toLowerCase();
-            if (usernameLower === String(currentUser.username_lower || '').toLowerCase()) {
-                req.session.user = publicUser(currentUser);
-                return res.json({ user: req.session.user, csrfToken: ensureCsrfToken(req) });
-            }
-
-            let updatedUser;
-            try {
-                updatedUser = await store.updateUsername(currentUser.id, { username, usernameLower });
-            } catch (error) {
-                if (error && error.code === '23505') {
-                    return res.status(409).json({ error: 'Username already exists' });
-                }
-                throw error;
-            }
-            if (!updatedUser) {
-                return res.status(404).json({ error: 'User not found' });
-            }
-            if (typeof store.bumpSecurityEpoch === 'function') {
-                await store.bumpSecurityEpoch(currentUser.id);
-            }
-            if (typeof store.deleteSessionsForUser === 'function') {
-                await store.deleteSessionsForUser(currentUser.id, req.sessionID);
-            }
-            await revokeOtherRequestAuthSessionsForUser(req, currentUser.id);
-            const authSessionAudience = req.session.authSession?.audience || resolveSessionAudience(req, currentUser);
-            await revokeRequestAuthSession(req);
-            const totpVerification = getSessionTotpVerificationMarker(req, currentUser);
-            await regenerateSession(req);
-            req.session.user = publicUser(updatedUser);
-            restoreSessionTotpVerification(req, totpVerification, req.session.user);
-            await establishRequestAuthSession(req, req.session.user, authSessionAudience);
-            return res.json({ user: req.session.user, csrfToken: ensureCsrfToken(req) });
-        } catch (error) {
-            return next(error);
-        }
+    // Legacy direct-app account mutation endpoints are retired. Public
+    // split-onion proxies still keep /api/auth/account* blocked.
+    router.patch('/account/username', (req, res) => {
+        return res.status(404).json({ error: 'Not found' });
     });
 
     router.patch('/account/password', (req, res) => {
@@ -1110,48 +1042,8 @@ function createAuthRouter(options = {}) {
         }
     });
 
-    router.delete('/account', requireLegacyDirectAccountApi, requireAuth, verifyCsrfToken, async (req, res, next) => {
-        try {
-            const parsed = deleteAccountSchema.safeParse(req.body || {});
-            if (!parsed.success) {
-                return sendValidationError(res, parsed, 'Invalid account deletion payload');
-            }
-            const clientIp = getCanonicalClientIp(req);
-            checkRateLimit(`account-delete:${clientIp}:${req.session.user.id}`);
-            const currentUser = await getCurrentStoredUser(store, req.session.user);
-            if (!currentUser) {
-                return res.status(401).json({ error: 'Authentication required' });
-            }
-            if (!isPasswordWithinBcryptByteLimit(parsed.data.password)) {
-                return res.status(401).json({ error: 'Current password is incorrect' });
-            }
-            const passwordOk = await bcryptImpl.compare(parsed.data.password, currentUser.password_hash);
-            if (!passwordOk) {
-                return res.status(401).json({ error: 'Current password is incorrect' });
-            }
-            if (String(parsed.data.confirm || '').trim() !== currentUser.username) {
-                return res.status(400).json({ error: 'Type your current username to confirm account deletion' });
-            }
-            if (publicUser(currentUser).role === 'admin'
-                && typeof store.countAdmins === 'function'
-                && await store.countAdmins() <= 1) {
-                return res.status(409).json({ error: 'The last admin account cannot be deleted' });
-            }
-            if (typeof store.deleteSessionsForUser === 'function') {
-                await store.deleteSessionsForUser(currentUser.id);
-            }
-            const deletedUser = await store.deleteUser(currentUser.id);
-            if (!deletedUser) {
-                return res.status(404).json({ error: 'User not found' });
-            }
-            await onDeleteUser(currentUser.id, deletedUser);
-            await revokeRequestAuthSession(req);
-            await destroySession(req);
-            clearSessionCookies(res);
-            return res.json({ ok: true, deleted: true });
-        } catch (error) {
-            return next(error);
-        }
+    router.delete('/account', (req, res) => {
+        return res.status(404).json({ error: 'Not found' });
     });
 
     return router;
