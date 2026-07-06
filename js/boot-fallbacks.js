@@ -170,7 +170,7 @@
       if (payload && payload.fresh === true) {
         return true;
       }
-      window.showMessage && window.showMessage('Confirm your password before importing or clearing practice data.', 'info');
+      window.showMessage && window.showMessage('Confirm your password before importing, restoring, or clearing practice data.', 'info');
       redirectFallbackDataManageStepUp(payload && payload.authActionStart);
       return false;
     } catch (error) {
@@ -180,7 +180,7 @@
         return false;
       }
       if (error && error.status === 403 && error.payload && error.payload.authActionStart) {
-        window.showMessage && window.showMessage('Confirm your password before importing or clearing practice data.', 'info');
+        window.showMessage && window.showMessage('Confirm your password before importing, restoring, or clearing practice data.', 'info');
         redirectFallbackDataManageStepUp(error.payload.authActionStart);
         return false;
       }
@@ -526,6 +526,10 @@
   async function _fallbackRestoreBackupById(backupId) {
     if (!backupId) {
       window.showMessage && window.showMessage('无效的备份ID', 'error');
+      return;
+    }
+
+    if (!(await ensureFallbackDataManageStepUp())) {
       return;
     }
 
