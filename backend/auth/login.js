@@ -115,11 +115,31 @@
         setStatus(message || `Open this login flow from the ${getAudienceEntryStartLabel()} so the request includes a valid destination.`, 'error');
     }
 
+    function blockGenericEntry() {
+        state.mode = 'entry-blocked';
+        setVisible(nodes.tabs, false);
+        setVisible(nodes.passwordForm, false);
+        setVisible(nodes.totpForm, false);
+        setVisible(nodes.setupPanel, false);
+        setVisible(nodes.recoveryPanel, false);
+        setVisible(nodes.sessionConflictPanel, false);
+        nodes.title.textContent = 'Start from IELTS Atlas';
+        setStatus('Open the business or admin site first so the auth request includes a valid destination.', 'error');
+    }
+
     function ensureAudienceEntryHasState() {
         if (!expectedAudience || handoffState) {
             return true;
         }
         blockAudienceEntry();
+        return false;
+    }
+
+    function ensureAuthEntryHasState() {
+        if (handoffState || expectedAudience) {
+            return true;
+        }
+        blockGenericEntry();
         return false;
     }
 
@@ -488,6 +508,9 @@
             completeHandoff().catch((error) => setStatus(error.message || 'Unable to complete auth handoff.', 'error'));
         });
         if (redirectGenericHandoffLogin()) {
+            return;
+        }
+        if (!ensureAuthEntryHasState()) {
             return;
         }
         if (!validateHandoffAudience()) {

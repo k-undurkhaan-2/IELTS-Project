@@ -4577,6 +4577,23 @@ test('auth audience login pages require a handoff state before showing credentia
     }
 });
 
+test('auth generic login page requires a handoff state before showing credential forms', async () => {
+    const harness = createAuthLoginScriptHarness({
+        pathname: '/auth/login'
+    });
+    await harness.flush();
+
+    assert.deepEqual(harness.calls, []);
+    assert.equal(harness.elements.get('password-form').hidden, true);
+    assert.equal(harness.elements.get('auth-tabs').hidden, true);
+    assert.equal(harness.elements.get('totp-form').hidden, true);
+    assert.equal(harness.elements.get('totp-setup').hidden, true);
+    assert.match(harness.elements.get('auth-title').textContent, /Start from IELTS Atlas/i);
+    assert.match(harness.elements.get('auth-status').textContent, /business or admin site/i);
+    assert.deepEqual(harness.assigned, []);
+    assert.deepEqual(harness.replaced, []);
+});
+
 test('auth audience login pages hide credentials for mismatched handoff state', async () => {
     const cases = [
         {
