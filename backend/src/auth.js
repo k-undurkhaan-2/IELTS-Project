@@ -1044,60 +1044,8 @@ function createAuthRouter(options = {}) {
         }
     });
 
-    router.patch('/account/password', requireLegacyDirectAccountApi, requireAuth, verifyCsrfToken, async (req, res, next) => {
-        try {
-            const parsed = updatePasswordSchema.safeParse(req.body || {});
-            if (!parsed.success) {
-                return sendValidationError(res, parsed, 'Invalid password update payload');
-            }
-            const clientIp = getCanonicalClientIp(req);
-            checkRateLimit(`account-password:${clientIp}:${req.session.user.id}`);
-            const currentUser = await getCurrentStoredUser(store, req.session.user);
-            if (!currentUser) {
-                return res.status(401).json({ error: 'Authentication required' });
-            }
-            if (publicUser(currentUser).role === 'admin') {
-                return res.status(403).json({
-                    error: 'Admin password changes must be performed through the server maintenance channel'
-                });
-            }
-            if (!isPasswordWithinBcryptByteLimit(parsed.data.currentPassword)) {
-                return res.status(401).json({ error: 'Current password is incorrect' });
-            }
-            const passwordOk = await bcryptImpl.compare(parsed.data.currentPassword, currentUser.password_hash);
-            if (!passwordOk) {
-                return res.status(401).json({ error: 'Current password is incorrect' });
-            }
-            const passwordCheck = validatePasswordStrength(parsed.data.newPassword);
-            if (!passwordCheck.valid) {
-                return res.status(400).json({ error: 'Password strength is insufficient', details: passwordCheck.errors });
-            }
-            if (parsed.data.currentPassword === parsed.data.newPassword) {
-                return res.status(400).json({ error: 'New password must be different from the current password' });
-            }
-            const passwordHash = await bcryptImpl.hash(parsed.data.newPassword, 12);
-            const updatedUser = await store.updatePassword(currentUser.id, passwordHash);
-            if (!updatedUser) {
-                return res.status(404).json({ error: 'User not found' });
-            }
-            if (typeof store.bumpSecurityEpoch === 'function') {
-                await store.bumpSecurityEpoch(currentUser.id);
-            }
-            if (typeof store.deleteSessionsForUser === 'function') {
-                await store.deleteSessionsForUser(currentUser.id, req.sessionID);
-            }
-            await revokeOtherRequestAuthSessionsForUser(req, currentUser.id);
-            const authSessionAudience = req.session.authSession?.audience || resolveSessionAudience(req, currentUser);
-            await revokeRequestAuthSession(req);
-            const totpVerification = getSessionTotpVerificationMarker(req, currentUser);
-            await regenerateSession(req);
-            req.session.user = publicUser(updatedUser);
-            restoreSessionTotpVerification(req, totpVerification, req.session.user);
-            await establishRequestAuthSession(req, req.session.user, authSessionAudience);
-            return res.json({ ok: true, user: req.session.user, csrfToken: ensureCsrfToken(req) });
-        } catch (error) {
-            return next(error);
-        }
+    router.patch('/account/password', (req, res) => {
+        return res.status(404).json({ error: 'Not found' });
     });
 
     router.patch('/password-change', requireAuth, verifyCsrfToken, async (req, res, next) => {

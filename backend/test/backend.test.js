@@ -1683,8 +1683,8 @@ test('direct app hides legacy account APIs unless explicitly enabled', async () 
             currentPassword: 'StrongPass1',
             newPassword: 'StrongerPass2'
         });
-        assert.equal(accountPassword.response.status, 401);
-        assert.equal(accountPassword.json.error, 'Authentication required');
+        assert.equal(accountPassword.response.status, 404);
+        assert.equal(accountPassword.json.error, 'Not found');
 
         const totpDisable = await optInClient.request('POST', '/api/auth/totp/disable', {
             password: 'StrongPass1',
@@ -1763,8 +1763,8 @@ test('password comparisons reject input beyond bcrypt byte limit', async () => {
             currentPassword: extendedPassword,
             newPassword: 'StrongerPass2'
         });
-        assert.equal(passwordChange.response.status, 401);
-        assert.equal(passwordChange.json.error, 'Current password is incorrect');
+        assert.equal(passwordChange.response.status, 404);
+        assert.equal(passwordChange.json.error, 'Not found');
 
         const deleteAttempt = await client.request('DELETE', '/api/auth/account', {
             password: extendedPassword,
@@ -1777,7 +1777,7 @@ test('password comparisons reject input beyond bcrypt byte limit', async () => {
     }
 });
 
-test('users can update their own username and password', async () => {
+test('users can update their own username while legacy password updates stay retired', async () => {
     const client = await createLegacyDirectAccountClient();
     try {
         const created = await register(client, 'account_user', 'StrongPass1');
@@ -1812,40 +1812,12 @@ test('users can update their own username and password', async () => {
         assert.equal(me.response.status, 200);
         assert.equal(me.json.user.username, 'renamed_user');
 
-        const weakPassword = await client.request('PATCH', '/api/auth/account/password', {
-            currentPassword: 'StrongPass1',
-            newPassword: 'weak'
-        });
-        assert.equal(weakPassword.response.status, 400);
-
-        const longPassword = `Aa1${'x'.repeat(70)}`;
-        assert(Buffer.byteLength(longPassword, 'utf8') > 72);
-        const tooLongPassword = await client.request('PATCH', '/api/auth/account/password', {
-            currentPassword: 'StrongPass1',
-            newPassword: longPassword
-        });
-        assert.equal(tooLongPassword.response.status, 400);
-        assert.equal(tooLongPassword.json.error, 'Password strength is insufficient');
-        assert(tooLongPassword.json.details.includes('Password must not exceed 72 UTF-8 bytes'));
-
-        const wrongCurrentPassword = await client.request('PATCH', '/api/auth/account/password', {
-            currentPassword: 'WrongPass1',
-            newPassword: 'StrongerPass2'
-        });
-        assert.equal(wrongCurrentPassword.response.status, 401);
-
-        const samePassword = await client.request('PATCH', '/api/auth/account/password', {
-            currentPassword: 'StrongPass1',
-            newPassword: 'StrongPass1'
-        });
-        assert.equal(samePassword.response.status, 400);
-
-        const passwordChanged = await client.request('PATCH', '/api/auth/account/password', {
+        const legacyPasswordChange = await client.request('PATCH', '/api/auth/account/password', {
             currentPassword: 'StrongPass1',
             newPassword: 'StrongerPass2'
         });
-        assert.equal(passwordChanged.response.status, 200);
-        assert.equal(passwordChanged.json.user.username, 'renamed_user');
+        assert.equal(legacyPasswordChange.response.status, 404);
+        assert.equal(legacyPasswordChange.json.error, 'Not found');
 
         const logout = await client.request('POST', '/api/auth/logout');
         assert.equal(logout.response.status, 200);
@@ -1853,28 +1825,22 @@ test('users can update their own username and password', async () => {
         await client.csrf();
         const oldUsernameLogin = await client.request('POST', '/api/auth/login', {
             username: 'account_user',
-            password: 'StrongerPass2'
+            password: 'StrongPass1'
         });
         assert.equal(oldUsernameLogin.response.status, 401);
 
-        const oldPasswordLogin = await client.request('POST', '/api/auth/login', {
+        const renamedLogin = await client.request('POST', '/api/auth/login', {
             username: 'renamed_user',
             password: 'StrongPass1'
         });
-        assert.equal(oldPasswordLogin.response.status, 401);
-
-        const newPasswordLogin = await client.request('POST', '/api/auth/login', {
-            username: 'renamed_user',
-            password: 'StrongerPass2'
-        });
-        assert.equal(newPasswordLogin.response.status, 200);
-        assert.equal(newPasswordLogin.json.user.username, 'renamed_user');
+        assert.equal(renamedLogin.response.status, 200);
+        assert.equal(renamedLogin.json.user.username, 'renamed_user');
     } finally {
         await client.close();
     }
 });
 
-test('account username and password changes revoke other sessions', async () => {
+test('account username changes revoke other sessions', async () => {
     const client = await createLegacyDirectAccountClient();
     try {
         const created = await register(client, 'session_user', 'StrongPass1');
@@ -1902,25 +1868,12 @@ test('account username and password changes revoke other sessions', async () => 
         const otherAfterRename = await otherSession.request('GET', '/api/auth/me');
         assert.equal(otherAfterRename.response.status, 401);
 
-        const anotherSession = client.createSession();
-        await anotherSession.csrf();
-        const anotherLogin = await anotherSession.request('POST', '/api/auth/login', {
-            username: 'session_user_renamed',
-            password: 'StrongPass1'
-        });
-        assert.equal(anotherLogin.response.status, 200);
-
-        const passwordChanged = await client.request('PATCH', '/api/auth/account/password', {
+        const retiredPasswordChange = await client.request('PATCH', '/api/auth/account/password', {
             currentPassword: 'StrongPass1',
             newPassword: 'StrongerPass2'
         });
-        assert.equal(passwordChanged.response.status, 200);
-        const passwordChangedSessionCookie = getResponseSessionCookie(passwordChanged);
-        assert(passwordChangedSessionCookie);
-        assert.notEqual(passwordChangedSessionCookie, renamedSessionCookie);
-
-        const anotherAfterPasswordChange = await anotherSession.request('GET', '/api/auth/me');
-        assert.equal(anotherAfterPasswordChange.response.status, 401);
+        assert.equal(retiredPasswordChange.response.status, 404);
+        assert.equal(retiredPasswordChange.json.error, 'Not found');
 
         const currentSession = await client.request('GET', '/api/auth/me');
         assert.equal(currentSession.response.status, 200);
@@ -1930,7 +1883,7 @@ test('account username and password changes revoke other sessions', async () => 
     }
 });
 
-test('sensitive account password checks are rate limited', async () => {
+test('sensitive account username and delete checks are rate limited while retired password route is hidden', async () => {
     const client = await createLegacyDirectAccountClient({
         rateLimit: { maxAttempts: 1, windowMs: 60_000 }
     });
@@ -1954,13 +1907,13 @@ test('sensitive account password checks are rate limited', async () => {
             currentPassword: 'WrongPass1',
             newPassword: 'StrongerPass2'
         });
-        assert.equal(wrongPassword.response.status, 401);
+        assert.equal(wrongPassword.response.status, 404);
 
         const limitedPassword = await client.request('PATCH', '/api/auth/account/password', {
             currentPassword: 'WrongPass1',
             newPassword: 'StrongerPass2'
         });
-        assert.equal(limitedPassword.response.status, 429);
+        assert.equal(limitedPassword.response.status, 404);
 
         const wrongDelete = await client.request('DELETE', '/api/auth/account', {
             password: 'WrongPass1',
@@ -3986,12 +3939,39 @@ test('business settings password and TOTP actions require scoped auth state', as
         assert.equal(totpStepUp.json.ok, true);
         assert.equal(totpStepUp.json.intent, 'totp-manage');
 
+        const weakPasswordChange = await authSession.request('PATCH', '/api/auth/password-change', {
+            authState: passwordState,
+            currentPassword: 'StrongPass1',
+            newPassword: 'weak'
+        }, { headers: authHeaders });
+        assert.equal(weakPasswordChange.response.status, 400);
+        assert.equal(weakPasswordChange.json.error, 'Password strength is insufficient');
+
+        const longPassword = `Aa1${'x'.repeat(70)}`;
+        assert(Buffer.byteLength(longPassword, 'utf8') > 72);
+        const tooLongPasswordChange = await authSession.request('PATCH', '/api/auth/password-change', {
+            authState: passwordState,
+            currentPassword: 'StrongPass1',
+            newPassword: longPassword
+        }, { headers: authHeaders });
+        assert.equal(tooLongPasswordChange.response.status, 400);
+        assert.equal(tooLongPasswordChange.json.error, 'Password strength is insufficient');
+        assert(tooLongPasswordChange.json.details.includes('Password must not exceed 72 UTF-8 bytes'));
+
         const wrongCurrentPassword = await authSession.request('PATCH', '/api/auth/password-change', {
             authState: passwordState,
             currentPassword: 'WrongPass1',
             newPassword: 'StrongerPass2'
         }, { headers: authHeaders });
         assert.equal(wrongCurrentPassword.response.status, 401);
+
+        const samePasswordChange = await authSession.request('PATCH', '/api/auth/password-change', {
+            authState: passwordState,
+            currentPassword: 'StrongPass1',
+            newPassword: 'StrongPass1'
+        }, { headers: authHeaders });
+        assert.equal(samePasswordChange.response.status, 400);
+        assert.equal(samePasswordChange.json.error, 'New password must be different from the current password');
 
         const changed = await authSession.request('PATCH', '/api/auth/password-change', {
             authState: passwordState,
@@ -6426,11 +6406,8 @@ test('admin web routes reject self password changes', async () => {
             currentPassword: 'StrongPass1',
             newPassword: 'StrongerPass2'
         });
-        assert.equal(selfUpdateViaAccount.response.status, 403);
-        assert.equal(
-            selfUpdateViaAccount.json.error,
-            'Admin password changes must be performed through the server maintenance channel'
-        );
+        assert.equal(selfUpdateViaAccount.response.status, 404);
+        assert.equal(selfUpdateViaAccount.json.error, 'Not found');
 
         const currentSummary = await adminSession.request('GET', '/api/admin/summary');
         assert.equal(currentSummary.response.status, 200);
@@ -6479,11 +6456,8 @@ test('admin account settings updates preserve current TOTP verification', async 
             currentPassword: 'StrongPass1',
             newPassword: 'StrongerPass2'
         });
-        assert.equal(passwordUpdate.response.status, 403);
-        assert.equal(
-            passwordUpdate.json.error,
-            'Admin password changes must be performed through the server maintenance channel'
-        );
+        assert.equal(passwordUpdate.response.status, 404);
+        assert.equal(passwordUpdate.json.error, 'Not found');
 
         const afterPasswordUpdate = await adminSession.request('GET', '/api/admin/summary');
         assert.equal(afterPasswordUpdate.response.status, 200);
