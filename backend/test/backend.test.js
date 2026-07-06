@@ -4536,6 +4536,69 @@ test('auth login binds signed handoff state to an audience-specific entry', asyn
     }
 });
 
+test('auth audience login pages require a handoff state before showing credential forms', async () => {
+    const entries = [
+        {
+            pathname: '/auth/business/login',
+            title: /Start from the business site/i,
+            status: /business site/i
+        },
+        {
+            pathname: '/auth/admin/login',
+            title: /Start from the admin onion/i,
+            status: /admin onion/i
+        }
+    ];
+
+    for (const entry of entries) {
+        const harness = createAuthLoginScriptHarness({
+            pathname: entry.pathname
+        });
+        await harness.flush();
+
+        assert.deepEqual(harness.calls, []);
+        assert.equal(harness.elements.get('password-form').hidden, true);
+        assert.equal(harness.elements.get('auth-tabs').hidden, true);
+        assert.equal(harness.elements.get('totp-form').hidden, true);
+        assert.equal(harness.elements.get('totp-setup').hidden, true);
+        assert.match(harness.elements.get('auth-title').textContent, entry.title);
+        assert.match(harness.elements.get('auth-status').textContent, entry.status);
+        assert.deepEqual(harness.assigned, []);
+        assert.deepEqual(harness.replaced, []);
+    }
+});
+
+test('auth audience login pages hide credentials for mismatched handoff state', async () => {
+    const cases = [
+        {
+            pathname: '/auth/admin/login',
+            state: createUnsignedAuthState({ audience: 'business', returnTo: '/' }),
+            title: /Start from the admin onion/i
+        },
+        {
+            pathname: '/auth/business/login',
+            state: createUnsignedAuthState({ audience: 'admin', returnTo: '/admin' }),
+            title: /Start from the business site/i
+        }
+    ];
+
+    for (const entry of cases) {
+        const harness = createAuthLoginScriptHarness({
+            pathname: entry.pathname,
+            search: `?state=${encodeURIComponent(entry.state)}`
+        });
+        await harness.flush();
+
+        assert.deepEqual(harness.calls, []);
+        assert.equal(harness.elements.get('password-form').hidden, true);
+        assert.equal(harness.elements.get('auth-tabs').hidden, true);
+        assert.match(harness.elements.get('auth-title').textContent, entry.title);
+        assert.match(harness.elements.get('auth-status').textContent, /does not match/i);
+        assert.deepEqual(harness.assigned, []);
+        assert.deepEqual(harness.replaced, []);
+    }
+});
+
 test('auth login page lets admin flow switch away from an existing learner auth session', async () => {
     const adminState = createUnsignedAuthState({ audience: 'admin', returnTo: '/admin' });
     const harness = createAuthLoginScriptHarness({

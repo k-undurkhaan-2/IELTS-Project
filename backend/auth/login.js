@@ -77,16 +77,50 @@
     }
 
     function validateHandoffAudience() {
+        if (!ensureAudienceEntryHasState()) {
+            return false;
+        }
         if (!handoffState || !expectedAudience) {
             return true;
         }
         if (!handoff || handoff.audience !== expectedAudience) {
             handoffState = '';
-            setMode('login', `This auth request does not match the ${expectedAudience} login entry. Start login again from the ${expectedAudience} site.`);
-            setStatus('Auth request mismatch. Please start login again.', 'error');
+            blockAudienceEntry(`This auth request does not match the ${expectedAudience} login entry. Start login again from the correct site.`);
             return false;
         }
         return true;
+    }
+
+    function getAudienceEntryStartLabel() {
+        if (expectedAudience === 'admin') {
+            return 'admin onion';
+        }
+        if (expectedAudience === 'business') {
+            return 'business site';
+        }
+        return 'site';
+    }
+
+    function blockAudienceEntry(message) {
+        state.mode = 'entry-blocked';
+        setVisible(nodes.tabs, false);
+        setVisible(nodes.passwordForm, false);
+        setVisible(nodes.totpForm, false);
+        setVisible(nodes.setupPanel, false);
+        setVisible(nodes.recoveryPanel, false);
+        setVisible(nodes.sessionConflictPanel, false);
+        nodes.title.textContent = expectedAudience === 'admin'
+            ? 'Start from the admin onion'
+            : 'Start from the business site';
+        setStatus(message || `Open this login flow from the ${getAudienceEntryStartLabel()} so the request includes a valid destination.`, 'error');
+    }
+
+    function ensureAudienceEntryHasState() {
+        if (!expectedAudience || handoffState) {
+            return true;
+        }
+        blockAudienceEntry();
+        return false;
     }
 
     function redirectGenericHandoffLogin() {
@@ -454,6 +488,9 @@
             completeHandoff().catch((error) => setStatus(error.message || 'Unable to complete auth handoff.', 'error'));
         });
         if (redirectGenericHandoffLogin()) {
+            return;
+        }
+        if (!validateHandoffAudience()) {
             return;
         }
         await loadCsrf();
