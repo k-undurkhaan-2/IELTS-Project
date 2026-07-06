@@ -1236,7 +1236,8 @@ test('business account session API lists safe metadata and revokes other session
         await authSession.csrf();
         const authLogin = await authSession.request('POST', '/api/auth/login', {
             username: 'session_owner',
-            password: 'StrongPass1'
+            password: 'StrongPass1',
+            authState: sessionState
         }, { headers: authHeaders });
         assert.equal(authLogin.response.status, 200);
 
@@ -2774,19 +2775,6 @@ test('ordinary users can disable TOTP through scoped auth action state', async (
         await register(client, 'totp_disable', 'StrongPass1');
         const { secret } = await enableTotpForCurrentSession(client);
         const storedUser = await client.authStore.findByUsernameLower('totp_disable');
-        const authSession = client.createSession();
-        await authSession.csrf();
-        const authLoginStart = await authSession.request('POST', '/api/auth/login', {
-            username: 'totp_disable',
-            password: 'StrongPass1'
-        }, { headers });
-        assert.equal(authLoginStart.response.status, 200);
-        assert.equal(authLoginStart.json.requiresTotp, true);
-        const authLogin = await withDateNowOffset(31_000, () => authSession.request('POST', '/api/auth/totp/login', {
-            token: generateTotpToken(secret)
-        }, { headers }));
-        assert.equal(authLogin.response.status, 200);
-
         const authState = createSignedAuthState('test-session-secret-0123456789abcdef', {
             audience: 'business',
             intent: 'totp-manage',
@@ -2797,6 +2785,19 @@ test('ordinary users can disable TOTP through scoped auth action state', async (
             issuedAt: Date.now(),
             nonce: 'totp-disable-test'
         });
+        const authSession = client.createSession();
+        await authSession.csrf();
+        const authLoginStart = await authSession.request('POST', '/api/auth/login', {
+            username: 'totp_disable',
+            password: 'StrongPass1',
+            authState
+        }, { headers });
+        assert.equal(authLoginStart.response.status, 200);
+        assert.equal(authLoginStart.json.requiresTotp, true);
+        const authLogin = await withDateNowOffset(31_000, () => authSession.request('POST', '/api/auth/totp/login', {
+            token: generateTotpToken(secret)
+        }, { headers }));
+        assert.equal(authLogin.response.status, 200);
 
         const legacyDisable = await withDateNowOffset(31_000, () => client.request('POST', '/api/auth/totp/disable', {
             password: 'StrongPass1',
@@ -2883,11 +2884,19 @@ test('admin users cannot disable TOTP through business scoped auth action state'
         assert.equal(login.response.status, 200);
         const { secret } = await enableTotpForCurrentSession(client);
         const storedAdmin = await client.authStore.findByUsernameLower(adminUser.username.toLowerCase());
+        const adminLoginState = createSignedAuthState('test-session-secret-0123456789abcdef', {
+            audience: 'admin',
+            returnTo: '/admin',
+            targetBaseUrl: 'http://admin.local',
+            issuedAt: Date.now(),
+            nonce: 'totp-disable-admin-login-test'
+        });
         const authSession = client.createSession();
         await authSession.csrf();
         const authLoginStart = await authSession.request('POST', '/api/auth/login', {
             username: 'totp_disable_admin',
-            password: 'StrongPass1'
+            password: 'StrongPass1',
+            authState: adminLoginState
         }, { headers });
         assert.equal(authLoginStart.response.status, 200);
         assert.equal(authLoginStart.json.requiresTotp, true);
@@ -2934,19 +2943,6 @@ test('managed TOTP disable revokes other active sessions for the same user', asy
         await register(client, 'totp_disable_revokes', 'StrongPass1');
         const { secret } = await enableTotpForCurrentSession(client);
         const storedUser = await client.authStore.findByUsernameLower('totp_disable_revokes');
-        const authSession = client.createSession();
-        await authSession.csrf();
-        const authLoginStart = await authSession.request('POST', '/api/auth/login', {
-            username: 'totp_disable_revokes',
-            password: 'StrongPass1'
-        }, { headers });
-        assert.equal(authLoginStart.response.status, 200);
-        assert.equal(authLoginStart.json.requiresTotp, true);
-        const authLogin = await withDateNowOffset(31_000, () => authSession.request('POST', '/api/auth/totp/login', {
-            token: generateTotpToken(secret)
-        }, { headers }));
-        assert.equal(authLogin.response.status, 200);
-
         const authState = createSignedAuthState('test-session-secret-0123456789abcdef', {
             audience: 'business',
             intent: 'totp-manage',
@@ -2957,6 +2953,19 @@ test('managed TOTP disable revokes other active sessions for the same user', asy
             issuedAt: Date.now(),
             nonce: 'totp-disable-revoke-test'
         });
+        const authSession = client.createSession();
+        await authSession.csrf();
+        const authLoginStart = await authSession.request('POST', '/api/auth/login', {
+            username: 'totp_disable_revokes',
+            password: 'StrongPass1',
+            authState
+        }, { headers });
+        assert.equal(authLoginStart.response.status, 200);
+        assert.equal(authLoginStart.json.requiresTotp, true);
+        const authLogin = await withDateNowOffset(31_000, () => authSession.request('POST', '/api/auth/totp/login', {
+            token: generateTotpToken(secret)
+        }, { headers }));
+        assert.equal(authLogin.response.status, 200);
 
         const otherSession = client.createSession();
         await otherSession.csrf();
@@ -4792,6 +4801,41 @@ test('auth API enforces account type for signed business and admin flows', async
         assert.equal(adminRegister.response.status, 403);
         assert.deepEqual(adminRegister.json, { error: 'Admin accounts cannot be registered here' });
         assert.equal(await client.authStore.findByUsernameLower('flow_admin_register'), null);
+    } finally {
+        await client.close();
+    }
+});
+
+test('auth proxy rejects no-state login and registration mutations', async () => {
+    const client = await createClient();
+    const authHeaders = {
+        host: 'auth.local',
+        'x-forwarded-host': 'auth.local',
+        'x-forwarded-proto': 'http',
+        'x-ielts-onion-audience': 'auth'
+    };
+    try {
+        const created = await register(client, 'auth_proxy_state_guard', 'StrongPass1');
+        assert.equal(created.response.status, 201);
+
+        const loginSession = client.createSession();
+        await loginSession.request('GET', '/api/auth/csrf', undefined, { headers: authHeaders });
+        const loginNoState = await loginSession.request('POST', '/api/auth/login', {
+            username: 'auth_proxy_state_guard',
+            password: 'StrongPass1'
+        }, { headers: authHeaders });
+        assert.equal(loginNoState.response.status, 403);
+        assert.deepEqual(loginNoState.json, { error: 'Valid auth handoff state is required' });
+
+        const registerSession = client.createSession();
+        await registerSession.request('GET', '/api/auth/csrf', undefined, { headers: authHeaders });
+        const registerNoState = await registerSession.request('POST', '/api/auth/register', {
+            username: 'auth_proxy_state_guard_new',
+            password: 'StrongPass1'
+        }, { headers: authHeaders });
+        assert.equal(registerNoState.response.status, 403);
+        assert.deepEqual(registerNoState.json, { error: 'Valid auth handoff state is required' });
+        assert.equal(await client.authStore.findByUsernameLower('auth_proxy_state_guard_new'), null);
     } finally {
         await client.close();
     }

@@ -292,6 +292,18 @@ function resolveAuthRequestAudience(req, resolveAuthState) {
         : null;
 }
 
+function isAuthProxyAudience(req) {
+    return normalizeSessionAudience(req.get('x-ielts-onion-audience')) === 'auth';
+}
+
+function rejectAuthProxyRequestWithoutState(req, res, audience) {
+    if (audience === '' && isAuthProxyAudience(req)) {
+        res.status(403).json({ error: 'Valid auth handoff state is required' });
+        return true;
+    }
+    return false;
+}
+
 async function resolveBusinessAccountActionUser(req, res, store, resolveAuthState, rawState, expectedIntent) {
     const context = await resolveBusinessAccountActionContext(
         req,
@@ -772,6 +784,9 @@ function createAuthRouter(options = {}) {
             if (audience === null) {
                 return res.status(400).json({ error: 'Invalid auth handoff state' });
             }
+            if (rejectAuthProxyRequestWithoutState(req, res, audience)) {
+                return;
+            }
             if (audience === 'admin') {
                 return res.status(403).json({ error: 'Admin accounts cannot be registered here' });
             }
@@ -816,6 +831,9 @@ function createAuthRouter(options = {}) {
             const audience = resolveAuthRequestAudience(req, resolveAuthState);
             if (audience === null) {
                 return res.status(400).json({ error: 'Invalid auth handoff state' });
+            }
+            if (rejectAuthProxyRequestWithoutState(req, res, audience)) {
+                return;
             }
             const username = normalizeUsername(parsed.data.username);
             const usernameLower = username.toLowerCase();
