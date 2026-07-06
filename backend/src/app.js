@@ -1516,10 +1516,10 @@ function createApp(options = {}) {
         }
     });
     app.get('/admin/login.js', (req, res) => {
-        res.sendFile(path.join(adminRoot, 'login.js'));
+        res.status(404).type('text/plain').send('Not found');
     });
     app.get('/admin/login.css', (req, res) => {
-        res.sendFile(path.join(adminRoot, 'login.css'));
+        res.status(404).type('text/plain').send('Not found');
     });
 
     async function sendProtectedAdminPage(req, res, next, fileName) {

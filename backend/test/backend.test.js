@@ -3367,10 +3367,12 @@ test('admin dashboard redirects anonymous users through auth handoff', async () 
         const authAccountStyles = await client.request('GET', '/auth/account.css', undefined, { redirect: 'manual' });
         assert.equal(authAccountStyles.response.status, 404);
 
-        const loginPage = await client.request('GET', '/admin/login.js');
-        assert.equal(loginPage.response.status, 200);
-        assert.doesNotMatch(loginPage.text, /js\/bundles\//);
-        assert.doesNotMatch(loginPage.text, /account-view/);
+        const legacyLoginScript = await client.request('GET', '/admin/login.js', undefined, { redirect: 'manual' });
+        assert.equal(legacyLoginScript.response.status, 404);
+        assert.equal(legacyLoginScript.text, 'Not found');
+        const legacyLoginStyles = await client.request('GET', '/admin/login.css', undefined, { redirect: 'manual' });
+        assert.equal(legacyLoginStyles.response.status, 404);
+        assert.equal(legacyLoginStyles.text, 'Not found');
 
         const api = await client.request('GET', '/api/admin/summary');
         assert.equal(api.response.status, 401);
