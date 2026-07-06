@@ -16,11 +16,10 @@ admin, and auth onion deployment.
 - Production split-onion deployment must not start the base `tor` service from
   `backend/docker-compose.yml`. That service is legacy/dev only and must require
   the explicit `--profile legacy-onion` profile.
-- All deployments must keep `ALLOW_LEGACY_DIRECT_ACCOUNT_APIS=false` unless a
-  short-lived local maintenance task explicitly opts in. Legacy direct-app
-  account and TOTP disable APIs are loopback/dev compatibility surfaces, not
-  public account-management paths, and they are disabled by default in every
-  environment.
+- Legacy direct-app account and TOTP-disable mutation APIs are retired. Do not
+  reintroduce opt-in environment switches for `/api/auth/account/*` or
+  `/api/auth/totp/disable`; self-service account security changes must use the
+  scoped auth action flows.
 
 ## Proxy And Tor Recreate Rule
 
