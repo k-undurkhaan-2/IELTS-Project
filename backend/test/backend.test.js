@@ -1704,8 +1704,8 @@ test('direct app hides legacy account APIs unless explicitly enabled', async () 
             password: 'StrongPass1',
             token: '000000'
         });
-        assert.equal(totpDisable.response.status, 401);
-        assert.equal(totpDisable.json.error, 'Authentication required');
+        assert.equal(totpDisable.response.status, 404);
+        assert.equal(totpDisable.json.error, 'Not found');
     } finally {
         await optInClient.close();
     }
@@ -2805,33 +2805,93 @@ test('Postgres TOTP time-step consumption rejects stale updates', async () => {
     assert.equal(await freshStore.consumeTotpStep('user-id', 12346), true);
 });
 
-test('ordinary users can disable TOTP with password and current code', async () => {
-    const client = await createLegacyDirectAccountClient();
+test('ordinary users can disable TOTP through scoped auth action state', async () => {
+    const client = await createClient();
     try {
-        const passwordAtLimit = `Aa1${'x'.repeat(69)}`;
-        const extendedPassword = `${passwordAtLimit}Z`;
-        assert.equal(Buffer.byteLength(passwordAtLimit, 'utf8'), 72);
-        assert(Buffer.byteLength(extendedPassword, 'utf8') > 72);
-        await register(client, 'totp_disable', passwordAtLimit);
+        const headers = {
+            host: 'auth.local',
+            'x-forwarded-host': 'auth.local',
+            'x-forwarded-proto': 'http',
+            'x-ielts-onion-audience': 'auth'
+        };
+        await register(client, 'totp_disable', 'StrongPass1');
         const { secret } = await enableTotpForCurrentSession(client);
+        const storedUser = await client.authStore.findByUsernameLower('totp_disable');
+        const authSession = client.createSession();
+        await authSession.csrf();
+        const authLoginStart = await authSession.request('POST', '/api/auth/login', {
+            username: 'totp_disable',
+            password: 'StrongPass1'
+        }, { headers });
+        assert.equal(authLoginStart.response.status, 200);
+        assert.equal(authLoginStart.json.requiresTotp, true);
+        const authLogin = await withDateNowOffset(31_000, () => authSession.request('POST', '/api/auth/totp/login', {
+            token: generateTotpToken(secret)
+        }, { headers }));
+        assert.equal(authLogin.response.status, 200);
 
-        const wrongPassword = await withDateNowOffset(31_000, () => client.request('POST', '/api/auth/totp/disable', {
-            password: 'WrongPass1',
+        const authState = createSignedAuthState('test-session-secret-0123456789abcdef', {
+            audience: 'business',
+            intent: 'totp-manage',
+            userId: storedUser.id,
+            securityEpoch: getUserSecurityEpoch(storedUser),
+            returnTo: '/settings',
+            targetBaseUrl: 'http://business.local',
+            issuedAt: Date.now(),
+            nonce: 'totp-disable-test'
+        });
+
+        const legacyDisable = await withDateNowOffset(31_000, () => client.request('POST', '/api/auth/totp/disable', {
+            password: 'StrongPass1',
             token: generateTotpToken(secret)
         }));
+        assert.equal(legacyDisable.response.status, 404);
+        assert.equal(legacyDisable.json.error, 'Not found');
+
+        const directManagedDisable = await withDateNowOffset(31_000, () => client.request('POST', '/api/auth/totp/disable-managed', {
+            authState,
+            token: generateTotpToken(secret)
+        }));
+        assert.equal(directManagedDisable.response.status, 403);
+        assert.equal(directManagedDisable.json.error, 'Valid auth action state is required');
+
+        const missingState = await withDateNowOffset(31_000, () => authSession.request('POST', '/api/auth/totp/disable-managed', {
+            token: generateTotpToken(secret)
+        }, { headers }));
+        assert.equal(missingState.response.status, 403);
+        assert.equal(missingState.json.error, 'Valid auth action state is required');
+
+        const notSteppedUp = await withDateNowOffset(31_000, () => authSession.request('POST', '/api/auth/totp/disable-managed', {
+            authState,
+            token: generateTotpToken(secret)
+        }, { headers }));
+        assert.equal(notSteppedUp.response.status, 403);
+        assert.equal(notSteppedUp.json.error, 'Recent authentication required');
+
+        const wrongPassword = await authSession.request('POST', '/api/auth/action-step-up', {
+            authState,
+            password: 'WrongPass1',
+        }, { headers });
         assert.equal(wrongPassword.response.status, 401);
 
-        const extendedPasswordAttempt = await withDateNowOffset(61_000, () => client.request('POST', '/api/auth/totp/disable', {
-            password: extendedPassword,
-            token: generateTotpToken(secret)
-        }));
-        assert.equal(extendedPasswordAttempt.response.status, 401);
-        assert.equal(extendedPasswordAttempt.json.error, 'Password is incorrect');
+        const stepUp = await authSession.request('POST', '/api/auth/action-step-up', {
+            authState,
+            password: 'StrongPass1',
+        }, { headers });
+        assert.equal(stepUp.response.status, 200);
+        assert.equal(stepUp.json.intent, 'totp-manage');
 
-        const disabled = await withDateNowOffset(91_000, () => client.request('POST', '/api/auth/totp/disable', {
-            password: passwordAtLimit,
+        const wrongToken = await withDateNowOffset(62_000, () => authSession.request('POST', '/api/auth/totp/disable-managed', {
+            authState,
+            token: '000000'
+        }, { headers }));
+        assert.equal(wrongToken.response.status, 401);
+        assert.equal(wrongToken.json.error, 'TOTP code is invalid');
+
+        const disabled = await withDateNowOffset(93_000, () => authSession.request('POST', '/api/auth/totp/disable-managed', {
+            authState,
             token: generateTotpToken(secret)
-        }));
+        }, { headers }));
         assert.equal(disabled.response.status, 200);
         assert.equal(disabled.json.status.enabled, false);
 
@@ -2839,7 +2899,7 @@ test('ordinary users can disable TOTP with password and current code', async () 
         await client.csrf();
         const login = await client.request('POST', '/api/auth/login', {
             username: 'totp_disable',
-            password: passwordAtLimit
+            password: 'StrongPass1'
         });
         assert.equal(login.response.status, 200);
         assert.equal(login.json.user.username, 'totp_disable');
@@ -2848,11 +2908,98 @@ test('ordinary users can disable TOTP with password and current code', async () 
     }
 });
 
-test('disabling TOTP revokes other active sessions for the same user', async () => {
-    const client = await createLegacyDirectAccountClient();
+test('admin users cannot disable TOTP through business scoped auth action state', async () => {
+    const client = await createClient();
     try {
+        const headers = {
+            host: 'auth.local',
+            'x-forwarded-host': 'auth.local',
+            'x-forwarded-proto': 'http',
+            'x-ielts-onion-audience': 'auth'
+        };
+        const adminUser = await seedAdmin(client, 'totp_disable_admin', 'StrongPass1');
+        await client.csrf();
+        const login = await client.request('POST', '/api/auth/login', {
+            username: 'totp_disable_admin',
+            password: 'StrongPass1'
+        });
+        assert.equal(login.response.status, 200);
+        const { secret } = await enableTotpForCurrentSession(client);
+        const storedAdmin = await client.authStore.findByUsernameLower(adminUser.username.toLowerCase());
+        const authSession = client.createSession();
+        await authSession.csrf();
+        const authLoginStart = await authSession.request('POST', '/api/auth/login', {
+            username: 'totp_disable_admin',
+            password: 'StrongPass1'
+        }, { headers });
+        assert.equal(authLoginStart.response.status, 200);
+        assert.equal(authLoginStart.json.requiresTotp, true);
+        const authLogin = await withDateNowOffset(31_000, () => authSession.request('POST', '/api/auth/totp/login', {
+            token: generateTotpToken(secret)
+        }, { headers }));
+        assert.equal(authLogin.response.status, 200);
+
+        const authState = createSignedAuthState('test-session-secret-0123456789abcdef', {
+            audience: 'business',
+            intent: 'totp-manage',
+            userId: storedAdmin.id,
+            securityEpoch: getUserSecurityEpoch(storedAdmin),
+            returnTo: '/settings',
+            targetBaseUrl: 'http://business.local',
+            issuedAt: Date.now(),
+            nonce: 'totp-disable-admin-test'
+        });
+
+        const disabled = await withDateNowOffset(62_000, () => authSession.request('POST', '/api/auth/totp/disable-managed', {
+            authState,
+            token: generateTotpToken(secret)
+        }, { headers }));
+        assert.equal(disabled.response.status, 403);
+        assert.equal(disabled.json.error, 'Business account required');
+
+        const status = await authSession.request('GET', '/api/auth/totp/status', undefined, { headers });
+        assert.equal(status.response.status, 200);
+        assert.equal(status.json.status.enabled, true);
+    } finally {
+        await client.close();
+    }
+});
+
+test('managed TOTP disable revokes other active sessions for the same user', async () => {
+    const client = await createClient();
+    try {
+        const headers = {
+            host: 'auth.local',
+            'x-forwarded-host': 'auth.local',
+            'x-forwarded-proto': 'http',
+            'x-ielts-onion-audience': 'auth'
+        };
         await register(client, 'totp_disable_revokes', 'StrongPass1');
         const { secret } = await enableTotpForCurrentSession(client);
+        const storedUser = await client.authStore.findByUsernameLower('totp_disable_revokes');
+        const authSession = client.createSession();
+        await authSession.csrf();
+        const authLoginStart = await authSession.request('POST', '/api/auth/login', {
+            username: 'totp_disable_revokes',
+            password: 'StrongPass1'
+        }, { headers });
+        assert.equal(authLoginStart.response.status, 200);
+        assert.equal(authLoginStart.json.requiresTotp, true);
+        const authLogin = await withDateNowOffset(31_000, () => authSession.request('POST', '/api/auth/totp/login', {
+            token: generateTotpToken(secret)
+        }, { headers }));
+        assert.equal(authLogin.response.status, 200);
+
+        const authState = createSignedAuthState('test-session-secret-0123456789abcdef', {
+            audience: 'business',
+            intent: 'totp-manage',
+            userId: storedUser.id,
+            securityEpoch: getUserSecurityEpoch(storedUser),
+            returnTo: '/settings',
+            targetBaseUrl: 'http://business.local',
+            issuedAt: Date.now(),
+            nonce: 'totp-disable-revoke-test'
+        });
 
         const otherSession = client.createSession();
         await otherSession.csrf();
@@ -2862,7 +3009,7 @@ test('disabling TOTP revokes other active sessions for the same user', async () 
         });
         assert.equal(passwordOnly.response.status, 200);
         assert.equal(passwordOnly.json.requiresTotp, true);
-        const otherLogin = await withDateNowOffset(31_000, () => otherSession.request('POST', '/api/auth/totp/login', {
+        const otherLogin = await withDateNowOffset(62_000, () => otherSession.request('POST', '/api/auth/totp/login', {
             token: generateTotpToken(secret)
         }));
         assert.equal(otherLogin.response.status, 200);
@@ -2870,16 +3017,22 @@ test('disabling TOTP revokes other active sessions for the same user', async () 
         const otherBefore = await otherSession.request('GET', '/api/auth/me');
         assert.equal(otherBefore.response.status, 200);
 
-        const disabled = await withDateNowOffset(62_000, () => client.request('POST', '/api/auth/totp/disable', {
-            password: 'StrongPass1',
+        const stepUp = await authSession.request('POST', '/api/auth/action-step-up', {
+            authState,
+            password: 'StrongPass1'
+        }, { headers });
+        assert.equal(stepUp.response.status, 200);
+
+        const disabled = await withDateNowOffset(93_000, () => authSession.request('POST', '/api/auth/totp/disable-managed', {
+            authState,
             token: generateTotpToken(secret)
-        }));
+        }, { headers }));
         assert.equal(disabled.response.status, 200);
         assert.equal(disabled.json.status.enabled, false);
         assert.equal(disabled.json.user.username, 'totp_disable_revokes');
         assert(disabled.json.csrfToken);
 
-        const currentAfter = await client.request('GET', '/api/auth/me');
+        const currentAfter = await authSession.request('GET', '/api/auth/me', undefined, { headers });
         assert.equal(currentAfter.response.status, 200);
         const otherAfter = await otherSession.request('GET', '/api/auth/me');
         assert.equal(otherAfter.response.status, 401);
@@ -3231,9 +3384,10 @@ test('admin dashboard redirects anonymous users through auth handoff', async () 
         assert.match(authTotpScript.text, /\/api\/auth\/action-step-up/);
         assert.match(authTotpScript.text, /authState,\s*token/);
         assert.match(authTotpScript.text, /replace\(\/\\s\+\/g/);
+        assert.match(authTotpScript.text, /\/api\/auth\/totp\/disable-managed/);
         assert.match(authTotpScript.text, /Confirm your current password before managing two-factor authentication/);
         assert.doesNotMatch(authTotpScript.text, /if \(!status\.enabled\)\s*\{\s*await startSetup\(\)/);
-        assert.doesNotMatch(authTotpScript.text, /\/api\/auth\/totp\/disable/);
+        assert.doesNotMatch(authTotpScript.text, /\/api\/auth\/totp\/disable['"]/);
 
         const authTotpPageSource = await client.request('GET', '/auth/totp?state=invalid', undefined, {
             redirect: 'manual'
@@ -3455,6 +3609,7 @@ test('admin shell and business account menu do not link back through the busines
         '/API/AUTH/ACCOUNT/PASSWORD',
         '/api/auth/totp/disable',
         '/api/auth/totp/disable/',
+        '/api/auth/totp/disable-managed',
         '/API/AUTH/TOTP/SETUP'
     ];
     for (const requestPath of businessProxyBypassPaths) {
@@ -3482,6 +3637,7 @@ test('admin shell and business account menu do not link back through the busines
     assert(!authProxyConfig.includes('location = /auth/account.js'));
     assert(!authProxyConfig.includes('location = /auth/account.css'));
     assert(authProxyConfig.includes('location = /api/auth/password-change { proxy_pass http://ielts_app; }'));
+    assert(authProxyConfig.includes('location = /api/auth/totp/disable-managed { proxy_pass http://ielts_app; }'));
     assert(!authProxyConfig.includes('location = /api/auth/account/password { proxy_pass http://ielts_app; }'));
     assert(authProxyConfig.includes('location = /api/auth/account { return 404; }'));
     assert(authProxyConfig.includes('location ^~ /api/auth/account/ { return 404; }'));
@@ -3490,6 +3646,7 @@ test('admin shell and business account menu do not link back through the busines
     assert(authProxyConfig.includes('location ^~ /api/auth/ { proxy_pass http://ielts_app; }'));
     const authApiAllowIndex = authProxyConfig.indexOf('location ^~ /api/auth/ { proxy_pass http://ielts_app; }');
     assert(authProxyConfig.indexOf('location = /api/auth/password-change { proxy_pass http://ielts_app; }') < authApiAllowIndex);
+    assert(authProxyConfig.indexOf('location = /api/auth/totp/disable-managed { proxy_pass http://ielts_app; }') < authApiAllowIndex);
     assert(authProxyConfig.indexOf('location = /api/auth/account { return 404; }') < authApiAllowIndex);
     assert(authProxyConfig.indexOf('location ^~ /api/auth/account/ { return 404; }') < authApiAllowIndex);
     assert(authProxyConfig.indexOf('location = /api/auth/totp/disable { return 404; }') < authApiAllowIndex);
@@ -3567,6 +3724,7 @@ test('admin shell and business account menu do not link back through the busines
             '/API/AUTH/ACCOUNT/PASSWORD',
             '/api/auth/totp/disable',
             '/api/auth/totp/disable/',
+            '/api/auth/totp/disable-managed',
             '/API/AUTH/TOTP/DISABLE',
             '/API/AUTH/TOTP/SETUP',
             '/internal',
@@ -3596,6 +3754,7 @@ test('admin shell and business account menu do not link back through the busines
             '/api/auth/login',
             '/api/auth/register',
             '/api/auth/totp/setup',
+            '/api/auth/totp/disable-managed',
             '/api/auth/password-change'
         ],
         deny: [
@@ -3665,6 +3824,7 @@ test('admin shell and business account menu do not link back through the busines
             '/auth/session',
             '/api/auth/login',
             '/api/auth/totp/setup',
+            '/api/auth/totp/disable-managed',
             '/api/auth/account',
             '/api/auth/account/username',
             '/api/auth/account/password',

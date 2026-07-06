@@ -24,6 +24,9 @@
         recoveryForm: document.getElementById('totp-recovery-form'),
         recoveryToken: document.getElementById('totp-recovery-token'),
         recoverySubmit: document.getElementById('totp-recovery-submit'),
+        disableForm: document.getElementById('totp-disable-form'),
+        disableToken: document.getElementById('totp-disable-token'),
+        disableSubmit: document.getElementById('totp-disable-submit'),
         recoveryCodes: document.getElementById('totp-recovery-codes'),
         startSetup: document.getElementById('totp-start-setup'),
         backLink: document.getElementById('totp-back-link')
@@ -137,11 +140,12 @@
         setVisible(nodes.stepUpForm, !canManage);
         setVisible(nodes.startSetup, !status.enabled && canManage);
         setVisible(nodes.recoveryForm, Boolean(status.enabled) && canManage);
+        setVisible(nodes.disableForm, Boolean(status.enabled) && canManage);
         setVisible(nodes.setupPanel, false);
         setVisible(nodes.recoveryCodes, false);
         setStatus(canManage
             ? (status.enabled
-                ? 'Use your current TOTP or recovery code to generate a fresh recovery-code set.'
+                ? 'Use your current TOTP or recovery code to generate recovery codes or disable TOTP.'
                 : 'Enable TOTP to add a second authentication factor.')
             : 'Confirm your current password before managing two-factor authentication.');
         return status;
@@ -241,6 +245,34 @@
         }
     }
 
+    async function submitDisable(event) {
+        event.preventDefault();
+        if (!isStepUpFresh()) {
+            setStatus('Confirm your current password before disabling TOTP.', 'error');
+            setVisible(nodes.stepUpForm, true);
+            return;
+        }
+        nodes.disableSubmit.disabled = true;
+        setStatus('Disabling TOTP...');
+        try {
+            const payload = await request('/api/auth/totp/disable-managed', {
+                method: 'POST',
+                body: {
+                    authState,
+                    token: nodes.disableToken.value.trim()
+                }
+            });
+            nodes.disableForm.reset();
+            state.totpEnabled = Boolean(payload.status?.enabled);
+            await renderStatus();
+            setStatus('TOTP disabled. Your account will use password-only sign-in until you enable TOTP again.', 'success');
+        } catch (error) {
+            setStatus(error.message || 'Could not disable TOTP.', 'error');
+        } finally {
+            nodes.disableSubmit.disabled = false;
+        }
+    }
+
     async function submitStepUp(event) {
         event.preventDefault();
         nodes.stepUpSubmit.disabled = true;
@@ -259,7 +291,7 @@
             setVisible(nodes.stepUpForm, false);
             if (state.totpEnabled) {
                 await renderStatus();
-                setStatus('Confirmed. Use your current TOTP or recovery code to generate a fresh recovery-code set.', 'success');
+                setStatus('Confirmed. Use your current TOTP or recovery code to generate recovery codes or disable TOTP.', 'success');
             } else {
                 await startSetup();
             }
@@ -288,6 +320,7 @@
         });
         nodes.setupForm.addEventListener('submit', submitSetup);
         nodes.recoveryForm.addEventListener('submit', submitRecovery);
+        nodes.disableForm.addEventListener('submit', submitDisable);
     }
 
     init().catch((error) => setStatus(error.message || 'TOTP page failed to initialize.', 'error'));

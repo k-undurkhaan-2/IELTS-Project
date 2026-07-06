@@ -8,10 +8,8 @@ const {
     createRateLimiter,
     getCanonicalClientIp,
     getFreshAuthActionStepUp,
-    isPasswordWithinBcryptByteLimit,
     publicUser,
     requireAuth,
-    resolveAllowLegacyDirectAccountApis,
     resolveBusinessAccountActionContext,
     verifyCsrfToken
 } = require('./auth');
@@ -26,11 +24,6 @@ const PLACEHOLDER_SESSION_SECRET = 'replace-with-a-long-random-session-secret';
 const TOTP_SESSION_MARKER_KEY = 'totpVerified';
 
 const tokenSchema = z.object({
-    token: z.string().trim().min(1).max(64)
-});
-
-const disableSchema = z.object({
-    password: z.string().min(1).max(128),
     token: z.string().trim().min(1).max(64)
 });
 
@@ -516,17 +509,9 @@ function createTotpRouter(options = {}) {
     const bcryptImpl = options.bcrypt || bcrypt;
     const config = getTotpConfig(options);
     const checkRateLimit = options.checkRateLimit || createRateLimiter(options.rateLimit);
-    const allowLegacyDirectAccountApis = resolveAllowLegacyDirectAccountApis(options);
     const resolveAuthState = typeof options.resolveAuthState === 'function'
         ? options.resolveAuthState
         : null;
-
-    function requireLegacyDirectAccountApi(req, res, next) {
-        if (!allowLegacyDirectAccountApis) {
-            return res.status(404).json({ error: 'Not found' });
-        }
-        return next();
-    }
 
     function assertEnabled() {
         if (!config.enabled) {
@@ -623,6 +608,29 @@ function createTotpRouter(options = {}) {
             return false;
         }
         return true;
+    }
+
+    async function resolveTotpManageActionState(req, res, rawState) {
+        if (!isAuthAudienceRequest(req)) {
+            res.status(403).json({ error: 'Valid auth action state is required' });
+            return null;
+        }
+        const context = await resolveBusinessAccountActionContext(
+            req,
+            res,
+            authStore,
+            resolveAuthState,
+            rawState,
+            'totp-manage'
+        );
+        if (!context) {
+            return null;
+        }
+        if (!getFreshAuthActionStepUp(req, context.user, context.state, rawState)) {
+            res.status(403).json({ error: 'Recent authentication required' });
+            return null;
+        }
+        return context;
     }
 
     router.get('/status', requireAuth, async (req, res, next) => {
@@ -838,37 +846,36 @@ function createTotpRouter(options = {}) {
         }
     });
 
-    // Legacy direct-app TOTP disable endpoint is retained for loopback/dev compatibility.
-    // Public split-onion proxies must keep /api/auth/totp/disable blocked.
-    router.post('/disable', requireLegacyDirectAccountApi, requireAuth, verifyCsrfToken, async (req, res, next) => {
+    router.post('/disable-managed', requireAuth, verifyCsrfToken, async (req, res, next) => {
         try {
             assertEnabled();
-            const user = publicUser(req.session.user);
+            const authState = authStateSchema.safeParse(req.body || {});
+            const context = await resolveTotpManageActionState(req, res, authState.success ? authState.data.authState : '');
+            if (!context) {
+                return;
+            }
+            const user = publicUser(context.user);
             if (user.role === 'admin') {
                 return res.status(403).json({ error: 'Admin TOTP cannot be disabled here' });
             }
             if (!authStore || typeof authStore.findByUsernameLower !== 'function') {
                 return res.status(500).json({ error: 'Auth store unavailable' });
             }
-            const parsed = disableSchema.safeParse(req.body || {});
+            const parsed = tokenSchema.safeParse(req.body || {});
             if (!parsed.success) {
-                return res.status(400).json({ error: 'Password and TOTP code are required' });
+                return res.status(400).json({ error: 'TOTP code is required' });
             }
             const clientIp = getCanonicalClientIp(req);
             checkRateLimit(`totp-disable:${clientIp}:${user.id}`);
-            const account = await authStore.findByUsernameLower(user.username.toLowerCase());
-            const passwordOk = account
-                && isPasswordWithinBcryptByteLimit(parsed.data.password)
-                && await bcryptImpl.compare(parsed.data.password, account.password_hash);
-            if (!passwordOk) {
-                return res.status(401).json({ error: 'Password is incorrect' });
-            }
             if (!(await verifyStoredToken(user.id, parsed.data.token))) {
                 return res.status(401).json({ error: 'TOTP code is invalid' });
             }
             await store.disable(user.id);
             await bumpUserSecurityEpoch(user.id);
-            const safeUser = await rotateAuthenticatedSession(req, user, { revokeOtherSessions: true });
+            const safeUser = await rotateAuthenticatedSession(req, user, {
+                revokeOtherSessions: true,
+                authSessionAudience: req.session.authSession?.audience || 'auth'
+            });
             return res.json({
                 user: safeUser,
                 status: await store.getStatus(user.id),
@@ -877,6 +884,10 @@ function createTotpRouter(options = {}) {
         } catch (error) {
             return next(error);
         }
+    });
+
+    router.post('/disable', (req, res) => {
+        return res.status(404).json({ error: 'Not found' });
     });
 
     return router;

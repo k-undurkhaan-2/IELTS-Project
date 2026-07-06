@@ -51,6 +51,14 @@
                     <button id="totp-recovery-submit" type="submit">Generate new recovery codes</button>
                 </form>
 
+                <form id="totp-disable-form" class="totp-form" hidden>
+                    <label>
+                        <span>Current TOTP or recovery code</span>
+                        <input id="totp-disable-token" name="disableToken" inputmode="numeric" autocomplete="one-time-code" maxlength="64" required />
+                    </label>
+                    <button id="totp-disable-submit" type="submit">Disable TOTP</button>
+                </form>
+
                 <ol id="totp-recovery-codes" class="totp-recovery-codes" hidden></ol>
 
                 <div class="totp-actions">
