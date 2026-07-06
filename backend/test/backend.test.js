@@ -3228,6 +3228,9 @@ test('site content UI renders with text nodes and admin edit controls', () => {
     const adminIndex = fs.readFileSync(path.join(repoRoot, 'backend', 'admin', 'index.html'), 'utf8');
     const adminScript = fs.readFileSync(path.join(repoRoot, 'backend', 'admin', 'admin.js'), 'utf8');
 
+    assert(!fs.existsSync(path.join(repoRoot, 'backend', 'admin', 'login.html')));
+    assert(!fs.existsSync(path.join(repoRoot, 'backend', 'admin', 'login.js')));
+    assert(!fs.existsSync(path.join(repoRoot, 'backend', 'admin', 'login.css')));
     assert(indexSource.includes('id="site-announcement-host"'));
     assert(indexSource.includes('js/siteContent.js'));
     assert(scriptSource.includes('textContent ='));
@@ -3402,6 +3405,17 @@ test('retired legacy admin login html is hidden from authenticated admin static 
         assert.equal(legacyLoginHtml.response.status, 404);
         assert.equal(legacyLoginHtml.text, 'Not found');
         assert.doesNotMatch(legacyLoginHtml.text, /admin-login|\/admin\/login\.js|\/api\/auth\/login/);
+
+        for (const variant of [
+            '/admin/login.html/',
+            '/admin//login.html',
+            '/admin/%6cogin.html',
+            '/admin/login%2ehtml'
+        ]) {
+            const variantResponse = await client.request('GET', variant, undefined, { redirect: 'manual' });
+            assert.notEqual(variantResponse.response.status, 200, `${variant} should not serve retired admin login HTML`);
+            assert.doesNotMatch(variantResponse.text, /admin-login|\/admin\/login\.js|\/api\/auth\/login/);
+        }
     } finally {
         await client.close();
     }
