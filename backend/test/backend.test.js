@@ -3690,6 +3690,8 @@ test('admin shell and business account menu do not link back through the busines
     const bootFallbacks = fs.readFileSync(path.join(repoRoot, 'js', 'boot-fallbacks.js'), 'utf8');
     const dataManagementPanel = fs.readFileSync(path.join(repoRoot, 'js', 'components', 'dataManagementPanel.js'), 'utf8');
     const dataIntegrityManager = fs.readFileSync(path.join(repoRoot, 'js', 'components', 'DataIntegrityManager.js'), 'utf8');
+    const examActions = fs.readFileSync(path.join(repoRoot, 'js', 'app', 'examActions.js'), 'utf8');
+    const practiceHistoryEnhancer = fs.readFileSync(path.join(repoRoot, 'js', 'components', 'practiceHistoryEnhancer.js'), 'utf8');
     const mainIndex = fs.readFileSync(path.join(repoRoot, 'index.html'), 'utf8');
 
     assert(adminScript.includes("window.location.href = '/auth/admin/start?return_to=/admin'"));
@@ -4072,7 +4074,8 @@ test('admin shell and business account menu do not link back through the busines
     assert(bootFallbacks.includes('/auth/business/data/start'));
     assert(bootFallbacks.includes('ensureFallbackDataManageStepUp().then((allowed) =>'));
     assert(bootFallbacks.indexOf('ensureFallbackDataManageStepUp().then((allowed) =>') < bootFallbacks.indexOf('showImportModeModal((mode) =>'));
-    assert(bootFallbacks.includes('importing, restoring, or clearing practice data'));
+    assert(bootFallbacks.includes('exporting backups, importing, restoring, or clearing practice data'));
+    assert(bootFallbacks.includes('window.ensureBusinessDataManageStepUp = ensureFallbackDataManageStepUp'));
     const restoreBackupStart = bootFallbacks.indexOf('async function _fallbackRestoreBackupById');
     const restoreBackupStepUp = bootFallbacks.indexOf('await ensureFallbackDataManageStepUp()', restoreBackupStart);
     const restoreBackupConfirm = bootFallbacks.indexOf('confirm(', restoreBackupStart);
@@ -4085,7 +4088,10 @@ test('admin shell and business account menu do not link back through the busines
     const exportDataEnd = bootFallbacks.indexOf('if (typeof window.importData !==', exportDataStart);
     assert(exportDataStart >= 0);
     assert(exportDataEnd > exportDataStart);
-    assert(!bootFallbacks.slice(exportDataStart, exportDataEnd).includes('ensureFallbackDataManageStepUp'));
+    const exportDataStepUp = bootFallbacks.indexOf('await ensureFallbackDataManageStepUp()', exportDataStart);
+    const exportDataWrite = bootFallbacks.indexOf('await manager.exportData()', exportDataStart);
+    assert(exportDataStepUp > exportDataStart);
+    assert(exportDataStepUp < exportDataWrite);
     const createBackupStart = bootFallbacks.indexOf('window.createManualBackup = async function');
     const createBackupEnd = bootFallbacks.indexOf('if (typeof window.showBackupList !==', createBackupStart);
     assert(createBackupStart >= 0);
@@ -4095,6 +4101,11 @@ test('admin shell and business account menu do not link back through the busines
     assert(dataManagementPanel.includes('/auth/business/data/start'));
     assert(dataManagementPanel.includes('async ensureDataManageStepUp()'));
     assert(dataManagementPanel.includes('async openImportFromSettings()'));
+    assert(dataManagementPanel.includes('includeBackups && !(await this.ensureDataManageStepUp())'));
+    assert(examActions.includes('async function ensureDataExportStepUp()'));
+    assert(examActions.includes('await ensureDataExportStepUp()'));
+    assert(practiceHistoryEnhancer.includes('async function ensurePracticeHistoryDataExportStepUp()'));
+    assert(practiceHistoryEnhancer.includes('await ensurePracticeHistoryDataExportStepUp()'));
     assert(dataIntegrityManager.includes('DATA_INTEGRITY_EXPORT_SENSITIVE_KEYS'));
     assert(dataIntegrityManager.includes('isSensitiveDataIntegrityExportKey(rawKey)'));
     assert(authOverlay.includes('/auth/business/logout?return_to='));

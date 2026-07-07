@@ -84,6 +84,9 @@ const context = {
     setTimeout(callback) {
         callback();
     },
+    async ensureBusinessDataManageStepUp() {
+        return true;
+    },
     getPracticeRecordsState() {
         return [
             circular,

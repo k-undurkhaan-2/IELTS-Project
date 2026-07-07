@@ -165,6 +165,84 @@
             .map((record) => sanitizeFallbackExportValue(record, 0, state));
     }
 
+    function getDataManageReturnTo() {
+        const path = global.location && global.location.pathname ? global.location.pathname : '/';
+        const search = global.location && global.location.search ? global.location.search : '';
+        return `${path}${search}` || '/';
+    }
+
+    function redirectToDataManageStepUp(startPath = '/auth/business/data/start') {
+        const safeStartPath = typeof startPath === 'string' && startPath.startsWith('/auth/business/data/start')
+            ? startPath
+            : '/auth/business/data/start';
+        global.location.href = `${safeStartPath}?return_to=${encodeURIComponent(getDataManageReturnTo())}`;
+    }
+
+    function getDataManageRemoteApiClient() {
+        if (global.remoteApiClient && typeof global.remoteApiClient.request === 'function') {
+            return global.remoteApiClient;
+        }
+        if (global.ExamData && global.ExamData.remoteApiClient && typeof global.ExamData.remoteApiClient.request === 'function') {
+            return global.ExamData.remoteApiClient;
+        }
+        return null;
+    }
+
+    async function requestDataManageStatus() {
+        const apiClient = getDataManageRemoteApiClient();
+        if (apiClient) {
+            return apiClient.request('/api/practice-records/data-manage/status', { method: 'GET', csrf: false });
+        }
+        if (typeof global.fetch !== 'function') {
+            throw new Error('Remote API client is unavailable');
+        }
+        const response = await global.fetch('/api/practice-records/data-manage/status', {
+            method: 'GET',
+            credentials: 'same-origin',
+            headers: { Accept: 'application/json' }
+        });
+        let payload = null;
+        try {
+            payload = await response.json();
+        } catch (_) { }
+        if (!response.ok) {
+            const error = new Error((payload && payload.error) || 'Data management step-up check failed');
+            error.status = response.status;
+            error.payload = payload;
+            throw error;
+        }
+        return payload || {};
+    }
+
+    async function ensureDataExportStepUp() {
+        if (typeof global.ensureBusinessDataManageStepUp === 'function') {
+            return global.ensureBusinessDataManageStepUp();
+        }
+        try {
+            const payload = await requestDataManageStatus();
+            if (payload && payload.fresh === true) {
+                return true;
+            }
+            try { global.showMessage && global.showMessage('Confirm your password before exporting practice data.', 'info'); } catch (_) { }
+            redirectToDataManageStepUp(payload && payload.authActionStart);
+            return false;
+        } catch (error) {
+            if (error && error.status === 401) {
+                try { global.showMessage && global.showMessage('Please sign in before exporting practice data.', 'warning'); } catch (_) { }
+                global.location.href = `/auth/business/start?return_to=${encodeURIComponent(getDataManageReturnTo())}`;
+                return false;
+            }
+            if (error && error.status === 403 && error.payload && error.payload.authActionStart) {
+                try { global.showMessage && global.showMessage('Confirm your password before exporting practice data.', 'info'); } catch (_) { }
+                redirectToDataManageStepUp(error.payload.authActionStart);
+                return false;
+            }
+            console.error('[ExamActions] data export step-up check failed:', summarizeExamActionsErrorForLog(error));
+            try { global.showMessage && global.showMessage('Unable to confirm data export access. Please sign in again.', 'error'); } catch (_) { }
+            return false;
+        }
+    }
+
     function normalizeExamSignature(value) {
         return String(value || '')
             .toLowerCase()
@@ -1539,6 +1617,9 @@
     }
 
     async function exportPracticeData() {
+        if (!(await ensureDataExportStepUp())) {
+            return;
+        }
         try {
             if (global.dataIntegrityManager && typeof global.dataIntegrityManager.exportData === 'function') {
                 global.dataIntegrityManager.exportData();
@@ -1562,6 +1643,9 @@
     }
 
     async function exportAllData() {
+        if (!(await ensureDataExportStepUp())) {
+            return;
+        }
         var manager = null;
         try {
             manager = await ensureDataIntegrityManagerReady();

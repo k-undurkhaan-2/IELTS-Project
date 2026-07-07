@@ -327,7 +327,7 @@ class DataManagementPanel {
             if (payload && payload.fresh === true) {
                 return true;
             }
-            this.showMessage('Confirm your password before importing or clearing practice data.', 'info');
+            this.showMessage('Confirm your password before exporting backups, importing, restoring, or clearing practice data.', 'info');
             this.redirectToDataManageStepUp(payload && payload.authActionStart);
             return false;
         } catch (error) {
@@ -337,7 +337,7 @@ class DataManagementPanel {
                 return false;
             }
             if (error && error.status === 403 && error.payload && error.payload.authActionStart) {
-                this.showMessage('Confirm your password before importing or clearing practice data.', 'info');
+                this.showMessage('Confirm your password before exporting backups, importing, restoring, or clearing practice data.', 'info');
                 this.redirectToDataManageStepUp(error.payload.authActionStart);
                 return false;
             }
@@ -871,6 +871,11 @@ class DataManagementPanel {
             const format = document.getElementById('exportFormat').value;
             const includeStats = document.getElementById('includeStats').checked;
             const includeBackups = document.getElementById('includeBackups').checked;
+
+            if (includeBackups && !(await this.ensureDataManageStepUp())) {
+                this.hideProgress();
+                return;
+            }
 
             const startDate = document.getElementById('exportStartDate').value;
             const endDate = document.getElementById('exportEndDate').value;

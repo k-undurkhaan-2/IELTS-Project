@@ -10,7 +10,7 @@ const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, '..', '..', '..');
 const panelSource = fs.readFileSync(path.join(repoRoot, 'js/components/dataManagementPanel.js'), 'utf8');
 
-function createPanelHarness({ missingControls = false, importFile = null } = {}) {
+function createPanelHarness({ missingControls = false, importFile = null, exportIncludeBackups = false } = {}) {
     const selectedFileName = { textContent: '' };
     const importButton = { disabled: true };
     const importInput = importFile
@@ -26,6 +26,18 @@ function createPanelHarness({ missingControls = false, importFile = null } = {})
             }
             if (id === 'importFile') {
                 return importInput;
+            }
+            if (id === 'exportFormat') {
+                return { value: 'json' };
+            }
+            if (id === 'includeStats') {
+                return { checked: true };
+            }
+            if (id === 'includeBackups') {
+                return { checked: exportIncludeBackups };
+            }
+            if (id === 'exportStartDate' || id === 'exportEndDate') {
+                return { value: '' };
             }
             return null;
         },
@@ -64,11 +76,19 @@ function createPanelHarness({ missingControls = false, importFile = null } = {})
     panel.showMessage = (message, type) => {
         messages.push({ message, type });
     };
+    panel.ensureDataManageStepUp = async () => true;
+    panel.showProgress = () => {};
+    panel.updateProgress = () => {};
+    panel.hideProgress = () => {};
+    panel.downloadFile = () => {};
     panel.loadDataStats = async () => {};
     panel.loadHistory = async () => {};
     panel.backupManager = {
         async importPracticeData() {
             return { success: true, importedCount: 1, skippedCount: 0 };
+        },
+        async exportPracticeRecords() {
+            return { data: '{}', filename: 'export.json', mimeType: 'application/json' };
         }
     };
     panel.readFile = (file) => new Promise((resolve, reject) => {
@@ -92,6 +112,29 @@ function createPanelHarness({ missingControls = false, importFile = null } = {})
         makeFile,
         makeEvent
     };
+}
+
+{
+    const harness = createPanelHarness({ exportIncludeBackups: true });
+    let stepUpCalls = 0;
+    let exportCalled = false;
+    let hideProgressCalled = false;
+    harness.panel.ensureDataManageStepUp = async () => {
+        stepUpCalls += 1;
+        return false;
+    };
+    harness.panel.hideProgress = () => {
+        hideProgressCalled = true;
+    };
+    harness.panel.backupManager.exportPracticeRecords = async () => {
+        exportCalled = true;
+        return { data: '{}', filename: 'export.json', mimeType: 'application/json' };
+    };
+
+    await harness.panel.handleExport();
+    assert.equal(stepUpCalls, 1);
+    assert.equal(exportCalled, false);
+    assert.equal(hideProgressCalled, true);
 }
 
 async function flushPromises() {

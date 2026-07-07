@@ -173,7 +173,7 @@
       if (payload && payload.fresh === true) {
         return true;
       }
-      window.showMessage && window.showMessage('Confirm your password before importing, restoring, or clearing practice data.', 'info');
+      window.showMessage && window.showMessage('Confirm your password before exporting backups, importing, restoring, or clearing practice data.', 'info');
       redirectFallbackDataManageStepUp(payload && payload.authActionStart);
       return false;
     } catch (error) {
@@ -183,7 +183,7 @@
         return false;
       }
       if (error && error.status === 403 && error.payload && error.payload.authActionStart) {
-        window.showMessage && window.showMessage('Confirm your password before importing, restoring, or clearing practice data.', 'info');
+        window.showMessage && window.showMessage('Confirm your password before exporting backups, importing, restoring, or clearing practice data.', 'info');
         redirectFallbackDataManageStepUp(error.payload.authActionStart);
         return false;
       }
@@ -191,6 +191,10 @@
       window.showMessage && window.showMessage('Unable to confirm data management access. Please sign in again.', 'error');
       return false;
     }
+  }
+
+  if (typeof window.ensureBusinessDataManageStepUp !== 'function') {
+    window.ensureBusinessDataManageStepUp = ensureFallbackDataManageStepUp;
   }
 
   function isFallbackUnsafeAttributeName(name) {
@@ -898,6 +902,9 @@
 
   if (typeof window.exportAllData !== 'function') {
     window.exportAllData = async function () {
+      if (!(await ensureFallbackDataManageStepUp())) {
+        return;
+      }
       var manager = null;
       try {
         manager = await _ensureFallbackDataIntegrityManagerAsync();
