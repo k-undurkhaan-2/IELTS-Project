@@ -241,7 +241,13 @@ try {
         practice_records: [{
             id: 'export-record',
             note: 'x'.repeat(20050),
-            big: 10n
+            big: 10n,
+            password: 'do-not-export',
+            accessToken: 'token-do-not-export',
+            metadata: {
+                safe: 'yes',
+                totpSecret: 'totp-do-not-export'
+            }
         }]
     };
     unsafeExportData.self = unsafeExportData;
@@ -259,6 +265,11 @@ try {
     assert.equal(storedBackup.data.practice_records[0].loop, '[Circular]');
     assert.equal(storedBackup.data.practice_records[0].big, '10');
     assert.equal(storedBackup.data.practice_records[0].note.length, 20003);
+    assert.equal(storedBackup.data.practice_records[0].password, undefined);
+    assert.equal(storedBackup.data.practice_records[0].accessToken, undefined);
+    assert.equal(storedBackup.data.practice_records[0].metadata.safe, 'yes');
+    assert.equal(storedBackup.data.practice_records[0].metadata.totpSecret, undefined);
+    assert(!JSON.stringify(storedBackup.data).includes('do-not-export'));
     assert.equal(typeof storedBackup.size, 'number');
     assert.equal(Object.prototype.hasOwnProperty.call(storedBackup.data, '__proto__'), false);
     assert.equal(Object.prototype.hasOwnProperty.call(storedBackup.data, 'constructor'), false);

@@ -10,6 +10,42 @@ const MAX_JSON_EXPORT_STRING_LENGTH = 20000;
 const MAX_JSON_EXPORT_DEPTH = 8;
 const MAX_JSON_EXPORT_NODES = 50000;
 const JSON_EXPORT_POLLUTION_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+const JSON_EXPORT_SENSITIVE_KEYS = new Set([
+    'password',
+    'passwordhash',
+    'currentpassword',
+    'newpassword',
+    'secret',
+    'secretkey',
+    'csrf',
+    'csrftoken',
+    'totp',
+    'totpsecret',
+    'recoverycode',
+    'recoverycodes',
+    'authorization',
+    'cookie',
+    'apikey',
+    'privatekey',
+    'authtoken',
+    'accesstoken',
+    'refreshtoken',
+    'session',
+    'sessionid',
+    'sid',
+    'state',
+    'ticket',
+    'token'
+]);
+
+function isSensitiveJsonExportKey(key) {
+    const normalized = String(key || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '');
+    return JSON_EXPORT_SENSITIVE_KEYS.has(normalized);
+}
+
 function summarizePracticeHistoryErrorForLog(error) {
     if (!error || typeof error !== 'object') {
         return { name: typeof error };
@@ -133,7 +169,7 @@ class PracticeHistoryEnhancer {
             }
             const keys = allKeys.slice(0, MAX_JSON_EXPORT_OBJECT_KEYS);
             for (const key of keys) {
-                if (JSON_EXPORT_POLLUTION_KEYS.has(key)) {
+                if (JSON_EXPORT_POLLUTION_KEYS.has(key) || isSensitiveJsonExportKey(key)) {
                     continue;
                 }
                 try {

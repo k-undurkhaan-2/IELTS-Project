@@ -3689,6 +3689,7 @@ test('admin shell and business account menu do not link back through the busines
     const remoteApiClient = fs.readFileSync(path.join(repoRoot, 'js', 'data', 'remoteApiClient.js'), 'utf8');
     const bootFallbacks = fs.readFileSync(path.join(repoRoot, 'js', 'boot-fallbacks.js'), 'utf8');
     const dataManagementPanel = fs.readFileSync(path.join(repoRoot, 'js', 'components', 'dataManagementPanel.js'), 'utf8');
+    const dataIntegrityManager = fs.readFileSync(path.join(repoRoot, 'js', 'components', 'DataIntegrityManager.js'), 'utf8');
     const mainIndex = fs.readFileSync(path.join(repoRoot, 'index.html'), 'utf8');
 
     assert(adminScript.includes("window.location.href = '/auth/admin/start?return_to=/admin'"));
@@ -4094,6 +4095,8 @@ test('admin shell and business account menu do not link back through the busines
     assert(dataManagementPanel.includes('/auth/business/data/start'));
     assert(dataManagementPanel.includes('async ensureDataManageStepUp()'));
     assert(dataManagementPanel.includes('async openImportFromSettings()'));
+    assert(dataIntegrityManager.includes('DATA_INTEGRITY_EXPORT_SENSITIVE_KEYS'));
+    assert(dataIntegrityManager.includes('isSensitiveDataIntegrityExportKey(rawKey)'));
     assert(authOverlay.includes('/auth/business/logout?return_to='));
     assert(authOverlay.includes("apiClient.request('/api/account/sessions'"));
     assert(authOverlay.includes("apiClient.request('/api/account/sessions/revoke-others'"));

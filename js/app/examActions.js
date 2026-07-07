@@ -32,6 +32,33 @@
     const MAX_FALLBACK_EXPORT_OBJECT_KEYS = 300;
     const MAX_FALLBACK_EXPORT_STRING_LENGTH = 20000;
     const FALLBACK_EXPORT_POLLUTION_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+    const FALLBACK_EXPORT_SENSITIVE_KEYS = new Set([
+        'password',
+        'passwordhash',
+        'currentpassword',
+        'newpassword',
+        'secret',
+        'secretkey',
+        'csrf',
+        'csrftoken',
+        'totp',
+        'totpsecret',
+        'recoverycode',
+        'recoverycodes',
+        'authorization',
+        'cookie',
+        'apikey',
+        'privatekey',
+        'authtoken',
+        'accesstoken',
+        'refreshtoken',
+        'session',
+        'sessionid',
+        'sid',
+        'state',
+        'ticket',
+        'token'
+    ]);
     let customSuitePortalPosition = null;
 
     function summarizeExamActionsErrorForLog(error) {
@@ -50,6 +77,14 @@
             seen: new WeakSet(),
             nodes: 0
         };
+    }
+
+    function isSensitiveFallbackExportKey(key) {
+        const normalized = String(key || '')
+            .trim()
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '');
+        return FALLBACK_EXPORT_SENSITIVE_KEYS.has(normalized);
     }
 
     function sanitizeFallbackExportValue(value, depth = 0, state = createFallbackExportState()) {
@@ -104,7 +139,7 @@
             }
             const safeObject = {};
             for (const key of keys.slice(0, MAX_FALLBACK_EXPORT_OBJECT_KEYS)) {
-                if (FALLBACK_EXPORT_POLLUTION_KEYS.has(key)) {
+                if (FALLBACK_EXPORT_POLLUTION_KEYS.has(key) || isSensitiveFallbackExportKey(key)) {
                     continue;
                 }
                 try {

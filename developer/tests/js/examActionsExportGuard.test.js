@@ -26,8 +26,11 @@ const circular = {
     id: 'cycle',
     text: `${'x'.repeat(20010)}<script>alert(1)</script>`,
     score: 10n,
+    password: 'do-not-export',
+    accessToken: 'token-do-not-export',
     nested: {
-        ok: true
+        ok: true,
+        totpSecret: 'totp-do-not-export'
     }
 };
 circular.self = circular;
@@ -106,6 +109,10 @@ assert.equal(exported.length, 5000, 'fallback export should cap record count');
 assert.equal(exported[0].self, '[Circular]', 'fallback export should serialize circular references safely');
 assert.equal(exported[0].score, '10', 'fallback export should serialize bigint values safely');
 assert(exported[0].text.endsWith('...'), 'fallback export should truncate oversized strings');
+assert.equal(exported[0].password, undefined, 'fallback export should strip password fields');
+assert.equal(exported[0].accessToken, undefined, 'fallback export should strip access token fields');
+assert.equal(exported[0].nested.totpSecret, undefined, 'fallback export should strip nested TOTP secret fields');
+assert(!JSON.stringify(exported).includes('do-not-export'), 'fallback export should not include sensitive sentinel values');
 assert(!Object.prototype.hasOwnProperty.call(exported[0].nested, '__proto__'), 'fallback export should strip __proto__ keys');
 assert(!Object.prototype.hasOwnProperty.call(exported[0].nested, 'constructor'), 'fallback export should strip constructor keys');
 assert.deepEqual(exported[1].meta, { label: 'shared' }, 'shared values should be preserved on first occurrence');
