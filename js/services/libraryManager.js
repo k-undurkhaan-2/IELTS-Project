@@ -196,16 +196,22 @@
         );
     }
 
-    function isBuiltInListeningLibraryAvailable() {
-        if (global.__defaultListeningLibraryAvailable === true) {
-            return true;
-        }
-        if (global.__defaultListeningLibraryAvailable === false) {
-            return false;
-        }
+    function hasBuiltInListeningIndex() {
         return hasBuiltInListeningManifest()
             && Array.isArray(global.listeningExamIndex)
             && global.listeningExamIndex.length > 0;
+    }
+
+    function isBuiltInListeningLibraryAvailable() {
+        if (global.__defaultListeningLibraryAvailable === false
+            || global.__defaultListeningLibrarySourceAvailable === false) {
+            return false;
+        }
+        if (global.__defaultListeningLibraryAvailable === true
+            || global.__defaultListeningLibrarySourceAvailable === true) {
+            return hasBuiltInListeningIndex();
+        }
+        return false;
     }
 
     function getActiveExamIndexSnapshot() {

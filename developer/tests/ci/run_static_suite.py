@@ -625,6 +625,11 @@ def _check_listening_generated_assets(index_path: Path, manifest_path: Path) -> 
             "manifestType": type(manifest).__name__,
         }
 
+    parts = ("P1", "P2", "P3", "P4")
+    listening_root = REPO_ROOT / "ListeningPractice"
+    source_part_roots = {part: (listening_root / part).is_dir() for part in parts}
+    source_root_available = any(source_part_roots.values())
+
     ids: List[str] = []
     duplicate_ids: List[str] = []
     seen: set[str] = set()
@@ -654,27 +659,27 @@ def _check_listening_generated_assets(index_path: Path, manifest_path: Path) -> 
             or "/vip/" in f"/{rel_path}"
         ):
             bad_paths.append(f"{exam_id}:{rel_path}")
-        if filename and not (REPO_ROOT / "ListeningPractice" / rel_path / filename).exists():
+        if source_root_available and filename and not (listening_root / rel_path / filename).exists():
             missing_html.append(f"{rel_path}{filename}")
         if pdf_filename:
             pdf_rel = f"{rel_path}{pdf_filename}".replace("\\", "/")
             indexed_pdf_paths.add(pdf_rel)
-            if not (REPO_ROOT / "ListeningPractice" / rel_path / pdf_filename).exists():
+            if source_root_available and not (listening_root / rel_path / pdf_filename).exists():
                 missing_pdf.append(pdf_rel)
         elif entry.get("hasPdf") is True:
             missing_pdf.append(f"{exam_id}:hasPdf-without-pdfFilename")
         else:
             entries_without_pdf.append(f"{rel_path}{filename or exam_id}")
-        if audio and not (REPO_ROOT / "ListeningPractice" / rel_path / audio).exists():
+        if source_root_available and audio and not (listening_root / rel_path / audio).exists():
             missing_audio.append(f"{rel_path}{audio}")
 
     disk_pdf_paths: set[str] = set()
-    listening_root = REPO_ROOT / "ListeningPractice"
-    for part in ("P1", "P2", "P3", "P4"):
-        part_root = listening_root / part
-        if part_root.exists():
-            for pdf_path in sorted(part_root.rglob("*.pdf")):
-                disk_pdf_paths.add(pdf_path.relative_to(listening_root).as_posix())
+    if source_root_available:
+        for part in parts:
+            part_root = listening_root / part
+            if part_root.exists():
+                for pdf_path in sorted(part_root.rglob("*.pdf")):
+                    disk_pdf_paths.add(pdf_path.relative_to(listening_root).as_posix())
     unindexed_disk_pdfs = sorted(disk_pdf_paths - indexed_pdf_paths)
 
     manifest_ids = set(manifest.keys())
@@ -697,6 +702,9 @@ def _check_listening_generated_assets(index_path: Path, manifest_path: Path) -> 
     return passed, {
         "indexCount": len(index_entries),
         "manifestCount": len(manifest),
+        "sourceRootAvailable": source_root_available,
+        "sourcePartRoots": source_part_roots,
+        "diskChecksSkipped": not source_root_available,
         "diskPdfCount": len(disk_pdf_paths),
         "indexedPdfCount": len(indexed_pdf_paths),
         "duplicateIds": duplicate_ids[:20],
@@ -714,12 +722,14 @@ def _check_listening_generated_assets(index_path: Path, manifest_path: Path) -> 
 
 def _check_listening_static_bridge_coverage() -> Tuple[bool, dict]:
     listening_root = REPO_ROOT / "ListeningPractice"
-    if not listening_root.exists():
+    parts = ("P1", "P2", "P3", "P4")
+    source_part_roots = {part: (listening_root / part).is_dir() for part in parts}
+    if not any(source_part_roots.values()):
         return True, {
             "skipped": True,
+            "sourcePartRoots": source_part_roots,
             "reason": "ListeningPractice 本地题源目录未放置，跳过静态 bridge 覆盖校验",
         }
-    parts = ("P1", "P2", "P3", "P4")
     bridge_name = "listening-record-bridge.bundle.js"
     bridge_target = (REPO_ROOT / "js" / "bundles" / bridge_name).resolve()
 

@@ -817,23 +817,101 @@
         );
     }
 
+    function setBuiltInListeningSourceAvailability(available, reason, detail) {
+        try {
+            global.__defaultListeningLibrarySourceAvailable = available === true;
+            global.__defaultListeningLibrarySourceAvailabilityReason = reason || (available ? 'available' : 'unavailable');
+            global.__defaultListeningLibrarySourceAvailabilityDetail = detail || null;
+        } catch (_) { }
+    }
+
+    function getListeningProbeEntry() {
+        var index = Array.isArray(global.listeningExamIndex) ? global.listeningExamIndex : [];
+        for (var i = 0; i < index.length; i += 1) {
+            var entry = index[i];
+            if (entry && entry.filename && entry.path && entry.hasHtml !== false) {
+                return Object.assign({}, entry, { type: 'listening' });
+            }
+        }
+        return null;
+    }
+
+    function ensureBuiltInListeningSourceRoot() {
+        var index = Array.isArray(global.listeningExamIndex) ? global.listeningExamIndex : [];
+        if (!index.length) {
+            setBuiltInListeningSourceAvailability(false, 'index-missing');
+            return Promise.resolve(false);
+        }
+
+        var probeEntry = getListeningProbeEntry();
+        if (!probeEntry) {
+            setBuiltInListeningSourceAvailability(false, 'source-probe-entry-missing');
+            return Promise.resolve(false);
+        }
+
+        var protocol = '';
+        try {
+            protocol = global.location && global.location.protocol
+                ? String(global.location.protocol).toLowerCase()
+                : '';
+        } catch (_) { }
+        if (protocol !== 'http:' && protocol !== 'https:') {
+            setBuiltInListeningSourceAvailability(false, 'source-probe-unavailable', { protocol: protocol || 'unknown' });
+            return Promise.resolve(false);
+        }
+
+        var resourceCore = global.ResourceCore;
+        if (!resourceCore || typeof resourceCore.resolveResource !== 'function') {
+            setBuiltInListeningSourceAvailability(false, 'source-probe-unavailable');
+            return Promise.resolve(false);
+        }
+
+        return resourceCore.resolveResource(probeEntry, 'html').then(function onListeningSourceProbe(result) {
+            var sourceUrl = result && result.url ? String(result.url) : '';
+            var available = !!sourceUrl;
+            setBuiltInListeningSourceAvailability(
+                available,
+                available ? 'available' : 'source-root-unavailable',
+                available ? { url: sourceUrl } : { attempts: result && result.attempts ? result.attempts : [] }
+            );
+            return available;
+        }).catch(function onListeningSourceProbeFailed(error) {
+            try {
+                console.warn('[LazyLoader] Listening source root probe failed:', summarizeLazyLoaderErrorForLog(error));
+            } catch (_) { }
+            setBuiltInListeningSourceAvailability(false, 'source-probe-failed');
+            return false;
+        });
+    }
+
     function ensureOptionalListeningExamData() {
         setBuiltInListeningAvailability(false, 'pending-manifest');
+        setBuiltInListeningSourceAvailability(false, 'pending-manifest');
         return loadOptionalScript(LISTENING_EXAM_MANIFEST_SCRIPT, 'listening manifest')
             .then(function afterManifestLoaded(loaded) {
                 if (!loaded || !hasListeningManifest()) {
                     setBuiltInListeningAvailability(false, loaded ? 'manifest-empty' : 'manifest-missing');
+                    setBuiltInListeningSourceAvailability(false, loaded ? 'manifest-empty' : 'manifest-missing');
                     return undefined;
                 }
                 return loadOptionalScript(LISTENING_EXAM_INDEX_SCRIPT, 'listening index')
                     .then(function afterListeningIndexLoaded(indexLoaded) {
-                        var available = !!(
+                        if (!(
                             indexLoaded
                             && Array.isArray(global.listeningExamIndex)
                             && global.listeningExamIndex.length > 0
-                        );
-                        setBuiltInListeningAvailability(available, available ? 'available' : 'index-missing');
-                        return undefined;
+                        )) {
+                            setBuiltInListeningAvailability(false, 'index-missing');
+                            setBuiltInListeningSourceAvailability(false, 'index-missing');
+                            return undefined;
+                        }
+                        return ensureBuiltInListeningSourceRoot().then(function afterListeningSourceChecked(sourceAvailable) {
+                            var reason = sourceAvailable
+                                ? 'available'
+                                : (global.__defaultListeningLibrarySourceAvailabilityReason || 'source-root-unavailable');
+                            setBuiltInListeningAvailability(sourceAvailable, reason);
+                            return undefined;
+                        });
                     });
             });
     }
