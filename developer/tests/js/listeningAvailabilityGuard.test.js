@@ -121,31 +121,58 @@ async function runLazyLoader(probeUrl, options = {}) {
     return harness;
 }
 
-async function testListeningUnavailableWhenSourceProbeFails() {
+async function testListeningUnavailableWhenHttpSourceProbeFails() {
     const { window, probeCalls } = await runLazyLoader('');
-    assert.strictEqual(probeCalls.length, 1, 'listening source should be probed once');
+    assert.strictEqual(probeCalls.length, 1, 'HTTP listening source should be probed once');
     assert.strictEqual(probeCalls[0].kind, 'html');
     assert.strictEqual(probeCalls[0].entry.type, 'listening');
     assert.strictEqual(window.__defaultListeningLibraryAvailable, false);
     assert.strictEqual(window.__defaultListeningLibraryAvailabilityReason, 'source-root-unavailable');
     assert.strictEqual(window.__defaultListeningLibrarySourceAvailable, false);
     assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityReason, 'source-root-unavailable');
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityDetail.protocol, 'http:');
 }
 
-async function testListeningUnavailableWhenSourceCannotBeActivelyProbed() {
-    const { window, probeCalls } = await runLazyLoader('file:///D:/IELTS/ListeningPractice/P1/Guard/Guard.html', { protocol: 'file:' });
-    assert.strictEqual(probeCalls.length, 0, 'file:// source should not use ResourceCore bypass as availability proof');
-    assert.strictEqual(window.__defaultListeningLibraryAvailable, false);
-    assert.strictEqual(window.__defaultListeningLibraryAvailabilityReason, 'source-probe-unavailable');
-    assert.strictEqual(window.__defaultListeningLibrarySourceAvailable, false);
-    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityDetail.protocol, 'file:');
-}
-async function testListeningAvailableWhenSourceProbeSucceeds() {
-    const { window } = await runLazyLoader('./ListeningPractice/P1/Guard/Guard.html');
+async function testListeningAvailableWhenHttpSourceProbeSucceeds() {
+    const { window, probeCalls } = await runLazyLoader('./ListeningPractice/P1/Guard/Guard.html');
+    assert.strictEqual(probeCalls.length, 1, 'HTTP listening source should be probed once');
     assert.strictEqual(window.__defaultListeningLibraryAvailable, true);
     assert.strictEqual(window.__defaultListeningLibraryAvailabilityReason, 'available');
     assert.strictEqual(window.__defaultListeningLibrarySourceAvailable, true);
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityDetail.protocol, 'http:');
     assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityDetail.url, './ListeningPractice/P1/Guard/Guard.html');
+}
+
+async function testListeningAvailableForFileProtocolWhenSourceResolves() {
+    const { window, probeCalls } = await runLazyLoader('file:///D:/IELTS/ListeningPractice/P1/Guard/Guard.html', { protocol: 'file:' });
+    assert.strictEqual(probeCalls.length, 1, 'file:// listening source should be resolved through ResourceCore');
+    assert.strictEqual(probeCalls[0].kind, 'html');
+    assert.strictEqual(probeCalls[0].entry.type, 'listening');
+    assert.strictEqual(window.__defaultListeningLibraryAvailable, true);
+    assert.strictEqual(window.__defaultListeningLibraryAvailabilityReason, 'available');
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailable, true);
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityDetail.protocol, 'file:');
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityDetail.url, 'file:///D:/IELTS/ListeningPractice/P1/Guard/Guard.html');
+}
+
+async function testListeningUnavailableForFileProtocolWhenSourceDoesNotResolve() {
+    const { window, probeCalls } = await runLazyLoader('', { protocol: 'file:' });
+    assert.strictEqual(probeCalls.length, 1, 'file:// listening source should still require ResourceCore confirmation');
+    assert.strictEqual(window.__defaultListeningLibraryAvailable, false);
+    assert.strictEqual(window.__defaultListeningLibraryAvailabilityReason, 'source-root-unavailable');
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailable, false);
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityReason, 'source-root-unavailable');
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityDetail.protocol, 'file:');
+
+    const managerWindow = createLibraryManagerHarness({
+        defaultAvailable: window.__defaultListeningLibraryAvailable,
+        sourceAvailable: window.__defaultListeningLibrarySourceAvailable
+    });
+    assert.strictEqual(
+        managerWindow.LibraryManager.isBuiltInListeningLibraryAvailable(),
+        false,
+        'file:// listening must stay hidden when ResourceCore cannot resolve a source'
+    );
 }
 
 function createLibraryManagerHarness(flags = {}) {
@@ -201,9 +228,10 @@ function testLibraryManagerRequiresConfirmedAvailability() {
 }
 
 try {
-    await testListeningUnavailableWhenSourceProbeFails();
-    await testListeningUnavailableWhenSourceCannotBeActivelyProbed();
-    await testListeningAvailableWhenSourceProbeSucceeds();
+    await testListeningUnavailableWhenHttpSourceProbeFails();
+    await testListeningAvailableWhenHttpSourceProbeSucceeds();
+    await testListeningAvailableForFileProtocolWhenSourceResolves();
+    await testListeningUnavailableForFileProtocolWhenSourceDoesNotResolve();
     testLibraryManagerRequiresConfirmedAvailability();
     console.log(JSON.stringify({
         status: 'pass',

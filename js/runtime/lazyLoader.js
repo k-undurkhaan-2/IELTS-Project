@@ -246,6 +246,16 @@
         return null;
     }
 
+    function getCurrentProtocol() {
+        try {
+            return global.location && global.location.protocol
+                ? String(global.location.protocol).toLowerCase()
+                : '';
+        } catch (_) {
+            return '';
+        }
+    }
+
     function ensureBuiltInListeningSourceRoot() {
         var index = Array.isArray(global.listeningExamIndex) ? global.listeningExamIndex : [];
         if (!index.length) {
@@ -259,20 +269,10 @@
             return Promise.resolve(false);
         }
 
-        var protocol = '';
-        try {
-            protocol = global.location && global.location.protocol
-                ? String(global.location.protocol).toLowerCase()
-                : '';
-        } catch (_) { }
-        if (protocol !== 'http:' && protocol !== 'https:') {
-            setBuiltInListeningSourceAvailability(false, 'source-probe-unavailable', { protocol: protocol || 'unknown' });
-            return Promise.resolve(false);
-        }
-
+        var protocol = getCurrentProtocol();
         var resourceCore = global.ResourceCore;
         if (!resourceCore || typeof resourceCore.resolveResource !== 'function') {
-            setBuiltInListeningSourceAvailability(false, 'source-probe-unavailable');
+            setBuiltInListeningSourceAvailability(false, 'source-probe-unavailable', { protocol: protocol || 'unknown' });
             return Promise.resolve(false);
         }
 
@@ -282,14 +282,16 @@
             setBuiltInListeningSourceAvailability(
                 available,
                 available ? 'available' : 'source-root-unavailable',
-                available ? { url: sourceUrl } : { attempts: result && result.attempts ? result.attempts : [] }
+                available
+                    ? { protocol: protocol || 'unknown', url: sourceUrl }
+                    : { protocol: protocol || 'unknown', attempts: result && result.attempts ? result.attempts : [] }
             );
             return available;
         }).catch(function onListeningSourceProbeFailed(error) {
             try {
                 console.warn('[LazyLoader] Listening source root probe failed:', summarizeLazyLoaderErrorForLog(error));
             } catch (_) { }
-            setBuiltInListeningSourceAvailability(false, 'source-probe-failed');
+            setBuiltInListeningSourceAvailability(false, 'source-probe-failed', { protocol: protocol || 'unknown' });
             return false;
         });
     }
