@@ -256,6 +256,7 @@
         }
     }
 
+
     function ensureBuiltInListeningSourceRoot() {
         var index = Array.isArray(global.listeningExamIndex) ? global.listeningExamIndex : [];
         if (!index.length) {
@@ -270,6 +271,12 @@
         }
 
         var protocol = getCurrentProtocol();
+        if (protocol !== 'http:' && protocol !== 'https:') {
+            // Local static file mode is intentionally unsupported; use a local HTTP server for development.
+            setBuiltInListeningSourceAvailability(false, 'unsupported-environment', { protocol: protocol || 'unknown' });
+            return Promise.resolve(false);
+        }
+
         var resourceCore = global.ResourceCore;
         if (!resourceCore || typeof resourceCore.resolveResource !== 'function') {
             setBuiltInListeningSourceAvailability(false, 'source-probe-unavailable', { protocol: protocol || 'unknown' });

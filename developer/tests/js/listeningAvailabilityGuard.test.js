@@ -143,36 +143,24 @@ async function testListeningAvailableWhenHttpSourceProbeSucceeds() {
     assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityDetail.url, './ListeningPractice/P1/Guard/Guard.html');
 }
 
-async function testListeningAvailableForFileProtocolWhenSourceResolves() {
+async function testListeningUnavailableForLocalStaticFileModeEvenWhenResolveResourceReturnsUrl() {
     const { window, probeCalls } = await runLazyLoader('file:///D:/IELTS/ListeningPractice/P1/Guard/Guard.html', { protocol: 'file:' });
-    assert.strictEqual(probeCalls.length, 1, 'file:// listening source should be resolved through ResourceCore');
-    assert.strictEqual(probeCalls[0].kind, 'html');
-    assert.strictEqual(probeCalls[0].entry.type, 'listening');
-    assert.strictEqual(window.__defaultListeningLibraryAvailable, true);
-    assert.strictEqual(window.__defaultListeningLibraryAvailabilityReason, 'available');
-    assert.strictEqual(window.__defaultListeningLibrarySourceAvailable, true);
+    assert.strictEqual(probeCalls.length, 0, 'file:// availability must not call ResourceCore.resolveResource as proof');
+    assert.strictEqual(window.__defaultListeningLibraryAvailable, false);
+    assert.strictEqual(window.__defaultListeningLibraryAvailabilityReason, 'unsupported-environment');
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailable, false);
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityReason, 'unsupported-environment');
     assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityDetail.protocol, 'file:');
-    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityDetail.url, 'file:///D:/IELTS/ListeningPractice/P1/Guard/Guard.html');
 }
 
-async function testListeningUnavailableForFileProtocolWhenSourceDoesNotResolve() {
-    const { window, probeCalls } = await runLazyLoader('', { protocol: 'file:' });
-    assert.strictEqual(probeCalls.length, 1, 'file:// listening source should still require ResourceCore confirmation');
+async function testListeningUnavailableForUnsupportedProtocol() {
+    const { window, probeCalls } = await runLazyLoader('app://local/ListeningPractice/P1/Guard/Guard.html', { protocol: 'app:' });
+    assert.strictEqual(probeCalls.length, 0, 'unsupported protocols must not call ResourceCore.resolveResource as proof');
     assert.strictEqual(window.__defaultListeningLibraryAvailable, false);
-    assert.strictEqual(window.__defaultListeningLibraryAvailabilityReason, 'source-root-unavailable');
+    assert.strictEqual(window.__defaultListeningLibraryAvailabilityReason, 'unsupported-environment');
     assert.strictEqual(window.__defaultListeningLibrarySourceAvailable, false);
-    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityReason, 'source-root-unavailable');
-    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityDetail.protocol, 'file:');
-
-    const managerWindow = createLibraryManagerHarness({
-        defaultAvailable: window.__defaultListeningLibraryAvailable,
-        sourceAvailable: window.__defaultListeningLibrarySourceAvailable
-    });
-    assert.strictEqual(
-        managerWindow.LibraryManager.isBuiltInListeningLibraryAvailable(),
-        false,
-        'file:// listening must stay hidden when ResourceCore cannot resolve a source'
-    );
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityReason, 'unsupported-environment');
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityDetail.protocol, 'app:');
 }
 
 function createLibraryManagerHarness(flags = {}) {
@@ -230,8 +218,8 @@ function testLibraryManagerRequiresConfirmedAvailability() {
 try {
     await testListeningUnavailableWhenHttpSourceProbeFails();
     await testListeningAvailableWhenHttpSourceProbeSucceeds();
-    await testListeningAvailableForFileProtocolWhenSourceResolves();
-    await testListeningUnavailableForFileProtocolWhenSourceDoesNotResolve();
+    await testListeningUnavailableForLocalStaticFileModeEvenWhenResolveResourceReturnsUrl();
+    await testListeningUnavailableForUnsupportedProtocol();
     testLibraryManagerRequiresConfirmedAvailability();
     console.log(JSON.stringify({
         status: 'pass',
