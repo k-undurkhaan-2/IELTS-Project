@@ -22,7 +22,8 @@ const listeningEntry = {
     audioFilename: 'audio.mp3',
     hasHtml: true,
     hasPdf: true,
-    hasAudio: true
+    hasAudio: true,
+    sourcePath: 'P1/Guard/Guard.html'
 };
 
 function loadScript(relativePath, context) {
@@ -45,11 +46,22 @@ function createScriptElement() {
     };
 }
 
-function createLazyLoaderHarness({ probeUrl, protocol = 'http:' }) {
-    const probeCalls = [];
+function toAbsoluteUrl(value, baseHref) {
+    return new URL(String(value), baseHref).href;
+}
+
+function createLazyLoaderHarness({
+    protocol = 'http:',
+    pathRoot = 'ListeningPractice/',
+    availableUrls = [],
+    genericResolverUrl = 'http://localhost/practice/listening/listening-p1-guard'
+} = {}) {
+    const resourceCoreCalls = [];
+    const fetchCalls = [];
     const isFileProtocol = protocol === 'file:';
     const locationHref = isFileProtocol ? 'file:///D:/IELTS/index.html' : 'http://localhost/index.html';
     const locationOrigin = isFileProtocol ? 'null' : 'http://localhost';
+    const available = new Set(availableUrls.map((url) => toAbsoluteUrl(url, locationHref)));
     let windowStub;
     const document = {
         baseURI: locationHref,
@@ -70,7 +82,7 @@ function createLazyLoaderHarness({ probeUrl, protocol = 'http:' }) {
                 }
                 if (pathname.endsWith('/assets/generated/listening-exams/listening-index.compat.js')) {
                     windowStub.listeningExamIndex = [Object.assign({}, listeningEntry)];
-                    windowStub.listeningExamIndex.pathRoot = 'ListeningPractice/';
+                    windowStub.listeningExamIndex.pathRoot = pathRoot;
                 }
                 if (typeof script.onload === 'function') {
                     script.onload({ type: 'load' });
@@ -86,12 +98,19 @@ function createLazyLoaderHarness({ probeUrl, protocol = 'http:' }) {
             protocol
         },
         document,
+        fetch(url, options = {}) {
+            const href = toAbsoluteUrl(url, locationHref);
+            const method = options && options.method ? String(options.method).toUpperCase() : 'GET';
+            fetchCalls.push({ url: href, method });
+            const ok = available.has(href);
+            return Promise.resolve({ ok, status: ok ? 200 : 404 });
+        },
         ResourceCore: {
             resolveResource(entry, kind) {
-                probeCalls.push({ entry, kind });
+                resourceCoreCalls.push({ entry, kind });
                 return Promise.resolve({
-                    url: probeUrl || '',
-                    attempts: [{ label: 'map', path: './ListeningPractice/P1/Guard/Guard.html' }]
+                    url: genericResolverUrl,
+                    attempts: [{ label: 'route', path: genericResolverUrl }]
                 });
             }
         }
@@ -108,44 +127,92 @@ function createLazyLoaderHarness({ probeUrl, protocol = 'http:' }) {
         Error,
         String,
         Boolean,
-        URL
+        Number,
+        URL,
+        encodeURIComponent,
+        decodeURIComponent
     });
 
     loadScript('js/runtime/lazyLoader.js', context);
-    return { window: windowStub, probeCalls };
+    return { window: windowStub, resourceCoreCalls, fetchCalls };
 }
 
-async function runLazyLoader(probeUrl, options = {}) {
-    const harness = createLazyLoaderHarness({ probeUrl, ...options });
+async function runLazyLoader(options = {}) {
+    const harness = createLazyLoaderHarness(options);
     await harness.window.AppLazyLoader.ensureGroup('exam-data');
     return harness;
 }
 
-async function testListeningUnavailableWhenHttpSourceProbeFails() {
-    const { window, probeCalls } = await runLazyLoader('');
-    assert.strictEqual(probeCalls.length, 1, 'HTTP listening source should be probed once');
-    assert.strictEqual(probeCalls[0].kind, 'html');
-    assert.strictEqual(probeCalls[0].entry.type, 'listening');
+async function testHttpProbeUsesPathRootAndEntryPath() {
+    const expectedUrl = 'http://localhost/ListeningPractice/P1/Guard/Guard.html';
+    const { window, fetchCalls, resourceCoreCalls } = await runLazyLoader({
+        availableUrls: [expectedUrl]
+    });
+    assert.strictEqual(resourceCoreCalls.length, 0, 'availability must not use ResourceCore generic route resolver');
+    assert.deepStrictEqual(fetchCalls, [{ url: expectedUrl, method: 'HEAD' }]);
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityDetail.url, expectedUrl);
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityDetail.pathRoot, 'ListeningPractice');
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityDetail.entryPath, 'P1/Guard/Guard.html');
+}
+
+async function testListeningAvailableWhenHttpSourceRootExists() {
+    const expectedUrl = 'http://localhost/CustomListening/P1/Guard/Guard.html';
+    const { window, fetchCalls } = await runLazyLoader({
+        pathRoot: 'CustomListening/',
+        availableUrls: [expectedUrl]
+    });
+    assert.deepStrictEqual(fetchCalls, [{ url: expectedUrl, method: 'HEAD' }]);
+    assert.strictEqual(window.__defaultListeningLibraryAvailable, true);
+    assert.strictEqual(window.__defaultListeningLibraryAvailabilityReason, 'available');
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailable, true);
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityReason, 'available');
+}
+
+async function testListeningUnavailableWhenHttpSourceRootIsWrong() {
+    const wrongUrl = 'http://localhost/MissingListening/P1/Guard/Guard.html';
+    const { window, fetchCalls } = await runLazyLoader({
+        pathRoot: 'MissingListening/',
+        availableUrls: ['http://localhost/ListeningPractice/P1/Guard/Guard.html']
+    });
+    assert.deepStrictEqual(fetchCalls, [{ url: wrongUrl, method: 'HEAD' }]);
     assert.strictEqual(window.__defaultListeningLibraryAvailable, false);
     assert.strictEqual(window.__defaultListeningLibraryAvailabilityReason, 'source-root-unavailable');
     assert.strictEqual(window.__defaultListeningLibrarySourceAvailable, false);
     assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityReason, 'source-root-unavailable');
-    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityDetail.protocol, 'http:');
 }
 
-async function testListeningAvailableWhenHttpSourceProbeSucceeds() {
-    const { window, probeCalls } = await runLazyLoader('./ListeningPractice/P1/Guard/Guard.html');
-    assert.strictEqual(probeCalls.length, 1, 'HTTP listening source should be probed once');
-    assert.strictEqual(window.__defaultListeningLibraryAvailable, true);
-    assert.strictEqual(window.__defaultListeningLibraryAvailabilityReason, 'available');
-    assert.strictEqual(window.__defaultListeningLibrarySourceAvailable, true);
-    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityDetail.protocol, 'http:');
-    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityDetail.url, './ListeningPractice/P1/Guard/Guard.html');
+async function testResourceCoreGenericResolverCandidateDoesNotCountAsSourceProof() {
+    const genericUrl = 'http://localhost/ListeningPractice/P1/Guard/Guard.html';
+    const wrongUrl = 'http://localhost/MissingListening/P1/Guard/Guard.html';
+    const { window, fetchCalls, resourceCoreCalls } = await runLazyLoader({
+        pathRoot: 'MissingListening/',
+        availableUrls: [genericUrl],
+        genericResolverUrl: genericUrl
+    });
+    assert.strictEqual(resourceCoreCalls.length, 0, 'ResourceCore candidate URLs must not be used as source availability proof');
+    assert.deepStrictEqual(fetchCalls, [{ url: wrongUrl, method: 'HEAD' }]);
+    assert.strictEqual(window.__defaultListeningLibraryAvailable, false);
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailable, false);
+}
+
+async function testListeningUnavailableWhenHttpSourceProbeFails() {
+    const expectedUrl = 'http://localhost/ListeningPractice/P1/Guard/Guard.html';
+    const { window, fetchCalls } = await runLazyLoader();
+    assert.deepStrictEqual(fetchCalls, [{ url: expectedUrl, method: 'HEAD' }]);
+    assert.strictEqual(window.__defaultListeningLibraryAvailable, false);
+    assert.strictEqual(window.__defaultListeningLibraryAvailabilityReason, 'source-root-unavailable');
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailable, false);
+    assert.strictEqual(window.__defaultListeningLibrarySourceAvailabilityReason, 'source-root-unavailable');
 }
 
 async function testListeningUnavailableForLocalStaticFileModeEvenWhenResolveResourceReturnsUrl() {
-    const { window, probeCalls } = await runLazyLoader('file:///D:/IELTS/ListeningPractice/P1/Guard/Guard.html', { protocol: 'file:' });
-    assert.strictEqual(probeCalls.length, 0, 'file:// availability must not call ResourceCore.resolveResource as proof');
+    const { window, fetchCalls, resourceCoreCalls } = await runLazyLoader({
+        protocol: 'file:',
+        genericResolverUrl: 'file:///D:/IELTS/ListeningPractice/P1/Guard/Guard.html',
+        availableUrls: ['file:///D:/IELTS/ListeningPractice/P1/Guard/Guard.html']
+    });
+    assert.strictEqual(resourceCoreCalls.length, 0, 'file:// availability must not call ResourceCore.resolveResource as proof');
+    assert.strictEqual(fetchCalls.length, 0, 'local static file mode is intentionally unsupported; use a local HTTP server for development');
     assert.strictEqual(window.__defaultListeningLibraryAvailable, false);
     assert.strictEqual(window.__defaultListeningLibraryAvailabilityReason, 'unsupported-environment');
     assert.strictEqual(window.__defaultListeningLibrarySourceAvailable, false);
@@ -154,8 +221,12 @@ async function testListeningUnavailableForLocalStaticFileModeEvenWhenResolveReso
 }
 
 async function testListeningUnavailableForUnsupportedProtocol() {
-    const { window, probeCalls } = await runLazyLoader('app://local/ListeningPractice/P1/Guard/Guard.html', { protocol: 'app:' });
-    assert.strictEqual(probeCalls.length, 0, 'unsupported protocols must not call ResourceCore.resolveResource as proof');
+    const { window, fetchCalls, resourceCoreCalls } = await runLazyLoader({
+        protocol: 'app:',
+        genericResolverUrl: 'app://local/ListeningPractice/P1/Guard/Guard.html'
+    });
+    assert.strictEqual(resourceCoreCalls.length, 0, 'unsupported protocols must not call ResourceCore.resolveResource as proof');
+    assert.strictEqual(fetchCalls.length, 0);
     assert.strictEqual(window.__defaultListeningLibraryAvailable, false);
     assert.strictEqual(window.__defaultListeningLibraryAvailabilityReason, 'unsupported-environment');
     assert.strictEqual(window.__defaultListeningLibrarySourceAvailable, false);
@@ -216,8 +287,11 @@ function testLibraryManagerRequiresConfirmedAvailability() {
 }
 
 try {
+    await testHttpProbeUsesPathRootAndEntryPath();
+    await testListeningAvailableWhenHttpSourceRootExists();
+    await testListeningUnavailableWhenHttpSourceRootIsWrong();
+    await testResourceCoreGenericResolverCandidateDoesNotCountAsSourceProof();
     await testListeningUnavailableWhenHttpSourceProbeFails();
-    await testListeningAvailableWhenHttpSourceProbeSucceeds();
     await testListeningUnavailableForLocalStaticFileModeEvenWhenResolveResourceReturnsUrl();
     await testListeningUnavailableForUnsupportedProtocol();
     testLibraryManagerRequiresConfirmedAvailability();

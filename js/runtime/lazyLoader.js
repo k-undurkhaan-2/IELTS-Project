@@ -255,8 +255,124 @@
             return '';
         }
     }
+    function hasProtocolPath(value) {
+        return /^[a-z][a-z0-9+.-]*:/i.test(String(value || ''));
+    }
 
+    function normalizeListeningSourcePathPart(value, trimTrailing) {
+        var raw = String(value || '').replace(/\\/g, '/').trim();
+        if (!raw || hasProtocolPath(raw)) {
+            return '';
+        }
+        raw = raw.replace(/^\/+/, '');
+        return trimTrailing === false ? raw : raw.replace(/\/+$/, '');
+    }
 
+    function joinListeningSourcePath() {
+        var parts = [];
+        for (var i = 0; i < arguments.length; i += 1) {
+            var part = normalizeListeningSourcePathPart(arguments[i]);
+            if (part) {
+                parts.push(part);
+            }
+        }
+        return parts.join('/');
+    }
+
+    function encodeSourcePathSegment(segment) {
+        try {
+            return encodeURIComponent(decodeURIComponent(segment));
+        } catch (_) {
+            return encodeURIComponent(segment);
+        }
+    }
+
+    function encodeSourcePathSegments(pathValue) {
+        return String(pathValue || '')
+            .split('/')
+            .filter(Boolean)
+            .map(encodeSourcePathSegment)
+            .join('/');
+    }
+
+    function getListeningSourceRoot() {
+        var index = Array.isArray(global.listeningExamIndex) ? global.listeningExamIndex : [];
+        var configuredRoot = normalizeListeningSourcePathPart(index.pathRoot);
+        return configuredRoot || 'ListeningPractice';
+    }
+
+    function getListeningEntrySourcePath(entry) {
+        if (!entry || typeof entry !== 'object') {
+            return '';
+        }
+        var sourcePath = normalizeListeningSourcePathPart(entry.sourcePath);
+        if (sourcePath) {
+            return sourcePath;
+        }
+        var entryPath = normalizeListeningSourcePathPart(entry.path);
+        var filename = normalizeListeningSourcePathPart(entry.filename);
+        if (!entryPath || !filename) {
+            return '';
+        }
+        return joinListeningSourcePath(entryPath, filename);
+    }
+
+    function buildListeningSourceProbeUrl(entry) {
+        var sourceRoot = getListeningSourceRoot();
+        var entrySourcePath = getListeningEntrySourcePath(entry);
+        if (!sourceRoot || !entrySourcePath) {
+            return '';
+        }
+        var lowerRoot = sourceRoot.toLowerCase();
+        var lowerEntryPath = entrySourcePath.toLowerCase();
+        var combinedPath = lowerEntryPath === lowerRoot || lowerEntryPath.indexOf(lowerRoot + '/') === 0
+            ? entrySourcePath
+            : joinListeningSourcePath(sourceRoot, entrySourcePath);
+        var encodedPath = encodeSourcePathSegments(combinedPath);
+        if (!encodedPath) {
+            return '';
+        }
+        try {
+            var baseHref = document.baseURI || (global.location && global.location.href) || 'http://localhost/';
+            var resolved = new URL(encodedPath, baseHref);
+            return (resolved.protocol === 'http:' || resolved.protocol === 'https:') ? resolved.href : '';
+        } catch (_) {
+            return '';
+        }
+    }
+
+    function responseIndicatesSourceAvailable(response) {
+        if (!response) {
+            return false;
+        }
+        var status = Number(response.status) || 0;
+        return response.ok === true || status === 304;
+    }
+
+    function probeListeningSourceUrl(sourceUrl) {
+        var fetcher = typeof global.fetch === 'function' ? global.fetch.bind(global) : null;
+        if (!fetcher) {
+            return Promise.resolve({ available: false, reason: 'source-probe-unavailable' });
+        }
+        return fetcher(sourceUrl, { method: 'HEAD', cache: 'no-store' }).then(function onHead(response) {
+            if (responseIndicatesSourceAvailable(response)) {
+                return { available: true, reason: 'available' };
+            }
+            if (response && Number(response.status) === 405) {
+                return fetcher(sourceUrl, { method: 'GET', cache: 'no-store' }).then(function onGet(getResponse) {
+                    return {
+                        available: responseIndicatesSourceAvailable(getResponse),
+                        reason: responseIndicatesSourceAvailable(getResponse) ? 'available' : 'source-root-unavailable'
+                    };
+                }).catch(function onGetFailed() {
+                    return { available: false, reason: 'source-root-unavailable' };
+                });
+            }
+            return { available: false, reason: 'source-root-unavailable' };
+        }).catch(function onHeadFailed() {
+            return { available: false, reason: 'source-root-unavailable' };
+        });
+    }
     function ensureBuiltInListeningSourceRoot() {
         var index = Array.isArray(global.listeningExamIndex) ? global.listeningExamIndex : [];
         if (!index.length) {
@@ -277,29 +393,26 @@
             return Promise.resolve(false);
         }
 
-        var resourceCore = global.ResourceCore;
-        if (!resourceCore || typeof resourceCore.resolveResource !== 'function') {
-            setBuiltInListeningSourceAvailability(false, 'source-probe-unavailable', { protocol: protocol || 'unknown' });
+        var probeUrl = buildListeningSourceProbeUrl(probeEntry);
+        if (!probeUrl) {
+            setBuiltInListeningSourceAvailability(false, 'source-probe-url-missing', { protocol: protocol || 'unknown' });
             return Promise.resolve(false);
         }
 
-        return resourceCore.resolveResource(probeEntry, 'html').then(function onListeningSourceProbe(result) {
-            var sourceUrl = result && result.url ? String(result.url) : '';
-            var available = !!sourceUrl;
+        return probeListeningSourceUrl(probeUrl).then(function onListeningSourceProbe(result) {
+            var available = result && result.available === true;
+            var reason = result && result.reason ? result.reason : (available ? 'available' : 'source-root-unavailable');
             setBuiltInListeningSourceAvailability(
                 available,
-                available ? 'available' : 'source-root-unavailable',
-                available
-                    ? { protocol: protocol || 'unknown', url: sourceUrl }
-                    : { protocol: protocol || 'unknown', attempts: result && result.attempts ? result.attempts : [] }
+                reason,
+                {
+                    protocol: protocol || 'unknown',
+                    pathRoot: getListeningSourceRoot(),
+                    entryPath: getListeningEntrySourcePath(probeEntry),
+                    url: probeUrl
+                }
             );
             return available;
-        }).catch(function onListeningSourceProbeFailed(error) {
-            try {
-                console.warn('[LazyLoader] Listening source root probe failed:', summarizeLazyLoaderErrorForLog(error));
-            } catch (_) { }
-            setBuiltInListeningSourceAvailability(false, 'source-probe-failed', { protocol: protocol || 'unknown' });
-            return false;
         });
     }
 
