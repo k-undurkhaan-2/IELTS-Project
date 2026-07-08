@@ -324,6 +324,36 @@ textarea {
     padding-inline: var(--space-3);
 }
 
+.ds-learning .practice-trend-options {
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    width: fit-content;
+    max-width: 100%;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface-subtle);
+    padding: var(--space-1);
+}
+
+.ds-learning .practice-trend-options .practice-trend-option {
+    border-color: var(--border);
+    background: var(--surface);
+}
+
+.ds-learning .practice-trend-options .practice-trend-option:hover,
+.ds-learning .practice-trend-options .practice-trend-option:focus-visible {
+    border-color: var(--control-secondary-border);
+    background: var(--control-secondary-surface-hover);
+}
+
+.ds-learning .practice-trend-options .practice-trend-option.active,
+.ds-learning .practice-trend-options .practice-trend-option[aria-pressed="true"] {
+    border-color: var(--control-selected-border);
+    background: var(--control-selected-surface);
+}
+
 .ds-learning .practice-custom-card__icon-btn {
     flex: 0 0 var(--control-height);
     width: var(--control-height);
@@ -331,13 +361,149 @@ textarea {
     padding: 0;
 }
 
+.ds-learning .practice-custom-card__header-actions,
+.ds-learning .practice-heatmap-month-controls {
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+}
+
+.ds-learning .practice-custom-card__front .practice-trend-card__header {
+    align-items: center;
+}
+
+.ds-learning .practice-custom-card__front .practice-custom-card__header-actions {
+    flex-wrap: nowrap;
+    justify-content: flex-end;
+    margin-left: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface-subtle);
+    padding: var(--space-1);
+}
+
+.ds-learning .practice-heatmap-month-controls {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface-subtle);
+    padding: var(--space-1);
+}
+
+.ds-learning .practice-custom-card__front .practice-heatmap-month-controls {
+    flex-wrap: nowrap;
+    gap: var(--space-1);
+    border: 0;
+    background: transparent;
+    padding: 0;
+}
+
+.ds-learning .practice-heatmap-month-controls .practice-custom-card__icon-btn,
+.ds-learning .practice-custom-card__flip-btn.practice-custom-card__icon-btn {
+    border-color: var(--control-secondary-border);
+    background: var(--control-secondary-surface);
+    color: var(--text-primary);
+}
+
+.ds-learning .practice-custom-card__front .practice-custom-card__icon-btn {
+    flex-basis: var(--control-height);
+    width: var(--control-height);
+    min-width: var(--control-height);
+}
+
+.ds-learning .practice-heatmap-month-label {
+    min-width: 9ch;
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    text-align: center;
+}
+
 .ds-learning .practice-custom-option {
     justify-content: flex-start;
-    min-height: 52px;
+    min-height: 48px;
     width: 100%;
     line-height: var(--line-height-normal);
-    padding: var(--space-3);
+    padding: var(--space-3) var(--space-4);
     text-align: left;
+}
+
+.ds-learning .practice-custom-options {
+    display: grid;
+    gap: var(--space-2);
+    width: 100%;
+}
+
+.ds-learning .practice-custom-options .practice-custom-option {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    justify-content: stretch;
+    border-color: var(--border);
+    background: var(--surface);
+}
+
+.ds-learning .practice-custom-options .practice-custom-option.active,
+.ds-learning .practice-custom-options .practice-custom-option[aria-pressed="true"] {
+    border-color: var(--control-selected-border);
+    background: var(--control-selected-surface);
+    color: var(--control-selected-text);
+}
+
+.ds-learning .practice-custom-option__icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface-subtle);
+    color: var(--text-secondary);
+}
+
+.ds-learning .practice-custom-option__body {
+    display: grid;
+    gap: var(--space-1);
+    min-width: 0;
+}
+
+.ds-learning .practice-custom-option__body strong {
+    color: var(--text-primary);
+    font-size: var(--font-size-sm);
+    font-weight: 700;
+}
+
+.ds-learning .practice-custom-option__body span {
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 500;
+    line-height: var(--line-height-normal);
+}
+
+.ds-learning .practice-custom-option__check {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-pill);
+    background: var(--surface-subtle);
+}
+
+.ds-learning .practice-custom-option.active .practice-custom-option__icon,
+.ds-learning .practice-custom-option[aria-pressed="true"] .practice-custom-option__icon {
+    border-color: var(--control-selected-border);
+    background: var(--control-selected-surface);
+    color: var(--control-selected-text);
+}
+
+.ds-learning .practice-custom-option.active .practice-custom-option__check,
+.ds-learning .practice-custom-option[aria-pressed="true"] .practice-custom-option__check {
+    border-color: var(--control-selected-border);
+    background: var(--accent);
+    box-shadow: inset 0 0 0 4px var(--control-selected-surface);
 }
 
 .ds-learning #settings-view .hero-settings-actions button {
@@ -419,6 +585,324 @@ textarea {
     background: var(--surface);
     background-image: none;
     box-shadow: var(--elevation-1);
+}
+
+.ds-learning .practice-trend-card__face,
+.ds-learning .practice-custom-card__face {
+    display: grid;
+    gap: var(--space-4);
+    padding: var(--space-5);
+}
+
+.ds-learning .practice-trend-card__header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-4);
+}
+
+.ds-learning .practice-trend-card__title-line {
+    display: grid;
+    gap: var(--space-1);
+}
+
+.ds-learning .practice-trend-card__eyebrow {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 700;
+    letter-spacing: 0;
+    text-transform: uppercase;
+}
+
+.ds-learning .practice-trend-card__title {
+    margin: 0;
+    color: var(--text-primary);
+    font-size: var(--font-size-lg);
+    font-weight: 700;
+    line-height: var(--line-height-tight);
+}
+
+.ds-learning .practice-trend-card__metrics {
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+}
+
+.ds-learning .practice-trend-card__metric {
+    display: inline-flex;
+    align-items: baseline;
+    gap: var(--space-1);
+    min-height: 30px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface-subtle);
+    color: var(--text-secondary);
+    padding: 0 var(--space-3);
+}
+
+.ds-learning .practice-trend-card__metric-value {
+    color: var(--text-primary);
+    font-weight: 700;
+}
+
+.ds-learning .practice-trend-card__metric-label,
+.ds-learning .practice-trend-card__range {
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+}
+
+.ds-learning .practice-trend-chart-shell {
+    display: grid;
+    place-items: center;
+    min-height: 136px;
+    border: 1px dashed var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface-subtle);
+    color: var(--text-secondary);
+    padding: var(--space-4);
+}
+
+.ds-learning .practice-trend-chart-shell canvas {
+    max-width: 100%;
+}
+
+.ds-learning .practice-trend-card.is-empty .practice-trend-chart-shell canvas {
+    display: none;
+}
+
+.ds-learning .practice-trend-empty:not([hidden]) {
+    display: grid;
+    place-items: center;
+    min-height: 88px;
+    width: min(100%, 420px);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    padding: var(--space-4);
+    text-align: center;
+}
+
+.ds-learning .practice-custom-widget-content:not([hidden]) {
+    display: grid;
+    gap: var(--space-3);
+}
+
+.ds-learning .practice-custom-widget-content[data-widget-type="heatmap"]:not([hidden]) {
+    gap: var(--space-3);
+    justify-items: center;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface-subtle);
+    padding: var(--space-3);
+}
+
+.ds-learning .practice-heatmap {
+    --practice-heatmap-cell: clamp(22px, 2.5vw, 28px);
+    --practice-heatmap-gap: var(--space-2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 132px;
+    width: min(100%, 360px);
+    box-sizing: border-box;
+    overflow-x: auto;
+    border: 1px dashed color-mix(in srgb, var(--border) 82%, var(--surface));
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    color: var(--text-secondary);
+    padding: var(--space-4);
+}
+
+.ds-learning .practice-heatmap__body {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    gap: var(--space-2);
+    width: max-content;
+    max-width: 100%;
+    align-items: center;
+}
+
+.ds-learning .practice-heatmap__weekdays,
+.ds-learning .practice-heatmap__grid {
+    display: grid;
+    grid-template-columns: repeat(7, var(--practice-heatmap-cell));
+    gap: var(--practice-heatmap-gap);
+    justify-content: center;
+}
+
+.ds-learning .practice-heatmap__weekdays {
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 700;
+    line-height: 1;
+    text-align: center;
+}
+
+.ds-learning .practice-heatmap__weekday {
+    min-width: 0;
+}
+
+.ds-learning .practice-heatmap__grid {
+    grid-template-rows: repeat(var(--practice-heatmap-weeks, 5), var(--practice-heatmap-cell));
+    align-content: center;
+}
+
+.ds-learning .practice-heatmap__cell {
+    --practice-heatmap-level: var(--surface);
+    position: relative;
+    width: var(--practice-heatmap-cell);
+    height: var(--practice-heatmap-cell);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--practice-heatmap-level);
+    box-shadow: none;
+    cursor: default;
+    outline: none;
+    padding: 0;
+    transition:
+        background-color var(--motion-duration) var(--motion-ease),
+        border-color var(--motion-duration) var(--motion-ease),
+        box-shadow var(--motion-duration) var(--motion-ease);
+}
+
+.ds-learning .practice-heatmap__cell[data-level="0"] {
+    --practice-heatmap-level: color-mix(in srgb, var(--surface-subtle) 72%, var(--surface));
+}
+
+.ds-learning .practice-heatmap__cell[data-level="1"] {
+    --practice-heatmap-level: color-mix(in srgb, var(--accent-subtle) 55%, var(--surface));
+}
+
+.ds-learning .practice-heatmap__cell[data-level="2"] {
+    --practice-heatmap-level: color-mix(in srgb, var(--accent-subtle) 78%, var(--surface));
+}
+
+.ds-learning .practice-heatmap__cell[data-level="3"] {
+    --practice-heatmap-level: color-mix(in srgb, var(--accent) 42%, var(--accent-subtle));
+}
+
+.ds-learning .practice-heatmap__cell[data-level="4"] {
+    --practice-heatmap-level: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 70%, var(--border));
+}
+
+.ds-learning .practice-heatmap__cell.is-outside-month {
+    opacity: 0.46;
+}
+
+.ds-learning .practice-heatmap__cell:hover,
+.ds-learning .practice-heatmap__cell:focus-visible {
+    border-color: var(--control-selected-border);
+    box-shadow: var(--focus-ring);
+    z-index: 1;
+}
+
+.ds-learning .practice-heatmap__cell::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    left: 50%;
+    bottom: calc(100% + var(--space-2));
+    width: max-content;
+    max-width: 180px;
+    border: 1px solid color-mix(in srgb, var(--text-primary) 28%, transparent);
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--text-primary) 92%, transparent);
+    color: var(--surface);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    line-height: var(--line-height-normal);
+    opacity: 0;
+    padding: var(--space-1) var(--space-2);
+    pointer-events: none;
+    text-align: center;
+    transform: translate(-50%, var(--space-1));
+    transition:
+        opacity var(--motion-duration-fast) var(--motion-ease),
+        transform var(--motion-duration-fast) var(--motion-ease);
+    white-space: normal;
+    z-index: 10;
+}
+
+.ds-learning .practice-heatmap__cell:hover::after,
+.ds-learning .practice-heatmap__cell:focus-visible::after {
+    opacity: 1;
+    transform: translate(-50%, 0);
+}
+
+.ds-learning .practice-heatmap__footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    width: min(100%, 360px);
+    box-sizing: border-box;
+    border-top: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    padding-top: var(--space-3);
+}
+
+.ds-learning #practice-heatmap-summary {
+    display: inline-flex;
+    align-items: center;
+    min-height: 30px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface);
+    color: var(--text-secondary);
+    padding: 0 var(--space-3);
+}
+
+.ds-learning .practice-heatmap__legend {
+    display: inline-flex;
+    align-items: center;
+    margin-left: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface);
+    gap: var(--space-1);
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 700;
+    min-height: 30px;
+    padding: 0 var(--space-2);
+}
+
+.ds-learning .practice-heatmap__legend-cell {
+    width: 12px;
+    height: 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+}
+
+.ds-learning .practice-heatmap__legend-cell--0 {
+    background: color-mix(in srgb, var(--surface-subtle) 72%, var(--surface));
+}
+
+.ds-learning .practice-heatmap__legend-cell--1 {
+    background: color-mix(in srgb, var(--accent-subtle) 55%, var(--surface));
+}
+
+.ds-learning .practice-heatmap__legend-cell--2 {
+    background: color-mix(in srgb, var(--accent-subtle) 78%, var(--surface));
+}
+
+.ds-learning .practice-heatmap__legend-cell--3 {
+    background: color-mix(in srgb, var(--accent) 42%, var(--accent-subtle));
+}
+
+.ds-learning .practice-heatmap__legend-cell--4 {
+    border-color: color-mix(in srgb, var(--accent) 70%, var(--border));
+    background: var(--accent);
 }
 
 .ui-card--subtle,
