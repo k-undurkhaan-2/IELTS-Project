@@ -66,8 +66,108 @@
         return global.AppLazyLoader.ensureGroup('practice-suite');
     }
 
+    function getDataManageReturnTo() {
+        try {
+            var location = global.location;
+            if (!location) {
+                return '/';
+            }
+            var path = String(location.pathname || '/');
+            var query = String(location.search || '');
+            var hash = String(location.hash || '');
+            return (path || '/') + query + hash;
+        } catch (_) {
+            return '/';
+        }
+    }
+
+    function redirectToDataManageStepUp(startPath) {
+        var safeStartPath = typeof startPath === 'string' && startPath.indexOf('/auth/business/data/start') === 0
+            ? startPath
+            : '/auth/business/data/start';
+        if (global.location) {
+            global.location.href = safeStartPath + '?return_to=' + encodeURIComponent(getDataManageReturnTo());
+        }
+    }
+
+    function getDataManageRemoteApiClient() {
+        if (global.remoteApiClient && typeof global.remoteApiClient.request === 'function') {
+            return global.remoteApiClient;
+        }
+        if (global.ExamData && global.ExamData.remoteApiClient && typeof global.ExamData.remoteApiClient.request === 'function') {
+            return global.ExamData.remoteApiClient;
+        }
+        return null;
+    }
+
+    function requestDataManageStatus() {
+        var apiClient = getDataManageRemoteApiClient();
+        if (apiClient) {
+            return apiClient.request('/api/practice-records/data-manage/status', { method: 'GET', csrf: false });
+        }
+        if (typeof global.fetch !== 'function') {
+            return Promise.reject(new Error('Remote API client is unavailable'));
+        }
+        return global.fetch('/api/practice-records/data-manage/status', {
+            method: 'GET',
+            credentials: 'same-origin',
+            headers: { Accept: 'application/json' }
+        }).then(function handleStatusResponse(response) {
+            return response.json().catch(function () {
+                return null;
+            }).then(function handleStatusPayload(payload) {
+                if (!response.ok) {
+                    var error = new Error((payload && payload.error) || 'Data management step-up check failed');
+                    error.status = response.status;
+                    error.payload = payload;
+                    throw error;
+                }
+                return payload || {};
+            });
+        });
+    }
+
+    function ensureMarkdownExportDataManageStepUp() {
+        if (typeof global.ensureBusinessDataManageStepUp === 'function') {
+            return Promise.resolve(global.ensureBusinessDataManageStepUp());
+        }
+        return requestDataManageStatus().then(function handleDataManageStatus(payload) {
+            if (payload && payload.fresh === true) {
+                return true;
+            }
+            if (typeof global.showMessage === 'function') {
+                global.showMessage('Confirm your password before exporting practice history.', 'info');
+            }
+            redirectToDataManageStepUp(payload && payload.authActionStart);
+            return false;
+        }).catch(function handleDataManageStatusError(error) {
+            if (error && (error.status === 401 || error.status === 403)) {
+                if (typeof global.showMessage === 'function') {
+                    global.showMessage('Please sign in before exporting practice history.', 'warning');
+                }
+                redirectToDataManageStepUp(error.payload && error.payload.authActionStart);
+                return false;
+            }
+            console.error('[AppActions] data export step-up check failed:', summarizeAppActionsErrorForLog(error));
+            if (typeof global.showMessage === 'function') {
+                global.showMessage('Unable to confirm data export access. Please sign in again.', 'error');
+            }
+            return false;
+        });
+    }
+
     function exportPracticeMarkdown() {
-        ensurePracticeSuite().then(function handleExportReady() {
+        return ensureMarkdownExportDataManageStepUp().then(function handleExportStepUp(allowed) {
+            if (!allowed) {
+                return false;
+            }
+            return ensurePracticeSuite().then(function () {
+                return true;
+            });
+        }).then(function handleExportReady(ready) {
+            if (!ready) {
+                return undefined;
+            }
             if (!global.markdownExporter || typeof global.markdownExporter.exportToMarkdown !== 'function') {
                 if (typeof global.MarkdownExporter === 'function') {
                     try {
@@ -80,17 +180,19 @@
 
             if (global.markdownExporter && typeof global.markdownExporter.exportToMarkdown === 'function') {
                 global.markdownExporter.exportToMarkdown();
-                return;
+                return true;
             }
 
             if (typeof global.showMessage === 'function') {
                 global.showMessage('Markdown 导出模块未就绪', 'warning');
             }
+            return undefined;
         }).catch(function handleExportError(error) {
             console.error('[AppActions] operation failed:', summarizeAppActionsErrorForLog(error));
             if (typeof global.showMessage === 'function') {
                 global.showMessage('导出失败，请稍后重试', 'error');
             }
+            return undefined;
         });
     }
 

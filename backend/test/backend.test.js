@@ -3691,7 +3691,9 @@ test('admin shell and business account menu do not link back through the busines
     const dataManagementPanel = fs.readFileSync(path.join(repoRoot, 'js', 'components', 'dataManagementPanel.js'), 'utf8');
     const dataIntegrityManager = fs.readFileSync(path.join(repoRoot, 'js', 'components', 'DataIntegrityManager.js'), 'utf8');
     const examActions = fs.readFileSync(path.join(repoRoot, 'js', 'app', 'examActions.js'), 'utf8');
+    const appActions = fs.readFileSync(path.join(repoRoot, 'js', 'presentation', 'app-actions.js'), 'utf8');
     const practiceHistoryEnhancer = fs.readFileSync(path.join(repoRoot, 'js', 'components', 'practiceHistoryEnhancer.js'), 'utf8');
+    const runtimeEntryBundle = fs.readFileSync(path.join(repoRoot, 'js', 'bundles', 'runtime-entry.bundle.js'), 'utf8');
     const mainIndex = fs.readFileSync(path.join(repoRoot, 'index.html'), 'utf8');
 
     assert(adminScript.includes("window.location.href = '/auth/admin/start?return_to=/admin'"));
@@ -4104,6 +4106,11 @@ test('admin shell and business account menu do not link back through the busines
     assert(dataManagementPanel.includes('includeBackups && !(await this.ensureDataManageStepUp())'));
     assert(examActions.includes('async function ensureDataExportStepUp()'));
     assert(examActions.includes('await ensureDataExportStepUp()'));
+    assert(appActions.includes('function ensureMarkdownExportDataManageStepUp()'));
+    assert(appActions.includes('/api/practice-records/data-manage/status'));
+    assert(appActions.indexOf('ensureMarkdownExportDataManageStepUp()') < appActions.indexOf('global.markdownExporter.exportToMarkdown()'));
+    assert(runtimeEntryBundle.includes('function ensureMarkdownExportDataManageStepUp()'));
+    assert(runtimeEntryBundle.indexOf('ensureMarkdownExportDataManageStepUp()') < runtimeEntryBundle.indexOf('global.markdownExporter.exportToMarkdown()'));
     assert(practiceHistoryEnhancer.includes('async function ensurePracticeHistoryDataExportStepUp()'));
     assert(practiceHistoryEnhancer.includes('await ensurePracticeHistoryDataExportStepUp()'));
     assert(dataIntegrityManager.includes('DATA_INTEGRITY_EXPORT_SENSITIVE_KEYS'));
