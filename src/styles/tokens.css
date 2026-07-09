@@ -172,7 +172,8 @@
     --bloom-shadow: var(--elevation-1);
 }
 
-body.ds-learning {
+body.ds-learning,
+body.ds-learning[data-learner-palette="sage"] {
     --learner-accent: #566253;
     --learner-accent-hover: #465145;
     --learner-accent-soft: #DAE6D3;
@@ -187,6 +188,84 @@ body.ds-learning {
     --learner-border: #D7DED3;
     --learner-text: #18211A;
     --learner-text-muted: #5C675B;
+    --color-brand-primary: var(--learner-accent);
+    --color-brand-secondary: var(--learner-accent-hover);
+    --color-brand-gradient: var(--learner-accent);
+}
+
+body.ds-learning[data-learner-palette="steel"] {
+    --learner-accent: #525F77;
+    --learner-accent-hover: #434E63;
+    --learner-accent-soft: #D6E3FF;
+    --learner-selected-surface: #F2F6FE;
+    --learner-selected-border: #BAC7E3;
+    --learner-selected-text: #3B465B;
+    --learner-secondary-surface: #F6F8FC;
+    --learner-secondary-border: #BAC7E3;
+    --learner-secondary-hover: #EEF3FC;
+    --learner-card-surface: #FFFFFF;
+    --learner-card-subtle: #F8FAFE;
+    --learner-border: #D6DEEF;
+    --learner-text: #171D28;
+    --learner-text-muted: #596477;
+    --color-brand-primary: var(--learner-accent);
+    --color-brand-secondary: var(--learner-accent-hover);
+    --color-brand-gradient: var(--learner-accent);
+}
+
+body.ds-learning[data-learner-palette="mist"] {
+    --learner-accent: #516164;
+    --learner-accent-hover: #425256;
+    --learner-accent-soft: #D4E6E9;
+    --learner-selected-surface: #F2F8F9;
+    --learner-selected-border: #B8CACD;
+    --learner-selected-text: #3B494C;
+    --learner-secondary-surface: #F6F9FA;
+    --learner-secondary-border: #B8CACD;
+    --learner-secondary-hover: #EDF4F5;
+    --learner-card-surface: #FFFFFF;
+    --learner-card-subtle: #F8FAFA;
+    --learner-border: #D4E0E2;
+    --learner-text: #162123;
+    --learner-text-muted: #596668;
+    --color-brand-primary: var(--learner-accent);
+    --color-brand-secondary: var(--learner-accent-hover);
+    --color-brand-gradient: var(--learner-accent);
+}
+
+body.ds-learning[data-learner-palette="warm"] {
+    --learner-accent: #705A4D;
+    --learner-accent-hover: #5C493E;
+    --learner-accent-soft: #FBDCCC;
+    --learner-selected-surface: #FCF4EF;
+    --learner-selected-border: #DEC1B1;
+    --learner-selected-text: #513F36;
+    --learner-secondary-surface: #FAF6F3;
+    --learner-secondary-border: #DEC1B1;
+    --learner-secondary-hover: #F7ECE5;
+    --learner-card-surface: #FFFFFF;
+    --learner-card-subtle: #FCFAF8;
+    --learner-border: #E8D5CA;
+    --learner-text: #271B16;
+    --learner-text-muted: #6C5C54;
+    --color-brand-primary: var(--learner-accent);
+    --color-brand-secondary: var(--learner-accent-hover);
+    --color-brand-gradient: var(--learner-accent);
+}
+
+body.ds-learning {
+    --learner-palette-sage-light: #DAE6D3;
+    --learner-palette-sage-mid: #BECAB8;
+    --learner-palette-sage-deep: #566253;
+    --learner-palette-steel-light: #D6E3FF;
+    --learner-palette-steel-mid: #BAC7E3;
+    --learner-palette-steel-deep: #525F77;
+    --learner-palette-mist-light: #D4E6E9;
+    --learner-palette-mist-mid: #B8CACD;
+    --learner-palette-mist-deep: #516164;
+    --learner-palette-warm-light: #FBDCCC;
+    --learner-palette-warm-mid: #DEC1B1;
+    --learner-palette-warm-deep: #705A4D;
 
     --background: var(--learner-card-subtle);
     --surface: var(--learner-card-surface);
@@ -223,6 +302,36 @@ body.ds-learning {
     --control-selected-surface-hover: var(--learner-secondary-hover);
     --control-selected-border: var(--learner-selected-border);
     --control-selected-text: var(--learner-selected-text);
+}
+
+body.ds-learning .learner-palette-option {
+    --learner-palette-swatch-surface: var(--learner-palette-sage-light);
+    --learner-palette-swatch-border: var(--learner-palette-sage-mid);
+    --learner-palette-swatch-accent: var(--learner-palette-sage-deep);
+}
+
+body.ds-learning .learner-palette-option[value="sage"] {
+    --learner-palette-swatch-surface: var(--learner-palette-sage-light);
+    --learner-palette-swatch-border: var(--learner-palette-sage-mid);
+    --learner-palette-swatch-accent: var(--learner-palette-sage-deep);
+}
+
+body.ds-learning .learner-palette-option[value="steel"] {
+    --learner-palette-swatch-surface: var(--learner-palette-steel-light);
+    --learner-palette-swatch-border: var(--learner-palette-steel-mid);
+    --learner-palette-swatch-accent: var(--learner-palette-steel-deep);
+}
+
+body.ds-learning .learner-palette-option[value="mist"] {
+    --learner-palette-swatch-surface: var(--learner-palette-mist-light);
+    --learner-palette-swatch-border: var(--learner-palette-mist-mid);
+    --learner-palette-swatch-accent: var(--learner-palette-mist-deep);
+}
+
+body.ds-learning .learner-palette-option[value="warm"] {
+    --learner-palette-swatch-surface: var(--learner-palette-warm-light);
+    --learner-palette-swatch-border: var(--learner-palette-warm-mid);
+    --learner-palette-swatch-accent: var(--learner-palette-warm-deep);
 }
 
 body.ds-admin {
