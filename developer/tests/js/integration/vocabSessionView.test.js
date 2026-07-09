@@ -1078,6 +1078,11 @@ async function run() {
         const store = createMockStore();
         hooks.setStore(store);
         hooks.state.ui.exporting = false;
+        let stepUpCalls = 0;
+        windowStub.ensureBusinessDataManageStepUp = async () => {
+            stepUpCalls += 1;
+            return true;
+        };
         windowStub.VocabDataIO = {
             exportProgress: async () => new windowStub.Blob(['data'])
         };
@@ -1092,6 +1097,7 @@ async function run() {
         vocabContext.document.body.removeChild = () => {};
 
         await hooks.handleExportRequest();
+        assert.strictEqual(stepUpCalls, 1);
         assert.strictEqual(anchor._clicked, true);
     });
 
