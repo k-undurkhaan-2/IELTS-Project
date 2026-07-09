@@ -9,6 +9,9 @@
     var SETTINGS_GROUP = 'settings-tools';
     var READING_CANDIDATE_CODE_PREF_KEY = 'ielts_reading_candidate_code_preferences_v1';
     var READING_CANDIDATE_CODE_PATTERN = /^\d{6}$/;
+    var LEARNER_PALETTE_STORAGE_KEY = 'ielts.learnerPalette';
+    var LEARNER_PALETTE_DEFAULT = 'sage';
+    var LEARNER_PALETTE_VALUES = Object.freeze(['sage', 'steel', 'mist', 'warm']);
 
     function summarizeMainEntryErrorForLog(error) {
         if (!error || typeof error !== 'object') {
@@ -98,6 +101,83 @@
         } else {
             delete element.dataset.state;
         }
+    }
+
+    function normalizeLearnerPalette(value) {
+        var normalized = String(value || '').trim().toLowerCase();
+        return LEARNER_PALETTE_VALUES.indexOf(normalized) === -1
+            ? LEARNER_PALETTE_DEFAULT
+            : normalized;
+    }
+
+    function readLearnerPalettePreference() {
+        try {
+            var raw = global.localStorage && global.localStorage.getItem(LEARNER_PALETTE_STORAGE_KEY);
+            return normalizeLearnerPalette(raw);
+        } catch (_) {
+            return LEARNER_PALETTE_DEFAULT;
+        }
+    }
+
+    function applyLearnerPalette(value, persist) {
+        var normalized = normalizeLearnerPalette(value);
+        if (document.body && document.body.classList && document.body.classList.contains('ds-learning')) {
+            document.body.setAttribute('data-learner-palette', normalized);
+        }
+        if (persist) {
+            try {
+                if (global.localStorage) {
+                    global.localStorage.setItem(LEARNER_PALETTE_STORAGE_KEY, normalized);
+                }
+            } catch (_) { }
+        }
+        return normalized;
+    }
+
+    function initializeLearnerPalette() {
+        applyLearnerPalette(readLearnerPalettePreference(), false);
+    }
+
+    function getLearnerPaletteButtonLabel(button) {
+        if (!button) {
+            return '';
+        }
+        return String(button.textContent || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function syncLearnerPaletteSettings(container, palette) {
+        var normalized = normalizeLearnerPalette(palette);
+        var selectedLabel = '\u7070\u7eff / Sage';
+        var buttons = Array.prototype.slice.call(container.querySelectorAll('.learner-palette-option[value]'));
+        buttons.forEach(function syncButton(button) {
+            var active = normalizeLearnerPalette(button.value) === normalized;
+            button.setAttribute('aria-pressed', active ? 'true' : 'false');
+            button.classList.toggle('active', active);
+            if (active) {
+                selectedLabel = getLearnerPaletteButtonLabel(button) || selectedLabel;
+            }
+        });
+        var status = container.querySelector('.learner-palette-settings__status');
+        if (status) {
+            status.textContent = '\u5f53\u524d: ' + selectedLabel;
+        }
+    }
+
+    function setupLearnerPaletteSettings() {
+        var container = document.querySelector('.learner-palette-settings');
+        if (!container) {
+            return;
+        }
+        var current = applyLearnerPalette(readLearnerPalettePreference(), false);
+        syncLearnerPaletteSettings(container, current);
+        var buttons = Array.prototype.slice.call(container.querySelectorAll('.learner-palette-option[value]'));
+        buttons.forEach(function bindLearnerPaletteButton(button) {
+            button.addEventListener('click', function onLearnerPaletteClick(event) {
+                event.preventDefault();
+                var next = applyLearnerPalette(button.value, true);
+                syncLearnerPaletteSettings(container, next);
+            });
+        });
     }
 
     function setupReadingCandidateCodeSettings() {
@@ -832,8 +912,10 @@
 
     function init() {
         setStorageNamespace();
+        initializeLearnerPalette();
         initializeNavigationShell();
         setupSettingsLayoutNavigation();
+        setupLearnerPaletteSettings();
         setupReadingCandidateCodeSettings();
         setupPracticeTimerSettings();
 
