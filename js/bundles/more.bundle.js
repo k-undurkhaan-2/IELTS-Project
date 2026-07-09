@@ -3212,6 +3212,69 @@
         setTimeout(() => URL.revokeObjectURL(url), 0);
     }
 
+    function getVocabExportReturnTo() {
+        const path = window.location && window.location.pathname ? window.location.pathname : '/';
+        const search = window.location && window.location.search ? window.location.search : '';
+        return `${path}${search}` || '/';
+    }
+
+    function redirectVocabExportDataManageStepUp(startPath = '/auth/business/data/start') {
+        const safeStartPath = typeof startPath === 'string' && startPath.startsWith('/auth/business/data/start')
+            ? startPath
+            : '/auth/business/data/start';
+        window.location.href = `${safeStartPath}?return_to=${encodeURIComponent(getVocabExportReturnTo())}`;
+    }
+
+    async function requestVocabDataManageStatus() {
+        if (typeof window.fetch !== 'function') {
+            throw new Error('Remote API client is unavailable');
+        }
+        const response = await window.fetch('/api/practice-records/data-manage/status', {
+            method: 'GET',
+            credentials: 'same-origin',
+            headers: { Accept: 'application/json' }
+        });
+        let payload = null;
+        try {
+            payload = await response.json();
+        } catch (_) { }
+        if (!response.ok) {
+            const error = new Error((payload && payload.error) || 'Data management step-up check failed');
+            error.status = response.status;
+            error.payload = payload;
+            throw error;
+        }
+        return payload || {};
+    }
+
+    async function ensureVocabProgressExportDataManageStepUp() {
+        if (typeof window.ensureBusinessDataManageStepUp === 'function') {
+            return window.ensureBusinessDataManageStepUp();
+        }
+        try {
+            const payload = await requestVocabDataManageStatus();
+            if (payload && payload.fresh === true) {
+                return true;
+            }
+            showFeedbackMessage('Confirm your password before exporting vocab progress.', 'info');
+            redirectVocabExportDataManageStepUp(payload && payload.authActionStart);
+            return false;
+        } catch (error) {
+            if (error && error.status === 401) {
+                showFeedbackMessage('Please sign in before exporting vocab progress.', 'warning');
+                window.location.href = `/auth/business/start?return_to=${encodeURIComponent(getVocabExportReturnTo())}`;
+                return false;
+            }
+            if (error && error.status === 403 && error.payload && error.payload.authActionStart) {
+                showFeedbackMessage('Confirm your password before exporting vocab progress.', 'info');
+                redirectVocabExportDataManageStepUp(error.payload.authActionStart);
+                return false;
+            }
+            console.error('[VocabSessionView] data management step-up check failed:', summarizeVocabSessionErrorForLog(error));
+            showFeedbackMessage('Unable to confirm data management access. Please sign in again.', 'error');
+            return false;
+        }
+    }
     function resetSessionState() {
         state.session.backlog = [];
         state.session.activeQueue = [];
@@ -3966,6 +4029,9 @@
         }
         try {
             state.ui.exporting = true;
+            if (!(await ensureVocabProgressExportDataManageStepUp())) {
+                return;
+            }
             await state.store.init();
             const blob = await io.exportProgress();
             const filename = `vocab-progress-${formatTimestamp()}.json`;
@@ -5165,6 +5231,16 @@
     };
 
     if (typeof module !== 'undefined' && module.exports) {
+        api._test = {
+            handleExportRequest,
+            ensureVocabProgressExportDataManageStepUp,
+            setStoreForExportTest(store) {
+                state.store = store;
+            },
+            resetExportingForExportTest() {
+                state.ui.exporting = false;
+            }
+        };
         module.exports = api;
     } else {
         window.VocabSessionView = api;
