@@ -1570,10 +1570,13 @@
             const status = ['answered', 'correct', 'incorrect'].includes(question.status) ? question.status : '';
             const active = isCurrent && question.qId === state.currentActiveQuestionId ? ' active' : '';
             const disabled = isCurrent ? '' : ' disabled';
+            const questionIdAttribute = isCurrent
+                ? ` data-question-id="${escapeHtml(question.qId)}"`
+                : '';
             return [
                 `<div class="q-column" data-question-id="${escapeHtml(question.qId)}" data-part="${escapeHtml(partKey)}">`,
                 `<div class="q-bar-segment ${escapeHtml(status)}"></div>`,
-                `<button class="q-item ${escapeHtml(status)}${active}${disabled}" data-question-id="${escapeHtml(question.qId)}" type="button">${escapeHtml(question.label)}</button>`,
+                `<button class="q-item ${escapeHtml(status)}${active}${disabled}"${questionIdAttribute} type="button">${escapeHtml(question.label)}</button>`,
                 '</div>'
             ].join('');
         }).join('');

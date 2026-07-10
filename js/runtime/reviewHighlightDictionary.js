@@ -17,6 +17,7 @@
     const MAX_CONTEXT_OBJECT_KEYS = 50;
     const MAX_CONTEXT_ARRAY_ITEMS = 50;
     const MAX_FALLBACK_STORAGE_STRING_LENGTH = 5 * 1024 * 1024;
+    const SCROLLBAR_EDGE_FALLBACK_PX = 14;
     const CONTEXT_POLLUTION_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
     const FALLBACK_STORAGE_POLLUTION_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 
@@ -578,8 +579,19 @@
             document.addEventListener('click', handleOutsideClick, true);
             document.addEventListener('keydown', handleDocumentKeydown, true);
             window.addEventListener('resize', closeBubble);
-            window.addEventListener('scroll', closeBubble, true);
+            window.addEventListener('scroll', handleOutsideScroll, true);
         }
+    }
+
+    function detachOutsideHandlers() {
+        if (!outsideHandlerAttached) {
+            return;
+        }
+        outsideHandlerAttached = false;
+        document.removeEventListener('click', handleOutsideClick, true);
+        document.removeEventListener('keydown', handleDocumentKeydown, true);
+        window.removeEventListener('resize', closeBubble);
+        window.removeEventListener('scroll', handleOutsideScroll, true);
     }
 
     function closeBubble() {
@@ -588,8 +600,53 @@
             bubble.style.display = 'none';
             bubble.replaceChildren();
         }
+        detachOutsideHandlers();
         activeHighlight = null;
         activeLookup = null;
+    }
+
+    function isScrollbarClick(event, bubble) {
+        if (!bubble || bubble.style.display === 'none') {
+            return false;
+        }
+        const rect = bubble.getBoundingClientRect();
+        if (!rect || rect.width <= 0 || rect.height <= 0) {
+            return false;
+        }
+        const style = window.getComputedStyle(bubble);
+        const overflowY = style.overflowY;
+        if (overflowY !== 'auto' && overflowY !== 'scroll') {
+            return false;
+        }
+        const clientX = event.clientX != null ? event.clientX : 0;
+        const clientY = event.clientY != null ? event.clientY : 0;
+        if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) {
+            return false;
+        }
+        let scrollbarWidth = bubble.offsetWidth - bubble.clientWidth;
+        if (scrollbarWidth <= 0) {
+            if (bubble.scrollHeight <= bubble.clientHeight) {
+                return false;
+            }
+            scrollbarWidth = SCROLLBAR_EDGE_FALLBACK_PX;
+        }
+        if (clientX >= rect.right - scrollbarWidth && clientX <= rect.right) {
+            return true;
+        }
+        const overflowX = style.overflowX;
+        if (overflowX === 'auto' || overflowX === 'scroll') {
+            let scrollbarHeight = bubble.offsetHeight - bubble.clientHeight;
+            if (scrollbarHeight <= 0) {
+                if (bubble.scrollWidth <= bubble.clientWidth) {
+                    return false;
+                }
+                scrollbarHeight = SCROLLBAR_EDGE_FALLBACK_PX;
+            }
+            if (clientY >= rect.bottom - scrollbarHeight && clientY <= rect.bottom) {
+                return true;
+            }
+        }
+        return false;
     }
 
     function handleOutsideClick(event) {
@@ -599,6 +656,9 @@
             return;
         }
         if (bubble.contains(target) || target.closest(`.${INTERACTIVE_CLASS}`)) {
+            return;
+        }
+        if (isScrollbarClick(event, bubble)) {
             return;
         }
         closeBubble();
@@ -617,6 +677,17 @@
             event.preventDefault();
             openBubble(highlight);
         }
+    }
+
+    function handleOutsideScroll(event) {
+        const bubble = document.getElementById(BUBBLE_ID);
+        if (!bubble || bubble.style.display === 'none') {
+            return;
+        }
+        if (event.target instanceof Node && bubble.contains(event.target)) {
+            return;
+        }
+        closeBubble();
     }
 
     function buildVocabPayload() {
