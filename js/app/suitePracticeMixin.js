@@ -1097,9 +1097,17 @@
                 }
 
                 const direction = String(data && data.direction || '').toLowerCase();
-                if (direction !== 'next' && direction !== 'prev' && direction !== 'previous') return false;
-                const targetIdx = direction === 'next' ? currentIdx + 1 : currentIdx - 1;
+                const rawTargetIndex = data?.targetIndex;
+                const requestedTargetIndex = Number(rawTargetIndex);
+                const hasRequestedTarget = rawTargetIndex !== null
+                    && rawTargetIndex !== undefined
+                    && Number.isInteger(requestedTargetIndex);
+                if (!hasRequestedTarget && direction !== 'next' && direction !== 'prev' && direction !== 'previous') return false;
+                const targetIdx = hasRequestedTarget
+                    ? requestedTargetIndex
+                    : (direction === 'next' ? currentIdx + 1 : currentIdx - 1);
                 if (targetIdx < 0 || targetIdx >= session.sequence.length) return false;
+                if (targetIdx === currentIdx) return false;
 
                 const targetEntry = session.sequence[targetIdx];
                 if (!targetEntry || !targetEntry.examId) return false;

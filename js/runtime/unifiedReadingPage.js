@@ -32,6 +32,7 @@
         'true_false_not_given',
         'yes_no_not_given'
     ]);
+    const PART_ORDER = ['p1', 'p2', 'p3'];
     const navStatus = new Map();
     const scriptCache = new Map();
     const LOCATOR_HIGHLIGHT_SELECTOR = '.reading-locator-highlight, .reading-locator-block';
@@ -1475,6 +1476,41 @@
         return 'p1';
     }
 
+    function getPartIndex(partKey) {
+        return PART_ORDER.indexOf(partKey);
+    }
+
+    function resolvePartNavigation(partKey, currentPart = resolveCurrentPartKey()) {
+        const targetIndex = getPartIndex(partKey);
+        const currentIndex = getPartIndex(currentPart);
+        if (
+            targetIndex < 0
+            || currentIndex < 0
+            || targetIndex === currentIndex
+            || !state.simulationMode
+            || !state.simulationCtx
+            || state.readOnly
+        ) {
+            return null;
+        }
+        const total = Number(state.simulationCtx.total);
+        if (Number.isInteger(total) && total > 0 && targetIndex >= total) {
+            return null;
+        }
+        const direction = targetIndex < currentIndex ? 'prev' : 'next';
+        if (direction === 'prev' && !state.simulationCtx.canPrev) {
+            return null;
+        }
+        if (direction === 'next' && !state.simulationCtx.canNext) {
+            return null;
+        }
+        return {
+            direction,
+            targetIndex,
+            targetPartKey: partKey
+        };
+    }
+
     function updateRedesignedSubHeader() {
         const partEl = document.getElementById('sub-header-part');
         const instructionEl = document.getElementById('sub-header-instruction');
@@ -1549,7 +1585,16 @@
         getPartDefinitions().forEach((part) => {
             const section = document.getElementById(`part-section-${part.key.slice(1)}`);
             if (section) {
-                section.classList.toggle('active', part.key === currentPart);
+                const isCurrent = part.key === currentPart;
+                const canSwitch = Boolean(!isCurrent && resolvePartNavigation(part.key, currentPart));
+                const partLabel = `Part ${part.key.slice(1)}`;
+                section.dataset.part = part.key;
+                section.classList.toggle('active', isCurrent);
+                section.classList.toggle('is-switchable', canSwitch);
+                section.tabIndex = canSwitch ? 0 : -1;
+                section.setAttribute('role', canSwitch ? 'button' : 'group');
+                section.setAttribute('aria-label', canSwitch ? `Go to ${partLabel}` : `${partLabel} questions`);
+                section.setAttribute('aria-current', isCurrent ? 'step' : 'false');
             }
             const name = section?.querySelector('.part-nav-name');
             if (name) {
@@ -1972,46 +2017,75 @@
         syncPrimaryActionButtons();
     }
 
-    function navClickHandler(event) {
-        const targetElement = event.target instanceof Element ? event.target : null;
-        const column = targetElement?.closest('.q-column[data-question-id]');
-        const button = targetElement?.closest('.q-item[data-question-id]');
-        if (!column && !button) return;
-        const questionId = column?.dataset.questionId || button?.dataset.questionId || '';
-        const partKey = column?.dataset.part || '';
-        const currentPart = resolveCurrentPartKey();
-        if (partKey && partKey !== currentPart) {
-            if (!state.simulationMode || !state.simulationCtx) {
-                return;
-            }
-            const partIndex = { p1: 0, p2: 1, p3: 2 };
-            const currentIndex = partIndex[currentPart];
-            const targetIndex = partIndex[partKey];
-            if (!Number.isFinite(currentIndex) || !Number.isFinite(targetIndex)) {
-                return;
-            }
-            if (targetIndex === currentIndex + 1 && state.simulationCtx.canNext) {
-                dispatchSimulationNavigate('next');
-            } else if (targetIndex === currentIndex - 1 && state.simulationCtx.canPrev) {
-                dispatchSimulationNavigate('prev', buildSubmissionSnapshot());
-            }
-            return;
+    function scrollToQuestion(questionId) {
+        if (!questionId) {
+            return false;
         }
         const target = findQuestionAnchor(questionId);
         if (target && typeof global.scrollToElement === 'function') {
             global.scrollToElement(target);
-            updateActiveQuestionHighlight(questionId);
+        } else {
+            target?.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
+        }
+        updateActiveQuestionHighlight(questionId);
+        return true;
+    }
+
+    function navigateToPart(partKey, questionId = '') {
+        if (!PART_ORDER.includes(partKey)) {
+            return false;
+        }
+        const currentPart = resolveCurrentPartKey();
+        if (partKey === currentPart) {
+            return questionId ? scrollToQuestion(questionId) : true;
+        }
+        const navigation = resolvePartNavigation(partKey, currentPart);
+        if (!navigation) {
+            return false;
+        }
+        return dispatchSimulationNavigate(navigation.direction, null, navigation);
+    }
+
+    function navClickHandler(event) {
+        const targetElement = event.target instanceof Element ? event.target : null;
+        const column = targetElement?.closest('.q-column[data-question-id]');
+        const button = targetElement?.closest('.q-item[data-question-id]');
+        const section = event.currentTarget?.dataset?.part ? event.currentTarget : null;
+        if (!column && !button && !section) return;
+        const questionId = column?.dataset.questionId || button?.dataset.questionId || '';
+        const partKey = column?.dataset.part || section?.dataset.part || '';
+        if (partKey) {
+            navigateToPart(partKey, questionId);
             return;
         }
-        target?.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
-        updateActiveQuestionHighlight(questionId);
+        scrollToQuestion(questionId);
     }
 
     function attachNavListeners() {
         dom.nav?.addEventListener('click', navClickHandler);
-        dom.partQuestions?.forEach((container) => {
-            container?.addEventListener('click', navClickHandler);
-        });
+        const partSections = getPartDefinitions()
+            .map((part) => document.getElementById(`part-section-${part.key.slice(1)}`))
+            .filter(Boolean);
+        if (partSections.length) {
+            const keyboardHandler = (event) => {
+                if (event.target !== event.currentTarget || !event.currentTarget.classList.contains('is-switchable')) {
+                    return;
+                }
+                if (event.key !== 'Enter' && event.key !== ' ') {
+                    return;
+                }
+                event.preventDefault();
+                navigateToPart(event.currentTarget.dataset.part || '');
+            };
+            partSections.forEach((section) => {
+                section.addEventListener('click', navClickHandler);
+                section.addEventListener('keydown', keyboardHandler);
+            });
+        } else {
+            dom.partQuestions?.forEach((container) => {
+                container?.addEventListener('click', navClickHandler);
+            });
+        }
         dom.right?.addEventListener('focusin', (event) => {
             const target = event.target instanceof HTMLElement ? event.target : null;
             const control = target?.closest('input, select, textarea');
@@ -4372,12 +4446,19 @@
         });
     }
 
-    function dispatchSimulationNavigate(direction, submissionSnapshot = null) {
+    function dispatchSimulationNavigate(direction, submissionSnapshot = null, options = {}) {
         if (!state.simulationMode || !state.simulationCtx || state.readOnly) {
-            return;
+            return false;
         }
         const snapshot = submissionSnapshot || buildSubmissionSnapshot();
-        postMessage('SIMULATION_NAVIGATE', {
+        const rawTargetIndex = options?.targetIndex;
+        const requestedTargetIndex = Number(rawTargetIndex);
+        const hasRequestedTarget = rawTargetIndex !== null
+            && rawTargetIndex !== undefined
+            && Number.isInteger(requestedTargetIndex)
+            && requestedTargetIndex >= 0
+            && requestedTargetIndex < PART_ORDER.length;
+        const payload = {
             direction: direction === 'prev' ? 'prev' : 'next',
             draft: {
                 answers: snapshot.answers || {},
@@ -4392,7 +4473,15 @@
             scrollY: Number.isFinite(Number(snapshot.scrollY)) ? Number(snapshot.scrollY) : 0,
             elapsed: Number.isFinite(Number(snapshot.elapsed)) ? Number(snapshot.elapsed) : getPageElapsedSeconds(),
             timerSnapshot: snapshot.timerSnapshot || getPracticeTimerSnapshot()
-        });
+        };
+        if (hasRequestedTarget) {
+            payload.targetIndex = requestedTargetIndex;
+            const targetPartKey = String(options.targetPartKey || '').trim().toLowerCase();
+            if (PART_ORDER.includes(targetPartKey)) {
+                payload.targetPartKey = targetPartKey;
+            }
+        }
+        return postMessage('SIMULATION_NAVIGATE', payload);
     }
     async function handleSubmit() {
         if (state.memorizeMode && !state.reviewMode && !state.simulationMode) {

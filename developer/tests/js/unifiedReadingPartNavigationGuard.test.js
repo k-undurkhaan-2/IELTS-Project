@@ -11,7 +11,8 @@ const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, '..', '..', '..');
 const source = fs.readFileSync(path.join(repoRoot, 'js', 'runtime', 'unifiedReadingPage.js'), 'utf8');
 
-function createContext() {
+function createContext(options = {}) {
+    const elements = options.elements || new Map();
     const context = {
         console,
         URL,
@@ -37,8 +38,8 @@ function createContext() {
         scrollX: 0,
         scrollTo() {},
         close() {},
-        opener: null,
-        parent: null,
+        opener: options.opener || null,
+        parent: options.parent || null,
         location: {
             href: 'http://127.0.0.1:3000/templates/reading.html?exam=test',
             origin: 'http://127.0.0.1:3000',
@@ -52,7 +53,7 @@ function createContext() {
         },
         document: {
             addEventListener() {},
-            getElementById() { return null; },
+            getElementById(id) { return elements.get(id) || null; },
             querySelector() { return null; },
             querySelectorAll() { return []; },
             createElement() {
@@ -84,8 +85,8 @@ function createContext() {
     return context;
 }
 
-function loadHooks() {
-    const context = createContext();
+function loadHooks(options = {}) {
+    const context = createContext(options);
     const marker = '    function buildQuestionNav() {';
     assert(source.includes(marker), 'expected unified Reading question navigation renderer');
     const patchedSource = source.replace(
@@ -93,8 +94,19 @@ function loadHooks() {
         [
             '    global.__UnifiedReadingPartNavigationGuardHooks = {',
             '        renderPartQuestions,',
+            '        resolvePartNavigation,',
+            '        updatePartSectionState,',
+            '        attachNavListeners,',
+            '        dispatchSimulationNavigate,',
             '        setCurrentActiveQuestionId(questionId) {',
             '            state.currentActiveQuestionId = questionId;',
+            '        },',
+            '        setNavigationState(options = {}) {',
+            "            state.dataset = { meta: { category: options.category || 'P1' }, questionOrder: [] };",
+            '            state.simulationMode = options.simulationMode !== false;',
+            '            state.simulationCtx = options.simulationCtx || { currentIndex: 0, total: 3, canPrev: false, canNext: true };',
+            '            state.readOnly = options.readOnly === true;',
+            "            state.suiteSessionId = options.suiteSessionId || 'suite-test';",
             '        }',
             '    };',
             '',
@@ -103,7 +115,7 @@ function loadHooks() {
     );
     vm.createContext(context);
     vm.runInContext(patchedSource, context, { filename: 'unifiedReadingPage.js' });
-    return context.__UnifiedReadingPartNavigationGuardHooks;
+    return { hooks: context.__UnifiedReadingPartNavigationGuardHooks, context };
 }
 
 function getStartTags(markup, tagName) {
@@ -111,7 +123,7 @@ function getStartTags(markup, tagName) {
 }
 
 test('part navigation assigns question IDs only to active question controls', () => {
-    const hooks = loadHooks();
+    const { hooks } = loadHooks();
     const questions = [
         { qId: 'q14', label: '14', status: 'answered' },
         { qId: 'q15', label: '15', status: '' }
@@ -147,4 +159,125 @@ test('part navigation assigns question IDs only to active question controls', ()
         /targetElement\?\.closest\('\.q-column\[data-question-id\]'\)/,
         'event delegation must continue resolving inactive Part clicks through the question column'
     );
+});
+
+function createClassList() {
+    const values = new Set();
+    return {
+        toggle(name, enabled) {
+            if (enabled) values.add(name);
+            else values.delete(name);
+        },
+        contains(name) {
+            return values.has(name);
+        }
+    };
+}
+
+function createPartSection() {
+    const attributes = new Map();
+    const listeners = new Map();
+    const name = { classList: createClassList() };
+    return {
+        dataset: {},
+        classList: createClassList(),
+        tabIndex: 0,
+        listeners,
+        setAttribute(key, value) {
+            attributes.set(key, String(value));
+        },
+        getAttribute(key) {
+            return attributes.get(key) || null;
+        },
+        querySelector(selector) {
+            return selector === '.part-nav-name' ? name : null;
+        },
+        addEventListener(type, handler) {
+            listeners.set(type, handler);
+        }
+    };
+}
+
+test('part sections expose direct navigation and keyboard semantics only when switchable', () => {
+    const sections = new Map([
+        ['part-section-1', createPartSection()],
+        ['part-section-2', createPartSection()],
+        ['part-section-3', createPartSection()]
+    ]);
+    const messages = [];
+    const opener = {
+        postMessage(payload, targetOrigin) {
+            messages.push({ payload, targetOrigin });
+        }
+    };
+    const { hooks } = loadHooks({ elements: sections, opener });
+    hooks.setNavigationState({ category: 'P1' });
+    hooks.updatePartSectionState('p1');
+    hooks.attachNavListeners();
+
+    const current = sections.get('part-section-1');
+    assert.equal(current.dataset.part, 'p1');
+    assert.equal(current.classList.contains('active'), true);
+    assert.equal(current.classList.contains('is-switchable'), false);
+    assert.equal(current.tabIndex, -1);
+    assert.equal(current.getAttribute('role'), 'group');
+    assert.equal(current.getAttribute('aria-current'), 'step');
+
+    for (const partNumber of [2, 3]) {
+        const section = sections.get(`part-section-${partNumber}`);
+        assert.equal(section.dataset.part, `p${partNumber}`);
+        assert.equal(section.classList.contains('is-switchable'), true);
+        assert.equal(section.tabIndex, 0);
+        assert.equal(section.getAttribute('role'), 'button');
+        assert.equal(section.getAttribute('aria-label'), `Go to Part ${partNumber}`);
+        assert.equal(section.getAttribute('aria-current'), 'false');
+        assert.equal(typeof section.listeners.get('click'), 'function');
+        assert.equal(typeof section.listeners.get('keydown'), 'function');
+    }
+
+    let prevented = false;
+    const p3Section = sections.get('part-section-3');
+    p3Section.listeners.get('keydown')({
+        target: p3Section,
+        currentTarget: p3Section,
+        key: 'Enter',
+        preventDefault() {
+            prevented = true;
+        }
+    });
+    assert.equal(prevented, true);
+    assert.equal(messages[0].payload.data.targetIndex, 2);
+});
+
+test('direct Part navigation sends a bounded target index to the suite controller', () => {
+    const messages = [];
+    const opener = {
+        postMessage(payload, targetOrigin) {
+            messages.push({ payload, targetOrigin });
+        }
+    };
+    const { hooks } = loadHooks({ opener });
+    hooks.setNavigationState({ category: 'P1' });
+    const navigation = hooks.resolvePartNavigation('p3', 'p1');
+
+    assert.equal(navigation.direction, 'next');
+    assert.equal(navigation.targetIndex, 2);
+    assert.equal(navigation.targetPartKey, 'p3');
+
+    const sent = hooks.dispatchSimulationNavigate('next', {
+        results: { answers: {} },
+        answers: {},
+        highlights: [],
+        scrollY: 0,
+        elapsed: 15,
+        updatedAt: 123,
+        timerSnapshot: { durationSeconds: 15 }
+    }, navigation);
+
+    assert.equal(sent, true);
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].payload.type, 'SIMULATION_NAVIGATE');
+    assert.equal(messages[0].payload.data.direction, 'next');
+    assert.equal(messages[0].payload.data.targetIndex, 2);
+    assert.equal(messages[0].payload.data.targetPartKey, 'p3');
 });
