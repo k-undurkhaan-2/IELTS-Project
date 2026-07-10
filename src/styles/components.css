@@ -264,6 +264,7 @@ textarea {
 .ds-learning .practice-trend-option,
 .ds-learning .practice-custom-card__icon-btn,
 .ds-learning .practice-custom-option,
+.ds-learning .learner-palette-option,
 .ds-learning #settings-view .hero-settings-actions button,
 .ds-learning #settings-view .practice-timer-save {
     display: inline-flex;
@@ -292,6 +293,7 @@ textarea {
 .ds-learning .practice-trend-option:hover,
 .ds-learning .practice-custom-card__icon-btn:hover,
 .ds-learning .practice-custom-option:hover,
+.ds-learning .learner-palette-option:hover:not(:disabled),
 .ds-learning #settings-view .hero-settings-actions button:hover:not(:disabled),
 .ds-learning #settings-view .practice-timer-save:hover:not(:disabled) {
     border-color: var(--control-selected-border);
@@ -303,6 +305,7 @@ textarea {
 .ds-learning .practice-trend-option:active,
 .ds-learning .practice-custom-card__icon-btn:active,
 .ds-learning .practice-custom-option:active,
+.ds-learning .learner-palette-option:active,
 .ds-learning #settings-view .hero-settings-actions button:active,
 .ds-learning #settings-view .practice-timer-save:active {
     background: var(--control-surface-active);
@@ -312,7 +315,8 @@ textarea {
 .ds-learning .practice-trend-option.active,
 .ds-learning .practice-trend-option[aria-pressed="true"],
 .ds-learning .practice-custom-option.active,
-.ds-learning .practice-custom-option[aria-pressed="true"] {
+.ds-learning .practice-custom-option[aria-pressed="true"],
+.ds-learning .learner-palette-option[aria-pressed="true"] {
     border-color: var(--control-selected-border);
     background: var(--control-selected-surface);
     color: var(--control-selected-text);
@@ -522,6 +526,74 @@ textarea {
     border-color: var(--control-selected-border);
     background: var(--control-secondary-surface-hover);
     color: var(--text-primary);
+}
+
+.ds-learning .learner-palette-settings {
+    display: grid;
+    gap: var(--space-3);
+    width: 100%;
+    margin-top: var(--space-3);
+    padding-top: var(--space-3);
+    border-top: 1px solid var(--border);
+}
+
+.ds-learning .learner-palette-settings__header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-3);
+    flex-wrap: wrap;
+}
+
+.ds-learning .learner-palette-settings__header h4 {
+    margin: 0;
+    color: var(--text-primary);
+    font-size: var(--font-size-sm);
+    font-weight: 700;
+}
+
+.ds-learning .learner-palette-settings__status {
+    min-height: 1em;
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+}
+
+.ds-learning .learner-palette-options {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(144px, 1fr));
+    gap: var(--space-2);
+    width: 100%;
+}
+
+.ds-learning .learner-palette-option {
+    justify-content: flex-start;
+    min-width: 0;
+    width: 100%;
+    min-height: var(--control-height-lg);
+    padding-inline: var(--space-3);
+    white-space: nowrap;
+}
+
+.ds-learning .learner-palette-swatch {
+    position: relative;
+    flex: 0 0 24px;
+    width: 24px;
+    height: 24px;
+    border: 1px solid var(--learner-palette-swatch-border);
+    border-radius: var(--radius-sm);
+    background: var(--learner-palette-swatch-surface);
+}
+
+.ds-learning .learner-palette-swatch::after {
+    content: "";
+    position: absolute;
+    right: 3px;
+    bottom: 3px;
+    width: 8px;
+    height: 8px;
+    border-radius: var(--radius-xs);
+    background: var(--learner-palette-swatch-accent);
 }
 
 .ui-button--danger,
