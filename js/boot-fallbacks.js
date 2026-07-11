@@ -317,8 +317,21 @@
         var t = document.getElementById('browse-title'); if (t) t.textContent = '题库浏览';
       }
       if (normalized === 'browse' && typeof window.loadExamList === 'function') window.loadExamList();
-      if (normalized === 'practice' && window.AppActions && typeof window.AppActions.ensurePracticeSuite === 'function') {
-        window.AppActions.ensurePracticeSuite();
+      if (normalized === 'practice') {
+        var practiceDependencies = [];
+        if (typeof window.ensureBrowseGroup === 'function') {
+          practiceDependencies.push(window.ensureBrowseGroup());
+        }
+        if (window.AppActions && typeof window.AppActions.ensurePracticeSuite === 'function') {
+          practiceDependencies.push(window.AppActions.ensurePracticeSuite());
+        }
+        if (practiceDependencies.length > 0) {
+          Promise.all(practiceDependencies).then(function () {
+            if (typeof window.updatePracticeView === 'function') window.updatePracticeView();
+          }).catch(function (error) {
+            console.warn('[Fallback] 练习视图模块加载失败:', summarizeBootFallbackErrorForLog(error));
+          });
+        }
       }
       if (normalized === 'practice' && typeof window.startPracticeRecordsSyncInBackground === 'function') {
         window.startPracticeRecordsSyncInBackground('practice-view');
