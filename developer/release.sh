@@ -93,15 +93,30 @@ fi
 
 # 打包：只包含用户运行时需要的文件
 # js/bundles/ 包含了所有 JS 逻辑，js/app/ js/core/ 等源文件不进入分发包
+SYMLINK_PATH="$(find index.html css js/bundles assets ReadingPractice src/styles "${LISTENING_ZIP_INPUTS[@]}" -type l -print -quit)"
+if [ -n "${SYMLINK_PATH}" ]; then
+    echo "ERROR: release input must not contain a symbolic link: ${SYMLINK_PATH}"
+    exit 1
+fi
+
 zip -r "${ZIP_PATH}" \
     index.html \
     css/ \
     js/bundles/ \
     assets/ \
     ReadingPractice/ \
+    src/styles/ \
     "${LISTENING_ZIP_INPUTS[@]}" \
     -x "*.DS_Store" \
        '~$*' \
+       ".env" \
+       "*/.env" \
+       ".env.*" \
+       "*/.env.*" \
+       "*.log" \
+       "*.tmp" \
+       "*.temp" \
+       "*.bak" \
        "*.MOV" \
        "*.mov" \
        "*.MP4" \
@@ -117,6 +132,20 @@ zip -r "${ZIP_PATH}" \
 
 ZIP_LIST="$(mktemp)"
 zipinfo -1 "${ZIP_PATH}" > "${ZIP_LIST}"
+
+DUPLICATE_ENTRY="$(LC_ALL=C sort "${ZIP_LIST}" | uniq -d | head -1)"
+if [ -n "${DUPLICATE_ENTRY}" ]; then
+    echo "ERROR: release zip contains duplicate entry: ${DUPLICATE_ENTRY}"
+    rm -f "${ZIP_LIST}"
+    exit 1
+fi
+
+if grep -Eq '(^/|^[A-Za-z]:[\\/]|\\|(^|/)\.\.(/|$))' "${ZIP_LIST}"; then
+    echo "ERROR: release zip contains an unsafe entry path"
+    grep -E '(^/|^[A-Za-z]:[\\/]|\\|(^|/)\.\.(/|$))' "${ZIP_LIST}" | head -20
+    rm -f "${ZIP_LIST}"
+    exit 1
+fi
 
 require_entry() {
     local entry="$1"
@@ -151,6 +180,9 @@ require_entry "index.html"
 require_entry "css/main.css"
 require_entry "css/heroui-bridge.css"
 require_entry "css/onboarding.css"
+require_entry "src/styles/tokens.css"
+require_entry "src/styles/components.css"
+require_entry "src/styles/layout.css"
 require_entry "assets/vendor/three.min.js"
 require_entry "assets/scripts/complete-exam-data.js"
 require_entry "assets/generated/reading-exams/manifest.js"
@@ -187,6 +219,12 @@ fi
 
 reject_entry_prefix "templates/"
 reject_entry_prefix "ListeningPractice/vip/"
+reject_entry_prefix ".git/"
+reject_entry_prefix "node_modules/"
+reject_entry_prefix "developer/tests/"
+reject_entry_prefix "backend/"
+reject_entry_pattern '(^|/)\.env($|\.)'
+reject_entry_pattern '(^|/)[^/]*\.(log|tmp|temp|bak)$'
 reject_entry_pattern '(^|/)~\$[^/]*$'
 reject_entry_pattern '^ListeningPractice/.*\.(MOV|mov|MP4|mp4)$'
 reject_entry_pattern '^assets/scripts/.*\.py$'

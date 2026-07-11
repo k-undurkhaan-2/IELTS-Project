@@ -85,9 +85,10 @@ function Test-ZipExcluded {
     if (-not $IsDirectory) {
         if ($name -eq '.DS_Store') { return $true }
         if ($name -like '~$*') { return $true }
+        if ($name -eq '.env' -or $name.StartsWith('.env.', [System.StringComparison]::Ordinal)) { return $true }
 
         $extension = [System.IO.Path]::GetExtension($name)
-        if ($extension -in @('.MOV', '.mov', '.MP4', '.mp4', '.md', '.py')) { return $true }
+        if ($extension -in @('.MOV', '.mov', '.MP4', '.mp4', '.md', '.py', '.log', '.tmp', '.temp', '.bak')) { return $true }
     }
 
     if ($entry -eq '.gitignore') { return $true }
@@ -150,6 +151,10 @@ function Add-ZipInput {
     }
 
     $item = Get-Item -LiteralPath $fullPath
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "release input must not contain a symbolic link or reparse point: $InputPath"
+    }
+
     if (-not $item.PSIsContainer) {
         $entryName = ConvertTo-ZipPath $InputPath
         if (-not (Test-ZipExcluded $entryName $false $IncludeLocalListening)) {
@@ -164,6 +169,11 @@ function Add-ZipInput {
     }
 
     Get-ChildItem -LiteralPath $item.FullName -Recurse -Force | ForEach-Object {
+        if (($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            $unsafePath = Join-RelativePath $RootPath $_.FullName
+            throw "release input must not contain a symbolic link or reparse point: $unsafePath"
+        }
+
         $entryName = Join-RelativePath $RootPath $_.FullName
         if (Test-ZipExcluded $entryName $_.PSIsContainer $IncludeLocalListening) {
             return
@@ -261,7 +271,7 @@ if (Test-Path -LiteralPath $DistDir) {
 [void](New-Item -ItemType Directory -Path $DistDir)
 
 $zipInputs = [System.Collections.Generic.List[string]]::new()
-@('index.html', 'css', 'js/bundles', 'assets', 'ReadingPractice') | ForEach-Object {
+@('index.html', 'css', 'js/bundles', 'assets', 'ReadingPractice', 'src/styles') | ForEach-Object {
     $zipInputs.Add($_)
 }
 
@@ -297,10 +307,28 @@ try {
     $verifyArchive.Dispose()
 }
 
+$duplicateEntries = @($zipEntries | Group-Object | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
+if ($duplicateEntries) {
+    throw "release zip contains duplicate entries:`n$($duplicateEntries -join "`n")"
+}
+
+$unsafeEntries = @($zipEntries | Where-Object {
+    $_.Contains('\') -or
+    $_.StartsWith('/', [System.StringComparison]::Ordinal) -or
+    [regex]::IsMatch($_, '^[A-Za-z]:') -or
+    [regex]::IsMatch($_, '(^|/)\.\.(/|$)')
+})
+if ($unsafeEntries) {
+    throw "release zip contains unsafe entry paths:`n$($unsafeEntries -join "`n")"
+}
+
 Require-ZipEntry $zipEntries 'index.html'
 Require-ZipEntry $zipEntries 'css/main.css'
 Require-ZipEntry $zipEntries 'css/heroui-bridge.css'
 Require-ZipEntry $zipEntries 'css/onboarding.css'
+Require-ZipEntry $zipEntries 'src/styles/tokens.css'
+Require-ZipEntry $zipEntries 'src/styles/components.css'
+Require-ZipEntry $zipEntries 'src/styles/layout.css'
 Require-ZipEntry $zipEntries 'assets/vendor/three.min.js'
 Require-ZipEntry $zipEntries 'assets/scripts/complete-exam-data.js'
 Require-ZipEntry $zipEntries 'assets/generated/reading-exams/manifest.js'
@@ -337,6 +365,12 @@ if ($IncludeLocalListening -and (Test-Path -LiteralPath (Join-Path $ProjectRoot 
 
 Reject-ZipEntryPrefix $zipEntries 'templates/'
 Reject-ZipEntryPrefix $zipEntries 'ListeningPractice/vip/'
+Reject-ZipEntryPrefix $zipEntries '.git/'
+Reject-ZipEntryPrefix $zipEntries 'node_modules/'
+Reject-ZipEntryPrefix $zipEntries 'developer/tests/'
+Reject-ZipEntryPrefix $zipEntries 'backend/'
+Reject-ZipEntryPattern $zipEntries '(^|/)\.env($|\.)'
+Reject-ZipEntryPattern $zipEntries '(^|/)[^/]*\.(log|tmp|temp|bak)$'
 Reject-ZipEntryPattern $zipEntries '(^|/)~\$[^/]*$'
 Reject-ZipEntryPattern $zipEntries '^ListeningPractice/.*\.(MOV|mov|MP4|mp4)$'
 Reject-ZipEntryPattern $zipEntries '^assets/scripts/.*\.py$'
