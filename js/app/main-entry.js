@@ -12,6 +12,7 @@
     var LEARNER_PALETTE_STORAGE_KEY = 'ielts.learnerPalette';
     var LEARNER_PALETTE_DEFAULT = 'sage';
     var LEARNER_PALETTE_VALUES = Object.freeze(['sage', 'steel', 'mist', 'warm']);
+    var LEARNER_PALETTE_BUTTON_BOUND_KEY = '__ieltsLearnerPaletteClickBound';
 
     function summarizeMainEntryErrorForLog(error) {
         if (!error || typeof error !== 'object') {
@@ -172,11 +173,15 @@
         syncLearnerPaletteSettings(container, current);
         var buttons = Array.prototype.slice.call(container.querySelectorAll('.learner-palette-option[value]'));
         buttons.forEach(function bindLearnerPaletteButton(button) {
+            if (button[LEARNER_PALETTE_BUTTON_BOUND_KEY]) {
+                return;
+            }
             button.addEventListener('click', function onLearnerPaletteClick(event) {
                 event.preventDefault();
                 var next = applyLearnerPalette(button.value, true);
                 syncLearnerPaletteSettings(container, next);
             });
+            button[LEARNER_PALETTE_BUTTON_BOUND_KEY] = true;
         });
     }
 
@@ -946,6 +951,8 @@
             global.OnboardingTour.init();
         }
     }
+
+    initializeLearnerPalette();
 
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', init);

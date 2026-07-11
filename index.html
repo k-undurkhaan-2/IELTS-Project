@@ -14,7 +14,9 @@
         <link rel="stylesheet" href="css/onboarding.css" />
     </head>
 
-    <body class="hero-body boot-active ds-learning" data-theme="heroui" data-learner-palette="sage">
+    <body class="hero-body boot-active ds-learning" data-theme="heroui">
+        <!-- Render-blocking UI shell restores the persisted learner palette before visible body content. -->
+        <script src="js/bundles/ui-shell.bundle.js"></script>
         <div id="boot-overlay" role="status" aria-live="polite">
             <div class="boot-panel">
                 <div class="boot-logo">SHUI · IELTS</div>
@@ -1612,9 +1614,6 @@
 
         <!-- 基础环境与日志 -->
         <script src="js/bundles/core-foundation.bundle.js"></script>
-
-        <!-- 工具库与基础视图 -->
-        <script src="js/bundles/ui-shell.bundle.js"></script>
 
         <!-- 入口与懒加载代理 -->
         <script src="js/bundles/legacy-app.bundle.js"></script>
