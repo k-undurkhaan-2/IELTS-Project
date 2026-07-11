@@ -322,6 +322,52 @@ textarea {
     color: var(--control-selected-text);
     box-shadow: none;
 }
+.ds-learning .practice-view__title-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+}
+
+.ds-learning .practice-summary-toggle {
+    display: inline-grid;
+    place-items: center;
+    flex: 0 0 auto;
+    width: 36px;
+    height: 36px;
+    border: 1px solid var(--control-border);
+    border-radius: var(--radius-md);
+    background: var(--control-surface);
+    color: var(--text-secondary);
+    cursor: pointer;
+}
+
+.ds-learning .practice-summary-toggle:hover {
+    border-color: var(--control-border-hover);
+    background: var(--control-surface-hover);
+    color: var(--text-primary);
+}
+
+.ds-learning .practice-summary-toggle:focus-visible {
+    outline: var(--focus-outline);
+    outline-offset: 2px;
+}
+
+.ds-learning .practice-summary-toggle__glyph {
+    width: 9px;
+    height: 9px;
+    border-right: 2px solid currentColor;
+    border-bottom: 2px solid currentColor;
+    transform: rotate(-135deg);
+}
+
+.ds-learning #practice-view.is-practice-summary-collapsed .practice-summary-toggle__glyph {
+    transform: rotate(45deg);
+}
+
+.ds-learning #practice-view.is-practice-summary-collapsed .practice-summary-region {
+    display: none;
+}
 
 .ds-learning .practice-trend-option {
     min-height: var(--control-height-sm);
@@ -554,9 +600,12 @@ textarea {
 
 .ds-learning .learner-palette-settings__status {
     min-height: 1em;
+    min-width: 15ch;
     color: var(--text-secondary);
     font-size: var(--font-size-xs);
     font-weight: 600;
+    text-align: right;
+    white-space: nowrap;
 }
 
 .ds-learning .learner-palette-options {
