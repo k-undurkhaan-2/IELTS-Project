@@ -4275,6 +4275,11 @@ storageManager.ready
             return Array.isArray(payload.records) ? payload.records : [];
         }
 
+        async exportPracticeRecords() {
+            const payload = await this.request('/api/practice-records/export', { method: 'GET', csrf: false });
+            return Array.isArray(payload.records) ? payload.records : [];
+        }
+
         async replacePracticeRecords(records) {
             const payload = await this.request('/api/practice-records', {
                 method: 'PUT',
