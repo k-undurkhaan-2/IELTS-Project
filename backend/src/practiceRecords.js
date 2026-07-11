@@ -579,14 +579,17 @@ function createPracticeRecordsRouter(options = {}) {
         authActionStart: '/auth/business/data/start'
     }));
 
-    router.get('/', async (req, res, next) => {
+    async function sendCompletePracticeRecords(req, res, next) {
         try {
             const records = await service.list(req.session.user.id);
             return res.json({ records });
         } catch (error) {
             return next(error);
         }
-    });
+    }
+
+    router.get('/export', requireDataManageStepUp, sendCompletePracticeRecords);
+    router.get('/', requireDataManageStepUp, sendCompletePracticeRecords);
 
     router.put('/', verifyCsrfToken, async (req, res, next) => {
         try {
