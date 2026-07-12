@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
+import { getBundleProfile } from '../../../scripts/bundle-manifest.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,6 +21,40 @@ const paletteLabels = {
 
 function readRepoFile(relativePath) {
     return fs.readFileSync(path.join(repoRoot, relativePath), 'utf8');
+}
+
+function getUiShellBundleContract(profileName) {
+    const profile = getBundleProfile(profileName);
+    assert.equal(profile.name, profileName, `${profileName} profile should be available`);
+    const bundle = profile.bundles.find((entry) => entry.outputPath === 'js/bundles/ui-shell.bundle.js');
+    assert.ok(bundle, `${profileName} profile should declare ui-shell.bundle.js`);
+    assert.ok(
+        bundle.inputs.includes('js/app/main-entry.js'),
+        `${profileName} ui-shell should include main-entry.js`
+    );
+    return bundle;
+}
+
+function readBundleSectionOrder(bundleSource) {
+    return Array.from(
+        bundleSource.matchAll(/^\/\* ===== (.+?) ===== \*\/$/gm),
+        (match) => match[1]
+    ).filter((section) => section !== 'bundle provided script markers');
+}
+
+function readBundleSection(bundleSource, inputPath, inputs) {
+    const inputIndex = inputs.indexOf(inputPath);
+    assert.notEqual(inputIndex, -1, `${inputPath} should be declared by the canonical manifest`);
+    const startMarker = `/* ===== ${inputPath} ===== */`;
+    const nextInput = inputs[inputIndex + 1];
+    const endMarker = nextInput
+        ? `/* ===== ${nextInput} ===== */`
+        : '/* ===== bundle provided script markers ===== */';
+    const start = bundleSource.indexOf(startMarker);
+    const end = bundleSource.indexOf(endMarker, start + startMarker.length);
+    assert.notEqual(start, -1, `bundle should contain the ${inputPath} source marker`);
+    assert.notEqual(end, -1, `bundle should contain the marker following ${inputPath}`);
+    return bundleSource.slice(start + startMarker.length, end).trim();
 }
 
 function createClassList(initialValues = []) {
@@ -467,23 +502,38 @@ test('four palette selectors expose the complete core token set and sage is the 
     assert.equal(/<body[^>]*data-learner-palette=/i.test(index), false, 'body should rely on pre-paint restore plus the CSS sage fallback');
 });
 
-test('main-entry source and ui-shell bundle are identical for palette logic', () => {
+test('main-entry source and root/VIP ui-shell bundles follow the canonical manifest', () => {
     const source = readRepoFile('js/app/main-entry.js').replace(/\r\n?/g, '\n').trim();
-    const bundle = readRepoFile('js/bundles/ui-shell.bundle.js').replace(/\r\n?/g, '\n');
-    const startMarker = '/* ===== js/app/main-entry.js ===== */';
-    const endMarker = '/* ===== js/presentation/indexInteractions.js ===== */';
-    const start = bundle.indexOf(startMarker);
-    const end = bundle.indexOf(endMarker, start + startMarker.length);
-    assert.notEqual(start, -1, 'ui-shell bundle should contain the main-entry source marker');
-    assert.notEqual(end, -1, 'ui-shell bundle should contain the next source marker');
-    const bundledMainEntry = bundle.slice(start + startMarker.length, end).trim();
-    assert.equal(bundledMainEntry, source);
+    const rootBundle = readRepoFile('js/bundles/ui-shell.bundle.js').replace(/\r\n?/g, '\n');
+    const vipBundle = readRepoFile('ListeningPractice/vip special/js/bundles/ui-shell.bundle.js')
+        .replace(/\r\n?/g, '\n');
+    const defaultContract = getUiShellBundleContract('default');
+    const vipContract = getUiShellBundleContract('vip');
 
-    const buildScript = readRepoFile('scripts/build-bundles.mjs');
-    assert.match(
-        buildScript,
-        /'js\/bundles\/ui-shell\.bundle\.js':[\s\S]*?'js\/app\/main-entry\.js'/,
-        'the standard build should generate ui-shell.bundle.js from main-entry.js'
+    assert.deepEqual(
+        vipContract.inputs,
+        defaultContract.inputs,
+        'default and VIP ui-shell source order should share the canonical manifest contract'
+    );
+    assert.deepEqual(
+        readBundleSectionOrder(rootBundle),
+        [...defaultContract.inputs],
+        'root ui-shell section order should match the default canonical manifest'
+    );
+    assert.deepEqual(
+        readBundleSectionOrder(vipBundle),
+        [...vipContract.inputs],
+        'VIP ui-shell section order should match the VIP canonical manifest'
+    );
+    assert.equal(
+        readBundleSection(rootBundle, 'js/app/main-entry.js', defaultContract.inputs),
+        source,
+        'root ui-shell should contain the current main-entry source'
+    );
+    assert.equal(
+        readBundleSection(vipBundle, 'js/app/main-entry.js', vipContract.inputs),
+        source,
+        'VIP ui-shell should contain the current main-entry source'
     );
     assert.equal(
         readRepoFile('js/bundles/legacy-app.bundle.js').includes(storageKey),
