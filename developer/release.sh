@@ -93,7 +93,14 @@ fi
 
 # 打包：只包含用户运行时需要的文件
 # js/bundles/ 包含了所有 JS 逻辑，js/app/ js/core/ 等源文件不进入分发包
-SYMLINK_PATH="$(find index.html css js/bundles assets ReadingPractice src/styles "${LISTENING_ZIP_INPUTS[@]}" -type l -print -quit)"
+READING_ZIP_INPUTS=()
+if [ -d "ReadingPractice" ]; then
+    READING_ZIP_INPUTS+=("ReadingPractice/")
+else
+    echo "       Optional release input skipped: ReadingPractice/"
+fi
+
+SYMLINK_PATH="$(find index.html css js/bundles assets src/styles "${READING_ZIP_INPUTS[@]}" "${LISTENING_ZIP_INPUTS[@]}" -type l -print -quit)"
 if [ -n "${SYMLINK_PATH}" ]; then
     echo "ERROR: release input must not contain a symbolic link: ${SYMLINK_PATH}"
     exit 1
@@ -104,7 +111,7 @@ zip -r "${ZIP_PATH}" \
     css/ \
     js/bundles/ \
     assets/ \
-    ReadingPractice/ \
+    "${READING_ZIP_INPUTS[@]}" \
     src/styles/ \
     "${LISTENING_ZIP_INPUTS[@]}" \
     -x "*.DS_Store" \

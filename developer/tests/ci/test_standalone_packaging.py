@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import collections
 import functools
+import hashlib
 import http.server
 from html.parser import HTMLParser
+import io
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -28,6 +30,7 @@ REQUIRED_STYLES = {
     "src/styles/layout.css",
 }
 FUTURE_STYLE = "src/styles/future-public-style.css"
+READING_FIXTURE = "ReadingPractice/example-public-fixture.txt"
 
 
 class _IndexAssetParser(HTMLParser):
@@ -115,53 +118,113 @@ class StandalonePackagingTest(unittest.TestCase):
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
 
+        reading_root = cls.source_root / "ReadingPractice"
+        if reading_root.exists():
+            raise AssertionError("tracked-only snapshot unexpectedly contains ReadingPractice/")
+
         future_style = cls.source_root / FUTURE_STYLE
         future_style.write_text(":root { --future-public-style: 1; }\n", encoding="utf-8")
         (cls.source_root / "src/styles/.env").write_text("DO_NOT_PACKAGE=1\n", encoding="utf-8")
         (cls.source_root / "src/styles/local-output.tmp").write_text("temporary\n", encoding="utf-8")
 
-        cls.first_entries = cls._build_release()
-        cls.second_entries = cls._build_release()
-        cls.archive_path = cls.source_root / "dist/ielts-practice-focused-test.zip"
+        cls.absent_windows = cls._build_release("windows", "focused-absent-windows")
+        cls.absent_unix = cls._build_release("unix", "focused-absent-unix")
+        cls.absent_windows_repeat = cls._build_release("windows", "focused-absent-windows-repeat")
         cls.extract_root = Path(cls.temp_dir.name) / "extracted"
-        with zipfile.ZipFile(cls.archive_path) as archive:
+        with zipfile.ZipFile(io.BytesIO(cls.absent_windows["archive_bytes"])) as archive:
             archive.extractall(cls.extract_root)
+
+        reading_fixture = cls.source_root / READING_FIXTURE
+        reading_fixture.parent.mkdir(parents=True)
+        reading_fixture.write_text("public reading fixture\n", encoding="utf-8")
+        cls.present_windows = cls._build_release("windows", "focused-present-windows")
+        cls.present_unix = cls._build_release("unix", "focused-present-unix")
 
     @classmethod
     def tearDownClass(cls) -> None:
         cls.temp_dir.cleanup()
 
     @classmethod
-    def _build_release(cls) -> list[zipfile.ZipInfo]:
+    def _run_release(cls, platform: str, version: str) -> tuple[subprocess.CompletedProcess[str], Path]:
         node = Path(_command("node", "NODE_EXE"))
-        powershell = _command("powershell")
         env = os.environ.copy()
         env["PATH"] = str(node.parent) + os.pathsep + env.get("PATH", "")
-        result = subprocess.run(
-            [
-                powershell,
+        if platform == "windows":
+            command = [
+                _command("powershell"),
                 "-NoProfile",
                 "-ExecutionPolicy",
                 "Bypass",
                 "-File",
                 str(cls.source_root / "developer/release.ps1"),
-                "focused-test",
-            ],
+                version,
+            ]
+        elif platform == "unix":
+            unix_release_image = env.get("UNIX_RELEASE_IMAGE", "")
+            if unix_release_image:
+                command = [
+                    _command("docker"),
+                    "run",
+                    "--rm",
+                    "--network",
+                    "none",
+                    "--volume",
+                    f"{cls.source_root}:/workspace",
+                    "--workdir",
+                    "/workspace",
+                    "--entrypoint",
+                    "bash",
+                    unix_release_image,
+                    "developer/release.sh",
+                    version,
+                ]
+            else:
+                command = [_command("bash", "BASH_EXE"), "developer/release.sh", version]
+        else:
+            raise ValueError(f"unknown release platform: {platform}")
+
+        result = subprocess.run(
+            command,
             cwd=cls.source_root,
             env=env,
             text=True,
+            encoding="utf-8" if platform == "unix" else None,
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=120,
+            timeout=180,
         )
+        archive_path = cls.source_root / f"dist/ielts-practice-{version}.zip"
+        return result, archive_path
+
+    @classmethod
+    def _build_release(cls, platform: str, version: str) -> dict[str, object]:
+        result, archive_path = cls._run_release(platform, version)
         if result.returncode:
-            raise AssertionError(f"release command failed ({result.returncode}):\n{result.stdout}")
-        archive_path = cls.source_root / "dist/ielts-practice-focused-test.zip"
-        with zipfile.ZipFile(archive_path) as archive:
-            return archive.infolist()
+            raise AssertionError(
+                f"{platform} release command failed ({result.returncode}):\n{result.stdout}"
+            )
+        archive_bytes = archive_path.read_bytes()
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+            entries = archive.infolist()
+            file_hashes = {
+                entry.filename: hashlib.sha256(archive.read(entry)).hexdigest()
+                for entry in entries
+                if not entry.is_dir()
+            }
+        return {
+            "archive_bytes": archive_bytes,
+            "entries": entries,
+            "file_hashes": file_hashes,
+            "stdout": result.stdout,
+        }
+
+    @staticmethod
+    def _entry_names(snapshot: dict[str, object]) -> list[str]:
+        return [entry.filename for entry in snapshot["entries"]]
 
     def test_all_public_styles_are_included_once_and_future_styles_follow_the_rule(self) -> None:
-        names = [entry.filename for entry in self.second_entries if not entry.is_dir()]
+        names = [entry.filename for entry in self.present_windows["entries"] if not entry.is_dir()]
         counts = collections.Counter(names)
         tracked_styles = {
             path for path in _git_paths("ls-files", "--", "src/styles")
@@ -173,7 +236,7 @@ class StandalonePackagingTest(unittest.TestCase):
 
     def test_archive_scope_matches_the_public_runtime_allowlist(self) -> None:
         actual_files = {
-            entry.filename for entry in self.second_entries
+            entry.filename for entry in self.present_windows["entries"]
             if not entry.is_dir()
         }
         expected_files: set[str] = set()
@@ -208,9 +271,9 @@ class StandalonePackagingTest(unittest.TestCase):
         self.assertFalse(any(PurePosixPath(name).name in {"WORKTREE_GUARD.md", "IELTS_WORKTREE_ROUTING.md"} for name in actual_files))
 
     def test_entries_are_unique_portable_relative_paths_without_symlinks(self) -> None:
-        names = [entry.filename for entry in self.second_entries]
+        names = self._entry_names(self.present_windows)
         self.assertEqual(len(names), len(set(names)))
-        for entry in self.second_entries:
+        for entry in self.present_windows["entries"]:
             name = entry.filename
             path = PurePosixPath(name)
             self.assertNotIn("\\", name)
@@ -221,10 +284,63 @@ class StandalonePackagingTest(unittest.TestCase):
             self.assertFalse(stat.S_ISLNK(unix_mode), name)
 
     def test_repeat_build_preserves_the_same_unique_entry_set(self) -> None:
-        first = [entry.filename for entry in self.first_entries]
-        second = [entry.filename for entry in self.second_entries]
+        first = self._entry_names(self.absent_windows)
+        second = self._entry_names(self.absent_windows_repeat)
         self.assertEqual(first, second)
         self.assertEqual(len(second), len(set(second)))
+
+    def test_reading_practice_absent_has_real_cross_platform_archive_parity(self) -> None:
+        windows_names = self._entry_names(self.absent_windows)
+        unix_names = self._entry_names(self.absent_unix)
+        for names in (windows_names, unix_names):
+            self.assertFalse(any(name.startswith("ReadingPractice/") for name in names))
+            counts = collections.Counter(names)
+            for required_style in REQUIRED_STYLES:
+                self.assertEqual(counts[required_style], 1, required_style)
+        self.assertSetEqual(set(windows_names), set(unix_names))
+        self.assertDictEqual(
+            self.absent_windows["file_hashes"],
+            self.absent_unix["file_hashes"],
+        )
+        self.assertIn(
+            "Optional release input skipped: ReadingPractice/",
+            self.absent_unix["stdout"],
+        )
+
+    def test_reading_practice_present_has_real_cross_platform_archive_parity(self) -> None:
+        windows_names = self._entry_names(self.present_windows)
+        unix_names = self._entry_names(self.present_unix)
+        self.assertEqual(windows_names.count(READING_FIXTURE), 1)
+        self.assertEqual(unix_names.count(READING_FIXTURE), 1)
+        self.assertSetEqual(set(windows_names), set(unix_names))
+        self.assertDictEqual(
+            self.present_windows["file_hashes"],
+            self.present_unix["file_hashes"],
+        )
+
+        absent_hashes = self.absent_windows["file_hashes"]
+        present_hashes = self.present_windows["file_hashes"]
+        self.assertSetEqual(set(present_hashes) - set(absent_hashes), {READING_FIXTURE})
+        self.assertDictEqual(
+            {name: present_hashes[name] for name in absent_hashes},
+            absent_hashes,
+        )
+
+    def test_required_release_root_stays_fail_closed_on_windows_and_unix(self) -> None:
+        required_root = self.source_root / "src/styles"
+        temporary_backup = self.source_root / "src/styles-required-root-backup"
+        required_root.rename(temporary_backup)
+        try:
+            for platform in ("windows", "unix"):
+                with self.subTest(platform=platform):
+                    result, _archive_path = self._run_release(
+                        platform,
+                        f"focused-missing-required-{platform}",
+                    )
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn("src/styles", result.stdout)
+        finally:
+            temporary_backup.rename(required_root)
 
     def test_extracted_html_and_css_references_are_self_contained(self) -> None:
         parser = _IndexAssetParser()
