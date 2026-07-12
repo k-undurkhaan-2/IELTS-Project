@@ -224,6 +224,7 @@ def _check_build_bundles_no_deleted_refs(build_script: Path) -> Tuple[bool, dict
     ]
     try:
         source = build_script.read_text(encoding="utf-8")
+        source += "\n" + build_script.with_name("bundle-manifest.mjs").read_text(encoding="utf-8")
     except Exception as exc:  # pragma: no cover - defensive guard
         return False, {"error": f"读取失败：{exc}"}
 
@@ -236,6 +237,7 @@ def _check_build_bundles_no_deleted_refs(build_script: Path) -> Tuple[bool, dict
 def _check_optional_listening_assets_not_bundled(build_script: Path, core_bundle: Path) -> Tuple[bool, dict]:
     try:
         build_source = build_script.read_text(encoding="utf-8")
+        build_source += "\n" + build_script.with_name("bundle-manifest.mjs").read_text(encoding="utf-8")
     except Exception as exc:  # pragma: no cover - defensive guard
         return False, {"error": f"读取 build-bundles 失败：{exc}"}
 
@@ -863,12 +865,14 @@ def _check_lazy_loader_dedupe(loader_path: Path) -> Tuple[bool, str]:
 
 def _check_settings_tools_split() -> Tuple[bool, dict]:
     build_script = REPO_ROOT / "scripts" / "build-bundles.mjs"
+    bundle_manifest = REPO_ROOT / "scripts" / "bundle-manifest.mjs"
     lazy_loader = REPO_ROOT / "js" / "runtime" / "lazyLoader.js"
     boot_fallbacks = REPO_ROOT / "js" / "boot-fallbacks.js"
     exam_actions = REPO_ROOT / "js" / "app" / "examActions.js"
 
     try:
         build_source = build_script.read_text(encoding="utf-8")
+        build_source += "\n" + bundle_manifest.read_text(encoding="utf-8")
         loader_source = lazy_loader.read_text(encoding="utf-8")
         fallback_source = boot_fallbacks.read_text(encoding="utf-8")
         actions_source = exam_actions.read_text(encoding="utf-8")

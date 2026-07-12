@@ -4156,8 +4156,7 @@ storageManager.ready
 
     function isAuthSurface(element) {
         return element.id === 'remote-auth-overlay'
-            || element.classList.contains('remote-auth-account')
-            || element.classList.contains('remote-auth-totp');
+            || element.classList.contains('remote-auth-account');
     }
 
     function setRemoteAuthGate(active) {
@@ -4284,13 +4283,13 @@ storageManager.ready
         const showMessage = options.showMessage || window.showMessage || function() {};
         let overlay = null;
         let account = null;
-        let totpPanel = null;
-        let accountFormsBound = false;
         let mode = 'login';
         let importPromptedInSession = false;
         let pendingRecoveryUser = null;
         let setOverlayMode = null;
         let clearOverlaySensitiveFields = null;
+        let sessionListLoadedForUserId = '';
+        let sessionListLoading = false;
 
         function ensureUi() {
             if (overlay) {
@@ -4426,7 +4425,10 @@ storageManager.ready
             const settings = createAccountMenuItem('button', 'remote-auth-account__menu-item remote-auth-account__settings', '设置', '管理题库、数据备份和安全');
             settings.type = 'button';
             settings.setAttribute('role', 'menuitem');
+            const settingsPassword = window.document.getElementById('settings-password-btn');
             const settingsTotp = window.document.getElementById('settings-totp-btn');
+            const settingsSessionsRefresh = window.document.getElementById('settings-sessions-refresh-btn');
+            const settingsSessionsRevokeOthers = window.document.getElementById('settings-sessions-revoke-others-btn');
             const logout = createAccountMenuItem('button', 'remote-auth-account__menu-item remote-auth-account__logout', '退出', '结束当前登录会话');
             logout.type = 'button';
             logout.setAttribute('role', 'menuitem');
@@ -4434,10 +4436,6 @@ storageManager.ready
             account.append(accountToggle, accountMenu);
             const accountHost = window.document.querySelector('.hero-header__actions') || window.document.body;
             accountHost.appendChild(account);
-
-            totpPanel = createElement('section', 'remote-auth-totp');
-            totpPanel.hidden = true;
-            window.document.body.appendChild(totpPanel);
 
             function setError(message) {
                 error.textContent = message || '';
@@ -4616,9 +4614,9 @@ storageManager.ready
                     setAccountMenuOpen(false);
                     await apiClient.logout();
                     updateAccount(null);
-                    hideTotpPanel();
                     window.dispatchEvent(new CustomEvent('remote-auth-changed', { detail: { user: null } }));
-                    show();
+                    const returnTo = getCurrentReturnTo();
+                    window.location.href = `/auth/business/logout?return_to=${encodeURIComponent(returnTo)}`;
                 } catch (requestError) {
                     showMessage(formatRemoteAuthError(requestError), 'error');
                 } finally {
@@ -4626,14 +4624,24 @@ storageManager.ready
                 }
             });
 
+            if (settingsPassword) {
+                settingsPassword.addEventListener('click', () => startBusinessAuthAction('password'));
+            }
             if (settingsTotp) {
-                settingsTotp.addEventListener('click', async () => {
-                    if (totpPanel.hidden) {
-                        totpPanel.hidden = false;
-                        await loadTotpPanel();
-                    } else {
-                        hideTotpPanel();
-                    }
+                settingsTotp.addEventListener('click', () => startBusinessAuthAction('totp'));
+            }
+            if (settingsSessionsRefresh) {
+                settingsSessionsRefresh.addEventListener('click', () => {
+                    loadAccountSessions({ force: true }).catch((requestError) => {
+                        setSessionManagerStatus(formatRemoteAuthError(requestError), 'error');
+                    });
+                });
+            }
+            if (settingsSessionsRevokeOthers) {
+                settingsSessionsRevokeOthers.addEventListener('click', () => {
+                    revokeOtherAccountSessions().catch((requestError) => {
+                        setSessionManagerStatus(formatRemoteAuthError(requestError), 'error');
+                    });
                 });
             }
 
@@ -4694,154 +4702,46 @@ storageManager.ready
                 }
             });
 
-            bindAccountForms();
-
             window.addEventListener('storage-sync', syncAccountStats);
             window.addEventListener('remote-auth-changed', syncAccountStats);
         }
 
-        function setAccountFormStatus(node, message, type) {
-            if (!node) {
-                return;
+        function getCurrentReturnTo() {
+            const returnTo = `${window.location.pathname || '/'}${window.location.search || ''}${window.location.hash || ''}`;
+            if (/^\/(?:auth|admin|api\/admin)(?:\/|$)/i.test(returnTo)) {
+                return '/';
             }
-            node.textContent = message || '';
-            node.classList.toggle('is-error', type === 'error');
-            node.classList.toggle('is-success', type === 'success');
-        }
-
-        function setFormBusy(form, busy) {
-            if (!form) {
-                return;
-            }
-            Array.from(form.querySelectorAll('button, input')).forEach((element) => {
-                element.disabled = Boolean(busy);
-            });
-        }
-
-        function bindAccountForms() {
-            if (accountFormsBound) {
-                return;
-            }
-            const management = window.document.getElementById('account-management');
-            const usernameForm = window.document.getElementById('account-username-form');
-            const passwordForm = window.document.getElementById('account-password-form');
-            const deleteForm = window.document.getElementById('account-delete-form');
-            if (!usernameForm && !passwordForm && !deleteForm) {
-                return;
-            }
-            accountFormsBound = true;
-            if (management) {
-                management.innerHTML = [
-                    '<h3 class="account-view__section-title">Account Management</h3>',
-                    '<p class="account-view__form-status">Security settings are managed in the dedicated auth portal.</p>',
-                    '<a class="btn hero-btn" href="/auth/business/account">Open auth account center</a>'
-                ].join('');
-                return;
-            }
-
-            if (usernameForm) {
-                usernameForm.addEventListener('submit', async (event) => {
-                    event.preventDefault();
-                    const username = window.document.getElementById('account-username-input')?.value || '';
-                    const password = window.document.getElementById('account-username-password')?.value || '';
-                    const status = window.document.getElementById('account-username-status');
-                    const normalizedUsername = String(username).trim();
-                    if (!USERNAME_PATTERN.test(normalizedUsername)) {
-                        setAccountFormStatus(status, 'Use 3-32 letters, numbers, "_" or "-".', 'error');
-                        return;
-                    }
-                    if (!password) {
-                        setAccountFormStatus(status, 'Current password is required.', 'error');
-                        return;
-                    }
-                    setFormBusy(usernameForm, true);
-                    setAccountFormStatus(status, 'Saving...', null);
-                    try {
-                        const payload = await apiClient.updateUsername(normalizedUsername, password);
-                        updateAccount(payload.user || apiClient.user);
-                        window.document.getElementById('account-username-password').value = '';
-                        window.dispatchEvent(new CustomEvent('remote-auth-changed', { detail: { user: payload.user || apiClient.user } }));
-                        setAccountFormStatus(status, 'Username updated.', 'success');
-                        showMessage('Username updated', 'success');
-                    } catch (requestError) {
-                        setAccountFormStatus(status, formatRemoteAuthError(requestError), 'error');
-                    } finally {
-                        setFormBusy(usernameForm, false);
-                    }
-                });
-            }
-
-            if (passwordForm) {
-                passwordForm.addEventListener('submit', async (event) => {
-                    event.preventDefault();
-                    const currentPassword = window.document.getElementById('account-current-password')?.value || '';
-                    const newPassword = window.document.getElementById('account-new-password')?.value || '';
-                    const confirmPassword = window.document.getElementById('account-confirm-password')?.value || '';
-                    const status = window.document.getElementById('account-password-status');
-                    if (!currentPassword || !newPassword) {
-                        setAccountFormStatus(status, 'Current and new passwords are required.', 'error');
-                        return;
-                    }
-                    if (newPassword !== confirmPassword) {
-                        setAccountFormStatus(status, 'New password confirmation does not match.', 'error');
-                        return;
-                    }
-                    setFormBusy(passwordForm, true);
-                    setAccountFormStatus(status, 'Updating...', null);
-                    try {
-                        const payload = await apiClient.updatePassword(currentPassword, newPassword);
-                        updateAccount(payload.user || apiClient.user);
-                        passwordForm.reset();
-                        setAccountFormStatus(status, 'Password updated.', 'success');
-                        showMessage('Password updated', 'success');
-                    } catch (requestError) {
-                        setAccountFormStatus(status, formatRemoteAuthError(requestError), 'error');
-                    } finally {
-                        setFormBusy(passwordForm, false);
-                    }
-                });
-            }
-
-            if (deleteForm) {
-                deleteForm.addEventListener('submit', async (event) => {
-                    event.preventDefault();
-                    const password = window.document.getElementById('account-delete-password')?.value || '';
-                    const confirm = window.document.getElementById('account-delete-confirm')?.value || '';
-                    const status = window.document.getElementById('account-delete-status');
-                    const username = apiClient.user?.username || '';
-                    if (!password || !confirm) {
-                        setAccountFormStatus(status, 'Password and username confirmation are required.', 'error');
-                        return;
-                    }
-                    if (confirm !== username) {
-                        setAccountFormStatus(status, 'Type your current username exactly.', 'error');
-                        return;
-                    }
-                    if (!window.confirm('Delete this account and all server-side practice records? This cannot be undone.')) {
-                        return;
-                    }
-                    setFormBusy(deleteForm, true);
-                    setAccountFormStatus(status, 'Deleting...', null);
-                    try {
-                        await apiClient.deleteAccount(password, confirm);
-                        deleteForm.reset();
-                        updateAccount(null);
-                        hideTotpPanel();
-                        window.dispatchEvent(new CustomEvent('remote-auth-changed', { detail: { user: null } }));
-                        show();
-                        showMessage('Account deleted', 'success');
-                    } catch (requestError) {
-                        setAccountFormStatus(status, formatRemoteAuthError(requestError), 'error');
-                    } finally {
-                        setFormBusy(deleteForm, false);
-                    }
-                });
-            }
+            return returnTo || '/';
         }
 
         function show() {
-            const returnTo = `${window.location.pathname || '/'}${window.location.search || ''}${window.location.hash || ''}`;
+            const returnTo = getCurrentReturnTo();
             window.location.href = `/auth/business/start?return_to=${encodeURIComponent(returnTo)}`;
+        }
+
+        function startBusinessAuthAction(action) {
+            const normalizedAction = action === 'totp'
+                ? 'totp'
+                : (action === 'session' ? 'session' : (action === 'data' ? 'data' : 'password'));
+            const returnTo = getCurrentReturnTo();
+            window.location.href = `/auth/business/${normalizedAction}/start?return_to=${encodeURIComponent(returnTo)}`;
+        }
+
+        function redirectToSessionManageStepUp(error) {
+            if (!error || error.status !== 403 || !error.payload?.requiresSessionManageStepUp) {
+                return false;
+            }
+            setSessionManagerStatus('Confirm your password before managing sessions.');
+            startBusinessAuthAction('session');
+            return true;
+        }
+
+        function redirectToDataManageStepUp(error) {
+            if (!error || error.status !== 403 || !error.payload?.requiresDataManageStepUp) {
+                return false;
+            }
+            startBusinessAuthAction('data');
+            return true;
         }
 
         function hide() {
@@ -4851,13 +4751,6 @@ storageManager.ready
             }
             overlay.hidden = true;
             setRemoteAuthGate(false);
-        }
-
-        function hideTotpPanel() {
-            if (totpPanel) {
-                totpPanel.hidden = true;
-                totpPanel.textContent = '';
-            }
         }
 
         function getAccountInitial(username) {
@@ -4902,6 +4795,240 @@ storageManager.ready
             });
         }
 
+        function getSessionManagerNodes() {
+            return {
+                manager: window.document.getElementById('settings-session-manager'),
+                list: window.document.getElementById('settings-sessions-list'),
+                refresh: window.document.getElementById('settings-sessions-refresh-btn'),
+                revokeOthers: window.document.getElementById('settings-sessions-revoke-others-btn'),
+                status: window.document.getElementById('settings-sessions-status')
+            };
+        }
+
+        function setSessionManagerStatus(message, kind = 'info') {
+            const { status } = getSessionManagerNodes();
+            if (!status) {
+                return;
+            }
+            status.textContent = sanitizeRemoteAuthMessage(message || '');
+            status.dataset.kind = kind;
+            if (!status.textContent) {
+                status.removeAttribute('data-kind');
+            }
+        }
+
+        function setSessionManagerLoading(loading) {
+            const { refresh, revokeOthers } = getSessionManagerNodes();
+            if (refresh) {
+                refresh.disabled = loading;
+            }
+            if (revokeOthers) {
+                revokeOthers.disabled = loading;
+            }
+        }
+
+        function formatSessionDate(value) {
+            if (!value) {
+                return 'Unknown';
+            }
+            const date = new Date(value);
+            if (Number.isNaN(Number(date))) {
+                return 'Unknown';
+            }
+            return date.toLocaleString();
+        }
+
+        function formatSessionAudience(value) {
+            const text = String(value || '').trim().toLowerCase();
+            if (text === 'admin') {
+                return 'Admin session';
+            }
+            if (text === 'auth') {
+                return 'Authentication session';
+            }
+            return 'Business session';
+        }
+
+        function getSessionAudienceRank(value) {
+            const text = String(value || '').trim().toLowerCase();
+            if (text === 'business') {
+                return 0;
+            }
+            if (text === 'auth') {
+                return 1;
+            }
+            if (text === 'admin') {
+                return 2;
+            }
+            return 3;
+        }
+
+        function getSessionAudienceGroupTitle(value) {
+            const text = String(value || '').trim().toLowerCase();
+            if (text === 'auth') {
+                return 'Authentication sessions';
+            }
+            if (text === 'admin') {
+                return 'Admin sessions';
+            }
+            return 'Business sessions';
+        }
+
+        function getSessionRevokeConfirm(session) {
+            const audience = String(session?.audience || '').trim().toLowerCase();
+            if (audience === 'auth') {
+                return 'Signing out this authentication session may require signing in again before changing password, managing TOTP, or starting a new handoff.';
+            }
+            if (audience === 'admin') {
+                return 'Sign out this admin session?';
+            }
+            return 'Sign out this business session?';
+        }
+
+        function renderAccountSessions(payload) {
+            const { list } = getSessionManagerNodes();
+            if (!list) {
+                return;
+            }
+            const sessions = Array.isArray(payload?.sessions) ? payload.sessions : [];
+            list.textContent = '';
+            if (!sessions.length) {
+                list.append(createElement('p', 'settings-session-list__empty', 'No active sessions found.'));
+                return;
+            }
+            const sortedSessions = sessions.slice().sort((left, right) => {
+                const rank = getSessionAudienceRank(left.audience) - getSessionAudienceRank(right.audience);
+                if (rank !== 0) {
+                    return rank;
+                }
+                return Number(new Date(right.lastSeenAt || right.createdAt || 0)) - Number(new Date(left.lastSeenAt || left.createdAt || 0));
+            });
+            let currentGroup = '';
+            sortedSessions.forEach((session) => {
+                const groupTitle = getSessionAudienceGroupTitle(session.audience);
+                if (groupTitle !== currentGroup) {
+                    currentGroup = groupTitle;
+                    list.append(createElement('h5', 'settings-session-list__group', groupTitle));
+                }
+                const card = createElement('article', 'settings-session-card');
+                card.setAttribute('role', 'listitem');
+                const head = createElement('div', 'settings-session-card__head');
+                const title = createElement('strong', null, session.deviceLabel || 'Signed-in browser');
+                const badges = createElement('span', 'settings-session-card__badges');
+                badges.append(createElement('span', 'settings-session-card__badge', formatSessionAudience(session.audience)));
+                if (session.current) {
+                    badges.append(createElement('span', 'settings-session-card__badge is-current', 'Current'));
+                }
+                head.append(title, badges);
+
+                const meta = createElement('div', 'settings-session-card__meta');
+                meta.append(
+                    createElement('span', null, `Last seen ${formatSessionDate(session.lastSeenAt || session.createdAt)}`),
+                    createElement('span', null, `Expires ${formatSessionDate(session.expiresAt)}`)
+                );
+                if (String(session.audience || '').trim().toLowerCase() === 'auth') {
+                    meta.append(createElement(
+                        'span',
+                        'settings-session-card__hint',
+                        'Used for sign-in, security settings, and onion handoff.'
+                    ));
+                }
+
+                const actions = createElement('div', 'settings-session-card__actions');
+                const revoke = createElement('button', 'btn hero-btn settings-session-card__revoke', session.current ? 'Current session' : 'Sign out');
+                revoke.type = 'button';
+                revoke.disabled = Boolean(session.current || !session.id);
+                revoke.addEventListener('click', () => {
+                    revokeAccountSession(session.id, session).catch((requestError) => {
+                        setSessionManagerStatus(formatRemoteAuthError(requestError), 'error');
+                    });
+                });
+                actions.append(revoke);
+                card.append(head, meta, actions);
+                list.append(card);
+            });
+        }
+
+        async function loadAccountSessions(options = {}) {
+            const { manager, list } = getSessionManagerNodes();
+            if (!manager || !list || !apiClient || typeof apiClient.request !== 'function') {
+                return;
+            }
+            if (sessionListLoading) {
+                return;
+            }
+            const currentUserId = options.userId || apiClient.user?.id || '';
+            if (!options.force && sessionListLoadedForUserId === currentUserId && list.childElementCount > 0) {
+                return;
+            }
+            manager.hidden = false;
+            sessionListLoading = true;
+            setSessionManagerLoading(true);
+            if (!options.silent) {
+                setSessionManagerStatus('Loading sessions...');
+            }
+            try {
+                const payload = await apiClient.request('/api/account/sessions', { method: 'GET', csrf: false });
+                sessionListLoadedForUserId = currentUserId;
+                renderAccountSessions(payload);
+                setSessionManagerStatus('Sessions refreshed.', 'success');
+            } catch (requestError) {
+                if (requestError && requestError.status === 401) {
+                    sessionListLoadedForUserId = '';
+                    updateAccount(null);
+                }
+                throw requestError;
+            } finally {
+                sessionListLoading = false;
+                setSessionManagerLoading(false);
+            }
+        }
+
+        async function revokeAccountSession(sessionId, session = null) {
+            const normalizedId = String(sessionId || '');
+            if (!normalizedId) {
+                return;
+            }
+            if (typeof window.confirm === 'function' && !window.confirm(getSessionRevokeConfirm(session))) {
+                return;
+            }
+            setSessionManagerStatus('Signing out selected session...');
+            try {
+                await apiClient.request(`/api/account/sessions/${encodeURIComponent(normalizedId)}`, {
+                    method: 'DELETE'
+                });
+            } catch (requestError) {
+                if (redirectToSessionManageStepUp(requestError)) {
+                    return;
+                }
+                throw requestError;
+            }
+            sessionListLoadedForUserId = '';
+            await loadAccountSessions({ force: true, silent: true });
+            setSessionManagerStatus('Selected session signed out.', 'success');
+        }
+
+        async function revokeOtherAccountSessions() {
+            if (typeof window.confirm === 'function' && !window.confirm('Sign out all other sessions for this account, including authentication sessions used for sign-in and security settings?')) {
+                return;
+            }
+            setSessionManagerStatus('Signing out other sessions...');
+            try {
+                await apiClient.request('/api/account/sessions/revoke-others', {
+                    method: 'POST',
+                    body: {}
+                });
+            } catch (requestError) {
+                if (redirectToSessionManageStepUp(requestError)) {
+                    return;
+                }
+                throw requestError;
+            }
+            sessionListLoadedForUserId = '';
+            await loadAccountSessions({ force: true, silent: true });
+            setSessionManagerStatus('Other sessions signed out.', 'success');
+        }
+
         function updateAccount(user) {
             ensureUi();
             const name = account.querySelector('.remote-auth-account__name');
@@ -4910,14 +5037,13 @@ storageManager.ready
             const menuName = account.querySelector('.remote-auth-account__menu-name');
             const menuRole = account.querySelector('.remote-auth-account__menu-role');
             const menuAvatar = account.querySelector('.remote-auth-account__menu-avatar');
+            const settingsPassword = window.document.getElementById('settings-password-btn');
             const settingsTotp = window.document.getElementById('settings-totp-btn');
             const profileName = window.document.getElementById('account-profile-name');
             const profileRole = window.document.getElementById('account-profile-role');
             const profileAvatar = window.document.getElementById('account-profile-avatar');
-            const usernameInput = window.document.getElementById('account-username-input');
-            const usernamePassword = window.document.getElementById('account-username-password');
-            const passwordForm = window.document.getElementById('account-password-form');
-            const deleteForm = window.document.getElementById('account-delete-form');
+            const sessionManager = window.document.getElementById('settings-session-manager');
+            const sessionList = window.document.getElementById('settings-sessions-list');
             if (user && user.username) {
                 const displayRole = user.role === 'admin' ? 'Admin' : 'User';
                 const initial = getAccountInitial(user.username);
@@ -4946,14 +5072,19 @@ storageManager.ready
                 if (profileAvatar) {
                     profileAvatar.textContent = initial;
                 }
+                if (settingsPassword) {
+                    settingsPassword.hidden = false;
+                }
                 if (settingsTotp) {
                     settingsTotp.hidden = false;
                 }
-                if (usernameInput) {
-                    usernameInput.value = user.username;
-                }
-                if (usernamePassword) {
-                    usernamePassword.value = '';
+                if (sessionManager) {
+                    sessionManager.hidden = false;
+                    if (user.id && sessionListLoadedForUserId !== user.id) {
+                        loadAccountSessions({ silent: true, userId: user.id }).catch((requestError) => {
+                            setSessionManagerStatus(formatRemoteAuthError(requestError), 'error');
+                        });
+                    }
                 }
                 account.hidden = false;
                 syncAccountStats();
@@ -4983,229 +5114,23 @@ storageManager.ready
                 if (profileAvatar) {
                     profileAvatar.textContent = 'U';
                 }
+                if (settingsPassword) {
+                    settingsPassword.hidden = true;
+                }
                 if (settingsTotp) {
                     settingsTotp.hidden = true;
                 }
-                if (usernameInput) {
-                    usernameInput.value = '';
+                if (sessionManager) {
+                    sessionManager.hidden = true;
                 }
-                if (usernamePassword) {
-                    usernamePassword.value = '';
+                if (sessionList) {
+                    sessionList.textContent = '';
                 }
-                if (passwordForm) {
-                    passwordForm.reset();
-                }
-                if (deleteForm) {
-                    deleteForm.reset();
-                }
-                ['account-username-status', 'account-password-status', 'account-delete-status'].forEach((id) => {
-                    setAccountFormStatus(window.document.getElementById(id), '', null);
-                });
+                sessionListLoadedForUserId = '';
+                setSessionManagerStatus('');
                 setAccountMenuOpen(false);
                 account.hidden = true;
             }
-        }
-
-        function renderRecoveryCodes(container, codes) {
-            const list = createElement('ol', 'remote-auth-recovery__list');
-            codes.forEach((code) => list.append(createElement('li', null, code)));
-            container.append(
-                createElement('p', 'remote-auth-totp__note', '请保存这些恢复码。它们只会显示一次。'),
-                list
-            );
-        }
-
-        function renderTotpActionForm(statusNode, body, options = {}) {
-            body.textContent = '';
-            const form = createElement('form', 'remote-auth-totp__form');
-            const note = createElement('p', 'remote-auth-totp__note', options.note || '');
-            const error = createElement('div', 'remote-auth-error');
-            error.hidden = true;
-
-            form.append(note);
-            let passwordInput = null;
-            if (options.requirePassword) {
-                const passwordLabel = createElement('label', 'remote-auth-field');
-                passwordInput = createElement('input');
-                passwordInput.type = 'password';
-                passwordInput.autocomplete = 'current-password';
-                passwordInput.required = true;
-                passwordLabel.append(createElement('span', null, '当前密码'), passwordInput);
-                form.append(passwordLabel);
-            }
-
-            const tokenLabel = createElement('label', 'remote-auth-field');
-            const tokenInput = createElement('input');
-            tokenInput.type = 'text';
-            tokenInput.inputMode = 'numeric';
-            tokenInput.autocomplete = 'one-time-code';
-            tokenInput.maxLength = 64;
-            tokenInput.required = true;
-            tokenLabel.append(createElement('span', null, 'TOTP 验证码或恢复码'), tokenInput);
-
-            const actions = createElement('div', 'remote-auth-totp__actions');
-            const submit = createElement('button', 'remote-auth-totp__primary', options.submitLabel || '确认');
-            submit.type = 'submit';
-            const cancel = createElement('button', 'remote-auth-totp__secondary', '取消');
-            cancel.type = 'button';
-            cancel.addEventListener('click', () => {
-                if (typeof options.onCancel === 'function') {
-                    options.onCancel();
-                }
-            });
-            actions.append(submit, cancel);
-
-            form.append(tokenLabel, error, actions);
-            form.addEventListener('submit', async (event) => {
-                event.preventDefault();
-                const token = normalizeCode(tokenInput.value);
-                const password = passwordInput ? passwordInput.value : '';
-                if (options.requirePassword && !password) {
-                    error.textContent = '请输入当前密码。';
-                    error.hidden = false;
-                    passwordInput.focus();
-                    return;
-                }
-                if (!token) {
-                    error.textContent = '请输入 TOTP 验证码或恢复码。';
-                    error.hidden = false;
-                    tokenInput.focus();
-                    return;
-                }
-                error.hidden = true;
-                submit.disabled = true;
-                cancel.disabled = true;
-                try {
-                    await options.onSubmit({ password, token });
-                } catch (requestError) {
-                    const message = formatRemoteAuthError(requestError);
-                    error.textContent = message;
-                    error.hidden = false;
-                    statusNode.textContent = message;
-                } finally {
-                    submit.disabled = false;
-                    cancel.disabled = false;
-                }
-            });
-
-            body.append(form);
-            window.setTimeout(() => {
-                const firstInput = passwordInput || tokenInput;
-                firstInput.focus({ preventScroll: true });
-            }, 0);
-        }
-
-        async function loadTotpPanel() {
-            if (!totpPanel) {
-                return;
-            }
-            totpPanel.textContent = '';
-            const head = createElement('div', 'remote-auth-totp__head');
-            head.append(createElement('h3', null, 'TOTP 二次验证'));
-            const close = createElement('button', 'remote-auth-totp__close', '×');
-            close.type = 'button';
-            close.setAttribute('aria-label', '关闭');
-            close.addEventListener('click', hideTotpPanel);
-            head.append(close);
-            const status = createElement('div', 'remote-auth-totp__status', '正在加载...');
-            const body = createElement('div', 'remote-auth-totp__body');
-            totpPanel.append(head, status, body);
-            try {
-                const payload = await apiClient.getTotpStatus();
-                renderTotpStatus(payload, status, body);
-            } catch (requestError) {
-                status.textContent = formatRemoteAuthError(requestError);
-            }
-        }
-
-        function renderTotpStatus(status, statusNode, body) {
-            body.textContent = '';
-            if (status.enabled) {
-                statusNode.textContent = `已启用，剩余恢复码 ${status.recoveryCodesRemaining || 0} 个，上次使用：${formatTotpTime(status.lastUsedAt)}`;
-                const regenerate = createElement('button', 'remote-auth-totp__primary', '重新生成恢复码');
-                const disable = createElement('button', 'remote-auth-totp__danger', '关闭 TOTP');
-                regenerate.type = 'button';
-                disable.type = 'button';
-                regenerate.addEventListener('click', () => {
-                    renderTotpActionForm(statusNode, body, {
-                        note: '输入验证器验证码或恢复码后，将生成一组新的恢复码。旧恢复码会立即失效。',
-                        submitLabel: '重新生成恢复码',
-                        onCancel: () => renderTotpStatus(status, statusNode, body),
-                        onSubmit: async ({ token }) => {
-                            const result = await apiClient.regenerateTotpRecoveryCodes(token);
-                            body.textContent = '';
-                            renderRecoveryCodes(body, result.recoveryCodes || []);
-                            statusNode.textContent = `已重新生成恢复码，剩余 ${result.status?.recoveryCodesRemaining || 0} 个。`;
-                        }
-                    });
-                });
-                disable.addEventListener('click', () => {
-                    if (apiClient.user?.role === 'admin') {
-                        statusNode.textContent = '管理员不能在这里关闭 TOTP。';
-                        return;
-                    }
-                    renderTotpActionForm(statusNode, body, {
-                        requirePassword: true,
-                        note: '关闭 TOTP 需要同时确认当前密码和验证码。',
-                        submitLabel: '关闭 TOTP',
-                        onCancel: () => renderTotpStatus(status, statusNode, body),
-                        onSubmit: async ({ password, token }) => {
-                            const result = await apiClient.disableTotp(password, token);
-                            renderTotpStatus(result, statusNode, body);
-                            showMessage('TOTP 已关闭', 'success');
-                        }
-                    });
-                });
-                body.append(regenerate, disable);
-                return;
-            }
-
-            statusNode.textContent = '未启用。启用后，登录需要输入认证器验证码。';
-            const enable = createElement('button', 'remote-auth-totp__primary', '启用 TOTP');
-            enable.type = 'button';
-            enable.addEventListener('click', async () => {
-                enable.disabled = true;
-                try {
-                    const setup = await apiClient.startTotpSetup();
-                    renderAccountTotpSetup(setup, statusNode, body);
-                } catch (requestError) {
-                    statusNode.textContent = formatRemoteAuthError(requestError);
-                } finally {
-                    enable.disabled = false;
-                }
-            });
-            body.append(enable);
-        }
-
-        function renderAccountTotpSetup(setup, statusNode, body) {
-            body.textContent = '';
-            statusNode.textContent = '扫描二维码后输入 6 位验证码完成绑定。';
-            const qr = createElement('img', 'remote-auth-totp__qr');
-            qr.alt = 'TOTP QR code';
-            qr.src = normalizeTotpQrDataUrl(setup.qrCodeDataUrl);
-            const secret = createElement('code', 'remote-auth-totp__secret', setup.secret || '');
-            const token = createElement('input', 'remote-auth-totp__input');
-            token.inputMode = 'numeric';
-            token.autocomplete = 'one-time-code';
-            token.placeholder = '验证码';
-            const verify = createElement('button', 'remote-auth-totp__primary', '验证并启用');
-            verify.type = 'button';
-            verify.addEventListener('click', async () => {
-                verify.disabled = true;
-                try {
-                    const result = await apiClient.verifyTotpSetup(token.value);
-                    body.textContent = '';
-                    renderRecoveryCodes(body, result.recoveryCodes || []);
-                    statusNode.textContent = 'TOTP 已启用。';
-                    updateAccount(result.user || apiClient.user);
-                } catch (requestError) {
-                    statusNode.textContent = formatRemoteAuthError(requestError);
-                } finally {
-                    verify.disabled = false;
-                }
-            });
-            body.append(qr, secret, token, verify);
-            window.setTimeout(() => token.focus({ preventScroll: true }), 0);
         }
 
         async function maybeImportLocalRecords(user) {
@@ -5224,7 +5149,15 @@ storageManager.ready
             if (!confirmImport(localRecords.length)) {
                 return;
             }
-            const records = await apiClient.importPracticeRecords(localRecords);
+            let records;
+            try {
+                records = await apiClient.importPracticeRecords(localRecords);
+            } catch (error) {
+                if (redirectToDataManageStepUp(error)) {
+                    return;
+                }
+                throw error;
+            }
             if (typeof localDataSource.write === 'function') {
                 await localDataSource.write('practice_records', records);
             }
@@ -5243,8 +5176,7 @@ storageManager.ready
             show,
             hide,
             updateAccount,
-            handleAuthenticated,
-            loadTotpPanel
+            handleAuthenticated
         };
     }
 

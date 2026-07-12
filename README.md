@@ -347,9 +347,17 @@ scripts/             构建脚本
 
 ```bash
 node scripts/build-bundles.mjs
+node scripts/build-bundles.mjs --profile vip --output-root "ListeningPractice/vip special"
 ```
 
-不要手动编辑 `js/bundles/*.bundle.js`。这些文件是构建产物，应由脚本生成。
+`scripts/bundle-manifest.mjs` 是 default/VIP bundle 的唯一输出与 source-input 清单。VIP profile
+只生成该清单声明的 14 个 tracked runtime bundle；VIP shell 不拥有独立的
+`listening-wrapper.bundle.js`，后端听力页使用根目录 tracked bundle，因此 canonical VIP build
+会移除旧 builder 遗留的同名 VIP 输出。`ListeningPractice/vip special/scripts/build-bundles.mjs`
+仅保留 fail-fast 迁移提示，不再包含第二套生成逻辑。
+
+不要手动编辑任何 `js/bundles/*.bundle.js`。这些文件是构建产物，应由根目录 canonical
+builder 生成；builder 会拒绝 profile 清单之外的 `.bundle.js` 输出。
 
 ### 生成发布包
 

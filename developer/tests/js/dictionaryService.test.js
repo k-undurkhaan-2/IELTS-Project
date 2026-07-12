@@ -64,7 +64,10 @@ function main() {
     const stats = service.stats();
     assert(stats.entries > 1000, 'dictionary should include a real local corpus');
 
-    const buildSource = fs.readFileSync(path.join(repoRoot, 'scripts/build-bundles.mjs'), 'utf8');
+    const buildSource = [
+        fs.readFileSync(path.join(repoRoot, 'scripts/build-bundles.mjs'), 'utf8'),
+        fs.readFileSync(path.join(repoRoot, 'scripts/bundle-manifest.mjs'), 'utf8')
+    ].join('\n');
     assert(buildSource.includes('assets/wordlists/ecdict_reading.bundle.js'));
     assert(buildSource.includes('js/core/dictionaryService.js'));
     assert(buildSource.includes('js/runtime/reviewHighlightDictionary.js'));
