@@ -159,7 +159,7 @@ assets/generated/listening-exams/listening-index.compat.js
 - 通过 `listening-record-bridge` 将听力练习结果转换为统一练习记录。
 - 在练习记录和统计系统中与阅读记录使用同一套数据管理流程。
 
-普通发布包默认不包含完整本地听力资源目录。需要随发布包包含 `ListeningPractice/P1-P4` 时，应使用 `INCLUDE_LOCAL_LISTENING=1` 进行打包。
+Public standalone ZIP 不包含 private `ListeningPractice/` 目录；这类内容必须通过独立的 runtime/deployment flow 提供。
 
 ### 套题练习模式
 
@@ -371,31 +371,54 @@ powershell -ExecutionPolicy Bypass -File developer/release.ps1 0.6.2
 dist/ielts-practice-{version}.zip
 ```
 
-发布脚本会先运行 `node scripts/build-bundles.mjs`，再创建只包含静态运行时文件的压缩包。用户解压后可直接打开 `index.html` 使用。
+发布脚本会先运行 `node scripts/build-bundles.mjs`，再由
+`developer/standalone-release-manifest.json` 授权静态运行时文件。Windows 和
+Unix 脚本使用同一个 manifest/helper contract，只压缩 helper 创建的临时 staging
+目录，并在 `dist/` 中同时输出 machine-readable release receipt。Node.js 只在构建和
+manifest 校验时需要；用户解压后仍可直接打开 `index.html`。
 
-### 包含本地听力资源
+manifest 的 `files` 是默认 standalone ZIP 的唯一成员授权。`assets/`、`css/`、
+`js/bundles/` 和 `src/styles/` 是 managed roots；其中每个现有文件都必须在 manifest
+中明确分类为 published `files` 或 `nonReleaseFiles`。任何未分类文件（包括 ignored、
+untracked、hidden、source map 或深层嵌套文件）都会令发布失败，不会被静默忽略。
+只有 `files` 授权 ZIP 成员。Git worktree 中的 manifest 和默认 payload 还必须 tracked 且 clean；
+不含 Git metadata 的 source archive 仍按同一 manifest 和 drift contract 发布。
 
-普通发布包默认排除完整 `ListeningPractice/` 目录和听力生成资产。如果需要将本地听力资源打入发布包，使用：
+### 显式授权 ReadingPractice
 
-```bash
-INCLUDE_LOCAL_LISTENING=1 bash developer/release.sh 0.6.2
+`ReadingPractice/` 不存在时，普通发布成功并省略该目录。目录存在时，操作者必须通过
+`READING_PRACTICE_PUBLIC_MANIFEST` 显式指定一个 manifest，否则发布在创建 ZIP 前失败：
+
+```json
+{
+  "schemaVersion": 1,
+  "files": [
+    {
+      "path": "example-public-file.html",
+      "sha256": "<lowercase sha256>"
+    }
+  ]
+}
 ```
 
-PowerShell：
+manifest 中的路径相对于固定的 `ReadingPractice/` root。每个文件必须存在、是普通
+非 symlink/reparse 文件且 SHA-256 匹配；目录中任何未授权文件也会令发布失败。外部
+manifest 自身不会进入 ZIP。
+
+```bash
+READING_PRACTICE_PUBLIC_MANIFEST=/path/to/reading-public.json bash developer/release.sh 0.6.2
+```
 
 ```powershell
-$env:INCLUDE_LOCAL_LISTENING = "1"
+$env:READING_PRACTICE_PUBLIC_MANIFEST = 'C:\path\to\reading-public.json'
 powershell -ExecutionPolicy Bypass -File developer/release.ps1 0.6.2
 ```
 
-该模式要求存在：
+### Private Listening policy
 
-```text
-assets/generated/listening-exams/manifest.js
-assets/generated/listening-exams/listening-index.compat.js
-```
-
-并会按脚本规则包含 `ListeningPractice/P1` 至 `ListeningPractice/P4` 中存在的目录。
+Private Listening 内容属于独立的 runtime/deployment flow，不属于 public standalone
+ZIP。旧的 `INCLUDE_LOCAL_LISTENING=1` 开关现在会 fail closed；发布脚本不会扫描或归档
+private Listening roots。已由默认 public manifest 明确列出的公共静态资产不受此政策影响。
 
 ### 部署后端模式
 
@@ -592,8 +615,8 @@ ReadingPractice/
 
 1. 是否存在 `assets/generated/listening-exams/manifest.js`。
 2. 是否存在 `assets/generated/listening-exams/listening-index.compat.js`。
-3. 如需本地听力目录，发布时是否设置 `INCLUDE_LOCAL_LISTENING=1`。
-4. `ListeningPractice/P1-P4` 中是否存在实际资源。
+3. public standalone ZIP 不会包含 private `ListeningPractice/`；请确认所需内容已通过独立 runtime/deployment flow 提供。
+4. 不要为 standalone release 设置旧的 `INCLUDE_LOCAL_LISTENING` 开关；该开关会 fail closed。
 
 ### 数据丢失或统计清零
 
