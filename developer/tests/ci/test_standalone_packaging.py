@@ -31,7 +31,6 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = Path("developer/standalone-release-manifest.json")
 HELPER_PATH = Path("developer/standalone-release-manifest.mjs")
 SAFE_SENTINEL = "SAFE_SENTINEL_NOT_A_REAL_SECRET\n"
-BASELINE_CONTENT_MANIFEST_SHA256 = "0105ece931e7697eb6c4c393b4e806bc42930b40e5df24ec8b70ddb052eede49"
 REQUIRED_STYLES = {
     "src/styles/tokens.css",
     "src/styles/components.css",
@@ -109,6 +108,49 @@ def _content_manifest_sha256(file_hashes: dict[str, str]) -> str:
     return _sha256_bytes(source.encode("utf-8"))
 
 
+def _normalized_file_hashes(
+    entries: list[tuple[str, str]],
+    label: str,
+) -> dict[str, str]:
+    file_hashes: dict[str, str] = {}
+    portable_paths: set[str] = set()
+    for path, sha256 in entries:
+        normalized_path = PurePosixPath(path).as_posix()
+        if (
+            normalized_path != path
+            or "\\" in path
+            or PurePosixPath(path).is_absolute()
+            or re.match(r"^[A-Za-z]:", path)
+            or ".." in PurePosixPath(path).parts
+        ):
+            raise AssertionError(f"{label} contains a non-normalized path: {path}")
+        if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            raise AssertionError(f"{label} contains a non-lowercase SHA-256: {path}")
+        portable_path = path.lower()
+        if path in file_hashes or portable_path in portable_paths:
+            raise AssertionError(f"{label} contains a duplicate or case-colliding path: {path}")
+        file_hashes[path] = sha256
+        portable_paths.add(portable_path)
+    return dict(sorted(file_hashes.items()))
+
+
+def _source_file_hashes(source_root: Path, relative_paths: list[str]) -> dict[str, str]:
+    return _normalized_file_hashes(
+        [(relative_path, _sha256_file(source_root / relative_path)) for relative_path in relative_paths],
+        "authorized source map",
+    )
+
+
+def _receipt_file_hashes(receipt: dict[str, object]) -> dict[str, str]:
+    return _normalized_file_hashes(
+        [
+            (entry["archivePath"], entry["sha256"])
+            for entry in receipt["files"]
+        ],
+        "staging receipt map",
+    )
+
+
 def _local_asset_path(value: str) -> str | None:
     value = value.strip().strip("\"'")
     if not value or value.startswith(("#", "data:", "blob:", "var(")):
@@ -146,6 +188,7 @@ class StandalonePackagingTest(unittest.TestCase):
 
         cls.absent_windows = cls._build_release("windows", "focused-default-windows")
         cls.absent_unix = cls._build_release("unix", "focused-default-unix")
+        cls.source_file_hashes = _source_file_hashes(cls.source_root, cls.manifest["files"])
         cls.extract_root = cls.temp_root / "extracted-default"
         with zipfile.ZipFile(io.BytesIO(cls.absent_windows["archive_bytes"])) as archive:
             archive.extractall(cls.extract_root)
@@ -319,11 +362,14 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
         shutil.copy2(receipt_path, receipt_copy)
         with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
             entries = archive.infolist()
-            file_hashes = {
-                entry.filename: _sha256_bytes(archive.read(entry))
-                for entry in entries
-                if not entry.is_dir()
-            }
+            file_hashes = _normalized_file_hashes(
+                [
+                    (entry.filename, _sha256_bytes(archive.read(entry)))
+                    for entry in entries
+                    if not entry.is_dir()
+                ],
+                f"{platform} archive map",
+            )
         return {
             "archive_bytes": archive_bytes,
             "entries": entries,
@@ -432,22 +478,66 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn(expected.lower(), result.stdout.lower())
 
+    def assertFileHashMapsEqual(
+        self,
+        expected: dict[str, str],
+        actual: dict[str, str],
+        *,
+        expected_label: str,
+        actual_label: str,
+    ) -> None:
+        missing_paths = sorted(set(expected) - set(actual))
+        extra_paths = sorted(set(actual) - set(expected))
+        hash_mismatch_paths = sorted(
+            path
+            for path in set(expected) & set(actual)
+            if expected[path] != actual[path]
+        )
+        if missing_paths or extra_paths or hash_mismatch_paths:
+            self.fail(
+                f"{actual_label} differs from {expected_label}; "
+                f"missing paths={missing_paths}; extra paths={extra_paths}; "
+                f"hash-mismatch paths={hash_mismatch_paths}"
+            )
+
     def test_default_windows_and_unix_release_use_one_positive_manifest(self) -> None:
         manifest_files = set(self.manifest["files"])
         self.assertEqual(len(manifest_files), 430)
         self.assertEqual(self.manifest["managedRoots"], MANAGED_ROOTS)
         self.assertSetEqual(set(self.manifest["nonReleaseFiles"]), NON_RELEASE_FILES)
+        self.assertSetEqual(set(self.source_file_hashes), manifest_files)
+        source_content_manifest_sha256 = _content_manifest_sha256(self.source_file_hashes)
 
-        for snapshot in (self.absent_windows, self.absent_unix):
+        for platform, snapshot in (
+            ("Windows", self.absent_windows),
+            ("Unix", self.absent_unix),
+        ):
             file_names = {
                 entry.filename for entry in snapshot["entries"]
                 if not entry.is_dir()
             }
+            receipt_file_hashes = _receipt_file_hashes(snapshot["receipt"])
             self.assertSetEqual(file_names, manifest_files)
             self.assertEqual(len(snapshot["entries"]), len({entry.filename for entry in snapshot["entries"]}))
+            self.assertFileHashMapsEqual(
+                self.source_file_hashes,
+                receipt_file_hashes,
+                expected_label="current authorized source map",
+                actual_label=f"{platform} staging receipt map",
+            )
+            self.assertFileHashMapsEqual(
+                self.source_file_hashes,
+                snapshot["file_hashes"],
+                expected_label="current authorized source map",
+                actual_label=f"{platform} archive map",
+            )
+            self.assertEqual(
+                _content_manifest_sha256(receipt_file_hashes),
+                source_content_manifest_sha256,
+            )
             self.assertEqual(
                 _content_manifest_sha256(snapshot["file_hashes"]),
-                BASELINE_CONTENT_MANIFEST_SHA256,
+                source_content_manifest_sha256,
             )
             self.assertEqual(snapshot["receipt"]["mainManifest"]["fileCount"], 430)
             self.assertEqual(snapshot["receipt"]["managedRoots"], MANAGED_ROOTS)
@@ -594,18 +684,46 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
 
     def test_clean_no_git_source_archive_still_releases_safely(self) -> None:
         no_git_root = self.temp_root / "no-git-source"
-        self._copy_candidate_tree(no_git_root)
+        shutil.copytree(
+            self.source_root,
+            no_git_root,
+            ignore=shutil.ignore_patterns("dist"),
+        )
+        for git_file in (no_git_root / ".git").rglob("*"):
+            if git_file.is_file():
+                git_file.chmod(stat.S_IWRITE)
+        shutil.rmtree(no_git_root / ".git")
+        self.assertFalse((no_git_root / ".git").exists())
+        no_git_source_file_hashes = _source_file_hashes(no_git_root, self.manifest["files"])
+        self.assertFileHashMapsEqual(
+            self.source_file_hashes,
+            no_git_source_file_hashes,
+            expected_label="tracked current source map",
+            actual_label="no-Git source map",
+        )
         snapshot = self._build_release(
             "windows",
             "focused-no-git",
             root=no_git_root,
         )
+        receipt_file_hashes = _receipt_file_hashes(snapshot["receipt"])
         self.assertFalse(snapshot["receipt"]["git"]["repository"])
         self.assertSetEqual(set(snapshot["file_hashes"]), set(self.manifest["files"]))
-        self.assertEqual(
-            _content_manifest_sha256(snapshot["file_hashes"]),
-            BASELINE_CONTENT_MANIFEST_SHA256,
+        self.assertFileHashMapsEqual(
+            no_git_source_file_hashes,
+            receipt_file_hashes,
+            expected_label="no-Git source map",
+            actual_label="no-Git staging receipt map",
         )
+        self.assertFileHashMapsEqual(
+            no_git_source_file_hashes,
+            snapshot["file_hashes"],
+            expected_label="no-Git source map",
+            actual_label="no-Git archive map",
+        )
+        no_git_content_manifest_sha256 = _content_manifest_sha256(no_git_source_file_hashes)
+        self.assertEqual(_content_manifest_sha256(receipt_file_hashes), no_git_content_manifest_sha256)
+        self.assertEqual(_content_manifest_sha256(snapshot["file_hashes"]), no_git_content_manifest_sha256)
 
     def test_unknown_files_in_every_managed_root_fail_before_staging(self) -> None:
         for relative_path in UNKNOWN_MANAGED_SENTINELS:
