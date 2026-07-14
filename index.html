@@ -15,6 +15,8 @@
     </head>
 
     <body class="hero-body boot-active ds-learning" data-theme="heroui">
+        <!-- Render-blocking UI shell restores the persisted learner palette before visible body content. -->
+        <script src="js/bundles/ui-shell.bundle.js"></script>
         <div id="boot-overlay" role="status" aria-live="polite">
             <div class="boot-panel">
                 <div class="boot-logo">SHUI · IELTS</div>
@@ -915,6 +917,73 @@
                                 🔄 强制刷新题库
                             </button>
                         </div>
+                        <div
+                            class="learner-palette-settings"
+                            aria-label="学习配色"
+                        >
+                            <div class="learner-palette-settings__header">
+                                <h4>学习配色</h4>
+                                <span
+                                    class="learner-palette-settings__status"
+                                    role="status"
+                                    aria-live="polite"
+                                >当前: 灰绿 / Sage</span>
+                            </div>
+                            <div
+                                class="learner-palette-options"
+                                role="group"
+                                aria-label="选择学习配色"
+                            >
+                                <button
+                                    class="learner-palette-option"
+                                    type="button"
+                                    value="sage"
+                                    aria-pressed="true"
+                                >
+                                    <span
+                                        class="learner-palette-swatch"
+                                        aria-hidden="true"
+                                    ></span>
+                                    <span>灰绿 / Sage</span>
+                                </button>
+                                <button
+                                    class="learner-palette-option"
+                                    type="button"
+                                    value="steel"
+                                    aria-pressed="false"
+                                >
+                                    <span
+                                        class="learner-palette-swatch"
+                                        aria-hidden="true"
+                                    ></span>
+                                    <span>蓝灰 / Steel</span>
+                                </button>
+                                <button
+                                    class="learner-palette-option"
+                                    type="button"
+                                    value="mist"
+                                    aria-pressed="false"
+                                >
+                                    <span
+                                        class="learner-palette-swatch"
+                                        aria-hidden="true"
+                                    ></span>
+                                    <span>青灰 / Mist</span>
+                                </button>
+                                <button
+                                    class="learner-palette-option"
+                                    type="button"
+                                    value="warm"
+                                    aria-pressed="false"
+                                >
+                                    <span
+                                        class="learner-palette-swatch"
+                                        aria-hidden="true"
+                                    ></span>
+                                    <span>暖沙 / Warm</span>
+                                </button>
+                            </div>
+                        </div>
                     </div>
 
                     <div class="hero-panel hero-section data-management-panel">
@@ -1545,9 +1614,6 @@
 
         <!-- 基础环境与日志 -->
         <script src="js/bundles/core-foundation.bundle.js"></script>
-
-        <!-- 工具库与基础视图 -->
-        <script src="js/bundles/ui-shell.bundle.js"></script>
 
         <!-- 入口与懒加载代理 -->
         <script src="js/bundles/legacy-app.bundle.js"></script>
