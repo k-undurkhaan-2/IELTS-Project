@@ -733,7 +733,7 @@ async function register(client, username = 'alice', password = 'StrongPass1') {
     return client.request('POST', '/api/auth/register', { username, password });
 }
 
-async function completeBusinessDataManageStepUp(client, username, password, returnTo = '/?view=settings') {
+async function completeBusinessDataManageStepUp(client, username, password, returnTo = '/?view=settings', browserSession = client) {
     const businessHeaders = {
         host: 'business.local',
         'x-forwarded-host': 'business.local',
@@ -746,7 +746,7 @@ async function completeBusinessDataManageStepUp(client, username, password, retu
         'x-forwarded-proto': 'http',
         'x-ielts-onion-audience': 'auth'
     };
-    const dataStart = await client.request('GET', `/auth/business/data/start?return_to=${encodeURIComponent(returnTo)}`, undefined, {
+    const dataStart = await browserSession.request('GET', `/auth/business/data/start?return_to=${encodeURIComponent(returnTo)}`, undefined, {
         redirect: 'manual',
         headers: businessHeaders
     });
@@ -773,7 +773,7 @@ async function completeBusinessDataManageStepUp(client, username, password, retu
     assert.equal(stepUp.json.intent, 'data-manage');
     assert(stepUp.json.actionProof);
 
-    const callback = await client.request('GET', `/auth/business/data/callback?state=${encodeURIComponent(dataState)}&proof=${encodeURIComponent(stepUp.json.actionProof)}`, undefined, {
+    const callback = await browserSession.request('GET', `/auth/business/data/callback?state=${encodeURIComponent(dataState)}&proof=${encodeURIComponent(stepUp.json.actionProof)}`, undefined, {
         redirect: 'manual',
         headers: businessHeaders
     });
@@ -1130,7 +1130,8 @@ test('login, logout, and authenticated practice API access', async () => {
         assert.equal(created.response.status, 201);
 
         const loggedInRecords = await client.request('GET', '/api/practice-records');
-        assert.equal(loggedInRecords.response.status, 200);
+        assert.equal(loggedInRecords.response.status, 403);
+        assert.equal(loggedInRecords.json.requiresDataManageStepUp, true);
 
         const logout = await client.request('POST', '/api/auth/logout');
         assert.equal(logout.response.status, 200);
@@ -1191,7 +1192,8 @@ test('authenticated APIs require the session verifier companion cookie', async (
         const fullReplayMe = await fullCookieReplay.request('GET', '/api/auth/me');
         assert.equal(fullReplayMe.response.status, 200);
         const fullReplayRecords = await fullCookieReplay.request('GET', '/api/practice-records');
-        assert.equal(fullReplayRecords.response.status, 200);
+        assert.equal(fullReplayRecords.response.status, 403);
+        assert.equal(fullReplayRecords.json.requiresDataManageStepUp, true);
 
         const logout = await client.request('POST', '/api/auth/logout');
         assert.equal(logout.response.status, 200);
@@ -1503,7 +1505,8 @@ test('sensitive API responses are not cacheable', async () => {
         assert.equal(created.response.status, 201);
 
         const records = await client.request('GET', '/api/practice-records');
-        assert.equal(records.response.status, 200);
+        assert.equal(records.response.status, 403);
+        assert.equal(records.json.requiresDataManageStepUp, true);
         assert.equal(records.response.headers.get('cache-control'), 'no-store');
 
         await seedAdmin(client, 'cache_admin', 'StrongPass1');
@@ -2513,7 +2516,8 @@ test('TOTP login requires a second factor before full session access', async () 
         assert.equal(login.json.user.username, 'totp_login');
 
         const records = await client.request('GET', '/api/practice-records');
-        assert.equal(records.response.status, 200);
+        assert.equal(records.response.status, 403);
+        assert.equal(records.json.requiresDataManageStepUp, true);
     } finally {
         await client.close();
     }
@@ -3105,6 +3109,15 @@ test('practice destructive data management requires data step-up bound to the bu
         assert.equal(statusWithoutStepUp.json.fresh, false);
         assert.equal(statusWithoutStepUp.json.authActionStart, '/auth/business/data/start');
 
+        const exportWithoutStepUp = await client.request('GET', '/api/practice-records/export');
+        assert.equal(exportWithoutStepUp.response.status, 403);
+        assert.equal(exportWithoutStepUp.json.requiresDataManageStepUp, true);
+        assert.equal(exportWithoutStepUp.json.authActionStart, '/auth/business/data/start');
+
+        const fullListWithoutStepUp = await client.request('GET', '/api/practice-records');
+        assert.equal(fullListWithoutStepUp.response.status, 403);
+        assert.equal(fullListWithoutStepUp.json.requiresDataManageStepUp, true);
+
         const importWithoutStepUp = await client.request('POST', '/api/practice-records/import', {
             records: [{ id: 'record-b', sessionId: 'session-b', type: 'listening', score: 70, date: '2026-03-02T00:00:00.000Z' }]
         });
@@ -3161,6 +3174,9 @@ test('practice destructive data management requires data step-up bound to the bu
             password: 'StrongPass1'
         }, { headers: businessHeaders });
         assert.equal(unrelatedLogin.response.status, 200);
+        const unrelatedExport = await unrelatedBusinessSession.request('GET', '/api/practice-records/export');
+        assert.equal(unrelatedExport.response.status, 403);
+        assert.equal(unrelatedExport.json.requiresDataManageStepUp, true);
         const crossBrowserCallback = await unrelatedBusinessSession.request('GET', `/auth/business/data/callback?state=${encodeURIComponent(dataState)}&proof=${encodeURIComponent(dataStepUp.json.actionProof)}`, undefined, {
             redirect: 'manual',
             headers: businessHeaders
@@ -3180,10 +3196,39 @@ test('practice destructive data management requires data step-up bound to the bu
         assert.equal(statusAfterStepUp.json.fresh, true);
         assert.equal(statusAfterStepUp.json.authActionStart, '/auth/business/data/start');
 
+        const exported = await client.request('GET', '/api/practice-records/export');
+        assert.equal(exported.response.status, 200);
+        assert.equal(exported.response.headers.get('cache-control'), 'no-store');
+        assert.deepEqual(exported.json.records.map((record) => record.id), ['record-a']);
+
+        const fullListAfterStepUp = await client.request('GET', '/api/practice-records');
+        assert.equal(fullListAfterStepUp.response.status, 200);
+        assert.deepEqual(fullListAfterStepUp.json.records.map((record) => record.id), ['record-a']);
+
+        const expiredExport = await withDateNowOffset(5 * 60 * 1000 + 1, () => (
+            client.request('GET', '/api/practice-records/export')
+        ));
+        assert.equal(expiredExport.response.status, 403);
+        assert.equal(expiredExport.json.requiresDataManageStepUp, true);
+
         const imported = await client.request('POST', '/api/practice-records/import', {
             records: [{ id: 'record-b', sessionId: 'session-b', type: 'listening', score: 70, date: '2026-03-02T00:00:00.000Z' }]
         });
         assert.equal(imported.response.status, 201);
+
+        const otherUserSession = client.createSession();
+        const otherUser = await register(otherUserSession, 'other_data_user', 'StrongPass1');
+        assert.equal(otherUser.response.status, 201);
+        const otherUserRecords = await otherUserSession.request('PUT', '/api/practice-records', {
+            records: [{ id: 'record-other', sessionId: 'session-other', type: 'reading', score: 80 }]
+        });
+        assert.equal(otherUserRecords.response.status, 200);
+        await completeBusinessDataManageStepUp(client, 'other_data_user', 'StrongPass1', '/?view=settings', otherUserSession);
+        const otherUserExport = await otherUserSession.request('GET', '/api/practice-records/export');
+        assert.deepEqual(otherUserExport.json.records.map((record) => record.id), ['record-other']);
+
+        const originalUserExport = await client.request('GET', '/api/practice-records/export');
+        assert.deepEqual(originalUserExport.json.records.map((record) => record.id).sort(), ['record-a', 'record-b']);
 
         const removed = await client.request('DELETE', '/api/practice-records/record-a');
         assert.equal(removed.response.status, 200);
@@ -3192,6 +3237,11 @@ test('practice destructive data management requires data step-up bound to the bu
         const cleared = await client.request('DELETE', '/api/practice-records');
         assert.equal(cleared.response.status, 200);
         assert.deepEqual(cleared.json.records, []);
+
+        const storedUser = client.authStore.users.get('data_manage_user');
+        await client.authStore.bumpSecurityEpoch(storedUser.id);
+        const invalidatedBySecurityEpoch = await client.request('GET', '/api/practice-records/export');
+        assert.equal(invalidatedBySecurityEpoch.response.status, 401);
     } finally {
         await client.close();
     }
@@ -3240,6 +3290,8 @@ test('PUT practice records replaces the list returned by GET', async () => {
         assert.equal(replaced.response.status, 200);
         assert.deepEqual(replaced.json.records, records);
 
+        await completeBusinessDataManageStepUp(client, 'replace_user', 'StrongPass1');
+
         const listed = await client.request('GET', '/api/practice-records');
         assert.deepEqual(listed.json.records, records);
     } finally {
@@ -3272,6 +3324,8 @@ test('PUT practice records deduplicates duplicate session ids before storing', a
                 ['separate-record', 'old-session', 70]
             ]
         );
+
+        await completeBusinessDataManageStepUp(client, 'replace_dedupe_user', 'StrongPass1');
 
         const listed = await client.request('GET', '/api/practice-records');
         assert.equal(listed.json.records.length, 3);
@@ -4103,7 +4157,7 @@ test('admin shell and business account menu do not link back through the busines
     assert(dataManagementPanel.includes('/auth/business/data/start'));
     assert(dataManagementPanel.includes('async ensureDataManageStepUp()'));
     assert(dataManagementPanel.includes('async openImportFromSettings()'));
-    assert(dataManagementPanel.includes('includeBackups && !(await this.ensureDataManageStepUp())'));
+    assert(dataManagementPanel.includes('if (!(await this.ensureDataManageStepUp()))'));
     assert(examActions.includes('async function ensureDataExportStepUp()'));
     assert(examActions.includes('await ensureDataExportStepUp()'));
     assert(appActions.includes('function ensureMarkdownExportDataManageStepUp()'));
@@ -6851,7 +6905,8 @@ test('admin user changes invalidate target sessions and stale admin roles', asyn
         const createdUser = await register(userSession, 'reset_target', 'StrongPass1');
         assert.equal(createdUser.response.status, 201);
         const userRecords = await userSession.request('GET', '/api/practice-records');
-        assert.equal(userRecords.response.status, 200);
+        assert.equal(userRecords.response.status, 403);
+        assert.equal(userRecords.json.requiresDataManageStepUp, true);
 
         const resetPassword = await adminSession.request('PATCH', `/api/admin/users/${createdUser.json.user.id}`, {
             password: 'StrongerPass2'

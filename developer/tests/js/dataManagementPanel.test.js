@@ -115,6 +115,52 @@ function createPanelHarness({ missingControls = false, importFile = null, export
 }
 
 {
+    const harness = createPanelHarness();
+    let stepUpCalls = 0;
+    let exportCalled = false;
+    let hideProgressCalled = false;
+    harness.panel.ensureDataManageStepUp = async () => {
+        stepUpCalls += 1;
+        return false;
+    };
+    harness.panel.hideProgress = () => {
+        hideProgressCalled = true;
+    };
+    harness.panel.backupManager.exportPracticeRecords = async () => {
+        exportCalled = true;
+        return { data: '{}', filename: 'export.json', mimeType: 'application/json' };
+    };
+
+    await harness.panel.handleExport();
+    assert.equal(stepUpCalls, 1, 'practice record export should require data-management step-up even without backups');
+    assert.equal(exportCalled, false, 'practice record export should not run without data-management step-up');
+    assert.equal(hideProgressCalled, true);
+}
+
+{
+    const harness = createPanelHarness();
+    let stepUpCalls = 0;
+    let exportCalled = false;
+    let downloadCalled = false;
+    harness.panel.ensureDataManageStepUp = async () => {
+        stepUpCalls += 1;
+        return true;
+    };
+    harness.panel.backupManager.exportPracticeRecords = async () => {
+        exportCalled = true;
+        return { data: '{}', filename: 'export.json', mimeType: 'application/json' };
+    };
+    harness.panel.downloadFile = () => {
+        downloadCalled = true;
+    };
+
+    await harness.panel.handleExport();
+    assert.equal(stepUpCalls, 1);
+    assert.equal(exportCalled, true, 'practice record export should proceed after data-management step-up');
+    assert.equal(downloadCalled, true, 'allowed practice record export should still download');
+}
+
+{
     const harness = createPanelHarness({ exportIncludeBackups: true });
     let stepUpCalls = 0;
     let exportCalled = false;
@@ -257,5 +303,5 @@ assert(
 
 console.log(JSON.stringify({
     status: 'pass',
-    detail: 'data management panel stale file read guard tests passed'
+    detail: 'data management panel export and stale file read guard tests passed'
 }, null, 2));
