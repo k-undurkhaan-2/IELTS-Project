@@ -654,6 +654,89 @@ console.log('[DOM] DOM工具库已加载，统一事件委托、DOM创建和样�
 })(window);
 
 
+/* ===== js/utils/practiceTimerPreferences.js ===== */
+(function initPracticeTimerPreferences(global) {
+    'use strict';
+
+    var READING_KEY = 'ielts_reading_timer_preferences_v2';
+    var LISTENING_KEY = 'ielts_listening_timer_preferences_v1';
+    var VERSION = 1;
+    var DEFAULTS = {
+        version: VERSION,
+        mode: 'elapsed',
+        countdownMinutes: 60,
+        limitEnabled: false,
+        limitMinutes: 60,
+        expiryAction: 'warn'
+    };
+    var VALID_MODES = { elapsed: true, countdown: true };
+    var VALID_ACTIONS = { warn: true, 'auto-submit': true, lock: true };
+    var MAX_MINUTES = 240;
+    var MIN_MINUTES = 1;
+
+    function clampMinutes(value, fallback) {
+        var number = Number(value);
+        if (!Number.isFinite(number)) {
+            number = fallback;
+        }
+        return Math.min(MAX_MINUTES, Math.max(MIN_MINUTES, Math.round(number)));
+    }
+
+    function normalize(raw) {
+        var source = raw && typeof raw === 'object' ? raw : {};
+        var mode = VALID_MODES[source.mode] ? source.mode : DEFAULTS.mode;
+        var expiryAction = VALID_ACTIONS[source.expiryAction] ? source.expiryAction : DEFAULTS.expiryAction;
+        return {
+            version: VERSION,
+            mode: mode,
+            countdownMinutes: clampMinutes(source.countdownMinutes, DEFAULTS.countdownMinutes),
+            limitEnabled: Boolean(source.limitEnabled),
+            limitMinutes: clampMinutes(source.limitMinutes, DEFAULTS.limitMinutes),
+            expiryAction: expiryAction
+        };
+    }
+
+    function keyFor(scope) {
+        return String(scope || '').toLowerCase() === 'listening' ? LISTENING_KEY : READING_KEY;
+    }
+
+    function read(scope) {
+        try {
+            var raw = global.localStorage && global.localStorage.getItem(keyFor(scope));
+            return normalize(raw ? JSON.parse(raw) : null);
+        } catch (_) {
+            return normalize(null);
+        }
+    }
+
+    function save(scope, preferences) {
+        var next = normalize(preferences);
+        try {
+            if (global.localStorage) {
+                global.localStorage.setItem(keyFor(scope), JSON.stringify(next));
+            }
+        } catch (_) { }
+        return next;
+    }
+
+    function minutesToSeconds(value) {
+        return clampMinutes(value, DEFAULTS.countdownMinutes) * 60;
+    }
+
+    global.PracticeTimerPreferences = {
+        VERSION: VERSION,
+        READING_KEY: READING_KEY,
+        LISTENING_KEY: LISTENING_KEY,
+        DEFAULTS: Object.freeze(Object.assign({}, DEFAULTS)),
+        normalize: normalize,
+        read: read,
+        save: save,
+        keyFor: keyFor,
+        minutesToSeconds: minutesToSeconds
+    };
+})(typeof window !== 'undefined' ? window : globalThis);
+
+
 /* ===== js/services/overviewStats.js ===== */
 (function (global) {
     'use strict';
@@ -1318,6 +1401,8 @@ console.log('[DOM] DOM工具库已加载，统一事件委托、DOM创建和样�
     var SESSION_GROUP = 'session-suite';
     var STATE_CORE_GROUP = 'state-core';
     var SETTINGS_GROUP = 'settings-tools';
+    var READING_CANDIDATE_CODE_PREF_KEY = 'ielts_reading_candidate_code_preferences_v1';
+    var READING_CANDIDATE_CODE_PATTERN = /^\d{6}$/;
 
     function summarizeMainEntryErrorForLog(error) {
         if (!error || typeof error !== 'object') {
@@ -1335,6 +1420,386 @@ console.log('[DOM] DOM工具库已加载，统一事件委托、DOM创建和样�
             return Promise.resolve();
         }
         return global.AppLazyLoader.ensureGroup(name);
+    }
+
+    function hashReadingCandidateCode(sourceId) {
+        var source = String(sourceId || '');
+        if (!source) {
+            return '';
+        }
+        var hash = 0;
+        for (var index = 0; index < source.length; index += 1) {
+            hash = ((hash << 5) - hash) + source.charCodeAt(index);
+            hash |= 0;
+        }
+        return String(Math.abs(hash) % 900000 + 100000);
+    }
+
+    function createReadingCandidateCodeSeed() {
+        var parts = [String(Date.now()), String(Math.random())];
+        try {
+            if (global.crypto && typeof global.crypto.getRandomValues === 'function') {
+                var values = new Uint32Array(4);
+                global.crypto.getRandomValues(values);
+                parts.push(Array.prototype.join.call(values, ':'));
+            }
+        } catch (_) { }
+        try {
+            parts.push(String(global.navigator && global.navigator.userAgent || ''));
+        } catch (_) { }
+        return parts.join(':');
+    }
+
+    function readReadingCandidateCodePreferences() {
+        try {
+            var raw = global.localStorage && global.localStorage.getItem(READING_CANDIDATE_CODE_PREF_KEY);
+            var parsed = raw ? JSON.parse(raw) : null;
+            var mode = parsed && parsed.mode === 'custom' ? 'custom' : 'auto';
+            var customCode = parsed && typeof parsed.customCode === 'string'
+                ? parsed.customCode.replace(/\D/g, '').slice(0, 6)
+                : '';
+            return {
+                mode: mode,
+                customCode: READING_CANDIDATE_CODE_PATTERN.test(customCode) ? customCode : ''
+            };
+        } catch (_) {
+            return { mode: 'auto', customCode: '' };
+        }
+    }
+
+    function saveReadingCandidateCodePreferences(preferences) {
+        var next = {
+            mode: preferences && preferences.mode === 'custom' ? 'custom' : 'auto',
+            customCode: preferences && typeof preferences.customCode === 'string'
+                ? preferences.customCode.replace(/\D/g, '').slice(0, 6)
+                : ''
+        };
+        try {
+            if (global.localStorage) {
+                global.localStorage.setItem(READING_CANDIDATE_CODE_PREF_KEY, JSON.stringify(next));
+            }
+        } catch (_) { }
+        return next;
+    }
+
+    function setReadingCandidateCodeStatus(element, message, state) {
+        if (!element) {
+            return;
+        }
+        element.textContent = message || '';
+        if (state) {
+            element.dataset.state = state;
+        } else {
+            delete element.dataset.state;
+        }
+    }
+
+    function setupReadingCandidateCodeSettings() {
+        var input = document.getElementById('reading-candidate-code-input');
+        var saveButton = document.getElementById('reading-candidate-code-save-btn');
+        var randomButton = document.getElementById('reading-candidate-code-random-btn');
+        var status = document.getElementById('reading-candidate-code-status');
+        var modeInputs = Array.prototype.slice.call(
+            document.querySelectorAll('input[name="reading-candidate-code-mode"]')
+        );
+        if (!input || !saveButton || !randomButton || !modeInputs.length) {
+            return;
+        }
+
+        function getSelectedMode() {
+            var selected = modeInputs.find(function findChecked(item) { return item.checked; });
+            return selected && selected.value === 'custom' ? 'custom' : 'auto';
+        }
+
+        function setSelectedMode(mode) {
+            modeInputs.forEach(function syncMode(item) {
+                item.checked = item.value === mode;
+            });
+            input.disabled = mode !== 'custom';
+        }
+
+        function syncFromStorage() {
+            var preferences = readReadingCandidateCodePreferences();
+            setSelectedMode(preferences.mode);
+            input.value = preferences.customCode || '';
+            setReadingCandidateCodeStatus(
+                status,
+                preferences.mode === 'custom' && preferences.customCode
+                    ? '当前使用自定义 code：' + preferences.customCode
+                    : '当前使用自动生成：按练习 session 生成 6 位 code。',
+                ''
+            );
+        }
+
+        modeInputs.forEach(function bindMode(item) {
+            item.addEventListener('change', function onModeChange() {
+                var mode = getSelectedMode();
+                input.disabled = mode !== 'custom';
+                if (mode === 'custom') {
+                    input.focus();
+                }
+            });
+        });
+
+        input.addEventListener('input', function sanitizeCandidateCodeInput() {
+            var cleaned = input.value.replace(/\D/g, '').slice(0, 6);
+            if (input.value !== cleaned) {
+                input.value = cleaned;
+            }
+            setReadingCandidateCodeStatus(status, '', '');
+        });
+
+        saveButton.addEventListener('click', function saveCandidateCodeSettings() {
+            var mode = getSelectedMode();
+            var code = input.value.replace(/\D/g, '').slice(0, 6);
+            if (mode === 'custom' && !READING_CANDIDATE_CODE_PATTERN.test(code)) {
+                setReadingCandidateCodeStatus(status, '请输入 6 位数字 code。', 'error');
+                input.focus();
+                return;
+            }
+            saveReadingCandidateCodePreferences({ mode: mode, customCode: code });
+            setReadingCandidateCodeStatus(
+                status,
+                mode === 'custom' ? '已保存自定义 code：' + code : '已保存：自动生成。',
+                'success'
+            );
+        });
+
+        randomButton.addEventListener('click', function generateCandidateCode() {
+            var code = hashReadingCandidateCode(createReadingCandidateCodeSeed());
+            setSelectedMode('custom');
+            input.value = code;
+            saveReadingCandidateCodePreferences({ mode: 'custom', customCode: code });
+            setReadingCandidateCodeStatus(status, '已随机生成并保存：' + code, 'success');
+        });
+
+        syncFromStorage();
+    }
+
+    function setPracticeTimerStatus(element, message, state) {
+        if (!element) {
+            return;
+        }
+        element.textContent = message || '';
+        if (state) {
+            element.dataset.state = state;
+        } else {
+            delete element.dataset.state;
+        }
+    }
+
+    function setupPracticeTimerSettings() {
+        var manager = global.PracticeTimerPreferences;
+        if (!manager || typeof manager.read !== 'function' || typeof manager.save !== 'function') {
+            return;
+        }
+
+        Array.prototype.slice.call(document.querySelectorAll('.practice-timer-card[data-timer-scope]'))
+            .forEach(function bindTimerCard(card) {
+                var scope = String(card.dataset.timerScope || '').toLowerCase() === 'listening'
+                    ? 'listening'
+                    : 'reading';
+                var status = card.querySelector('.practice-timer-status');
+                var saveButton = card.querySelector('[data-timer-save]');
+                var fields = {
+                    mode: card.querySelector('[data-timer-field="mode"]'),
+                    countdownMinutes: card.querySelector('[data-timer-field="countdownMinutes"]'),
+                    limitEnabled: card.querySelector('[data-timer-field="limitEnabled"]'),
+                    limitMinutes: card.querySelector('[data-timer-field="limitMinutes"]'),
+                    expiryAction: card.querySelector('[data-timer-field="expiryAction"]')
+                };
+                if (!saveButton || !fields.mode || !fields.countdownMinutes || !fields.limitEnabled || !fields.limitMinutes || !fields.expiryAction) {
+                    return;
+                }
+
+                function syncLimitState() {
+                    fields.limitMinutes.disabled = !fields.limitEnabled.checked;
+                }
+
+                function apply(preferences) {
+                    var normalized = manager.normalize(preferences);
+                    fields.mode.value = normalized.mode;
+                    fields.countdownMinutes.value = String(normalized.countdownMinutes);
+                    fields.limitEnabled.checked = Boolean(normalized.limitEnabled);
+                    fields.limitMinutes.value = String(normalized.limitMinutes);
+                    fields.expiryAction.value = normalized.expiryAction;
+                    syncLimitState();
+                    setPracticeTimerStatus(status, 'Saved', '');
+                }
+
+                function collect() {
+                    return manager.normalize({
+                        mode: fields.mode.value,
+                        countdownMinutes: fields.countdownMinutes.value,
+                        limitEnabled: fields.limitEnabled.checked,
+                        limitMinutes: fields.limitMinutes.value,
+                        expiryAction: fields.expiryAction.value
+                    });
+                }
+
+                fields.limitEnabled.addEventListener('change', function onLimitToggle() {
+                    syncLimitState();
+                    setPracticeTimerStatus(status, '', '');
+                });
+                [fields.mode, fields.countdownMinutes, fields.limitMinutes, fields.expiryAction].forEach(function bindField(field) {
+                    field.addEventListener('input', function clearTimerStatus() {
+                        setPracticeTimerStatus(status, '', '');
+                    });
+                    field.addEventListener('change', function clearTimerStatus() {
+                        setPracticeTimerStatus(status, '', '');
+                    });
+                });
+                saveButton.addEventListener('click', function saveTimerPreferences() {
+                    var saved = manager.save(scope, collect());
+                    apply(saved);
+                    setPracticeTimerStatus(status, 'Saved', 'success');
+                });
+
+                apply(manager.read(scope));
+            });
+    }
+
+    function setupSettingsLayoutNavigation() {
+        var view = document.getElementById('settings-view');
+        if (!view || view.querySelector('.settings-layout')) {
+            return;
+        }
+        var group = view.querySelector('.hero-settings-group');
+        if (!group) {
+            return;
+        }
+
+        var definitions = [
+            { id: 'settings-system-management', label: 'System', selector: '.system-management-panel' },
+            { id: 'settings-data-management', label: 'Data', selector: '.data-management-panel' },
+            { id: 'settings-security', label: 'Security', selector: '.settings-security-panel' },
+            { id: 'settings-reading-display', label: 'Reading Display', selector: '.reading-candidate-code-panel' },
+            { id: 'settings-practice-timer', label: 'Practice Timer', selector: '.practice-timer-settings-panel' },
+            { id: 'settings-system-info', label: 'System Info', selector: null }
+        ];
+
+        var panels = Array.prototype.slice.call(group.children)
+            .filter(function filterElement(node) { return node && node.nodeType === 1; });
+        var usedPanels = [];
+        var layout = document.createElement('div');
+        var sidebar = document.createElement('nav');
+        var content = document.createElement('div');
+        var sectionButtons = new Map();
+        var sectionElements = [];
+        var scrollFrame = null;
+        var manualActiveTarget = '';
+        var manualActiveUntil = 0;
+        layout.className = 'settings-layout';
+        sidebar.className = 'settings-sidebar';
+        sidebar.setAttribute('aria-label', 'Settings sections');
+        content.className = 'settings-content';
+
+        function markActive(button) {
+            if (!button) {
+                return;
+            }
+            Array.prototype.slice.call(sidebar.querySelectorAll('.settings-sidebar__item'))
+                .forEach(function syncButton(item) {
+                    var active = item === button;
+                    item.classList.toggle('is-active', active);
+                    item.setAttribute('aria-current', active ? 'true' : 'false');
+                });
+            try {
+                button.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+            } catch (_) { }
+        }
+
+        function syncActiveSectionFromScroll() {
+            if (scrollFrame) {
+                return;
+            }
+            scrollFrame = global.requestAnimationFrame(function updateActiveSection() {
+                scrollFrame = null;
+                if (manualActiveTarget && Date.now() < manualActiveUntil) {
+                    var manualButton = sectionButtons.get(manualActiveTarget);
+                    if (manualButton) {
+                        markActive(manualButton);
+                        return;
+                    }
+                }
+                manualActiveTarget = '';
+                var headerOffset = 96;
+                try {
+                    var rootStyles = global.getComputedStyle(document.documentElement);
+                    var declaredHeader = parseFloat(rootStyles.getPropertyValue('--header-height'));
+                    if (Number.isFinite(declaredHeader) && declaredHeader > 0) {
+                        headerOffset = declaredHeader;
+                    }
+                } catch (_) { }
+                var anchorY = headerOffset + 120;
+                var activeSection = sectionElements[0] || null;
+                sectionElements.forEach(function resolveVisibleSection(section) {
+                    var rect = section.getBoundingClientRect();
+                    if (rect.top <= anchorY && rect.bottom > anchorY) {
+                        activeSection = section;
+                        return;
+                    }
+                    if (rect.top <= anchorY) {
+                        activeSection = section;
+                    }
+                });
+                if (activeSection) {
+                    markActive(sectionButtons.get(activeSection.id));
+                }
+            });
+        }
+
+        function resolvePanel(definition, index) {
+            var panel = definition.selector ? group.querySelector(definition.selector) : null;
+            if (!panel && index === definitions.length - 1) {
+                panel = panels.find(function findUnused(candidate) {
+                    return usedPanels.indexOf(candidate) === -1;
+                });
+            }
+            return panel;
+        }
+
+        definitions.forEach(function buildSection(definition, index) {
+            var panel = resolvePanel(definition, index);
+            if (!panel) {
+                return;
+            }
+            usedPanels.push(panel);
+            panel.id = definition.id;
+            panel.classList.add('settings-section-card');
+            Array.prototype.slice.call(panel.querySelectorAll('.hero-settings-actions'))
+                .forEach(function markActionGrid(actions) {
+                    actions.classList.add('settings-action-grid');
+                });
+
+            var button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'settings-sidebar__item';
+            button.dataset.settingsTarget = definition.id;
+            button.textContent = definition.label;
+            button.addEventListener('click', function onSidebarClick() {
+                manualActiveTarget = definition.id;
+                manualActiveUntil = Date.now() + 900;
+                markActive(button);
+                panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            });
+            sidebar.appendChild(button);
+            content.appendChild(panel);
+            sectionButtons.set(definition.id, button);
+            sectionElements.push(panel);
+        });
+
+        layout.appendChild(sidebar);
+        layout.appendChild(content);
+        group.replaceWith(layout);
+
+        var firstButton = sidebar.querySelector('.settings-sidebar__item');
+        if (firstButton) {
+            markActive(firstButton);
+        }
+        global.addEventListener('scroll', syncActiveSectionFromScroll, { passive: true });
+        global.addEventListener('resize', syncActiveSectionFromScroll, { passive: true });
+        syncActiveSectionFromScroll();
     }
 
     var browseGroupPromise = null;
@@ -1762,6 +2227,9 @@ console.log('[DOM] DOM工具库已加载，统一事件委托、DOM创建和样�
     function init() {
         setStorageNamespace();
         initializeNavigationShell();
+        setupSettingsLayoutNavigation();
+        setupReadingCandidateCodeSettings();
+        setupPracticeTimerSettings();
 
         if (STRICT_ON_DEMAND) {
             setTimeout(function () {
@@ -2871,6 +3339,7 @@ console.log('[DOM] DOM工具库已加载，统一事件委托、DOM创建和样�
     if (global.AppLazyLoader && typeof global.AppLazyLoader.markProvided === "function") {
         global.AppLazyLoader.markProvided([
     "js/utils/dom.js",
+    "js/utils/practiceTimerPreferences.js",
     "js/services/overviewStats.js",
     "js/views/overviewView.js",
     "js/presentation/navigation-controller.js",

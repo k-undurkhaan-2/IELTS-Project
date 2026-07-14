@@ -139,7 +139,10 @@ function testBuildBundlesNoDeletedScriptRefs() {
         'js/runtime/mainRuntime.js',
         'js/runtime/legacyPublicAPI.js'
     ];
-    const buildSource = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-bundles.mjs'), 'utf8');
+    const buildSource = [
+        fs.readFileSync(path.join(repoRoot, 'scripts', 'build-bundles.mjs'), 'utf8'),
+        fs.readFileSync(path.join(repoRoot, 'scripts', 'bundle-manifest.mjs'), 'utf8')
+    ].join('\n');
     const staleRefs = removedScripts.filter((relativePath) => buildSource.includes(relativePath));
 
     assert.strictEqual(
