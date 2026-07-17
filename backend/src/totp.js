@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Kevin
+// SPDX-License-Identifier: AGPL-3.0-only
+
 const crypto = require('node:crypto');
 const bcrypt = require('bcryptjs');
 const otp = require('otplib');

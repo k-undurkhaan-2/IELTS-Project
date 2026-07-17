@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Kevin
+// SPDX-License-Identifier: AGPL-3.0-only
+
 const { createApp } = require('./app');
 
 const port = Number(process.env.PORT || 3000);

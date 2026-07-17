@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2026 Kevin
+-- SPDX-License-Identifier: AGPL-3.0-only
+
 CREATE TABLE IF NOT EXISTS auth_handoff_tickets (
     token_hash text PRIMARY KEY,
     user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,

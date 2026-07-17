@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2026 Kevin
+-- SPDX-License-Identifier: AGPL-3.0-only
+
 CREATE TABLE IF NOT EXISTS site_content_settings (
     key text PRIMARY KEY CHECK (key IN ('login_notice', 'home_banner')),
     payload jsonb NOT NULL DEFAULT '{}'::jsonb,

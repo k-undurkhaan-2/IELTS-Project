@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Kevin
+# SPDX-License-Identifier: AGPL-3.0-only
+
 # Empty bridge placeholder for encrypted bridge deployments.
 #
 # docker-compose.bridges-encrypted.yml binds this file over the default

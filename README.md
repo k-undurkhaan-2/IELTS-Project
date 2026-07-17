@@ -1,714 +1,197 @@
-# IELTS Atlas / IELTS Practice
+# IELTMPS Project
 
-## 重要使用声明
+**Interactive English Language Test Mock Practice System**
 
-本项目允许个人基于学习、研究和自用目的进行本地运行、私人部署或在个人控制的网页环境中使用。使用者可以将项目部署到自己的电脑、私人服务器、NAS 或个人网页空间，但应确保访问范围和传播范围可控。
+English | [简体中文（机器辅助翻译占位页）](README.zh-CN.md)
 
-请勿将包含题源、音频、PDF、解析、二次修改页面或打包产物的网站、镜像站、压缩包继续公开分发给更多人；请勿将本项目用于商业售卖、付费社群、引流推广、公开宣传或其他盈利行为。项目涉及的题源和部分素材存在第三方版权风险，机考网页形式的公开部署也可能触及相关从业者利益。大规模传播会显著增加被投诉、举报、删除仓库或关闭页面的风险，最终影响所有使用者。
+A computer-based and server-first platform for teams providing publicly accessible English-language test mock-practice services.
 
-为保证项目能够长期稳定存在，请遵循以下原则：**自行部署，个人使用，控制传播范围，不以项目或其题源牟利。**
+IELTMPS is intended for teams providing publicly accessible English-language test mock-practice services while retaining a self-hosted path for independent operators.
 
-授权边界见下文“许可证与内容版权”。题源、文章、音频、PDF、图片和其他第三方内容版权归原权利人所有，仅建议用于个人学习与备考场景。
+> [!NOTE]
+> A complete Simplified Chinese translation is not yet available. The linked
+> Chinese README is a machine-assisted translation placeholder for navigation
+> and accessibility preparation. A full translation will be produced only
+> after the English documentation and license-governance text stabilize.
+> English remains the authoritative project-documentation version.
+>
+> This notice does not replace or modify any applicable software license.
+> The original English texts of the GNU licenses govern the licensed software.
 
-## 项目概述
+> [!IMPORTANT]
+> IELTMPS is an independent, unofficial project. It is not affiliated with,
+> endorsed by, sponsored by, or operated by the British Council, IDP IELTS,
+> Cambridge University Press & Assessment, or IELTS Partners. Do not use
+> official logos or imply that IELTMPS conducts an official examination.
+>
+> The current repository combines the IELTMPS Web Client, which has GPLv3-family
+> upstream provenance through IELTS Atlas, with the independently developed
+> IELTMPS Server. The eligible first-party Server scope is now licensed under
+> `AGPL-3.0-only`; [LICENSE.md](LICENSE.md) defines that mixed-license boundary.
+> The exact frontend GPL identifier remains unresolved. The former proprietary
+> API-contract placeholder has been replaced, but no separately versioned
+> contract artifact exists yet.
+>
+> Copyright ownership remains with the respective copyright holders.
+> Open-source permissions are granted only under the applicable licenses;
+> copyright ownership is not transferred. Software licenses do not
+> automatically grant rights to questions, articles, audio, PDFs, images,
+> explanations, fonts, dictionaries, logos, trade marks, or other separately
+> copyrighted materials.
+>
+> The project is designed for public-interest and non-profit-oriented service
+> teams. This is not a claim of nonprofit or charitable legal status. A
+> maintainer-operated service may in the future be supported through voluntary
+> contributions, sponsorship, resource-backed fees, and managed services.
+> Those fees would cover operated services, third-party costs, resources, or
+> support—not exclusive rights to source code. No payment, donation, or
+> subscription system is currently evidenced in this repository.
+>
+> The maintainer-operated deployment is designed for Tor-only access. The
+> public business-layer onion address has not yet been published. The IELTMPS
+> Project recommends Tor Browser and intends to support it for its
+> maintainer-operated Hosted Service once that service is launched. No public
+> clearnet Hosted Service endpoint is currently published, and live operation
+> has not been independently verified. Third-party Tor-capable browser integrations may
+> work technically, but they are unsupported and are not considered
+> privacy-equivalent to Tor Browser. Source code and public documentation may
+> remain available through ordinary development platforms such as GitHub.
 
-IELTS Atlas 是一个面向雅思阅读与听力练习的个人自部署练习系统。当前主入口仍为 `index.html`，静态 HTML、CSS、JavaScript bundle 和本地题库资源可以独立运行；本分支同时提供可选的 `backend/` 服务，用于在自己的电脑、NAS 或私人服务器上统一托管应用、登录账号和练习记录。
+## Documentation
 
-系统提供题库浏览、阅读练习、听力练习、套题练习、练习记录、成绩统计、错题分析、数据备份、题库导入、词汇辅助、阅读背题和成就系统等功能。单机使用时，数据默认保存在浏览器本地存储中；多设备使用时，可以通过后端模式把练习记录保存到 PostgreSQL，同一账号在不同浏览器或设备上登录后读取同一份历史记录。
+- [Usage](docs/USAGE.md)
+- [Tor access](docs/TOR_ACCESS.md)
+- [Service model](docs/SERVICE_MODEL.md)
+- [Content policy](docs/CONTENT_POLICY.md)
+- [Development status](docs/STATUS.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Development guide](docs/DEVELOPMENT.md)
+- [Roadmap](ROADMAP.md)
+- [Mixed-license scope](LICENSE.md)
+- [Project notices](NOTICE.md)
+- [GNU AGPL Version 3 text](LICENSES/AGPL-3.0-only.txt)
 
-当前公开发布说明见 [RELEASE_NOTE-0.6.2.md](RELEASE_NOTE-0.6.2.md)。后端服务的依赖和脚本见 [backend/package.json](backend/package.json)。
+See [Licensing and governance](docs/STATUS.md#licensing-and-governance) for the current mixed-license classification and unresolved work.
 
-## 快速开始
+## About IELTMPS
 
-### 系统要求
+The IELTMPS Project develops the IELTMPS Web Client and IELTMPS Server as one server-first practice platform. The Web Client provides browser-based Reading, Listening, mock-practice, account, record, statistics, and data-management experiences. The Server provides authentication, session, record, administration, and protected-resource functions backed by PostgreSQL.
 
-- 推荐浏览器：Chrome 或 Edge 最新稳定版。
-- 基础能力：支持 ES6、IndexedDB、localStorage、sessionStorage、`window.open` 和 `postMessage`。
-- 运行方式：支持直接通过 `file://` 打开，也支持通过本地静态服务器、静态网页托管或 `backend/` 后端模式访问。
-- 浏览器设置：首次练习时需要允许弹窗，否则练习窗口可能无法打开。
-- 多设备部署：后端模式需要 Node.js、PostgreSQL；推荐使用 Docker Compose 一次性启动应用、数据库和可选 Tor hidden service。
+The currently shipped interface and several compatibility identifiers still contain historical IELTS Atlas or IELTS Practice naming. Those names are not being mechanically replaced in this documentation batch. Runtime branding, package names, container and database identifiers, browser-storage keys, release artifacts, and tests require separately planned compatibility migrations.
 
-Firefox、Safari 和移动浏览器可以使用，但对 `file://`、PDF、音频、跨窗口通信和弹窗策略的限制可能更严格。
+## Mission
 
-### 本地直接运行
+IELTMPS aims to make serious computer-based English-language test practice more accessible to public-interest service teams and self-hosters. The project direction favors a server-assisted experience in which accounts, protected resources, durable records, and eventually authoritative result processing can be managed consistently across devices.
 
-1. 下载或解压完整项目目录。
-2. 保持目录结构完整，不要只复制 `index.html`。
-3. 双击打开根目录下的 `index.html`。
-4. 进入“题库浏览”确认题库列表是否正常显示。
-5. 点击任意练习项时，如浏览器提示弹窗拦截，请允许该页面打开新窗口。
+The project also keeps a clear boundary between public source code, separately authorized runtime content, and deployment secrets. Public availability of source code is not permission to redistribute every bundled or locally supplied learning resource. A sustainable service must respect both open-source obligations and the rights attached to educational content.
 
-当前入口只有 `index.html`。旧文档中出现过的 `improved-working-system.html` 不再是有效入口。
+## Current platform capabilities
 
-### 本地静态服务器运行
+The following capabilities are available in tracked code, although their maturity and deployment requirements vary:
 
-如果浏览器对 `file://` 的资源访问限制较多，可以在项目根目录启动静态服务器：
+- A browser-based IELTMPS Web Client.
+- Account registration and login.
+- PostgreSQL-backed practice records and multi-device record access.
+- Administration UI and API functions.
+- TOTP, session management, and protected-resource middleware.
+- Reading practice.
+- Listening integration when separately supplied runtime content is authorized.
+- Suite and mock-practice modes.
+- Practice statistics.
+- Data import and export.
+- Browser-data backup and restore.
+- Docker Compose development and self-hosted deployment.
+- Tracked separation of business, administration, and authentication services.
 
-```bash
-python -m http.server 8000
-```
+“Available” means that implementation and supporting repository evidence are present. It does not certify a particular deployment, content set, security posture, or operating environment.
 
-然后访问：
+Several areas remain in active development: Tor deployment documentation and operational consistency, public-service readiness, server-authoritative behavior, release and corresponding-source compliance, and license/provenance governance. A public Hosted Service launch, publication of the business onion address, product AI/model API integration, payment workflows, turnkey PostgreSQL disaster recovery, and production-readiness certification are not currently evidenced.
 
-```text
-http://localhost:8000/
-```
+## Hosted service and deployment models
 
-本地服务器适合调试资源路径、浏览器控制台错误、PDF 或音频加载问题。正式分发给个人用户时，发布包仍应保持解压后可直接打开 `index.html` 使用。
+IELTMPS distinguishes two deployment models.
 
-### 静态网页部署
+The **IELTMPS Hosted Service** is the intended maintainer-operated service. Its public-interest direction, Tor-only access policy, funding boundaries, and readiness limits are described in the [service model](docs/SERVICE_MODEL.md) and [status document](docs/STATUS.md). The repository does not establish that this service is currently open to the public.
 
-可以将运行时文件部署到静态网页空间，但应仅用于个人或小范围自用场景。部署时必须保留目录层级，避免 bundle、题库、字体、图片、PDF、音频或生成资产出现 404。
+A **third-party self-hosted deployment** is operated independently by another person or organization. Self-hosters are responsible for infrastructure security, lawful content, user support, privacy notices, backups, abuse handling, and compliance with applicable software and content licenses. The project’s intended service policies do not automatically govern or endorse third-party deployments.
 
-公开部署前请重新阅读顶部使用声明。部署可行不等于适合公开传播，尤其不要将包含题源的网页用于商业化、宣传或大规模分发。
+## Access through Tor
 
-### 多设备便捷部署
+The maintainer-operated deployment is designed to expose its public business layer through the Tor network. The IELTMPS Project recommends Tor Browser and intends to support it for its maintainer-operated Hosted Service once that service is launched. The business onion address is not yet published, and no public clearnet Hosted Service endpoint is currently published.
 
-如果希望在手机、平板、桌面浏览器或不同电脑之间共享练习记录，使用 `backend/` 后端模式。该模式把前端静态文件、登录账号、练习记录 API 和管理员页面放在同一个站点下，减少跨域、Cookie 和手动数据迁移问题。
+Other Tor-capable browsers, extensions, proxies, and integrations are unsupported. They may behave differently and are not considered privacy-equivalent to Tor Browser. When an address is eventually published, users should verify it through a signed release announcement and another maintainer-controlled trusted channel. See [Tor access](docs/TOR_ACCESS.md).
 
-推荐用 Docker Compose 启动完整环境：
+## Architecture overview
+
+The current architecture combines substantial browser-side practice logic with server-backed capabilities. The Web Client uses generated bundles, browser storage, local data sources, and local fallback paths. Authenticated operation can use the Server for accounts and PostgreSQL-backed practice records. Protected runtime resources are supplied separately from the public source tree.
+
+Tracked deployment configuration separates business, administration, and authentication services, including Tor-based exposure, but live production operation has not been verified. The approved direction moves more trust-sensitive behavior—such as durable state and authoritative grading—toward the Server without pretending that this migration is already complete.
+
+Future extension points may support third-party APIs, including model providers, but no product AI/model API integration is currently evidenced. See the [architecture overview](docs/ARCHITECTURE.md).
+
+## Getting started
+
+The recommended starting point is a server-assisted development or self-hosted environment. From the repository root, create a local backend environment file from the tracked example, review every required placeholder, and start the tracked Compose configuration:
 
 ```powershell
 Copy-Item backend\.env.example backend\.env
-# 编辑 backend\.env，至少替换 POSTGRES_PASSWORD、SESSION_SECRET、ADMIN_PASSWORD
 docker compose --env-file backend\.env -f backend\docker-compose.yml up --build
 ```
 
-启动后访问：
+Do not commit the resulting environment file. Do not reuse example or development credentials in an exposed deployment.
 
-```text
-http://127.0.0.1:3000/
-```
+These commands are development/self-hosted starting points, not a complete production-security procedure. Internet-facing or onion-service operation requires a separate security review covering secrets, content authorization, reverse-proxy behavior, backups, monitoring, incident response, and access boundaries.
 
-Docker 镜像启动时会自动执行数据库迁移和管理员账号初始化。若不使用 Docker，而是在本机直接运行后端，则需要手动执行：
+Current code still supports direct file and static operation. That behavior is transitional compatibility, not the long-term primary product direction. Removing or deprecating it requires a separate runtime migration; this documentation rewrite does not remove or disable it. See [Usage](docs/USAGE.md) for the current operating models.
 
-```powershell
-npm --prefix backend install
-npm --prefix backend run migrate
-npm --prefix backend run bootstrap:admin
-npm --prefix backend start
-```
+## Current status
 
-后端模式的使用边界：
+The repository contains a functional Web Client, server components, database migrations, administration and authentication features, test entry points, generated bundles, and multiple deployment configurations. These parts should not be interpreted as a verified public service or a general production certification.
 
-- 普通用户通过首页注册或登录，登录后练习记录写入 PostgreSQL。
-- 首次登录时如检测到浏览器本地已有练习记录，界面会提示是否导入到当前账号。
-- 管理员账号由 `ADMIN_USERNAME`、`ADMIN_PASSWORD` 初始化；访问 `/admin` 前需要完成 TOTP 二次验证。
-- Docker Compose 默认只绑定 `127.0.0.1:3000` 和 `127.0.0.1:55432`。如需局域网访问，应先确认防火墙、反向代理、HTTPS 和访问范围。
-- `tor` 服务提供可选的 hidden service，用于私人访问场景；不要把包含题源的站点公开推广。
+The [development status](docs/STATUS.md) records available capabilities, active work, planned direction, absent evidence, legacy behavior, governance limits, and documentation gaps. It is the public source of truth for readiness wording in this documentation set.
 
-更多实现和运维细节见 [developer/docs/postgresql-auth-plan.md](developer/docs/postgresql-auth-plan.md) 与 [developer/docs/totp-auth.md](developer/docs/totp-auth.md)。
+## Roadmap
 
-## 功能说明
+Near-term work focuses on identity and license governance, server stabilization, protected-resource boundaries, reproducible delivery, and release compliance. Later phases cover public-service policy, stable Tor access, extensibility, model-provider abstractions, cost controls, community governance, and sustainable operations.
 
-### 学习总览
+Roadmap entries describe direction rather than release-date commitments. Planned features are not current features. See [ROADMAP.md](ROADMAP.md).
 
-总览页面用于展示学习状态和练习概况。系统会根据本地练习记录汇总已练习题目、平均表现、学习时长、连续学习状态和分类进度等信息。该页面适合作为每日打开应用后的入口，用于判断后续应继续刷题、复盘错题还是切换到词汇辅助。
+## Funding and paid capabilities
 
-### 题库浏览与管理
+The project is public-interest and non-profit-oriented, but it does not claim a particular legal-entity or charitable status. The intended basic public-access model may be supported by voluntary contributions, sponsorship, donated infrastructure, or other operational support.
 
-题库浏览是系统的核心入口。当前实现支持阅读与听力两类资源，并按题目元数据生成可检索、可筛选的题库列表。
+Managed hosting, resource-intensive processing, third-party services, support, and future model-provider access may create real costs. A maintainer-operated service may charge for those services or resources. Such fees would not provide exclusive rights to the applicable open-source source code and would not change the recipient’s rights under the applicable license.
 
-主要能力包括：
+AI model API access is one possible future paid capability. It is not a current product feature. The repository currently provides no evidenced billing, donation, or subscription workflow. See the [service model](docs/SERVICE_MODEL.md).
 
-- 类型筛选：支持“全部”“阅读”“听力”等过滤方式。
-- 分类筛选：支持按 P1、P2、P3 等分类查看题目。
-- 关键词搜索：支持按题目标题、文件名或元数据关键字检索。
-- 排序与状态：支持题库排序、练习状态展示和进度回显。
-- 资源区分：阅读资源主要来自生成后的阅读题库资产；听力资源可来自内置听力索引或用户导入的本地听力目录。
-- 题库导入：设置页提供“加载题库”入口，可通过文件夹选择器导入自定义阅读或听力资源。
-- 配置切换：设置页提供“题库配置切换”，用于在默认题库和导入题库配置之间切换。
-- 强制刷新：设置页提供“强制刷新题库”，用于重新同步当前题库索引和界面状态。
+## Contributing direction
 
-题库索引不应手写维护。默认阅读与听力索引来自 `assets/generated/` 下的生成资产；用户导入题库时由浏览器侧扫描和标准化流程生成配置。
+Contribution procedures will be formalized after license scope, notices, and governance responsibilities are settled. Until then, prospective contributors should keep changes focused, preserve the public/private resource boundary, avoid adding content without documented permission, and avoid manually editing generated bundles.
 
-### 阅读练习
+Contributors must not assume that adding a file transfers copyright ownership. Future contribution guidance will explain the applicable license, provenance expectations, generated-file rules, review gates, and treatment of third-party material.
 
-阅读练习使用统一阅读页面运行，核心资产位于：
+## Security and privacy
 
-```text
-assets/generated/reading-exams/
-assets/generated/reading-explanations/
-```
+Tracked authentication, TOTP, session, administration, protected-resource, proxy, and Tor configuration is evidence of implementation—not proof that every deployment is secure. Operators remain responsible for secrets, updates, backups, monitoring, user-data handling, network exposure, and incident response.
 
-当前实现支持：
+Never commit environment files, hidden-service keys, client-auth credentials, database exports, private runtime content, or production overlays. Public security and deployment guidance remains subject to security-owner review.
 
-- 通过题库卡片打开阅读练习窗口。
-- 在统一阅读页中完成答题、提交和查看结果。
-- 回传用户答案、正确答案、得分信息和题目上下文。
-- 支持解析内容、定位高亮和答案对比。
-- 与练习记录系统同步，完成后自动写入本地历史。
-- 支持阅读背题模式，复用统一阅读页查看答案、解析和定位信息。
+A dedicated confidential vulnerability-reporting channel has not yet been published. Until one is established, do not place exploit details, credentials, personal data, or other sensitive material in a public issue. A reporter may open a minimal, non-sensitive issue asking the maintainers to establish private contact, without disclosing the vulnerability itself.
 
-阅读练习依赖浏览器新窗口和跨窗口通信。若练习页能打开但成绩没有保存，应优先检查弹窗权限、控制台错误和 `postMessage` 通信状态。
+Establishing and documenting a verified confidential reporting channel is required before public-service or security-readiness sign-off. The detailed reporting policy belongs to the future security-governance phase.
 
-### 听力练习
+## Copyright, licensing and upstream attribution
 
-听力练习通过听力索引和记录桥接模块接入。当前仓库包含听力生成索引：
+IELTMPS is a mixed-license repository. The IELTMPS Web Client has GPLv3-family upstream provenance through IELTS Atlas. The exact “only” versus “or-later” identifier and the precise frontend file scope remain unresolved.
 
-```text
-assets/generated/listening-exams/manifest.js
-assets/generated/listening-exams/listening-index.compat.js
-```
+The eligible original IELTMPS Server scope identified in [LICENSE.md](LICENSE.md) is licensed under `AGPL-3.0-only`. See the [canonical AGPL text](LICENSES/AGPL-3.0-only.txt) and [NOTICE.md](NOTICE.md). The proprietary API-contract placeholder has been replaced, but no versioned contract artifact is published. The existing root `LICENSE` is preserved, and no final frontend SPDX identifier is assigned by this change.
 
-主要能力包括：
+Upstream and third-party rights remain with their respective rightsholders. Open-source licenses grant permissions under their terms without transferring copyright ownership. Git authorship, repository maintenance, and distribution do not by themselves establish ownership of every included work.
 
-- 支持从默认听力索引加载听力题目。
-- 支持用户通过题库加载流程导入本地听力资源。
-- 支持 P1-P4 听力目录结构。
-- 通过 `listening-record-bridge` 将听力练习结果转换为统一练习记录。
-- 在练习记录和统计系统中与阅读记录使用同一套数据管理流程。
+See [Licensing and governance](docs/STATUS.md#licensing-and-governance) for the current decisions and unresolved work.
 
-Public standalone ZIP 不包含 private `ListeningPractice/` 目录；这类内容必须通过独立的 runtime/deployment flow 提供。
+## Content and trade-mark notice
 
-### 套题练习模式
+Software licensing does not automatically cover examination questions, articles, audio, PDFs, images, explanations, fonts, dictionaries, logos, trade marks, or separately supplied practice resources. Public-service operators and self-hosters must have an independent legal basis to use and distribute their content.
 
-套题模式用于连续完成多个练习单元，并将结果聚合为套题记录。该模式适合模拟完整练习流程，减少单篇练习之间的手动跳转。
-
-当前支持：
-
-- 创建套题会话。
-- 顺序打开和切换题目。
-- 跟踪当前套题窗口和当前题目。
-- 聚合每个子题目的得分、耗时和结果。
-- 保存完整套题记录。
-- 在异常关闭、中断或部分完成时尽量保留已完成记录。
-- 清理套题子记录，避免历史列表重复展示。
-
-套题模式依赖更严格的窗口管理和通信流程。如果浏览器阻止弹窗或用户手动关闭练习窗口，系统会进入降级保存路径。
-
-### 练习记录与统计
-
-练习记录页面用于查看、筛选、导出和管理历史记录。记录来源包括阅读练习、听力练习、套题练习和部分降级保存流程。
-
-主要能力包括：
-
-- 统计卡片：展示已练习题目、平均正确率、学习时长等核心指标。
-- 趋势分析：展示近期练习趋势，可按时间范围切换。
-- 练习热力图：按日期展示练习频率。
-- 中高频进度：展示重点题库或优先级题目的练习进度。
-- 阅读错题雷达：根据最近阅读记录统计错题题型分布。
-- 历史列表：按全部、阅读、听力等维度筛选记录。
-- 批量管理：支持选择多条记录并批量删除。
-- Markdown 导出：支持将练习历史导出为 Markdown 报告。
-- 详情查看：支持打开单条练习记录，查看分数、耗时、答案对比和原始结果信息。
-
-练习记录是本系统的核心用户数据。清理缓存、切换浏览器、隐私模式和浏览器自动清理站点数据都可能影响记录持久性，建议定期使用设置页的数据导出或备份功能。
-
-### 账号与多设备同步
-
-后端模式用于解决多设备使用时的记录迁移问题。用户登录后，练习记录由 PostgreSQL 持久化保存；同一账号在不同设备、浏览器或访问入口中登录后，可以读取同一份练习历史。
-
-当前支持：
-
-- 用户名和密码注册、登录、登出。
-- 服务端 session cookie 和 CSRF 保护。
-- 首次登录时提示导入浏览器本地已有练习记录。
-- 登录后读写远端 `practice_records`，未登录或 API 不可用时继续使用本地存储 fallback。
-- 账号面板支持用户名、密码、TOTP 和账号删除等自助操作。
-- 管理员页面 `/admin` 支持用户管理、练习记录查看、基础统计和流量分析。
-
-多设备同步只覆盖练习记录。题库索引、主题、词表、浏览偏好和部分本地配置仍保存在当前浏览器中，跨设备迁移这些数据时仍应使用导出、导入和题库加载功能。
-
-### 系统设置与数据管理
-
-设置页集中放置系统维护、题库管理和数据管理功能。
-
-系统管理能力：
-
-- 清除缓存：清理部分运行缓存并刷新状态。
-- 加载题库：导入阅读或听力题库目录。
-- 主题切换：切换当前界面的背景与视觉主题。
-- 题库配置切换：查看、切换或管理题库配置。
-- 强制刷新题库：重新同步题库索引、统计和界面状态。
-
-数据管理能力：
-
-- 创建备份：将当前练习数据、统计数据和相关配置保存为备份。
-- 备份列表：查看已有备份并选择恢复。
-- 导出数据：导出当前本地数据，便于迁移或长期保存。
-- 导入数据：从外部 JSON 数据恢复或合并历史记录。
-- 完整性检查：对导入数据和本地数据进行基础校验。
-
-静态模式下，系统数据优先写入 IndexedDB，并通过 localStorage、sessionStorage 和内存存储提供降级路径。不同浏览器、不同协议和不同域名下的数据互相隔离。
-
-后端模式下，登录用户的练习记录优先写入 PostgreSQL；前端仍会保留本地镜像和 fallback，保证 API 暂时不可用时不会破坏现有界面流程。浏览器本地记录不会自动上传，只有用户在首次登录导入确认中同意后，才会合并到当前账号。
-
-### 更多工具
-
-“更多工具”页面提供练习以外的辅助能力：
-
-- 词汇练习：使用内置词表和记忆调度能力辅助复习。
-- 阅读背题：复用统一阅读页，直接查看答案、解析和定位高亮。
-- 成就系统：根据练习和使用行为展示已解锁徽章。
-
-这些功能共享主应用的数据层和界面状态，不需要额外后端服务。
-
-### 主题与界面
-
-当前主界面为 HeroUI 风格，包含动态背景、主导航、题库面板、练习记录面板、设置面板和更多工具面板。项目保留了主题适配基础设施，主题相关逻辑位于 `js/plugins/themes/` 和 `js/presentation/`。
-
-主题切换主要影响视觉呈现，不应改变练习记录、题库索引或数据存储格式。
-
-## 详细使用指南
-
-### 开始单篇练习
-
-1. 打开 `index.html`。
-2. 进入“题库浏览”。
-3. 使用类型筛选、分类筛选或搜索框定位题目。
-4. 点击题目卡片上的练习入口。
-5. 在新窗口中完成答题并提交。
-6. 返回主窗口，在“练习记录”中查看保存结果。
-
-如果练习窗口未打开，请先允许浏览器弹窗。如果练习完成后没有记录，请检查控制台是否存在资源加载失败或通信错误。
-
-### 使用套题模式
-
-1. 在题库或相关练习入口中选择套题练习。
-2. 系统创建套题会话并打开练习窗口。
-3. 按顺序完成每个题目。
-4. 套题结束后，系统聚合子题目结果并保存为套题记录。
-5. 在“练习记录”中查看套题结果。
-
-套题模式不适合在多个浏览器窗口中并行操作同一套题。并行操作会增加窗口引用、状态同步和记录归并的复杂度。
-
-### 查看与导出练习记录
-
-1. 进入“练习记录”。
-2. 查看统计卡片、趋势、热力图和历史列表。
-3. 使用“全部 / 阅读 / 听力”筛选历史记录。
-4. 点击单条记录查看详情。
-5. 使用“导出 Markdown”生成学习报告。
-6. 如需清理历史，使用批量选择和批量删除。
-
-删除记录前建议先导出或创建备份。删除后的数据是否可恢复取决于是否存在可用备份。
-
-### 导入自定义题库
-
-1. 进入“系统设置”。
-2. 点击“加载题库”。
-3. 选择阅读或听力资源目录。
-4. 根据界面提示选择全量或增量导入。
-5. 导入完成后返回“题库浏览”检查列表。
-6. 如有多个配置，通过“题库配置切换”选择当前使用的题库配置。
-
-自定义题库应保持稳定的目录结构。频繁移动文件、重命名目录或混合不同来源题库，可能导致记录与题目索引无法准确匹配。
-
-### 备份、恢复与迁移
-
-1. 进入“系统设置”。
-2. 使用“创建备份”保存当前数据快照。
-3. 使用“导出数据”生成外部文件，用于跨浏览器或跨设备迁移。
-4. 在新环境中使用“导入数据”恢复记录。
-5. 导入后检查练习记录、统计卡片和题库状态。
-
-浏览器本地存储与协议和域名绑定。例如，`file://` 打开的数据与 `http://localhost:8000/` 下的数据不一定共享。
-
-## 项目结构
-
-运行时文件：
-
-```text
-index.html
-css/
-js/bundles/
-assets/
-ReadingPractice/
-```
-
-主要源码目录：
-
-```text
-js/app/              应用入口、状态桥、题库浏览、练习会话和套题逻辑
-js/core/             练习、记录、存储、词汇等核心能力
-js/data/             repository 与数据源封装
-js/runtime/          懒加载、启动屏、统一阅读页运行时
-js/services/         题库发现、题库管理、统计、成就等服务
-js/components/       设置、诊断、记录弹窗、题库状态等 UI 组件
-js/presentation/     导航、主题、更多工具、首页交互
-js/utils/            存储、答案匹配、导入导出、性能和 DOM 工具
-js/plugins/          主题和扩展桥接
-backend/             可选后端服务、PostgreSQL migration、管理员页面和 Tor 部署配置
-assets/generated/    生成后的阅读、听力题库索引、页面和解析资产
-assets/wordlists/    词汇数据
-developer/doc/Wiki/  架构文档、历史决策和模块说明
-developer/tests/     静态回归、E2E、工具脚本和测试报告
-scripts/             构建脚本
-```
-
-静态发布包只应包含用户运行所需文件。源码目录、开发文档、测试工具、`backend/` 和 `node_modules/` 不应进入普通静态分发包。需要多设备同步时，应部署仓库中的 `backend/` 服务，而不是把普通静态 zip 当作后端发布包。
-
-## 构建与发布
-
-### 生成 bundle
-
-`index.html` 当前加载 `js/bundles/*.bundle.js`。修改源码后必须重新生成 bundle：
-
-```bash
-node scripts/build-bundles.mjs
-node scripts/build-bundles.mjs --profile vip --output-root "ListeningPractice/vip special"
-```
-
-`scripts/bundle-manifest.mjs` 是 default/VIP bundle 的唯一输出与 source-input 清单。VIP profile
-只生成该清单声明的 14 个 tracked runtime bundle；VIP shell 不拥有独立的
-`listening-wrapper.bundle.js`，后端听力页使用根目录 tracked bundle，因此 canonical VIP build
-会移除旧 builder 遗留的同名 VIP 输出。`ListeningPractice/vip special/scripts/build-bundles.mjs`
-仅保留 fail-fast 迁移提示，不再包含第二套生成逻辑。
-
-不要手动编辑任何 `js/bundles/*.bundle.js`。这些文件是构建产物，应由根目录 canonical
-builder 生成；builder 会拒绝 profile 清单之外的 `.bundle.js` 输出。
-
-### 生成发布包
-
-Linux / Git Bash：
-
-```bash
-bash developer/release.sh 0.6.2
-```
-
-Windows PowerShell：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File developer/release.ps1 0.6.2
-```
-
-输出位置：
-
-```text
-dist/ielts-practice-{version}.zip
-```
-
-发布脚本会先运行 `node scripts/build-bundles.mjs`，再由
-`developer/standalone-release-manifest.json` 授权静态运行时文件。Windows 和
-Unix 脚本使用同一个 manifest/helper contract，只压缩 helper 创建的临时 staging
-目录，并在 `dist/` 中同时输出 machine-readable release receipt。Node.js 只在构建和
-manifest 校验时需要；用户解压后仍可直接打开 `index.html`。
-
-manifest 的 `files` 是默认 standalone ZIP 的唯一成员授权。`assets/`、`css/`、
-`js/bundles/` 和 `src/styles/` 是 managed roots；其中每个现有文件都必须在 manifest
-中明确分类为 published `files` 或 `nonReleaseFiles`。任何未分类文件（包括 ignored、
-untracked、hidden、source map 或深层嵌套文件）都会令发布失败，不会被静默忽略。
-只有 `files` 授权 ZIP 成员。Git worktree 中的 manifest 和默认 payload 还必须 tracked 且 clean；
-不含 Git metadata 的 source archive 仍按同一 manifest 和 drift contract 发布。
-
-### 显式授权 ReadingPractice
-
-`ReadingPractice/` 不存在时，普通发布成功并省略该目录。目录存在时，操作者必须通过
-`READING_PRACTICE_PUBLIC_MANIFEST` 显式指定一个 manifest，否则发布在创建 ZIP 前失败：
-
-```json
-{
-  "schemaVersion": 1,
-  "files": [
-    {
-      "path": "example-public-file.html",
-      "sha256": "<lowercase sha256>"
-    }
-  ]
-}
-```
-
-manifest 中的路径相对于固定的 `ReadingPractice/` root。每个文件必须存在、是普通
-非 symlink/reparse 文件且 SHA-256 匹配；目录中任何未授权文件也会令发布失败。外部
-manifest 自身不会进入 ZIP。
-
-```bash
-READING_PRACTICE_PUBLIC_MANIFEST=/path/to/reading-public.json bash developer/release.sh 0.6.2
-```
-
-```powershell
-$env:READING_PRACTICE_PUBLIC_MANIFEST = 'C:\path\to\reading-public.json'
-powershell -ExecutionPolicy Bypass -File developer/release.ps1 0.6.2
-```
-
-### Private Listening policy
-
-Private Listening 内容属于独立的 runtime/deployment flow，不属于 public standalone
-ZIP。旧的 `INCLUDE_LOCAL_LISTENING=1` 开关现在会 fail closed；发布脚本不会扫描或归档
-private Listening roots。已由默认 public manifest 明确列出的公共静态资产不受此政策影响。
-
-### 部署后端模式
-
-后端模式不是静态 zip 发布包的一部分。它需要保留 `backend/`、根目录静态资源、`js/bundles/` 和题库资产，并通过 Node.js 或 Docker 启动。
-
-Docker Compose 会启动：
-
-- `postgres`：保存账号、session、练习记录、TOTP 和流量事件。
-- `app`：运行 Express 后端，托管首页、API 和 `/admin`。
-- `tor`：可选 hidden service，用于私人访问场景。
-
-常用命令：
-
-```powershell
-docker compose --env-file backend\.env -f backend\docker-compose.yml up --build
-docker compose --env-file backend\.env -f backend\docker-compose.yml down
-```
-
-直接运行 Node.js 后端时，先准备 PostgreSQL，再执行：
-
-```powershell
-npm --prefix backend install
-npm --prefix backend run migrate
-npm --prefix backend run bootstrap:admin
-npm --prefix backend start
-```
-
-## 测试要求
-
-功能或优化改动后，按顺序运行：
-
-```bash
-python developer/tests/ci/run_static_suite.py
-python developer/tests/e2e/suite_practice_flow.py
-```
-
-如果改动涉及 `backend/`、登录、远端练习记录、管理员页面、TOTP 或 Docker 部署，还应运行：
-
-```bash
-npm --prefix backend test
-npm --prefix backend run migrate
-npm --prefix backend run smoke:postgres
-```
-
-第一条会生成：
-
-```text
-developer/tests/e2e/reports/static-ci-report.json
-```
-
-测试原则：
-
-- 修改运行时代码、题库索引、资源路径、练习记录、套题流程或发布脚本后，必须运行上述测试。
-- 修改后端 API、数据库 schema、管理员功能或多设备同步逻辑后，必须运行后端测试；如本机没有 PostgreSQL，应至少说明未运行 `migrate` 和 `smoke:postgres` 的原因。
-- 修改 README、说明文档或纯文本材料时，可不运行浏览器流程，但仍应检查路径和命令是否真实存在。
-- 新增 QA、测试工具或验证脚本应放在 `developer/tests/` 下，避免污染发布包。
-
-## 技术说明
-
-### 启动流程
-
-应用启动由 `index.html` 加载 bundle 完成。核心 bundle 包括：
-
-```text
-js/bundles/runtime-entry.bundle.js
-js/bundles/core-foundation.bundle.js
-js/bundles/ui-shell.bundle.js
-js/bundles/legacy-app.bundle.js
-```
-
-初始化过程包括：
-
-1. 启动屏和基础运行时加载。
-2. 存储命名空间初始化。
-3. 应用实例创建。
-4. 题库索引和练习记录加载。
-5. 导航、题库、记录、设置等视图初始化。
-6. 按需加载题库浏览、练习记录、套题、设置、更多工具等功能 bundle。
-
-### 数据存储
-
-静态模式采用多层本地存储策略：
-
-- IndexedDB：优先存储结构化数据。
-- localStorage：兼容和跨标签页同步场景。
-- sessionStorage：会话级降级存储。
-- 内存存储：持久化不可用时的兜底方案。
-
-本地主要数据包括：
-
-- 题库索引。
-- 练习记录。
-- 用户设置。
-- 备份数据。
-- 统计和派生状态。
-
-后端模式会把登录用户的练习记录交给 `RemoteApiClient` 和 remote-backed data source 读写，通过 `/api/practice-records` 保存到 PostgreSQL。题库索引、用户设置、词表、主题和部分派生状态仍保留在当前浏览器本地。
-
-不同浏览器、不同域名、不同协议下的本地数据隔离。迁移本地数据时应使用导出和导入功能，不要直接复制浏览器内部存储；迁移远端数据时应备份 PostgreSQL。
-
-### 练习通信
-
-练习窗口与主窗口通过 `postMessage` 通信。典型流程如下：
-
-1. 主窗口打开练习页面。
-2. 主窗口创建练习会话。
-3. 练习页加载增强或桥接脚本。
-4. 用户提交答案。
-5. 练习页发送完成消息。
-6. 主窗口标准化成绩并保存记录。
-
-相关运行时包括：
-
-```text
-js/bundles/practice-page-enhancer.bundle.js
-js/bundles/listening-record-bridge.bundle.js
-js/bundles/session.bundle.js
-js/bundles/practice.bundle.js
-```
-
-### 题库资产
-
-阅读生成资产位于：
-
-```text
-assets/generated/reading-exams/
-assets/generated/reading-explanations/
-```
-
-听力生成资产位于：
-
-```text
-assets/generated/listening-exams/
-```
-
-运行时题库数量以生成资产中的 manifest 和当前题库配置为准。README 不再写固定题量，避免题库更新后文档失真。
-
-## 常见问题
-
-### 页面打开后样式异常或功能缺失
-
-通常是目录不完整或资源路径错误。确认以下目录存在并保持相对路径不变：
-
-```text
-css/
-js/bundles/
-assets/
-ReadingPractice/
-```
-
-如果使用发布包，确认压缩包解压完整。不要将 `index.html` 单独复制到其他目录运行。
-
-### 点击练习后没有打开窗口
-
-检查浏览器是否拦截弹窗。练习页需要通过新窗口或新标签打开，主窗口依赖该窗口回传成绩。
-
-处理步骤：
-
-1. 允许当前页面弹窗。
-2. 重新点击练习入口。
-3. 打开开发者工具查看 Console 是否有错误。
-4. 检查目标练习资源是否 404。
-
-### 练习完成后没有保存记录
-
-常见原因包括：
-
-- 浏览器阻止跨窗口通信。
-- 练习页资源加载失败。
-- 用户在隐私模式中运行，存储被限制。
-- IndexedDB 或 localStorage 被禁用。
-- 使用了不同协议或不同域名，导致查看的是另一份本地数据。
-
-处理步骤：
-
-1. 查看 Console 中是否有 `postMessage`、storage 或资源加载错误。
-2. 在“系统设置”中导出数据，确认当前环境是否已有记录。
-3. 换用 Chrome 或 Edge 最新稳定版复测。
-4. 必要时通过本地静态服务器运行。
-
-### 题库列表为空
-
-检查以下内容：
-
-1. `assets/generated/reading-exams/manifest.js` 是否存在。
-2. `assets/generated/reading-exams/reading-practice-unified.html` 是否存在。
-3. `js/bundles/core-foundation.bundle.js` 是否正常加载。
-4. 是否误删或移动了 `assets/` 目录。
-5. 如使用自定义题库，重新通过“系统设置”中的“加载题库”导入。
-
-### 听力题库不可见
-
-普通发布包可能不包含完整听力资源。检查：
-
-1. 是否存在 `assets/generated/listening-exams/manifest.js`。
-2. 是否存在 `assets/generated/listening-exams/listening-index.compat.js`。
-3. public standalone ZIP 不会包含 private `ListeningPractice/`；请确认所需内容已通过独立 runtime/deployment flow 提供。
-4. 不要为 standalone release 设置旧的 `INCLUDE_LOCAL_LISTENING` 开关；该开关会 fail closed。
-
-### 数据丢失或统计清零
-
-浏览器本地数据可能因清理缓存、隐私模式、协议变化或域名变化而不可见。
-
-处理步骤：
-
-1. 检查当前是否使用了与之前相同的浏览器、路径、协议和域名。
-2. 在设置页查看备份列表。
-3. 使用导入功能恢复之前导出的数据。
-4. 如需长期保存，请定期导出数据文件。
-
-### 登录后看不到原来的本地记录
-
-后端模式不会静默上传浏览器本地记录。首次登录同一账号时，如果页面检测到本地 `practice_records`，会提示是否导入；如果跳过或换了浏览器环境，需要先从旧环境导出数据，再在新环境中导入。
-
-处理步骤：
-
-1. 确认当前账号是否正确。
-2. 检查旧记录是否还存在于原浏览器、原协议和原域名下。
-3. 在旧环境使用“导出数据”或“导出 Markdown”保留记录。
-4. 重新登录后按界面提示导入，或使用设置页的数据导入功能。
-
-### 无法进入 `/admin`
-
-管理员页面要求当前 session 是管理员账号，并且在启用 TOTP 时已经完成二次验证。
-
-处理步骤：
-
-1. 确认 `backend/.env` 中设置了 `ADMIN_USERNAME` 和强密码 `ADMIN_PASSWORD`。
-2. Docker 模式重启 `app`，或本机模式运行 `npm --prefix backend run bootstrap:admin`。
-3. 使用管理员账号登录首页，先绑定并验证 TOTP。
-4. 再访问 `http://127.0.0.1:3000/admin`。
-5. 如果丢失 TOTP 和恢复码，临时设置 `ADMIN_RESET_TOTP=true` 后重新执行管理员初始化。
-
-### 局域网或反向代理访问后登录异常
-
-后端默认按本机访问配置：`HOST=127.0.0.1`、`COOKIE_SECURE=false`、`TRUST_PROXY=false`。如果放到局域网、HTTPS 反向代理或 onion 入口后面，需要按实际入口调整环境变量。
-
-检查项：
-
-1. 局域网监听需要把 `HOST` 改为合适的地址，Docker 模式还要调整端口绑定。
-2. HTTPS 入口建议设置 `COOKIE_SECURE=true` 和 `TRUST_PROXY=true`。
-3. 反向代理必须保留 Cookie，并转发原始协议相关头。
-4. 不同域名、端口和协议会产生不同的本地存储空间。
-
-### `file://` 与本地服务器表现不一致
-
-这是浏览器安全策略造成的正常差异。项目要求尽量兼容 `file://`，但部分浏览器会限制音频、PDF、新窗口、跨页面脚本或本地文件访问。遇到差异时，应先在 Chrome 或 Edge 下验证，再使用本地静态服务器定位问题。
-
-## 维护原则
-
-- 主入口保持为 `index.html`。
-- 用户运行依赖 `js/bundles/`，源码改动后必须重新构建 bundle。
-- 保持 `file://` 静态模式可用；新增功能如需服务器能力，必须提供本地存储 fallback 或明确的非后端路径。
-- 静态发布包只包含运行时文件，不包含源码、开发工具、测试目录、`backend/` 和 `node_modules/`。
-- 后端部署必须把敏感配置放在 `backend/.env` 或部署环境中，不提交真实密码、session secret、TOTP 密钥或桥接私密信息。
-- 题库、记录和统计应通过统一数据结构流转，避免为单个题型堆叠特殊分支。
-- 文档中的命令、路径和入口必须能在当前仓库中验证。
-
-## 许可证与内容版权
-
-本仓库采用分区授权。除目录或文件内另有明确声明外：
-
-- `frontend/` is licensed under `GPL-3.0-only`. In the current repository layout, this covers the static frontend application files, including `index.html`, `css/`, `js/`, frontend runtime assets, and the GPL text in [LICENSE](LICENSE).
-- `backend/` is independently developed and is not licensed under `GPL-3.0`.
-
-  Unless otherwise agreed in writing, `backend/` is proprietary and all rights are reserved.
-
-- The API schema/docs are licensed under `LicenseRef-Proprietary` / proprietary terms, as stated in [api-contract/](api-contract/README.md).
-- Third-party libraries and assets retain their own upstream license terms and notices.
-
-GPL 前端文件应使用 GPL 标识，例如：
-
-```js
-// SPDX-License-Identifier: GPL-3.0-only
-```
-
-专有文件（例如 `backend/` 或 proprietary API contract 文件）应使用：
-
-```js
-// SPDX-License-Identifier: LicenseRef-Proprietary
-// Copyright © 2026 Kevin. All rights reserved.
-```
-
-题源、文章、音频、PDF、图片和解析材料可能来自第三方或原始考试资料，版权归原权利人所有。本项目不授予这些内容的商业使用权或公开传播权。使用者应自行承担因复制、部署、传播或商业化使用相关内容产生的法律和平台风险。
-
+IELTS-related names and marks belong to their respective owners. IELTMPS must remain clearly independent, avoid official branding, and avoid representing practice results as certified examination results. The repository has not completed a full rights inventory for all existing content categories. See the [content policy](docs/CONTENT_POLICY.md).
