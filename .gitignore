@@ -21,6 +21,8 @@
 !/docs/TOR_ACCESS.md
 /tools/
 /dist/
+/.build/public-container-transactions/
+/.build/BUILD_VIA_DEVELOPER_BUILD_PUBLIC_CONTAINER_MJS
 /apps/
 /logs/
 /server/

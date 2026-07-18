@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 2,
+  "includeExact": [
+    ".dockerignore",
+    "index.html",
+    "backend/Dockerfile",
+    "backend/package.json",
+    "backend/package-lock.json",
+    "backend/.env.example",
+    "developer/verify-public-container-context.mjs"
+  ],
+  "includePrefixes": [
+    "assets/",
+    "css/",
+    "js/",
+    "src/styles/",
+    "templates/",
+    "backend/src/",
+    "backend/scripts/",
+    "backend/migrations/",
+    "backend/admin/",
+    "backend/auth/"
+  ]
+}

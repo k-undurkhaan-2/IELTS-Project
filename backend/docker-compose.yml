@@ -22,8 +22,12 @@ services:
 
   app:
     build:
-      context: ..
+      context: ../.build/BUILD_VIA_DEVELOPER_BUILD_PUBLIC_CONTAINER_MJS
       dockerfile: backend/Dockerfile
+      args:
+        IELTMPS_SOURCE_COMMIT: ${IELTMPS_SOURCE_COMMIT:?Use developer/build-public-container.mjs}
+        IELTMPS_CONTEXT_MANIFEST_SHA256: ${IELTMPS_CONTEXT_MANIFEST_SHA256:?Use developer/build-public-container.mjs}
+        IELTMPS_CONTEXT_RECEIPT_SHA256: ${IELTMPS_CONTEXT_RECEIPT_SHA256:?Use developer/build-public-container.mjs}
     container_name: ielts-practice-app
     restart: unless-stopped
     depends_on:
