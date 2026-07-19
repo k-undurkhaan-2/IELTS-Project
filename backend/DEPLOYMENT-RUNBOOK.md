@@ -60,16 +60,15 @@ Use `--no-build` for target-host app recreates after loading an exported
 for development, and omitting `--no-build` can make the target host attempt a
 slow or failing rebuild instead of using the already loaded image.
 
-## Listening Runtime Assets
+## Public Listening application assets
 
-The business UI depends on generated Listening runtime assets at:
+The business UI depends on these generated public Listening application assets:
 
 - `assets/generated/listening-exams/manifest.js`
 - `assets/generated/listening-exams/listening-index.compat.js`
 - `assets/generated/listening-exams/listening-practice-unified.html`
-- `ListeningPractice/`
 
-Production app-image builds must include those files and directories. Do not
+Production app-image builds must include those public files. Do not
 stage deployment sources from Git-tracked files only unless the generated
 Listening index files are present in that staged source. If they are omitted,
 the app can remain healthy while the business Listening entry disappears.
@@ -82,7 +81,6 @@ docker run --rm --entrypoint sh backend-app:latest -lc '
   test -s /app/assets/generated/listening-exams/manifest.js
   test -s /app/assets/generated/listening-exams/listening-index.compat.js
   test -s /app/assets/generated/listening-exams/listening-practice-unified.html
-  test -d /app/ListeningPractice
 '
 ```
 
@@ -97,6 +95,61 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 curl -s -o /dev/null -w '%{http_code}\n' \
   http://127.0.0.1:3000/practice/listening/test
 ```
+
+## Runtime-only Listening resource overlay
+
+The public application image intentionally excludes private Listening
+resources. Successful image construction and inspection must confirm that the
+private resource root is absent from public image layers. Authorized Listening
+resources are provisioned separately from public image construction and are
+supplied only through the Compose runtime bind mount. The overlay is
+runtime-only, and operators must not rebuild private Listening resources into
+public image layers to remedy a missing overlay.
+
+The bind mount must be read-only. The Compose-configured host source must
+already exist before Compose starts, and deployment preflight must fail closed
+rather than allow Compose to create a missing source directory automatically;
+the tracked bind contract keeps `create_host_path` false. Missing, unauthorized,
+unreadable, or incomplete overlay resources block readiness and launch.
+
+Image verification and running-service overlay verification are separate gates;
+passing either gate does not satisfy the other.
+
+### Stage A - Public image verification
+
+Complete this gate against the public image without mounting or accessing the
+private overlay:
+
+- Confirm image construction and layer inspection show that the private
+  Listening resource root is absent from every public image layer.
+- Confirm the expected public application files remain present.
+- Confirm the application process is configured to run as its intended
+  non-root user.
+- Confirm image-content integrity without requiring a private overlay.
+
+### Stage B - Running-service overlay readiness
+
+Complete this separate gate only after the authorized resources have been
+provisioned for the application service:
+
+- Before starting Compose, confirm the Compose-configured host source already
+  exists; do not let Compose create a missing source directory.
+- Confirm the running application service receives the runtime overlay only
+  through the configured bind mount at `/app/ListeningPractice`.
+- Confirm the target is readable through an approved, non-content-revealing
+  readiness check.
+- Confirm from mount configuration or metadata that the mount is read-only. Do
+  not write to mounted content as a test.
+- Confirm the separately governed private deployment process validated the
+  authorized runtime resource manifest or deployment receipt. Do not list,
+  open, print, or otherwise inspect private resource content.
+- Fail closed: missing, unauthorized, unreadable, or incomplete resources block
+  readiness and service launch.
+
+Overlay authorization, manifesting, hashing, delivery, and rollback remain
+separately governed private-runtime procedures. This public runbook neither
+defines those procedures nor claims that they are complete; Stage B requires
+their authorized manifest or deployment receipt before readiness can pass.
 
 ## Admin Password Maintenance Rotation
 

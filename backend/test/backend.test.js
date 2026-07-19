@@ -22,6 +22,175 @@ const { runMigrations } = require('../src/migrations');
 const { MemoryPracticeRecordStore, extractColumns, mergePracticeRecords, normalizePracticeRecord } = require('../src/practiceRecords');
 const { MemoryTotpStore, PostgresTotpStore } = require('../src/totp');
 
+const F6_PROTECTED_PRACTICE_ROOTS = new Set(['listeningpractice', 'readingpractice']);
+
+function normalizeF6Text(value) {
+    return value.replace(/\r\n?/g, '\n');
+}
+
+function splitF6DockerShellWords(value, escapeCharacter) {
+    assert(['\\', '`'].includes(escapeCharacter), 'F6 Dockerfile escape character must be known');
+    const words = [];
+    let current = '';
+    let quote = null;
+    for (let index = 0; index < value.length; index += 1) {
+        const character = value[index];
+        if (character === escapeCharacter) {
+            assert(index + 1 < value.length, 'F6 Dockerfile shell form must not end with an escape character');
+            current += value[index + 1];
+            index += 1;
+            continue;
+        }
+        if (quote) {
+            if (character === quote) {
+                quote = null;
+            } else {
+                current += character;
+            }
+            continue;
+        }
+        if (character === '"' || character === "'") {
+            quote = character;
+        } else if (/\s/.test(character)) {
+            if (current) {
+                words.push(current);
+                current = '';
+            }
+        } else {
+            current += character;
+        }
+    }
+    assert.equal(quote, null, 'F6 Dockerfile shell form must not contain an unterminated quote');
+    if (current) {
+        words.push(current);
+    }
+    return words;
+}
+
+function logicalF6DockerfileLines(source) {
+    const logical = [];
+    let escapeCharacter = '\\';
+    let pending = null;
+    let parserDirectivesEligible = true;
+    for (const rawLine of normalizeF6Text(source).split('\n')) {
+        const stripped = rawLine.trim();
+        const directive = parserDirectivesEligible && pending === null
+            ? stripped.match(/^#\s*([A-Za-z][A-Za-z0-9_-]*)\s*=\s*(.*?)\s*$/)
+            : null;
+        const directiveName = directive?.[1].toLowerCase();
+        if (directive && ['syntax', 'escape', 'check'].includes(directiveName)) {
+            if (directiveName === 'escape') {
+                assert.match(directive[2], /^[`\\]$/, 'F6 Dockerfile escape directive must contain one supported character');
+                escapeCharacter = directive[2];
+            }
+            continue;
+        }
+        parserDirectivesEligible = false;
+        if (!stripped || stripped.startsWith('#')) {
+            continue;
+        }
+        const physicalLine = pending === null ? rawLine.trimStart() : rawLine;
+        const combined = `${pending ?? ''}${physicalLine}`;
+        if (physicalLine.endsWith(escapeCharacter)) {
+            pending = combined.slice(0, -escapeCharacter.length);
+            continue;
+        }
+        logical.push({ escapeCharacter, logicalLine: combined.trim() });
+        pending = null;
+    }
+    assert.equal(pending, null, 'F6 Dockerfile parser found an unterminated continuation');
+    return logical;
+}
+
+function parseF6DockerfileSources(source) {
+    const parsed = [];
+    let stageIndex = -1;
+    let stageName = null;
+    for (const { escapeCharacter, logicalLine } of logicalF6DockerfileLines(source)) {
+        const instructionMatch = logicalLine.match(/^([A-Za-z]+)\s+([\s\S]+)$/);
+        if (!instructionMatch) {
+            continue;
+        }
+        const instruction = instructionMatch[1].toUpperCase();
+        if (instruction === 'FROM') {
+            stageIndex += 1;
+            stageName = instructionMatch[2].match(/\s+AS\s+([^\s]+)\s*$/i)?.[1] || null;
+            continue;
+        }
+        if (instruction !== 'COPY' && instruction !== 'ADD') {
+            continue;
+        }
+
+        let argumentsText = instructionMatch[2].trimStart();
+        while (argumentsText.startsWith('--')) {
+            const flag = argumentsText.match(/^--[^\s]+(?:\s+|$)/);
+            assert(flag, `F6 Dockerfile ${instruction} option is malformed: ${logicalLine}`);
+            argumentsText = argumentsText.slice(flag[0].length).trimStart();
+        }
+
+        let argumentsList;
+        if (argumentsText.startsWith('[')) {
+            argumentsList = JSON.parse(argumentsText);
+            assert(Array.isArray(argumentsList), `F6 Dockerfile ${instruction} JSON form must be an array`);
+            assert(argumentsList.every((entry) => typeof entry === 'string'), `F6 Dockerfile ${instruction} JSON entries must be strings`);
+        } else {
+            argumentsList = splitF6DockerShellWords(argumentsText, escapeCharacter);
+        }
+        assert(argumentsList.length >= 2, `F6 Dockerfile ${instruction} must have a source and destination`);
+        for (const sourcePath of argumentsList.slice(0, -1)) {
+            parsed.push({ instruction, logicalLine, sourcePath, stageIndex, stageName });
+        }
+    }
+    return parsed;
+}
+
+function isF6ProtectedDockerSource(sourcePath) {
+    const normalized = path.posix.normalize(sourcePath.replaceAll('\\', '/'));
+    return normalized
+        .split('/')
+        .filter((component) => component && component !== '.' && component !== '..')
+        .some((component) => F6_PROTECTED_PRACTICE_ROOTS.has(component.toLowerCase()));
+}
+
+function extractF6ComposeService(source, serviceName) {
+    const lines = normalizeF6Text(source).split('\n');
+    const start = lines.findIndex((line) => line === `  ${serviceName}:`);
+    assert.notEqual(start, -1, `Compose must define the ${serviceName} service`);
+    let end = lines.length;
+    for (let index = start + 1; index < lines.length; index += 1) {
+        if (/^  [A-Za-z0-9_-]+:$/.test(lines[index])) {
+            end = index;
+            break;
+        }
+    }
+    return lines.slice(start, end).join('\n');
+}
+
+function extractF6ComposeVolumeItems(service) {
+    const lines = service.split('\n');
+    const volumeHeaders = lines
+        .map((line, index) => ({ index, line }))
+        .filter(({ line }) => line === '    volumes:');
+    assert.equal(volumeHeaders.length, 1, 'app service must define exactly one volumes section');
+    const start = volumeHeaders[0].index + 1;
+    let end = lines.length;
+    for (let index = start; index < lines.length; index += 1) {
+        if (/^    [A-Za-z0-9_-]+:$/.test(lines[index])) {
+            end = index;
+            break;
+        }
+    }
+    const volumeLines = lines.slice(start, end);
+    const itemStarts = volumeLines
+        .map((line, index) => ({ index, line }))
+        .filter(({ line }) => line.startsWith('      - '))
+        .map(({ index }) => index);
+    return itemStarts.map((itemStart, index) => {
+        const itemEnd = itemStarts[index + 1] ?? volumeLines.length;
+        return volumeLines.slice(itemStart, itemEnd).join('\n');
+    });
+}
+
 test('docker image hardening excludes secrets and runs app as non-root', () => {
     const repoRoot = path.resolve(__dirname, '..', '..');
     const dockerfile = fs.readFileSync(path.join(repoRoot, 'backend', 'Dockerfile'), 'utf8');
@@ -55,8 +224,6 @@ test('docker image hardening excludes secrets and runs app as non-root', () => {
             `.dockerignore must exclude ${pattern}`
         );
     }
-    assert(!dockerignore.split(/\r?\n/).includes('ListeningPractice'));
-    assert(dockerfile.includes('COPY ListeningPractice ./ListeningPractice'));
     for (const listeningAssetPath of [
         'assets/generated/listening-exams/manifest.js',
         'assets/generated/listening-exams/listening-index.compat.js',
@@ -158,10 +325,10 @@ test('docker image hardening excludes secrets and runs app as non-root', () => {
     assert(!composeProfileCheck.includes("'up'"));
     assert(deploymentRunbook.includes('Recreate only `app` with `--no-build`.'));
     assert(deploymentRunbook.includes('omitting `--no-build` can make the target host attempt'));
-    assert(deploymentRunbook.includes('Listening Runtime Assets'));
+    assert(deploymentRunbook.includes('Runtime-only Listening resource overlay'));
     assert(deploymentRunbook.includes('assets/generated/listening-exams/manifest.js'));
     assert(deploymentRunbook.includes('assets/generated/listening-exams/listening-index.compat.js'));
-    assert(deploymentRunbook.includes('test -d /app/ListeningPractice'));
+    assert(!deploymentRunbook.includes('test -d /app/ListeningPractice'));
     assert(deploymentRunbook.includes('Admin Password Maintenance Rotation'));
     assert(deploymentRunbook.includes('Do not overwrite the long-lived target `backend/.env`'));
     assert(deploymentRunbook.includes('Do not commit the temporary file'));
@@ -368,6 +535,128 @@ test('docker image hardening excludes secrets and runs app as non-root', () => {
     assert(appSource.includes('function normalizeHttpErrorStatus(error, fallback = 500)'));
     assert(appSource.includes('Number.isInteger(status) && status >= 400 && status < 600 ? status : fallback'));
     assert(!appSource.includes('const status = isZodError ? 400 : (error.status || error.statusCode || 500)'));
+});
+
+test('Listening resources remain outside image layers and use a read-only runtime overlay', () => {
+    const repoRoot = path.resolve(__dirname, '..', '..');
+    const dockerignore = normalizeF6Text(fs.readFileSync(path.join(repoRoot, '.dockerignore'), 'utf8'));
+    const dockerfile = fs.readFileSync(path.join(repoRoot, 'backend', 'Dockerfile'), 'utf8');
+    const compose = normalizeF6Text(fs.readFileSync(path.join(repoRoot, 'backend', 'docker-compose.yml'), 'utf8'));
+    const manifest = JSON.parse(fs.readFileSync(path.join(repoRoot, 'developer', 'public-container-context-manifest.json'), 'utf8'));
+    const runbook = normalizeF6Text(fs.readFileSync(path.join(repoRoot, 'backend', 'DEPLOYMENT-RUNBOOK.md'), 'utf8'));
+
+    const dockerignoreEntries = dockerignore
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line && !line.startsWith('#'));
+    for (const protectedRoot of ['ListeningPractice', 'ReadingPractice']) {
+        assert(dockerignoreEntries.includes(protectedRoot), `.dockerignore must exclude ${protectedRoot} as a root`);
+        assert(dockerignoreEntries.includes(`${protectedRoot}/**`), `.dockerignore must exclude descendants of ${protectedRoot}`);
+    }
+    for (const exception of dockerignoreEntries.filter((entry) => entry.startsWith('!'))) {
+        assert(!isF6ProtectedDockerSource(exception.slice(1)), `.dockerignore must not re-include a protected root: ${exception}`);
+    }
+
+    const syntheticSources = parseF6DockerfileSources(String.raw`
+# COPY ListeningPractice ignored-comment
+FROM scratch AS source
+COPY ListeningPractice /one
+COPY ./ReadingPractice /two
+COPY ["ListeningPractice/example", "/three"]
+ADD ReadingPractice/example /four
+COPY \
+  ./ListeningPractice/nested \
+  /five
+FROM scratch AS runtime
+COPY --from=source /verified-context/ReadingPractice /six
+`);
+    syntheticSources.push(
+        ...parseF6DockerfileSources([
+            'FROM scratch AS default-escaped-source',
+            `COPY Listening${String.fromCharCode(92)}Practice /seven`
+        ].join('\n')),
+        ...parseF6DockerfileSources([
+            '# escape=`',
+            'FROM scratch AS backtick-escaped-source',
+            'COPY Listening`Practice /eight'
+        ].join('\n')),
+        ...parseF6DockerfileSources([
+            'FROM scratch AS late-directive',
+            '# escape=`',
+            `COPY Listening${String.fromCharCode(92)}Practice /nine`
+        ].join('\n')),
+        ...parseF6DockerfileSources([
+            'FROM scratch AS default-spanning-source',
+            `COPY Listening${String.fromCharCode(92)}`,
+            'Practice /ten'
+        ].join('\n')),
+        ...parseF6DockerfileSources([
+            '# escape=`',
+            'FROM scratch AS backtick-spanning-source',
+            'COPY Reading`',
+            'Practice /eleven'
+        ].join('\n')),
+        ...parseF6DockerfileSources([
+            '# unknown=directive',
+            '# escape=`',
+            'FROM scratch AS unknown-directive-boundary',
+            `COPY Reading${String.fromCharCode(92)}Practice /twelve`
+        ].join('\n'))
+    );
+    assert.equal(syntheticSources.filter(({ sourcePath }) => isF6ProtectedDockerSource(sourcePath)).length, 12);
+
+    const dockerSources = parseF6DockerfileSources(dockerfile);
+    assert(dockerSources.length > 0, 'Dockerfile must contain parsed COPY or ADD sources');
+    for (const entry of dockerSources) {
+        assert(!isF6ProtectedDockerSource(entry.sourcePath), `${entry.instruction} must not source a protected practice root: ${entry.logicalLine}`);
+    }
+    const dockerStages = logicalF6DockerfileLines(dockerfile)
+        .filter(({ logicalLine }) => /^FROM(?:\s|$)/i.test(logicalLine));
+    assert(dockerStages.length > 0, 'Dockerfile must contain a build stage');
+    assert.match(dockerStages.at(-1).logicalLine, /\s+AS\s+runtime\s*$/i, 'runtime must be the final Dockerfile stage');
+    const finalStageIndex = dockerStages.length - 1;
+    const runtimeSources = dockerSources.filter(({ stageName }) => stageName?.toLowerCase() === 'runtime');
+    assert(runtimeSources.length > 0, 'Dockerfile must define a final runtime stage with COPY or ADD sources');
+    assert(runtimeSources.every(({ stageIndex }) => stageIndex === finalStageIndex), 'runtime must be the final stage that imports files');
+    for (const entry of runtimeSources) {
+        assert(!isF6ProtectedDockerSource(entry.sourcePath), `runtime stage must not source a protected practice root: ${entry.logicalLine}`);
+    }
+
+    const selectedPaths = [
+        ...manifest.includeExact.map((entry) => ({ entry, prefix: false })),
+        ...manifest.includePrefixes.map((entry) => ({ entry, prefix: true }))
+    ];
+    for (const protectedRoot of F6_PROTECTED_PRACTICE_ROOTS) {
+        for (const { entry, prefix } of selectedPaths) {
+            const normalized = path.posix.normalize(entry).replace(/^\.\//, '').replace(/\/$/, '').toLowerCase();
+            const selectsProtectedRoot = normalized === protectedRoot
+                || normalized.startsWith(`${protectedRoot}/`)
+                || (prefix && (normalized === '' || normalized === '.' || protectedRoot.startsWith(`${normalized}/`)));
+            assert(!selectsProtectedRoot, `public context manifest must not select ${protectedRoot}: ${entry}`);
+        }
+    }
+
+    const appService = extractF6ComposeService(compose, 'app');
+    const listeningMounts = extractF6ComposeVolumeItems(appService)
+        .filter((item) => item.includes('/app/ListeningPractice'));
+    assert.equal(listeningMounts.length, 1, 'app service must define exactly one Listening target mount');
+    assert.equal(listeningMounts[0], [
+        '      - type: bind',
+        '        source: ../ListeningPractice',
+        '        target: /app/ListeningPractice',
+        '        read_only: true',
+        '        bind:',
+        '          create_host_path: false'
+    ].join('\n'), 'app service must define the exact fail-closed Listening bind contract');
+
+    assert.match(runbook, /^## Runtime-only Listening resource overlay$/m);
+    assert.match(runbook, /public application image intentionally excludes private Listening\s+resources\./);
+    assert.match(runbook, /supplied only through the Compose runtime bind mount\. The overlay is\s+runtime-only/);
+    assert.match(runbook, /Image verification and running-service overlay verification are separate gates;/);
+    assert.match(runbook, /must not rebuild private Listening resources into\s+public image layers/);
+    assert.doesNotMatch(runbook, /^## Listening Runtime Assets$/m);
+    assert.doesNotMatch(runbook, /^- `ListeningPractice\/`$/m);
+    assert.doesNotMatch(runbook, /test\s+-d\s+\/app\/ListeningPractice/);
 });
 
 async function createClient(options = {}) {

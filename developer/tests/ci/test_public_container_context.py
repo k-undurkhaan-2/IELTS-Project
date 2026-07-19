@@ -39,6 +39,7 @@ GATEWAY = "developer/build-public-container.mjs"
 MANIFEST = "developer/public-container-context-manifest.json"
 COMPOSE = "backend/docker-compose.yml"
 DOCKERFILE = "backend/Dockerfile"
+RUNBOOK = "backend/DEPLOYMENT-RUNBOOK.md"
 RECEIPT = ".ieltmps-public-context.json"
 SENTINEL_CONTEXT = "../.build/BUILD_VIA_DEVELOPER_BUILD_PUBLIC_CONTAINER_MJS"
 IDENTITY_NAMES = (
@@ -46,6 +47,10 @@ IDENTITY_NAMES = (
     "IELTMPS_CONTEXT_MANIFEST_SHA256",
     "IELTMPS_CONTEXT_RECEIPT_SHA256",
 )
+F6_TRACKED_TEXT_PATHS = frozenset(
+    (MANIFEST, GENERATOR, VERIFIER, DOCKERFILE, COMPOSE, RUNBOOK)
+)
+F6_PROTECTED_ROOTS = frozenset(("listeningpractice", "readingpractice"))
 GIT_REDIRECTION_NAMES = {
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -89,6 +94,52 @@ def _json_bytes(value: object) -> bytes:
     return (json.dumps(value, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
 
 
+def _read_f6_tracked_text(relative: str) -> str:
+    if relative not in F6_TRACKED_TEXT_PATHS:
+        raise ValueError(f"F6 tracked-text path is not approved: {relative}")
+    normalized = PurePosixPath(relative)
+    if (
+        normalized.is_absolute()
+        or normalized.as_posix() != relative
+        or any(part in {"", ".", ".."} for part in normalized.parts)
+    ):
+        raise ValueError(f"F6 tracked-text path is not normalized: {relative}")
+    repo_resolved = REPO_ROOT.resolve(strict=True)
+    target = REPO_ROOT / normalized
+    target_absolute = Path(os.path.abspath(target))
+    try:
+        target_resolved = target.resolve(strict=True)
+    except OSError as error:
+        raise AssertionError(
+            f"approved F6 tracked-text path is not a regular file: {relative}"
+        ) from error
+    canonical = lambda path: os.path.normcase(os.path.normpath(str(path)))
+    if canonical(target_resolved) != canonical(target_absolute):
+        raise AssertionError(
+            f"approved F6 tracked-text path resolves through a link or reparse point: {relative}"
+        )
+    try:
+        target_resolved.relative_to(repo_resolved)
+    except ValueError as error:
+        raise AssertionError(
+            f"approved F6 tracked-text path resolves outside the repository: {relative}"
+        ) from error
+    if not target_resolved.is_file():
+        raise AssertionError(f"approved F6 tracked-text path is not a regular file: {relative}")
+    return target_resolved.read_text(encoding="utf-8")
+
+
+def _f6_javascript_string_collection(source: str, name: str) -> frozenset[str]:
+    match = re.search(
+        rf"const\s+{re.escape(name)}\s*=\s*(?:Object\.freeze|new Set)\(\[(.*?)\]\);",
+        source,
+        flags=re.DOTALL,
+    )
+    if match is None:
+        raise AssertionError(f"JavaScript string collection is missing: {name}")
+    return frozenset(re.findall(r'"([^"]+)"', match.group(1)))
+
+
 def _service_block(source: str, service_name: str) -> str | None:
     lines = source.splitlines()
     start = next(
@@ -105,22 +156,178 @@ def _service_block(source: str, service_name: str) -> str | None:
     return "\n".join(lines[start:end])
 
 
-def _logical_dockerfile_lines(source: str) -> list[str]:
-    logical: list[str] = []
-    pending = ""
+def _f6_logical_dockerfile_lines(source: str) -> list[tuple[str, str]]:
+    logical: list[tuple[str, str]] = []
+    pending: str | None = None
+    escape_character = "\\"
+    parser_directives_eligible = True
     for raw in source.splitlines():
         stripped = raw.strip()
+        directive = (
+            re.fullmatch(r"#\s*([A-Za-z][A-Za-z0-9_-]*)\s*=\s*(.*?)\s*", stripped)
+            if parser_directives_eligible and pending is None
+            else None
+        )
+        directive_name = directive.group(1).casefold() if directive else None
+        if directive and directive_name in {"syntax", "escape", "check"}:
+            if directive_name == "escape":
+                if directive.group(2) not in {"\\", "`"}:
+                    raise ValueError(
+                        "F6 Dockerfile escape directive must contain one supported character"
+                    )
+                escape_character = directive.group(2)
+            continue
+        parser_directives_eligible = False
         if not stripped or stripped.startswith("#"):
             continue
-        pending = f"{pending} {stripped}".strip()
-        if pending.endswith("\\"):
-            pending = pending[:-1].rstrip()
+        physical_line = raw.lstrip() if pending is None else raw
+        combined = f"{pending or ''}{physical_line}"
+        if physical_line.endswith(escape_character):
+            pending = combined[: -len(escape_character)]
             continue
-        logical.append(pending)
-        pending = ""
-    if pending:
-        logical.append(pending)
+        logical.append((combined.strip(), escape_character))
+        pending = None
+    if pending is not None:
+        raise ValueError("Dockerfile contains an unterminated continuation")
     return logical
+
+
+def _logical_dockerfile_lines(source: str) -> list[str]:
+    return [logical_line for logical_line, _ in _f6_logical_dockerfile_lines(source)]
+
+
+def _f6_split_docker_shell_words(value: str, escape_character: str) -> list[str]:
+    if escape_character not in {"\\", "`"}:
+        raise ValueError("F6 Dockerfile escape character must be known")
+    words: list[str] = []
+    current = ""
+    quote: str | None = None
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == escape_character:
+            if index + 1 >= len(value):
+                raise ValueError(
+                    "F6 Dockerfile shell form must not end with an escape character"
+                )
+            current += value[index + 1]
+            index += 2
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            else:
+                current += character
+            index += 1
+            continue
+        if character in {"\"", "'"}:
+            quote = character
+        elif character.isspace():
+            if current:
+                words.append(current)
+                current = ""
+        else:
+            current += character
+        index += 1
+    if quote is not None:
+        raise ValueError("F6 Dockerfile shell form must not contain an unterminated quote")
+    if current:
+        words.append(current)
+    return words
+
+
+def _f6_dockerfile_copy_add_sources(source: str) -> list[dict[str, object]]:
+    parsed: list[dict[str, object]] = []
+    stage_index = -1
+    stage_name: str | None = None
+    for logical_line, escape_character in _f6_logical_dockerfile_lines(source):
+        instruction_match = re.match(r"^([A-Za-z]+)\s+([\s\S]+)$", logical_line)
+        if instruction_match is None:
+            continue
+        instruction = instruction_match.group(1).upper()
+        if instruction == "FROM":
+            from_match = re.fullmatch(
+                r"FROM(?:\s+--[^\s]+)*\s+\S+(?:\s+AS\s+([A-Za-z0-9_.-]+))?",
+                logical_line,
+                flags=re.IGNORECASE,
+            )
+            if from_match is None:
+                raise ValueError(f"unsupported Dockerfile FROM instruction: {logical_line}")
+            stage_index += 1
+            stage_name = from_match.group(1)
+            continue
+        if instruction not in {"COPY", "ADD"}:
+            continue
+
+        arguments_text = instruction_match.group(2).lstrip()
+        flags: dict[str, str] = {}
+        while arguments_text.startswith("--"):
+            flag_match = re.match(
+                r"^--([A-Za-z][A-Za-z0-9_-]*)=([^\s]+)(?:\s+|$)",
+                arguments_text,
+            )
+            if flag_match is None:
+                raise ValueError(f"malformed Dockerfile {instruction} option: {logical_line}")
+            flag_name = flag_match.group(1).lower()
+            if flag_name in flags:
+                raise ValueError(f"duplicate Dockerfile {instruction} option: {flag_name}")
+            flags[flag_name] = flag_match.group(2)
+            arguments_text = arguments_text[flag_match.end():].lstrip()
+
+        if arguments_text.startswith("["):
+            arguments = json.loads(arguments_text)
+            if not isinstance(arguments, list) or not all(
+                isinstance(argument, str) for argument in arguments
+            ):
+                raise ValueError(f"Dockerfile {instruction} JSON form must contain strings")
+        else:
+            arguments = _f6_split_docker_shell_words(arguments_text, escape_character)
+        if len(arguments) < 2:
+            raise ValueError(f"Dockerfile {instruction} must contain source and destination")
+        for source_path in arguments[:-1]:
+            parsed.append(
+                {
+                    "instruction": instruction,
+                    "line": logical_line,
+                    "source": source_path,
+                    "stage_index": stage_index,
+                    "stage_name": stage_name,
+                    "from_stage": flags.get("from"),
+                }
+            )
+    return parsed
+
+
+def _f6_is_protected_docker_path(value: str) -> bool:
+    components = {
+        component.casefold()
+        for component in value.replace("\\", "/").split("/")
+        if component not in {"", ".", ".."}
+    }
+    return not components.isdisjoint(F6_PROTECTED_ROOTS)
+
+
+def _f6_compose_volume_items(service: str) -> list[str]:
+    lines = service.splitlines()
+    volume_headers = [
+        index for index, line in enumerate(lines) if line == "    volumes:"
+    ]
+    if len(volume_headers) != 1:
+        raise AssertionError("app service must define exactly one volumes section")
+    start = volume_headers[0] + 1
+    end = len(lines)
+    for index in range(start, len(lines)):
+        if re.fullmatch(r"    [A-Za-z0-9_-]+:", lines[index]):
+            end = index
+            break
+    volume_lines = lines[start:end]
+    item_starts = [
+        index for index, line in enumerate(volume_lines) if line.startswith("      - ")
+    ]
+    return [
+        "\n".join(volume_lines[item_start:item_end])
+        for item_start, item_end in zip(item_starts, [*item_starts[1:], len(volume_lines)])
+    ]
 
 
 class PublicContainerContextTest(unittest.TestCase):
@@ -132,7 +339,7 @@ class PublicContainerContextTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.node = _find_command("node", "NODE_EXE")
         cls.git = _find_command("git", "GIT_EXE")
-        required = [GENERATOR, VERIFIER, GATEWAY, MANIFEST, COMPOSE, DOCKERFILE]
+        required = [GENERATOR, VERIFIER, GATEWAY, MANIFEST, COMPOSE, DOCKERFILE, RUNBOOK]
         missing = [name for name in required if not (REPO_ROOT / name).is_file()]
         if missing:
             raise unittest.SkipTest("repository source is unavailable: " + ", ".join(missing))
@@ -1154,6 +1361,221 @@ if (process.env.IELTMPS_TEST_HOOK_RECORD) {
         self._assert_failure(result, "full context verification")
         self.assertFalse(record_path.exists())
         self.assertEqual(self._transaction_children(), [])
+
+    # Focused F6 runtime-only Listening overlay contract.
+
+    def test_f6_reader_is_limited_to_approved_tracked_files(self) -> None:
+        expected = frozenset(
+            {MANIFEST, GENERATOR, VERIFIER, DOCKERFILE, COMPOSE, RUNBOOK}
+        )
+        self.assertSetEqual(F6_TRACKED_TEXT_PATHS, expected)
+        for relative in sorted(F6_TRACKED_TEXT_PATHS):
+            with self.subTest(relative=relative):
+                tracked = self._git_at(
+                    REPO_ROOT,
+                    "ls-files",
+                    "--error-unmatch",
+                    "--",
+                    relative,
+                    original=True,
+                )
+                self.assertEqual(
+                    tracked.stdout.decode("utf-8").splitlines(),
+                    [relative],
+                )
+                self.assertIsInstance(_read_f6_tracked_text(relative), str)
+        with self.assertRaisesRegex(ValueError, "not approved"):
+            _read_f6_tracked_text("backend/package.json")
+
+    def test_f6_manifest_and_code_policies_deny_both_protected_roots(self) -> None:
+        manifest = json.loads(_read_f6_tracked_text(MANIFEST))
+        selections = [*manifest["includeExact"], *manifest["includePrefixes"]]
+        for selection in selections:
+            components = {
+                component.casefold()
+                for component in PurePosixPath(selection.rstrip("/")).parts
+            }
+            with self.subTest(selection=selection):
+                self.assertTrue(components.isdisjoint(F6_PROTECTED_ROOTS))
+
+        generator = _read_f6_tracked_text(GENERATOR)
+        verifier = _read_f6_tracked_text(VERIFIER)
+        generator_denials = _f6_javascript_string_collection(
+            generator, "DENIED_PATH_COMPONENTS"
+        )
+        verifier_denials = _f6_javascript_string_collection(
+            verifier, "FORBIDDEN_COMPONENTS"
+        )
+        self.assertSetEqual(
+            set(F6_PROTECTED_ROOTS),
+            set(F6_PROTECTED_ROOTS & generator_denials),
+        )
+        self.assertSetEqual(
+            set(F6_PROTECTED_ROOTS),
+            set(F6_PROTECTED_ROOTS & verifier_denials),
+        )
+        self.assertIn("|| hasDeniedComponent(relativePath)", generator)
+        self.assertIn(
+            "components.some((component) => FORBIDDEN_COMPONENTS.has(component))",
+            verifier,
+        )
+
+    def test_f6_dockerfile_parser_covers_common_protected_source_forms(self) -> None:
+        synthetic = r"""
+# COPY ListeningPractice ignored-comment
+FROM scratch AS source
+COPY ListeningPractice /one
+COPY ./ReadingPractice /two
+COPY ["ListeningPractice/example", "/three"]
+ADD ReadingPractice/example /four
+COPY \
+  ./ListeningPractice/nested \
+  /five
+FROM scratch AS runtime
+COPY --from=source /verified-context/ReadingPractice /six
+"""
+        parsed = _f6_dockerfile_copy_add_sources(synthetic)
+        parsed.extend(
+            _f6_dockerfile_copy_add_sources(
+                f"FROM scratch\nCOPY Listening{chr(92)}Practice /seven\n"
+            )
+        )
+        parsed.extend(
+            _f6_dockerfile_copy_add_sources(
+                "# escape=`\nFROM scratch\nCOPY Listening`Practice /eight\n"
+            )
+        )
+        parsed.extend(
+            _f6_dockerfile_copy_add_sources(
+                f"FROM scratch\n# escape=`\nCOPY Listening{chr(92)}Practice /nine\n"
+            )
+        )
+        parsed.extend(
+            _f6_dockerfile_copy_add_sources(
+                f"FROM scratch\nCOPY Listening{chr(92)}\nPractice /ten\n"
+            )
+        )
+        parsed.extend(
+            _f6_dockerfile_copy_add_sources(
+                "# escape=`\nFROM scratch\nCOPY Reading`\nPractice /eleven\n"
+            )
+        )
+        parsed.extend(
+            _f6_dockerfile_copy_add_sources(
+                f"# unknown=directive\n# escape=`\nFROM scratch\nCOPY Reading{chr(92)}Practice /twelve\n"
+            )
+        )
+        protected = [
+            entry for entry in parsed if _f6_is_protected_docker_path(str(entry["source"]))
+        ]
+        self.assertEqual(len(protected), 12)
+        self.assertSetEqual(
+            {str(entry["instruction"]) for entry in protected},
+            {"COPY", "ADD"},
+        )
+
+    def test_f6_dockerfile_has_no_protected_sources_and_runtime_is_verified(self) -> None:
+        dockerfile = _read_f6_tracked_text(DOCKERFILE)
+        parsed = _f6_dockerfile_copy_add_sources(dockerfile)
+        self.assertTrue(parsed)
+        for entry in parsed:
+            with self.subTest(line=entry["line"]):
+                self.assertFalse(
+                    _f6_is_protected_docker_path(str(entry["source"]))
+                )
+
+        logical_lines = _f6_logical_dockerfile_lines(dockerfile)
+        from_entries = [
+            (index, logical_line)
+            for index, (logical_line, _) in enumerate(logical_lines)
+            if re.match(r"(?i)^FROM(?:\s|$)", logical_line)
+        ]
+        self.assertTrue(from_entries)
+        last_from_index, last_from = from_entries[-1]
+        last_from_match = re.fullmatch(
+            r"FROM(?:\s+--[^\s]+)*\s+\S+(?:\s+AS\s+([A-Za-z0-9_.-]+))?\s*",
+            last_from,
+            flags=re.IGNORECASE,
+        )
+        self.assertIsNotNone(last_from_match)
+        last_stage_name = last_from_match.group(1) if last_from_match else None
+        self.assertEqual((last_stage_name or "").casefold(), "runtime")
+        runtime_index = len(from_entries) - 1
+        runtime_entries = [
+            entry for entry in parsed if entry["stage_index"] == runtime_index
+        ]
+        self.assertTrue(runtime_entries)
+        for entry in runtime_entries:
+            with self.subTest(line=entry["line"]):
+                self.assertEqual(entry["instruction"], "COPY")
+                self.assertEqual(entry["from_stage"], "verified-context")
+        for logical_line, _ in logical_lines[last_from_index + 1:]:
+            self.assertNotRegex(logical_line, r"(?i)^RUN\s+--mount=")
+
+    def test_f6_compose_listening_mount_is_one_fail_closed_bind(self) -> None:
+        app = _service_block(_read_f6_tracked_text(COMPOSE), "app")
+        self.assertIsNotNone(app)
+        items = _f6_compose_volume_items(app or "")
+        listening = [
+            item
+            for item in items
+            if "/app/ListeningPractice" in item
+        ]
+        self.assertEqual(len(listening), 1)
+        mount = listening[0]
+        self.assertEqual(
+            mount,
+            "\n".join(
+                (
+                    "      - type: bind",
+                    "        source: ../ListeningPractice",
+                    "        target: /app/ListeningPractice",
+                    "        read_only: true",
+                    "        bind:",
+                    "          create_host_path: false",
+                )
+            ),
+        )
+
+    def test_f6_runbook_separates_image_and_runtime_readiness(self) -> None:
+        runbook = _read_f6_tracked_text(RUNBOOK)
+        self.assertNotIn("- `ListeningPractice/`", runbook)
+        self.assertNotRegex(runbook, r"test\s+-d\s+/app/ListeningPractice")
+
+        marker = "## Runtime-only Listening resource overlay"
+        start = runbook.index(marker)
+        following = re.search(r"(?m)^##\s+", runbook[start + len(marker):])
+        end = (
+            start + len(marker) + following.start()
+            if following is not None
+            else len(runbook)
+        )
+        section = runbook[start:end]
+        stage_a_start = section.index("### Stage A - Public image verification")
+        stage_b_start = section.index("### Stage B - Running-service overlay readiness")
+        stage_a = section[stage_a_start:stage_b_start]
+        stage_b = section[stage_b_start:]
+        collapsed = re.sub(r"\s+", " ", section)
+
+        self.assertNotIn("/app/ListeningPractice", stage_a)
+        self.assertIn("/app/ListeningPractice", stage_b)
+        for required in (
+            "public application image intentionally excludes private Listening resources",
+            "private resource root is absent from public image layers",
+            "resources are provisioned separately from public image construction",
+            "supplied only through the Compose runtime bind mount",
+            "The overlay is runtime-only",
+            "The bind mount must be read-only",
+            "Compose-configured host source must already exist before Compose starts",
+            "create_host_path` false",
+            "Missing, unauthorized, unreadable, or incomplete overlay resources block readiness and launch",
+            "Image verification and running-service overlay verification are separate gates",
+            "passing either gate does not satisfy the other",
+            "must not rebuild private Listening resources into public image layers",
+            "authorization, manifesting, hashing, delivery, and rollback remain separately governed private-runtime procedures",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, collapsed)
 
     # Part I 37-45: Dockerfile, Compose, and ignore-file structural gates.
 
