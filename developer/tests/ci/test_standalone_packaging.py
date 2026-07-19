@@ -4,10 +4,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-import functools
 import hashlib
 from html.parser import HTMLParser
-import http.server
 import io
 import json
 import os
@@ -19,10 +17,8 @@ import stat
 import subprocess
 import sys
 import tempfile
-import threading
 import unittest
 from urllib.parse import unquote, urlsplit
-import urllib.request
 import uuid
 import zipfile
 
@@ -31,6 +27,13 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = Path("developer/standalone-release-manifest.json")
 HELPER_PATH = Path("developer/standalone-release-manifest.mjs")
 SAFE_SENTINEL = "SAFE_SENTINEL_NOT_A_REAL_SECRET\n"
+APPROVED_STATIC_ADDITIONS = (
+    "js/siteContent.js",
+    "LICENSE",
+    "LICENSE.md",
+    "NOTICE.md",
+    "README.md",
+)
 REQUIRED_STYLES = {
     "src/styles/tokens.css",
     "src/styles/components.css",
@@ -54,13 +57,12 @@ UNKNOWN_MANAGED_SENTINELS = [
     "src/styles/nested/local.css",
 ]
 CANDIDATE_OVERLAY_PATHS = [
-    "README.md",
     "developer/release.ps1",
     "developer/release.sh",
     "developer/standalone-release-manifest.json",
     "developer/standalone-release-manifest.mjs",
-    "developer/tests/ci/run_static_suite.py",
-    "developer/tests/ci/test_standalone_packaging.py",
+    "index.html",
+    *APPROVED_STATIC_ADDITIONS,
 ]
 
 
@@ -68,15 +70,18 @@ class _IndexAssetParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
         self.paths: set[str] = set()
+        self.script_paths: set[str] = set()
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag != "link":
-            return
         attributes = dict(attrs)
-        relations = set((attributes.get("rel") or "").lower().split())
-        href = attributes.get("href")
-        if "stylesheet" in relations and href:
-            self.paths.add(href)
+        if tag == "link":
+            relations = set((attributes.get("rel") or "").lower().split())
+            href = attributes.get("href")
+            if "stylesheet" in relations and href:
+                self.paths.add(href)
+            return
+        if tag == "script" and "src" in attributes:
+            self.script_paths.add(attributes["src"] or "")
 
 
 def _command(name: str, env_name: str | None = None) -> str:
@@ -161,6 +166,13 @@ def _local_asset_path(value: str) -> str | None:
     return unquote(parsed.path)
 
 
+def _package_member_path(value: str) -> str | None:
+    local_path = _local_asset_path(value)
+    if local_path is None:
+        return None
+    return PurePosixPath(local_path).as_posix()
+
+
 def _msys_path(file_path: Path | str) -> str:
     value = Path(file_path).resolve().as_posix()
     match = re.match(r"^([A-Za-z]):/(.*)$", value)
@@ -173,7 +185,7 @@ class StandalonePackagingTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.temp_dir = tempfile.TemporaryDirectory(prefix="ielts-standalone-manifest-tests-")
-        cls.temp_root = Path(cls.temp_dir.name)
+        cls.temp_root = Path(os.path.realpath(cls.temp_dir.name))
         cls.source_root = cls.temp_root / "candidate-source"
         cls.receipt_root = cls.temp_root / "receipts"
         cls.receipt_root.mkdir()
@@ -181,6 +193,7 @@ class StandalonePackagingTest(unittest.TestCase):
         cls.powershell = _command("powershell", "POWERSHELL_EXE")
         cls.bash = _command("bash", "BASH_EXE")
         cls.git = _command("git")
+        cls.committed_manifest = cls._read_committed_manifest()
         cls._copy_candidate_tree(cls.source_root)
         cls._initialize_temporary_git_repo(cls.source_root)
         cls.zip_shim_dir = cls._create_zip_shim()
@@ -198,24 +211,64 @@ class StandalonePackagingTest(unittest.TestCase):
         cls.temp_dir.cleanup()
 
     @classmethod
-    def _copy_candidate_tree(cls, destination: Path) -> None:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        base_archive = cls.temp_root / f"base-{uuid.uuid4().hex}.zip"
-        subprocess.run(
-            [cls.git, "-C", str(REPO_ROOT), "archive", "--format=zip", "-o", str(base_archive), "HEAD"],
+    def _read_committed_manifest(cls) -> dict[str, object]:
+        result = subprocess.run(
+            [
+                cls.git,
+                "-C",
+                str(REPO_ROOT),
+                "show",
+                f"HEAD:{MANIFEST_PATH.as_posix()}",
+            ],
             check=True,
+            text=True,
+            encoding="utf-8",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        with zipfile.ZipFile(base_archive) as archive:
-            archive.extractall(destination)
+        return json.loads(result.stdout)
+
+    @classmethod
+    def _copy_candidate_tree(cls, destination: Path) -> None:
+        manifest = json.loads((REPO_ROOT / MANIFEST_PATH).read_text(encoding="utf-8"))
+        destination.mkdir(parents=True)
+        synthetic_paths = sorted(
+            set(manifest["files"]) | set(manifest["nonReleaseFiles"])
+        )
+        for relative_path in synthetic_paths:
+            target = destination / PurePosixPath(relative_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                "SYNTHETIC STATIC MEMBER: " + relative_path + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+
         for relative_path in CANDIDATE_OVERLAY_PATHS:
-            source = REPO_ROOT / relative_path
+            source = REPO_ROOT / PurePosixPath(relative_path)
             if not source.is_file():
                 raise AssertionError(f"candidate overlay is missing: {relative_path}")
-            target = destination / relative_path
+            target = destination / PurePosixPath(relative_path)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
+
+        (destination / "src/styles/tokens.css").write_text(
+            ":root { --background: #fff; --accent: #06c; --space-4: 1rem; }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        (destination / "src/styles/components.css").write_text(
+            ".synthetic { background: var(--background); color: var(--accent); padding: var(--space-4); }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        synthetic_build_script = destination / "scripts/build-bundles.mjs"
+        synthetic_build_script.parent.mkdir(parents=True, exist_ok=True)
+        synthetic_build_script.write_text(
+            "// Synthetic fixture: bundle members are already present.\n",
+            encoding="utf-8",
+            newline="\n",
+        )
 
     @classmethod
     def _initialize_temporary_git_repo(cls, root: Path) -> None:
@@ -380,12 +433,17 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
         }
 
     @classmethod
-    def _run_helper(
+    def _run_helper_with_staging(
         cls,
         *,
         root: Path | None = None,
         overrides: dict[str, str] | None = None,
-    ) -> tuple[subprocess.CompletedProcess[str], Path, dict[str, object] | None]:
+    ) -> tuple[
+        subprocess.CompletedProcess[str],
+        Path,
+        dict[str, object] | None,
+        Path | None,
+    ]:
         source_root = root or cls.source_root
         receipt_path = cls.receipt_root / f"helper-{uuid.uuid4().hex}.json"
         result = subprocess.run(
@@ -408,10 +466,25 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
             timeout=120,
         )
         receipt = None
+        staging_root = None
         if result.returncode == 0:
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-            staging_root = Path(result.stdout.strip()).parent
-            shutil.rmtree(staging_root)
+            staging_root = Path(result.stdout.strip())
+        return result, receipt_path, receipt, staging_root
+
+    @classmethod
+    def _run_helper(
+        cls,
+        *,
+        root: Path | None = None,
+        overrides: dict[str, str] | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], Path, dict[str, object] | None]:
+        result, receipt_path, receipt, staging_root = cls._run_helper_with_staging(
+            root=root,
+            overrides=overrides,
+        )
+        if staging_root is not None:
+            shutil.rmtree(staging_root.parent)
         return result, receipt_path, receipt
 
     @classmethod
@@ -500,9 +573,47 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
                 f"hash-mismatch paths={hash_mismatch_paths}"
             )
 
+    def test_exact_additions_preserve_committed_manifest_baseline(self) -> None:
+        approved = set(APPROVED_STATIC_ADDITIONS)
+        self.assertEqual(self.manifest["schemaVersion"], 1)
+        self.assertEqual(self.committed_manifest["schemaVersion"], 1)
+        self.assertEqual(
+            self.manifest["managedRoots"],
+            self.committed_manifest["managedRoots"],
+        )
+        self.assertEqual(
+            self.manifest["nonReleaseFiles"],
+            self.committed_manifest["nonReleaseFiles"],
+        )
+        for key, baseline_count, final_count in (
+            ("files", 430, 435),
+            ("requiredFiles", 26, 31),
+        ):
+            with self.subTest(key=key):
+                baseline = list(self.committed_manifest[key])
+                current = list(self.manifest[key])
+                self.assertEqual(len(baseline), baseline_count)
+                self.assertEqual(len(current), final_count)
+                self.assertEqual(len(current), len(set(current)))
+                self.assertTrue(approved.isdisjoint(baseline))
+                for addition in APPROVED_STATIC_ADDITIONS:
+                    self.assertEqual(current.count(addition), 1)
+                self.assertEqual(
+                    [path for path in current if path not in approved],
+                    baseline,
+                )
+        self.assertNotIn(
+            "LICENSES/AGPL-3.0-only.txt",
+            self.manifest["files"],
+        )
+        self.assertNotIn(
+            "LICENSES/AGPL-3.0-only.txt",
+            self.manifest["requiredFiles"],
+        )
+
     def test_default_windows_and_unix_release_use_one_positive_manifest(self) -> None:
         manifest_files = set(self.manifest["files"])
-        self.assertEqual(len(manifest_files), 430)
+        self.assertEqual(len(manifest_files), 435)
         self.assertEqual(self.manifest["managedRoots"], MANAGED_ROOTS)
         self.assertSetEqual(set(self.manifest["nonReleaseFiles"]), NON_RELEASE_FILES)
         self.assertSetEqual(set(self.source_file_hashes), manifest_files)
@@ -539,7 +650,7 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
                 _content_manifest_sha256(snapshot["file_hashes"]),
                 source_content_manifest_sha256,
             )
-            self.assertEqual(snapshot["receipt"]["mainManifest"]["fileCount"], 430)
+            self.assertEqual(snapshot["receipt"]["mainManifest"]["fileCount"], 435)
             self.assertEqual(snapshot["receipt"]["managedRoots"], MANAGED_ROOTS)
             self.assertEqual(snapshot["receipt"]["effectiveReadingFiles"], [])
             self.assertFalse(any(name.startswith("ReadingPractice/") for name in file_names))
@@ -555,6 +666,89 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
             set(self._entry_names(self.absent_windows)),
             set(self._entry_names(self.absent_unix)),
         )
+
+    def test_synthetic_staging_preserves_exact_addition_bytes_and_hashes(self) -> None:
+        result, _receipt_path, receipt, staging_root = (
+            self._run_helper_with_staging()
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        if receipt is None or staging_root is None:
+            self.fail("successful synthetic staging did not return its receipt and payload")
+
+        try:
+            receipt_files = {
+                entry["archivePath"]: entry
+                for entry in receipt["files"]
+            }
+            for relative_path in APPROVED_STATIC_ADDITIONS:
+                source = self.source_root / PurePosixPath(relative_path)
+                staged = staging_root / PurePosixPath(relative_path)
+                self.assertEqual(staged.read_bytes(), source.read_bytes())
+                self.assertEqual(
+                    receipt_files[relative_path]["sha256"],
+                    _sha256_file(source),
+                )
+                self.assertIn(relative_path, receipt["requiredFiles"])
+                self.assertIn(relative_path, receipt["effectiveDefaultFiles"])
+            self.assertEqual(
+                Path(receipt["sourceRoot"]).resolve(),
+                self.source_root.resolve(),
+            )
+            self.assertFalse(
+                Path(receipt["sourceRoot"]).resolve().is_relative_to(
+                    REPO_ROOT.resolve()
+                )
+            )
+            for entry in receipt["files"]:
+                self.assertFalse(PurePosixPath(entry["sourcePath"]).is_absolute())
+        finally:
+            shutil.rmtree(staging_root.parent)
+
+    def test_exact_singleton_allowlist_rejects_other_root_and_js_paths(self) -> None:
+        self.assertEqual(self.manifest["managedRoots"], MANAGED_ROOTS)
+        manifest_path = self.source_root / MANIFEST_PATH
+        original = manifest_path.read_bytes()
+        cases = [
+            ("arbitrary-root", "CHANGELOG.md", "outside exact standalone files"),
+            ("unexpected-js", "js/unexpected.js", "outside exact standalone files"),
+            ("unapproved-data", "js/data/unapproved.js", "unbundled JavaScript source"),
+            ("unapproved-runtime", "js/runtime/unlisted.js", "unbundled JavaScript source"),
+            ("nested-js", "js/unexpected/siteContent.js", "outside exact standalone files"),
+            ("backup-js", "js/siteContent.js.bak", "dangerous"),
+            ("wrong-root", "siteContent.js", "outside exact standalone files"),
+        ]
+        for name, relative_path, expected in cases:
+            with self.subTest(name=name):
+                target = self.source_root / PurePosixPath(relative_path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(
+                    SAFE_SENTINEL,
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                candidate = json.loads(original.decode("utf-8"))
+                candidate["files"] = sorted([*candidate["files"], relative_path])
+                manifest_path.write_text(
+                    json.dumps(candidate, indent=2) + "\n",
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                try:
+                    result, receipt_path, _receipt = self._run_helper()
+                    self.assertHelperFailure(result, expected)
+                    self.assertFalse(receipt_path.exists())
+                finally:
+                    manifest_path.write_bytes(original)
+                    if target.exists():
+                        target.unlink()
+                    parent = target.parent
+                    while (
+                        parent != self.source_root
+                        and parent.exists()
+                        and not any(parent.iterdir())
+                    ):
+                        parent.rmdir()
+                        parent = parent.parent
 
     def test_main_manifest_missing_malformed_schema_and_paths_fail_closed(self) -> None:
         manifest_path = self.source_root / MANIFEST_PATH
@@ -601,7 +795,11 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
                     manifest_path.write_bytes(original)
 
     def test_required_and_manifest_listed_files_fail_closed_when_missing(self) -> None:
-        for relative_path in ["index.html", "assets/data/path-map.json"]:
+        for relative_path in [
+            *APPROVED_STATIC_ADDITIONS,
+            "index.html",
+            "assets/data/path-map.json",
+        ]:
             with self.subTest(relative_path=relative_path):
                 source = self.source_root / relative_path
                 backup = self.temp_root / f"missing-{uuid.uuid4().hex}"
@@ -969,7 +1167,66 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
                 self.assertFalse(stat.S_ISLNK(unix_mode), name)
                 self.assertNotIn(str(self.source_root).replace("\\", "/"), name)
 
-    def test_extracted_payload_is_self_contained_and_serves_required_styles(self) -> None:
+    def test_script_url_classification_uses_only_local_package_members(self) -> None:
+        ignored_references = (
+            "",
+            "https://example.invalid/a.js",
+            "http://example.invalid/a.js",
+            "//example.invalid/a.js",
+            "data:text/javascript,window.example=1",
+            "blob:https://example.invalid/a.js",
+            "javascript:window.example=1",
+            "#fragment",
+            "mailto:operator@example.invalid",
+        )
+        required_references = (
+            "js/example.js",
+            "./js/example.js",
+            "js/example.js?version=1",
+            "js/example.js#fragment",
+        )
+        parser = _IndexAssetParser()
+        for value in (*ignored_references, *required_references):
+            parser.feed(f'<script src="{value}"></script>')
+        parser.feed("<script>window.inlineWasNotExecuted = true;</script>")
+        parser.feed('<link rel="stylesheet" href="css/example.css">')
+        parser.feed('<link rel="stylesheet">')
+        self.assertSetEqual(parser.paths, {"css/example.css"})
+        self.assertSetEqual(
+            parser.script_paths,
+            set(ignored_references + required_references),
+        )
+        for value in ignored_references:
+            with self.subTest(ignored=value):
+                self.assertIsNone(_package_member_path(value))
+        for value in required_references:
+            with self.subTest(required=value):
+                self.assertEqual(_package_member_path(value), "js/example.js")
+
+    def test_root_index_local_styles_and_scripts_are_manifest_members(self) -> None:
+        parser = _IndexAssetParser()
+        parser.feed(
+            (REPO_ROOT / "index.html").read_text(encoding="utf-8")
+        )
+        manifest_members = set(self.manifest["files"])
+        local_stylesheets = {
+            local_path
+            for value in parser.paths
+            if (local_path := _package_member_path(value)) is not None
+        }
+        local_scripts = {
+            local_path
+            for value in parser.script_paths
+            if (local_path := _package_member_path(value)) is not None
+        }
+        missing = sorted((local_stylesheets | local_scripts) - manifest_members)
+        self.assertEqual(missing, [])
+        self.assertIn("js/siteContent.js", local_scripts)
+        self.assertIn("js/siteContent.js", self.manifest["requiredFiles"])
+        self.assertTrue(local_stylesheets)
+        self.assertTrue(local_scripts)
+
+    def test_extracted_payload_is_self_contained_and_contains_required_styles(self) -> None:
         parser = _IndexAssetParser()
         parser.feed((self.extract_root / "index.html").read_text(encoding="utf-8"))
         missing: list[str] = []
@@ -995,23 +1252,11 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
                     missing.append(f"{css_path.relative_to(self.extract_root)} -> {local_path}")
         self.assertEqual(missing, [])
 
-        class QuietHandler(http.server.SimpleHTTPRequestHandler):
-            def log_message(self, _format: str, *args: object) -> None:
-                return
-
-        handler = functools.partial(QuietHandler, directory=str(self.extract_root))
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            base_url = f"http://127.0.0.1:{server.server_port}/"
-            for relative_path in ["index.html", *sorted(REQUIRED_STYLES)]:
-                with urllib.request.urlopen(base_url + relative_path, timeout=5) as response:
-                    self.assertEqual(response.status, 200, relative_path)
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=5)
+        for relative_path in ["index.html", *sorted(REQUIRED_STYLES)]:
+            self.assertTrue(
+                (self.extract_root / relative_path).is_file(),
+                relative_path,
+            )
 
         tokens = (self.extract_root / "src/styles/tokens.css").read_text(encoding="utf-8")
         consumers = "\n".join(

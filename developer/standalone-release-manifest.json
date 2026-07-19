@@ -14,6 +14,10 @@
                              "assets/scripts/generate_reading_explanations_with_agent.py"
                          ],
     "requiredFiles":  [
+                          "LICENSE",
+                          "LICENSE.md",
+                          "NOTICE.md",
+                          "README.md",
                           "assets/generated/reading-exams/manifest.js",
                           "assets/generated/reading-exams/reading-practice-unified.html",
                           "assets/scripts/complete-exam-data.js",
@@ -37,11 +41,16 @@
                           "js/bundles/settings.bundle.js",
                           "js/bundles/theme.bundle.js",
                           "js/bundles/ui-shell.bundle.js",
+                          "js/siteContent.js",
                           "src/styles/components.css",
                           "src/styles/layout.css",
                           "src/styles/tokens.css"
                       ],
     "files":  [
+                  "LICENSE",
+                  "LICENSE.md",
+                  "NOTICE.md",
+                  "README.md",
                   "assets/data/path-map.json",
                   "assets/data/vocabulary.json",
                   "assets/fonts/wenkai-regular.woff2",
@@ -469,6 +478,7 @@
                   "js/bundles/settings.bundle.js",
                   "js/bundles/theme.bundle.js",
                   "js/bundles/ui-shell.bundle.js",
+                  "js/siteContent.js",
                   "src/styles/components.css",
                   "src/styles/layout.css",
                   "src/styles/tokens.css"

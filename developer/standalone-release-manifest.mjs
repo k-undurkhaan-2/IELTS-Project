@@ -22,6 +22,14 @@ import { fileURLToPath } from "node:url";
 const SCHEMA_VERSION = 1;
 const MANIFEST_RELATIVE_PATH = "developer/standalone-release-manifest.json";
 const EXPECTED_MANAGED_ROOTS = ["assets", "css", "js/bundles", "src/styles"];
+const EXACT_STANDALONE_FILES = new Set([
+  "index.html",
+  "js/siteContent.js",
+  "LICENSE",
+  "LICENSE.md",
+  "NOTICE.md",
+  "README.md",
+]);
 const READING_ROOT = "ReadingPractice";
 const LEGACY_LISTENING_SWITCH = "INCLUDE_LOCAL_LISTENING";
 const READING_MANIFEST_VARIABLE = "READING_PRACTICE_PUBLIC_MANIFEST";
@@ -300,8 +308,8 @@ function validateMainManifest(manifest) {
     if (relativePath.startsWith(`${READING_ROOT}/`) || relativePath === READING_ROOT) {
       fail(`ReadingPractice must be authorized only by the external manifest: ${relativePath}`);
     }
-    if (relativePath !== "index.html" && !managedRoots.some((root) => isWithinManagedRoot(relativePath, root))) {
-      fail(`main manifest path is outside index.html and managedRoots: ${relativePath}`);
+    if (!EXACT_STANDALONE_FILES.has(relativePath) && !managedRoots.some((root) => isWithinManagedRoot(relativePath, root))) {
+      fail(`main manifest path is outside exact standalone files and managedRoots: ${relativePath}`);
     }
   }
 
