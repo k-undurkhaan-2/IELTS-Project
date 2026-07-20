@@ -34,6 +34,12 @@ APPROVED_STATIC_ADDITIONS = (
     "NOTICE.md",
     "README.md",
 )
+APPROVED_PRE_R1_1A_FILES_SHA256 = (
+    "44d1e483deb293f1834e69ac258f7af18aad54934a1ea45687e40e841571cfc1"
+)
+APPROVED_PRE_R1_1A_REQUIRED_FILES_SHA256 = (
+    "7284d84047aa4575db39f2e42e3e7d6afda7151968eaa5b38465979e7fbfdd68"
+)
 REQUIRED_STYLES = {
     "src/styles/tokens.css",
     "src/styles/components.css",
@@ -106,6 +112,11 @@ def _sha256_bytes(content: bytes) -> str:
 
 def _sha256_file(file_path: Path) -> str:
     return _sha256_bytes(file_path.read_bytes())
+
+
+def _canonical_ordered_array_sha256(values: list[str]) -> str:
+    serialized = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+    return _sha256_bytes(serialized.encode("utf-8"))
 
 
 def _content_manifest_sha256(file_hashes: dict[str, str]) -> str:
@@ -193,7 +204,6 @@ class StandalonePackagingTest(unittest.TestCase):
         cls.powershell = _command("powershell", "POWERSHELL_EXE")
         cls.bash = _command("bash", "BASH_EXE")
         cls.git = _command("git")
-        cls.committed_manifest = cls._read_committed_manifest()
         cls._copy_candidate_tree(cls.source_root)
         cls._initialize_temporary_git_repo(cls.source_root)
         cls.zip_shim_dir = cls._create_zip_shim()
@@ -209,24 +219,6 @@ class StandalonePackagingTest(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         cls.temp_dir.cleanup()
-
-    @classmethod
-    def _read_committed_manifest(cls) -> dict[str, object]:
-        result = subprocess.run(
-            [
-                cls.git,
-                "-C",
-                str(REPO_ROOT),
-                "show",
-                f"HEAD:{MANIFEST_PATH.as_posix()}",
-            ],
-            check=True,
-            text=True,
-            encoding="utf-8",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        return json.loads(result.stdout)
 
     @classmethod
     def _copy_candidate_tree(cls, destination: Path) -> None:
@@ -573,34 +565,42 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
                 f"hash-mismatch paths={hash_mismatch_paths}"
             )
 
-    def test_exact_additions_preserve_committed_manifest_baseline(self) -> None:
+    def test_exact_additions_preserve_approved_pre_r1_1a_contract(self) -> None:
         approved = set(APPROVED_STATIC_ADDITIONS)
         self.assertEqual(self.manifest["schemaVersion"], 1)
-        self.assertEqual(self.committed_manifest["schemaVersion"], 1)
-        self.assertEqual(
-            self.manifest["managedRoots"],
-            self.committed_manifest["managedRoots"],
-        )
-        self.assertEqual(
-            self.manifest["nonReleaseFiles"],
-            self.committed_manifest["nonReleaseFiles"],
-        )
-        for key, baseline_count, final_count in (
-            ("files", 430, 435),
-            ("requiredFiles", 26, 31),
+        self.assertEqual(self.manifest["managedRoots"], MANAGED_ROOTS)
+        self.assertSetEqual(set(self.manifest["nonReleaseFiles"]), NON_RELEASE_FILES)
+        for key, baseline_count, final_count, baseline_sha256 in (
+            ("files", 430, 435, APPROVED_PRE_R1_1A_FILES_SHA256),
+            (
+                "requiredFiles",
+                26,
+                31,
+                APPROVED_PRE_R1_1A_REQUIRED_FILES_SHA256,
+            ),
         ):
             with self.subTest(key=key):
-                baseline = list(self.committed_manifest[key])
                 current = list(self.manifest[key])
-                self.assertEqual(len(baseline), baseline_count)
+                baseline = [path for path in current if path not in approved]
                 self.assertEqual(len(current), final_count)
+                self.assertEqual(len(baseline), baseline_count)
+                self.assertEqual(current, sorted(current))
                 self.assertEqual(len(current), len(set(current)))
                 self.assertTrue(approved.isdisjoint(baseline))
+                for path in current:
+                    normalized_path = PurePosixPath(path)
+                    self.assertEqual(normalized_path.as_posix(), path)
+                    self.assertNotIn("\\", path)
+                    self.assertFalse(normalized_path.is_absolute(), path)
+                    self.assertIsNone(re.match(r"^[A-Za-z]:", path), path)
+                    self.assertNotIn("..", normalized_path.parts, path)
+                    self.assertFalse(path.endswith("/"), path)
+                    self.assertIsNone(re.search(r"[*?\[\]{}]", path), path)
                 for addition in APPROVED_STATIC_ADDITIONS:
                     self.assertEqual(current.count(addition), 1)
                 self.assertEqual(
-                    [path for path in current if path not in approved],
-                    baseline,
+                    _canonical_ordered_array_sha256(baseline),
+                    baseline_sha256,
                 )
         self.assertNotIn(
             "LICENSES/AGPL-3.0-only.txt",
