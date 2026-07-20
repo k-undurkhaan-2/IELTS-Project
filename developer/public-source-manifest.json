@@ -1,0 +1,333 @@
+{
+  "schemaVersion": 1,
+  "artifactKind": "public-code-corresponding-source",
+  "selectionBasis": "git-commit-tree",
+  "policyProfile": "public-source-foundation-v1",
+  "licenseScopes": [
+    {
+      "id": "eligible-server-source",
+      "label": "GNU Affero General Public License version 3 only",
+      "spdx": "AGPL-3.0-only",
+      "status": "resolved"
+    },
+    {
+      "id": "frontend",
+      "label": "GPLv3-family",
+      "spdx": null,
+      "status": "unresolved-exact-identifier",
+      "blocker": "D6"
+    },
+    {
+      "id": "governance-context",
+      "label": "scope-not-finalized",
+      "spdx": null,
+      "status": "unresolved"
+    },
+    {
+      "id": "license-texts",
+      "label": "legal-text-role",
+      "spdx": null,
+      "status": "not-a-license-claim"
+    },
+    {
+      "id": "shared-build-tooling",
+      "label": "scope-not-finalized",
+      "spdx": null,
+      "status": "unresolved"
+    },
+    {
+      "id": "third-party",
+      "label": "per-component-record",
+      "spdx": null,
+      "status": "component-record-required"
+    }
+  ],
+  "components": [
+    {
+      "id": "eligible-server-source",
+      "selectors": {
+        "includeExact": [
+          "api-contract/README.md",
+          "backend/Dockerfile",
+          "backend/package.json"
+        ],
+        "includePrefixes": [
+          "backend/admin/",
+          "backend/auth/",
+          "backend/migrations/",
+          "backend/scripts/",
+          "backend/src/",
+          "backend/test/"
+        ]
+      },
+      "pathRole": "preferred-source",
+      "licenseScope": "eligible-server-source",
+      "preferredSourceStatus": "preferred-editable",
+      "securityReviewStatus": "not-required",
+      "rightsReviewStatus": "not-required",
+      "requirementStatus": "required"
+    },
+    {
+      "id": "frontend-build-tooling",
+      "selectors": {
+        "includeExact": [
+          "scripts/build-bundles.mjs",
+          "scripts/bundle-manifest.mjs"
+        ],
+        "includePrefixes": []
+      },
+      "pathRole": "build-source",
+      "licenseScope": "shared-build-tooling",
+      "preferredSourceStatus": "preferred-editable",
+      "securityReviewStatus": "not-required",
+      "rightsReviewStatus": "not-required",
+      "requirementStatus": "required"
+    },
+    {
+      "id": "frontend-preferred-source",
+      "selectors": {
+        "includeExact": [
+          "index.html"
+        ],
+        "includePrefixes": [
+          "css/",
+          "js/",
+          "src/styles/"
+        ]
+      },
+      "pathRole": "preferred-source",
+      "licenseScope": "frontend",
+      "preferredSourceStatus": "preferred-editable",
+      "securityReviewStatus": "not-required",
+      "rightsReviewStatus": "not-required",
+      "requirementStatus": "required"
+    },
+    {
+      "id": "governance-context",
+      "selectors": {
+        "includeExact": [
+          "LICENSE.md",
+          "NOTICE.md",
+          "README.md",
+          "docs/CONTENT_POLICY.md",
+          "docs/STATUS.md"
+        ],
+        "includePrefixes": []
+      },
+      "pathRole": "governance-context",
+      "licenseScope": "governance-context",
+      "preferredSourceStatus": "context-document",
+      "securityReviewStatus": "not-required",
+      "rightsReviewStatus": "scope-review-required",
+      "requirementStatus": "required"
+    },
+    {
+      "id": "license-texts",
+      "selectors": {
+        "includeExact": [
+          "LICENSE",
+          "LICENSES/AGPL-3.0-only.txt"
+        ],
+        "includePrefixes": []
+      },
+      "pathRole": "license-text",
+      "licenseScope": "license-texts",
+      "preferredSourceStatus": "not-applicable",
+      "securityReviewStatus": "not-required",
+      "rightsReviewStatus": "not-applicable",
+      "requirementStatus": "required"
+    },
+    {
+      "id": "server-dependency-lock",
+      "selectors": {
+        "includeExact": [
+          "backend/package-lock.json"
+        ],
+        "includePrefixes": []
+      },
+      "pathRole": "dependency-install-metadata",
+      "licenseScope": "third-party",
+      "preferredSourceStatus": "generated-install-metadata",
+      "securityReviewStatus": "not-required",
+      "rightsReviewStatus": "component-record-required",
+      "requirementStatus": "required"
+    },
+    {
+      "id": "shared-release-build-tooling",
+      "selectors": {
+        "includeExact": [
+          "developer/prepare-public-container-context.mjs",
+          "developer/public-container-context-manifest.json",
+          "developer/public-source-manifest.json",
+          "developer/release.ps1",
+          "developer/release.sh",
+          "developer/standalone-release-manifest.json",
+          "developer/standalone-release-manifest.mjs",
+          "developer/tests/ci/test_public_container_context.py",
+          "developer/tests/ci/test_public_source_membership.py",
+          "developer/tests/ci/test_standalone_packaging.py",
+          "developer/verify-public-container-context.mjs",
+          "developer/verify-public-source-membership.mjs"
+        ],
+        "includePrefixes": []
+      },
+      "pathRole": "build-and-verification-source",
+      "licenseScope": "shared-build-tooling",
+      "preferredSourceStatus": "preferred-editable",
+      "securityReviewStatus": "not-required",
+      "rightsReviewStatus": "scope-review-required",
+      "requirementStatus": "required"
+    }
+  ],
+  "deferred": [
+    {
+      "id": "exact-artifact-source-binding",
+      "status": "later-phase-required",
+      "blocker": "R1.1C",
+      "requiredBefore": "corrected-static-publication"
+    },
+    {
+      "id": "frontend-exact-license-identifier",
+      "status": "foundation-deferred",
+      "blocker": "D6",
+      "requiredBefore": "corrected-static-publication"
+    },
+    {
+      "id": "generated-bundle-convenience-decision",
+      "status": "foundation-deferred",
+      "blocker": "R1.1B3",
+      "requiredBefore": "source-archive-publication"
+    },
+    {
+      "id": "generated-data-preferred-source",
+      "status": "preferred-source-blocked",
+      "blocker": "R1.1D",
+      "requiredBefore": "corrected-static-publication"
+    },
+    {
+      "id": "public-content-rights",
+      "status": "rights-review-blocked",
+      "blocker": "R1-04",
+      "requiredBefore": "corrected-static-publication"
+    },
+    {
+      "id": "security-sensitive-deployment-membership",
+      "status": "security-review-blocked",
+      "blocker": "security-membership-review",
+      "requiredBefore": "container-or-onion-publication"
+    },
+    {
+      "id": "shared-build-tooling-license-scope",
+      "status": "foundation-deferred",
+      "blocker": "R1.1B2",
+      "requiredBefore": "source-tree-generation"
+    },
+    {
+      "id": "source-archive-format",
+      "status": "later-phase-required",
+      "blocker": "D9",
+      "requiredBefore": "source-archive-publication"
+    },
+    {
+      "id": "source-tree-materializer",
+      "status": "later-phase-required",
+      "blocker": "R1.1B2",
+      "requiredBefore": "source-tree-generation"
+    },
+    {
+      "id": "templates-membership-review",
+      "status": "rights-review-blocked",
+      "blocker": "D7",
+      "requiredBefore": "corrected-static-publication"
+    },
+    {
+      "id": "third-party-component-records",
+      "status": "later-phase-required",
+      "blocker": "third-party-records",
+      "requiredBefore": "source-tree-generation"
+    }
+  ],
+  "securityReviewRequired": [
+    {
+      "id": "compose-membership",
+      "status": "security-review-required",
+      "owner": "server-security",
+      "requiredBefore": "container-publication"
+    },
+    {
+      "id": "environment-example-membership",
+      "status": "security-review-required",
+      "owner": "server-security",
+      "requiredBefore": "container-publication"
+    },
+    {
+      "id": "proxy-configuration-membership",
+      "status": "security-review-required",
+      "owner": "server-security",
+      "requiredBefore": "onion-publication"
+    },
+    {
+      "id": "tor-program-configuration-membership",
+      "status": "security-review-required",
+      "owner": "server-security",
+      "requiredBefore": "onion-publication"
+    }
+  ],
+  "blockers": [
+    {
+      "id": "D3",
+      "status": "open",
+      "impact": "decision-open"
+    },
+    {
+      "id": "D6",
+      "status": "open",
+      "impact": "publication-blocked"
+    },
+    {
+      "id": "D7",
+      "status": "open",
+      "impact": "publication-blocked"
+    },
+    {
+      "id": "D9",
+      "status": "open",
+      "impact": "decision-open"
+    },
+    {
+      "id": "R1-04",
+      "status": "open",
+      "impact": "publication-blocked"
+    },
+    {
+      "id": "R1.1B2",
+      "status": "open",
+      "impact": "corresponding-source-incomplete"
+    },
+    {
+      "id": "R1.1B3",
+      "status": "open",
+      "impact": "corresponding-source-incomplete"
+    },
+    {
+      "id": "R1.1C",
+      "status": "open",
+      "impact": "publication-blocked"
+    },
+    {
+      "id": "R1.1D",
+      "status": "open",
+      "impact": "publication-blocked"
+    },
+    {
+      "id": "security-membership-review",
+      "status": "open",
+      "impact": "publication-blocked"
+    },
+    {
+      "id": "third-party-records",
+      "status": "open",
+      "impact": "publication-blocked"
+    }
+  ]
+}
