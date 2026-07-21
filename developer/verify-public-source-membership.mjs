@@ -2,8 +2,10 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { lstat, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { TextDecoder } from "node:util";
 
 const SCHEMA_VERSION = 1;
@@ -1202,7 +1204,16 @@ function readGitBlobs(repoRoot, objectIds) {
     if (contentEnd >= result.stdout.length || result.stdout[contentEnd] !== 0x0a) {
       fail("git cat-file returned truncated blob bytes for " + requestedId);
     }
-    blobs.set(requestedId, result.stdout.subarray(contentStart, contentEnd));
+    const blobBytes = Buffer.from(
+      result.stdout.subarray(contentStart, contentEnd),
+    );
+    if (blobBytes.length !== size) {
+      fail("git cat-file returned an inconsistent declared blob size");
+    }
+    blobs.set(requestedId, Object.freeze({
+      declaredByteSize: size,
+      blobBytes,
+    }));
     offset = contentEnd + 1;
   }
   if (offset !== result.stdout.length) {
@@ -1223,9 +1234,13 @@ function loadCommitOwnedManifest(repoRoot, sourceCommit) {
   ) {
     fail("selected commit manifest must be a regular Git blob");
   }
-  const manifestBytes = readGitBlobs(repoRoot, [entry.objectId]).get(entry.objectId);
-  if (!manifestBytes) {
+  const manifestBlob = readGitBlobs(repoRoot, [entry.objectId]).get(entry.objectId);
+  if (!manifestBlob) {
     fail("selected commit manifest blob was not loaded");
+  }
+  const manifestBytes = manifestBlob.blobBytes;
+  if (manifestBytes.length !== manifestBlob.declaredByteSize) {
+    fail("selected commit manifest blob size validation failed");
   }
   let text;
   try {
@@ -1380,16 +1395,23 @@ function enumerateMembership(repoRoot, sourceCommit, manifest) {
   );
   const blobs = readGitBlobs(repoRoot, ordered.map((entry) => entry.objectId));
   return ordered.map((entry) => {
-    const bytes = blobs.get(entry.objectId);
-    if (!bytes) {
+    const blob = blobs.get(entry.objectId);
+    if (!blob) {
       failPath(entry.path, "selected Git blob was not loaded");
+    }
+    const blobBytes = Buffer.from(blob.blobBytes);
+    if (blobBytes.length !== blob.declaredByteSize) {
+      failPath(entry.path, "selected Git blob size validation failed");
     }
     return Object.freeze({
       path: entry.path,
       gitMode: entry.mode,
-      sha256: sha256Bytes(bytes),
+      objectId: entry.objectId,
+      declaredByteSize: blob.declaredByteSize,
+      sha256: sha256Bytes(blobBytes),
       role: entry.role,
       licenseScope: entry.licenseScope,
+      blobBytes,
     });
   });
 }
@@ -1432,24 +1454,69 @@ function buildReport(sourceCommit, manifestSha256, manifest, members) {
     .filter((record) => record.status === "open")
     .map((record) => record.id)
     .sort(compareOrdinal);
+  const publicMembers = members.map((member) => Object.freeze({
+    path: member.path,
+    gitMode: member.gitMode,
+    sha256: member.sha256,
+    role: member.role,
+    licenseScope: member.licenseScope,
+  }));
 
-  return {
+  return Object.freeze({
     schemaVersion: SCHEMA_VERSION,
     sourceCommit,
     manifestPath: MANIFEST_PATH,
     manifestSha256,
     membershipValid: true,
     membershipCount: members.length,
-    members,
-    deferredCategories: manifest.deferred.map((record) => record.id).sort(compareOrdinal),
-    securityReviewRequired: manifest.securityReviewRequired
-      .map((record) => record.id)
-      .sort(compareOrdinal),
-    rightsReviewRequired: [...rightsReviewRequired].sort(compareOrdinal),
+    members: Object.freeze(publicMembers),
+    deferredCategories: Object.freeze(
+      manifest.deferred.map((record) => record.id).sort(compareOrdinal),
+    ),
+    securityReviewRequired: Object.freeze(
+      manifest.securityReviewRequired
+        .map((record) => record.id)
+        .sort(compareOrdinal),
+    ),
+    rightsReviewRequired: Object.freeze(
+      [...rightsReviewRequired].sort(compareOrdinal),
+    ),
     correspondingSourceComplete: manifest.completeness.correspondingSourceComplete,
     publicationBlocked: manifest.completeness.publicationBlocked,
-    blockers: activeBlockers,
-  };
+    blockers: Object.freeze(activeBlockers),
+  });
+}
+
+function buildValidatedMembershipResult(repoRoot, sourceCommit, loaded) {
+  const members = Object.freeze(
+    enumerateMembership(repoRoot, sourceCommit, loaded.manifest),
+  );
+  const report = buildReport(
+    sourceCommit,
+    loaded.manifestSha256,
+    loaded.manifest,
+    members,
+  );
+  const reportBytes = Buffer.from(JSON.stringify(report, null, 2) + "\n", "utf8");
+  const serialized = reportBytes.toString("utf8");
+  if (serialized.includes(repoRoot) || /"[A-Za-z]:[\\/]/u.test(serialized)) {
+    fail("internal report privacy validation detected an absolute host path");
+  }
+  return Object.freeze({
+    repoRoot,
+    sourceCommit,
+    manifestSha256: loaded.manifestSha256,
+    report,
+    reportBytes,
+    members,
+  });
+}
+
+export async function loadValidatedPublicSourceMembership({ repo, commit } = {}) {
+  const repoRoot = await validateRepository(repo);
+  const sourceCommit = validateOriginalCommit(repoRoot, commit);
+  const loaded = loadCommitOwnedManifest(repoRoot, sourceCommit);
+  return buildValidatedMembershipResult(repoRoot, sourceCommit, loaded);
 }
 
 async function writeReportAtomically(output, reportBytes) {
@@ -1501,33 +1568,47 @@ async function main() {
   }
 
   const output = await prepareOutputPath(repoRoot, options.values.get("--output"));
-  const members = enumerateMembership(repoRoot, sourceCommit, loaded.manifest);
-  const report = buildReport(
-    sourceCommit,
-    loaded.manifestSha256,
-    loaded.manifest,
-    members,
-  );
-  const reportBytes = Buffer.from(JSON.stringify(report, null, 2) + "\n", "utf8");
-  const serialized = reportBytes.toString("utf8");
-  if (
-    serialized.includes(repoRoot)
-    || serialized.includes(output.outputPath)
-    || /"[A-Za-z]:[\\/]/u.test(serialized)
-  ) {
+  const validated = buildValidatedMembershipResult(repoRoot, sourceCommit, loaded);
+  if (validated.reportBytes.toString("utf8").includes(output.outputPath)) {
     fail("internal report privacy validation detected an absolute host path");
   }
-  await writeReportAtomically(output, reportBytes);
+  await writeReportAtomically(output, validated.reportBytes);
   process.stdout.write(JSON.stringify({
     status: "ok",
     mode: "dry-run-report",
     sourceCommit,
-    membershipCount: members.length,
-    reportSha256: sha256Bytes(reportBytes),
+    membershipCount: validated.members.length,
+    reportSha256: sha256Bytes(validated.reportBytes),
   }) + "\n");
 }
 
-main().catch((error) => {
-  process.stderr.write("ERROR: " + error.message + "\n");
-  process.exitCode = 1;
-});
+function comparableCanonicalPath(value) {
+  const canonical = realpathSync.native(value);
+  return process.platform === "win32"
+    ? canonical.toLowerCase()
+    : canonical;
+}
+
+function isMainModule() {
+  const argvEntry = process.argv[1];
+  if (typeof argvEntry !== "string" || argvEntry.length === 0) {
+    return false;
+  }
+  try {
+    const modulePath = fileURLToPath(import.meta.url);
+    const argvPath = path.resolve(argvEntry);
+    return (
+      comparableCanonicalPath(modulePath) ===
+      comparableCanonicalPath(argvPath)
+    );
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
+  main().catch((error) => {
+    process.stderr.write("ERROR: " + error.message + "\n");
+    process.exitCode = 1;
+  });
+}

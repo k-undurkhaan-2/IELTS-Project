@@ -264,6 +264,65 @@ class PublicSourceMembershipTest(unittest.TestCase):
             timeout=60,
         )
 
+    def _run_imported_api(
+        self,
+        *,
+        commit: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = self._environment()
+        environment["IELTMPS_TEST_VERIFIER"] = str(VERIFIER)
+        environment["IELTMPS_TEST_REPO"] = str(self.fixture_root)
+        environment["IELTMPS_TEST_COMMIT"] = commit or self.base_commit
+        script = r"""
+import { pathToFileURL } from "node:url";
+
+const verifierUrl = pathToFileURL(process.env.IELTMPS_TEST_VERIFIER).href;
+const { loadValidatedPublicSourceMembership } = await import(verifierUrl);
+const result = await loadValidatedPublicSourceMembership({
+  repo: process.env.IELTMPS_TEST_REPO,
+  commit: process.env.IELTMPS_TEST_COMMIT,
+});
+process.stdout.write(JSON.stringify({
+  repoRoot: result.repoRoot,
+  sourceCommit: result.sourceCommit,
+  manifestSha256: result.manifestSha256,
+  report: result.report,
+  reportBytesBase64: result.reportBytes.toString("base64"),
+  resultFrozen: Object.isFrozen(result),
+  reportFrozen: Object.isFrozen(result.report),
+  reportMembersFrozen: Object.isFrozen(result.report.members),
+  membersFrozen: Object.isFrozen(result.members),
+  members: result.members.map((member) => ({
+    path: member.path,
+    gitMode: member.gitMode,
+    objectId: member.objectId,
+    declaredByteSize: member.declaredByteSize,
+    sha256: member.sha256,
+    role: member.role,
+    licenseScope: member.licenseScope,
+    blobBytesBase64: member.blobBytes.toString("base64"),
+    metadataFrozen: Object.isFrozen(member),
+  })),
+}));
+"""
+        return subprocess.run(
+            [str(self.node), "--input-type=module", "--eval", script],
+            cwd=self.temp_root,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+
+    def _read_imported_api(self, *, commit: str | None = None) -> dict[str, object]:
+        result = self._run_imported_api(commit=commit)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        return json.loads(result.stdout)
+
     def _assert_success(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual(result.returncode, 0, result.stdout)
 
@@ -623,6 +682,270 @@ class PublicSourceMembershipTest(unittest.TestCase):
         paths = [member["path"] for member in self._read_report()["members"]]
         self.assertIn("js/siteContent.js", paths)
         self.assertNotIn("js/bundles/generated.js", paths)
+
+    def test_41_import_is_side_effect_free_and_does_not_execute_cli(self) -> None:
+        shim_root = self.temp_root / "git-shim"
+        shim_root.mkdir()
+        marker = self.temp_root / "git-was-invoked"
+        if os.name == "nt":
+            shim = shim_root / "git.cmd"
+            shim.write_text(
+                '@echo off\r\n> "%IELTMPS_TEST_GIT_MARKER%" echo invoked\r\nexit /b 99\r\n',
+                encoding="ascii",
+                newline="",
+            )
+        else:
+            shim = shim_root / "git"
+            shim.write_text(
+                '#!/bin/sh\nprintf invoked > "$IELTMPS_TEST_GIT_MARKER"\nexit 99\n',
+                encoding="ascii",
+                newline="\n",
+            )
+            shim.chmod(0o755)
+
+        environment = self._environment()
+        environment["IELTMPS_TEST_VERIFIER"] = str(VERIFIER)
+        environment["IELTMPS_TEST_GIT_MARKER"] = str(marker)
+        environment["PATH"] = os.pathsep.join(
+            [str(shim_root), str(self.node.parent), environment.get("PATH", "")]
+        )
+        script = r"""
+import { pathToFileURL } from "node:url";
+
+const before = process.exitCode;
+await import(pathToFileURL(process.env.IELTMPS_TEST_VERIFIER).href);
+if (process.exitCode !== before) {
+  process.exit(91);
+}
+"""
+        result = subprocess.run(
+            [str(self.node), "--input-type=module", "--eval", script],
+            cwd=self.temp_root,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"")
+        self.assertFalse(marker.exists())
+        self.assertFalse(self.output_path.exists())
+
+    def test_42_exported_api_returns_validated_metadata_and_exact_binary_bytes(self) -> None:
+        payload = self._read_imported_api()
+        self.assertEqual(payload["repoRoot"], str(self.fixture_root))
+        self.assertEqual(payload["sourceCommit"], self.base_commit)
+        self.assertEqual(payload["manifestSha256"], _sha256(self.manifest_bytes))
+        self.assertTrue(payload["resultFrozen"])
+        self.assertTrue(payload["reportFrozen"])
+        self.assertTrue(payload["reportMembersFrozen"])
+        self.assertTrue(payload["membersFrozen"])
+
+        expected_bytes = self._git(
+            "show", f"{self.base_commit}:index.html"
+        ).stdout
+        expected_object = self._git(
+            "rev-parse", f"{self.base_commit}:index.html"
+        ).stdout.decode("ascii").strip()
+        member = next(
+            item for item in payload["members"] if item["path"] == "index.html"
+        )
+        self.assertEqual(
+            list(member),
+            [
+                "path",
+                "gitMode",
+                "objectId",
+                "declaredByteSize",
+                "sha256",
+                "role",
+                "licenseScope",
+                "blobBytesBase64",
+                "metadataFrozen",
+            ],
+        )
+        self.assertEqual(member["objectId"], expected_object)
+        self.assertEqual(member["declaredByteSize"], len(expected_bytes))
+        self.assertEqual(member["sha256"], _sha256(expected_bytes))
+        self.assertEqual(
+            __import__("base64").b64decode(member["blobBytesBase64"]),
+            expected_bytes,
+        )
+        self.assertTrue(member["metadataFrozen"])
+        self.assertEqual(
+            [item["path"] for item in payload["members"]],
+            [item["path"] for item in payload["report"]["members"]],
+        )
+
+    def test_43_exported_report_bytes_equal_direct_cli_report_bytes(self) -> None:
+        self._assert_success(self._run())
+        payload = self._read_imported_api()
+        api_bytes = __import__("base64").b64decode(payload["reportBytesBase64"])
+        self.assertEqual(api_bytes, self.output_path.read_bytes())
+        self.assertEqual(json.loads(api_bytes), payload["report"])
+
+    def test_44_exported_bytes_ignore_dirty_source_and_manifest(self) -> None:
+        before = self._read_imported_api()
+        self._write("index.html", b"dirty\x00working-tree\xffbytes\r\n")
+        (self.fixture_root / MANIFEST_RELATIVE).write_text(
+            '{"invalid":"dirty manifest"}\n', encoding="utf-8", newline="\n"
+        )
+        after = self._read_imported_api()
+        self.assertEqual(before["reportBytesBase64"], after["reportBytesBase64"])
+        self.assertEqual(before["members"], after["members"])
+
+    def test_45_exported_results_ignore_replacement_objects(self) -> None:
+        before = self._read_imported_api()
+        self._write("index.html", b"replacement API bytes\n")
+        replacement_commit = self._commit_paths("API replacement", "index.html")
+        self._git("replace", self.base_commit, replacement_commit)
+        after = self._read_imported_api(commit=self.base_commit)
+        self.assertEqual(before["reportBytesBase64"], after["reportBytesBase64"])
+        self.assertEqual(before["members"], after["members"])
+
+    def test_46_direct_alias_executes_cli_and_alias_import_is_side_effect_free(self) -> None:
+        real_tool_root = self.temp_root / "alternate-real-tool"
+        real_developer = real_tool_root / "developer"
+        real_developer.mkdir(parents=True)
+        real_verifier = real_developer / VERIFIER.name
+        shutil.copy2(VERIFIER, real_verifier)
+        self.assertNotEqual(real_verifier.resolve(), VERIFIER.resolve())
+
+        file_alias = self.temp_root / "verify-public-source-membership-alias.mjs"
+        directory_alias = self.temp_root / "alternate-tool-alias"
+        alias_script = file_alias
+        alias_kind: str | None = None
+        file_symlink_error: OSError | None = None
+        directory_symlink_error: OSError | None = None
+
+        try:
+            try:
+                file_alias.symlink_to(real_verifier)
+                alias_kind = "file symlink"
+            except OSError as error:
+                file_symlink_error = error
+                try:
+                    directory_alias.symlink_to(real_tool_root, target_is_directory=True)
+                    alias_kind = "directory symlink"
+                    alias_script = directory_alias / "developer" / VERIFIER.name
+                except OSError as directory_error:
+                    directory_symlink_error = directory_error
+                    if os.name != "nt":
+                        self.fail(
+                            "host cannot create a file or directory symlink: "
+                            f"{file_symlink_error}; {directory_symlink_error}"
+                        )
+                    completed = subprocess.run(
+                        [
+                            "cmd",
+                            "/d",
+                            "/c",
+                            "mklink",
+                            "/J",
+                            str(directory_alias),
+                            str(real_tool_root),
+                        ],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=30,
+                    )
+                    if completed.returncode != 0:
+                        self.fail(
+                            "host cannot create a file symlink, directory symlink, "
+                            "or junction: "
+                            f"{file_symlink_error}; {directory_symlink_error}; "
+                            f"{completed.stdout.strip()}"
+                        )
+                    alias_kind = "junction"
+                    alias_script = directory_alias / "developer" / VERIFIER.name
+
+            self.assertIsNotNone(alias_kind)
+            self.assertNotEqual(str(alias_script), str(real_verifier))
+            self.assertEqual(
+                alias_script.resolve(strict=True),
+                real_verifier.resolve(strict=True),
+            )
+
+            def run_alias(*args: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [str(self.node), str(alias_script), *args],
+                    cwd=self.temp_root,
+                    env=self._environment(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=60,
+                )
+
+            valid = run_alias(
+                "--repo",
+                str(self.fixture_root),
+                "--commit",
+                self.base_commit,
+                "--policy-only",
+            )
+            self.assertEqual(valid.returncode, 0, valid.stderr)
+            self.assertEqual(valid.stderr, "")
+            self.assertTrue(valid.stdout.endswith("\n"), valid.stdout)
+            self.assertEqual(valid.stdout.count("\n"), 1)
+            summary = json.loads(valid.stdout)
+            self.assertEqual(summary["status"], "ok")
+            self.assertEqual(summary["mode"], "policy-only")
+            self.assertEqual(summary["sourceCommit"], self.base_commit)
+            self.assertEqual(summary["manifestSha256"], _sha256(self.manifest_bytes))
+            self.assertTrue(summary["policyValid"])
+            self.assertFalse(summary["membershipValidated"])
+            self.assertNotIn("membershipValid", summary)
+            self.assertFalse(self.output_path.exists())
+
+            invalid = run_alias("--repo")
+            self.assertNotEqual(invalid.returncode, 0)
+            self.assertEqual(invalid.stdout, "")
+            self.assertTrue(invalid.stderr.startswith("ERROR: "), invalid.stderr)
+
+            import_probe = self.temp_root / "import-verifier-alias.mjs"
+            import_probe.write_text(
+                'import { pathToFileURL } from "node:url";\n'
+                "const before = process.exitCode;\n"
+                "await import(pathToFileURL("
+                "process.env.IELTMPS_TEST_VERIFIER_ALIAS).href);\n"
+                "if (process.exitCode !== before) process.exit(91);\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            environment = self._environment()
+            environment["IELTMPS_TEST_VERIFIER_ALIAS"] = str(alias_script)
+            imported = subprocess.run(
+                [str(self.node), str(import_probe)],
+                cwd=self.temp_root,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+            )
+            self.assertEqual(
+                imported.returncode,
+                0,
+                imported.stderr.decode("utf-8", errors="replace"),
+            )
+            self.assertEqual(imported.stdout, b"")
+            self.assertEqual(imported.stderr, b"")
+            self.assertFalse(self.output_path.exists())
+        finally:
+            if alias_kind == "file symlink" and file_alias.is_symlink():
+                file_alias.unlink()
+            elif alias_kind in {"directory symlink", "junction"} and directory_alias.exists():
+                if os.name == "nt":
+                    os.rmdir(directory_alias)
+                else:
+                    directory_alias.unlink()
+
 
 
 if __name__ == "__main__":
