@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2026 Kevin
+-- SPDX-License-Identifier: AGPL-3.0-only
+
 CREATE TABLE IF NOT EXISTS traffic_events (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     occurred_at timestamptz NOT NULL DEFAULT now(),

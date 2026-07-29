@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Kevin
+# SPDX-License-Identifier: AGPL-3.0-only
+
 DataDirectory /var/lib/tor
 HiddenServiceDir /var/lib/tor/hidden_service
 HiddenServiceVersion 3

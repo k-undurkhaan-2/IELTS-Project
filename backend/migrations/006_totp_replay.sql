@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2026 Kevin
+-- SPDX-License-Identifier: AGPL-3.0-only
+
 ALTER TABLE user_totp_settings
     ADD COLUMN IF NOT EXISTS last_totp_step bigint;
 
