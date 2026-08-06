@@ -1,0 +1,15668 @@
+#!/usr/bin/env python3
+"""Baseline-aware, cross-platform CI policy runner.
+
+The runner intentionally uses only Python's standard library.  It invokes a
+small allowlist of repository validation commands, converts their output into
+scoped observations, and compares every non-pass observation with the frozen
+Phase 1 baseline.  Raw command output is never printed or persisted.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import concurrent.futures
+import ctypes
+import errno
+import hashlib
+import html
+import io
+import json
+import math
+import os
+import platform
+import re
+import select
+import signal
+import shlex
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tokenize
+import unicodedata
+import uuid
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, Iterable, Mapping, Sequence
+from urllib.parse import quote, unquote_to_bytes, urlsplit
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+BASELINE_PATH = REPO_ROOT / "developer" / "tests" / "ci" / "phase1-ci-baseline.json"
+WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+OUTPUT_DIR = REPO_ROOT / ".ci-results"
+
+PROFILES = ("policy", "static", "frontend", "backend", "standalone", "all")
+EXIT_SUCCESS = 0
+EXIT_POLICY_VIOLATION = 2
+EXIT_CONFIGURATION_ERROR = 3
+EXIT_RUNNER_ERROR = 4
+
+BASELINE_COMMIT = "db743cc625daded38442834731cbf35db024e10f"
+BASELINE_TREE = "c3f3825ecc4523a6e39da1164df41d6d59e3527a"
+CHECKPOINT_TAG = "checkpoint-phase1-20260730"
+POLICY_VERSION = "1.0.0"
+STATIC_MACHINE_DOCUMENT_KIND = "ieltmps-static-suite-machine-report-v2"
+STATIC_MACHINE_SCHEMA_VERSION = 2
+CANONICAL_FAILURE_MATERIAL_VERSION = 4
+FROZEN_V1_RELEASE_SKIP_SIGNATURE_SCHEMA_VERSION = 1
+RAW_OBSERVATION_SCHEMA_VERSION = 1
+TARGET_EXECUTION_LEASE_VERSION = 1
+PROTECTED_TARGET_BUNDLE_VERSION = 1
+VERIFICATION_REPLAY_TRANSCRIPT_VERSION = 1
+EVIDENCE_EXECUTION_BINDING_SCHEMA_VERSION = 2
+EXTERNALLY_EXPECTED_VERIFICATION_CONTEXT_SCHEMA_VERSION = 2
+AUTHORIZATION_CONTEXT_BINDING_SCHEMA_VERSION = 1
+VERIFIER_REPLAY_CONTEXT_BINDING_SCHEMA_VERSION = 1
+REPLAY_AUTHORIZATION_ENVELOPE_SCHEMA_VERSION = 1
+CI_TRUST_FILE_SET_SCHEMA_VERSION = 1
+RUNTIME_DEPENDENCY_CLOSURE_SCHEMA_VERSION = 1
+RUNTIME_DEPENDENCY_GUARD_SCHEMA_VERSION = 1
+LINUX_CONTAINMENT_PROTOCOL_VERSION = 1
+POSIX_PROCESS_IDENTITY_SCHEMA_VERSION = 1
+
+# Normative Canonical Framing Grammar, version 1.  These byte constants are
+# mirrored exactly in docs/CI_POLICY.md and in an independent test encoder.
+CANONICAL_FRAME_SPECIFICATION_VERSION = 1
+CANONICAL_FRAME_TEXT_ENCODING = "utf-8"
+CANONICAL_FRAME_UNICODE_NORMALIZATION = "NFC"
+CANONICAL_FRAME_LENGTH_WIDTH_BYTES = 8
+CANONICAL_FRAME_COUNT_WIDTH_BYTES = 8
+CANONICAL_FRAME_BYTE_ORDER = "big"
+CANONICAL_FRAME_MAP_KEY_ORDER = "nfc-utf8-byte-lexicographic"
+CANONICAL_FRAME_ARRAY_ORDER = "input-order"
+CANONICAL_FRAME_TAGS = MappingProxyType(
+    {
+        "null": b"n",
+        "boolean": b"b",
+        "integer": b"i",
+        "float": b"f",
+        "text": b"s",
+        "bytes": b"y",
+        "list": b"l",
+        "map": b"m",
+        "map-key": b"k",
+    }
+)
+AUTHORIZATION_CONTEXT_BINDING_DIGEST_DOMAIN = (
+    "ieltmps-authorization-context-binding-v1"
+)
+VERIFIER_REPLAY_CONTEXT_BINDING_DIGEST_DOMAIN = (
+    "ieltmps-verifier-replay-context-binding-v1"
+)
+REPLAY_AUTHORIZATION_ENVELOPE_DIGEST_DOMAIN = (
+    "ieltmps-replay-authorization-envelope-v1"
+)
+LOCAL_REPOSITORY_IDENTITY_PROJECTION_DOMAIN = (
+    "ieltmps-local-repository-identity-v1"
+)
+
+MAX_STDOUT_BYTES = 1_048_576
+MAX_STDERR_BYTES = 1_048_576
+MAX_OUTPUT_LINE_BYTES = 16_384
+MAX_EVIDENCE_PREVIEW_BYTES = 4_096
+MAX_COMMAND_RESULTS_JSON_BYTES = 33_554_432
+MAX_STATIC_MACHINE_STDOUT_BYTES = 8_388_608
+MAX_STATIC_MACHINE_STDERR_BYTES = 1_048_576
+OUTPUT_READ_CHUNK_BYTES = 16_384
+SECRET_SCAN_CHUNK_BYTES = 65_536
+SECRET_SCAN_MAX_PATTERN_BYTES = 8_192
+SECRET_SCAN_OVERLAP_BYTES = SECRET_SCAN_MAX_PATTERN_BYTES - 1
+SECRET_SCAN_CLASSIFICATION_SAMPLE_BYTES = 8_192
+UTF16_ASCII_CREDENTIAL_VIEWS = (
+    "utf-16le-offset-0",
+    "utf-16le-offset-1",
+    "utf-16be-offset-0",
+    "utf-16be-offset-1",
+)
+MAX_JOB_TIMEOUT_SECONDS = 3_600
+MAX_RECORDED_STREAM_BYTES = MAX_STATIC_MACHINE_STDOUT_BYTES + OUTPUT_READ_CHUNK_BYTES
+MAX_SCANNED_FILE_BYTES = 1_099_511_627_776
+MAX_PROFILE_COMMANDS = 50_000
+PROCESS_TREE_GRACE_SECONDS = 1.0
+PROCESS_TREE_KILL_SECONDS = 5.0
+PROCESS_TREE_FAILURE_EXIT = 126
+LINUX_CONTAINMENT_SETTLE_SECONDS = 8.0
+LINUX_CONTAINMENT_SCAN_SECONDS = 0.01
+LINUX_CONTAINMENT_STABLE_SCANS = 3
+
+EVIDENCE_FILE_NAMES = (
+    "summary.json",
+    "summary.md",
+    "observed-debt.json",
+    "resolved-candidates.json",
+    "command-results.json",
+)
+EVIDENCE_MANIFEST_FILE_NAMES = EVIDENCE_FILE_NAMES[1:]
+EVIDENCE_DOCUMENT_KINDS = MappingProxyType(
+    {
+        "summary.json": "ieltmps-ci-foundation-summary-v2",
+        "summary.md": "ieltmps-ci-summary-markdown-v2",
+        "observed-debt.json": "ieltmps-ci-observed-debt-v2",
+        "resolved-candidates.json": "ieltmps-ci-resolved-candidates-v2",
+        "command-results.json": "ieltmps-ci-command-results-v2",
+    }
+)
+EVIDENCE_FILE_BYTE_LIMITS = MappingProxyType(
+    {
+        "summary.json": 4_194_304,
+        "summary.md": 2_097_152,
+        "observed-debt.json": 4_194_304,
+        "resolved-candidates.json": 4_194_304,
+        "command-results.json": MAX_COMMAND_RESULTS_JSON_BYTES,
+    }
+)
+MAX_EVIDENCE_COLLECTION_ITEMS = 20_000
+MAX_EVIDENCE_JSON_DEPTH = 20
+MAX_EVIDENCE_STRING_BYTES = 65_536
+
+CI_TRUST_FILE_PATHS = (
+    ".github/workflows/ci.yml",
+    "developer/tests/ci/phase1-ci-baseline.json",
+    "developer/tests/ci/run_ci_foundation.py",
+    "developer/tests/ci/run_static_suite.py",
+    "developer/tests/ci/test_ci_foundation.py",
+    "developer/tests/ci/test_standalone_packaging.py",
+    "docs/CI_POLICY.md",
+    ".gitignore",
+)
+
+WORKFLOW_JOB_PROFILE_AUTHORITY = MappingProxyType(
+    {
+        "repository-policy": MappingProxyType(
+            {
+                "jobId": "repository-policy",
+                "producerJobId": "repository-policy-producer",
+                "verifierJobId": "repository-policy",
+                "runnerOS": "Linux",
+                "profile": "policy",
+                "verificationProfile": "policy",
+                "artifactIdentity": "untrusted-repository-policy-${{ runner.os }}-${{ github.run_attempt }}",
+                "evidenceRoot": ".ci-untrusted/repository-policy",
+                "evidencePaths": EVIDENCE_FILE_NAMES,
+            }
+        ),
+        "ubuntu-canonical": MappingProxyType(
+            {
+                "jobId": "ubuntu-canonical",
+                "producerJobId": "ubuntu-canonical-producer",
+                "verifierJobId": "ubuntu-canonical",
+                "runnerOS": "Linux",
+                "profile": "all",
+                "verificationProfile": "all",
+                "artifactIdentity": "untrusted-ubuntu-canonical-${{ runner.os }}-${{ github.run_attempt }}",
+                "evidenceRoot": ".ci-untrusted/ubuntu-canonical",
+                "evidencePaths": EVIDENCE_FILE_NAMES,
+            }
+        ),
+        "windows-compatibility": MappingProxyType(
+            {
+                "jobId": "windows-compatibility",
+                "producerJobId": "windows-compatibility-producer",
+                "verifierJobId": "windows-compatibility",
+                "runnerOS": "Windows",
+                "profile": "all",
+                "verificationProfile": "all",
+                "artifactIdentity": "untrusted-windows-compatibility-${{ runner.os }}-${{ github.run_attempt }}",
+                "evidenceRoot": ".ci-untrusted/windows-compatibility",
+                "evidencePaths": EVIDENCE_FILE_NAMES,
+            }
+        ),
+    }
+)
+
+
+@dataclass(frozen=True)
+class ExternallyExpectedVerificationContext:
+    """Producer and verifier authority built before any artifact byte is read."""
+
+    binding_mode: str
+    expected_profile: str
+    producer_job_id: str
+    verifier_job_id: str
+    runner_os: str
+    run_id: str
+    run_attempt: str
+    event_name: str
+    repository: str
+    checkout_commit: str
+    checkout_tree: str
+    baseline_commit: str
+    baseline_tree: str
+    trust_file_digest: str
+    command_plan_digest: str
+    producer_invocation_id: str
+    fresh_runtime_closure_digest: str
+    verifier_invocation_id: str
+
+    def evidence_binding(self) -> dict[str, Any]:
+        return {
+            "bindingSchemaVersion": EVIDENCE_EXECUTION_BINDING_SCHEMA_VERSION,
+            "bindingKind": "ProducerExecutionBinding",
+            "bindingMode": self.binding_mode,
+            "producerJobId": self.producer_job_id,
+            "producerRunnerOS": self.runner_os,
+            "producerProfile": self.expected_profile,
+            "runId": self.run_id,
+            "runAttempt": self.run_attempt,
+            "eventName": self.event_name,
+            "repository": self.repository,
+            "checkoutCommit": self.checkout_commit,
+            "checkoutTree": self.checkout_tree,
+            "baselineCommit": self.baseline_commit,
+            "baselineTree": self.baseline_tree,
+            "trustFileDigest": self.trust_file_digest,
+            "commandPlanDigest": self.command_plan_digest,
+            "producerInvocationId": self.producer_invocation_id,
+        }
+
+    def authorization_context_binding(self) -> dict[str, Any]:
+        """Return the stable producer/verifier authorization projection."""
+
+        return {
+            "bindingSchemaVersion": AUTHORIZATION_CONTEXT_BINDING_SCHEMA_VERSION,
+            "bindingKind": "AuthorizationContextBinding",
+            "bindingMode": self.binding_mode,
+            "expectedProfile": self.expected_profile,
+            "producerJobId": self.producer_job_id,
+            "expectedVerifierJobId": self.verifier_job_id,
+            "runnerOS": self.runner_os,
+            "runId": self.run_id,
+            "runAttempt": self.run_attempt,
+            "eventName": self.event_name,
+            "repository": self.repository,
+            "checkoutCommit": self.checkout_commit,
+            "checkoutTree": self.checkout_tree,
+            "baselineCommit": self.baseline_commit,
+            "baselineTree": self.baseline_tree,
+            "trustFileDigest": self.trust_file_digest,
+            "commandPlanDigest": self.command_plan_digest,
+            "producerInvocationId": self.producer_invocation_id,
+        }
+
+    def verifier_binding(self) -> dict[str, Any]:
+        return {
+            "bindingSchemaVersion": EVIDENCE_EXECUTION_BINDING_SCHEMA_VERSION,
+            "bindingKind": "VerifierExecutionBinding",
+            "bindingMode": self.binding_mode,
+            "verifierJobId": self.verifier_job_id,
+            "verifierRunnerOS": self.runner_os,
+            "expectedProfile": self.expected_profile,
+            "expectedProducerJobId": self.producer_job_id,
+            "runId": self.run_id,
+            "runAttempt": self.run_attempt,
+            "eventName": self.event_name,
+            "repository": self.repository,
+            "checkoutCommit": self.checkout_commit,
+            "checkoutTree": self.checkout_tree,
+            "baselineCommit": self.baseline_commit,
+            "baselineTree": self.baseline_tree,
+            "trustFileDigest": self.trust_file_digest,
+            "independentlyRebuiltCommandPlanDigest": self.command_plan_digest,
+            "freshRuntimeClosureDigest": self.fresh_runtime_closure_digest,
+            "verifierInvocationId": self.verifier_invocation_id,
+        }
+
+    @property
+    def workflow_job_id(self) -> str:
+        return self.verifier_job_id
+
+    @property
+    def ci_trust_file_set_digest(self) -> str:
+        return self.trust_file_digest
+
+    @property
+    def invocation_id(self) -> str:
+        return self.producer_invocation_id
+
+TRUST_BOUNDARY = MappingProxyType(
+    {
+        "selfValidatorTrust": "candidate-controlled",
+        "mergeAuthorization": "not provided by this workflow",
+        "independentReview": "required for CI trust-file changes",
+    }
+)
+TRUST_WARNING_LINES = (
+    "SELF-VALIDATOR TRUST: candidate-controlled",
+    "MERGE AUTHORIZATION: not provided by this workflow",
+    "INDEPENDENT REVIEW: required for CI trust-file changes",
+)
+PROHIBITED_AUTHORITY_PHRASES = (
+    "immutable authority",
+    "independent security approval",
+    "tamper-proof policy authority",
+    "provides sufficient merge authorization",
+    "is sufficient merge authorization",
+    "externally authenticated policy",
+    "security approved",
+    "safe to merge",
+    "policy independently verified",
+    "merge authorized",
+)
+
+TRUSTED_FILE_PATHS = (
+    ".github/workflows/ci.yml",
+    "developer/tests/ci/phase1-ci-baseline.json",
+    "developer/tests/ci/run_ci_foundation.py",
+    "developer/tests/ci/run_static_suite.py",
+    "developer/tests/ci/test_ci_foundation.py",
+    "developer/tests/ci/test_standalone_packaging.py",
+    "developer/package.json",
+    "developer/package-lock.json",
+    "backend/package.json",
+    "backend/package-lock.json",
+)
+
+LOCKED_FILE_SHA256 = MappingProxyType(
+    {
+        "developer/package.json": "7f90adcb5862ca5340b31e1fcf2cdefada42d06ddbc46c93b1dbcb5dc426d8de",
+        "developer/package-lock.json": "9d1226d8bcf53e712a5ceec1421899243f0d316c0497f0400c251d9fe30f5b6e",
+        "backend/package.json": "2a4f5fc9c2587ff92598f83e9516212ced6304d5c4bceecf0797084423c7bdf7",
+        "backend/package-lock.json": "bfce9f62f140f8a73579f84dd4258a8ce9a0c1738676efad215e380cdb7a560c",
+    }
+)
+
+ESBUILD_VERSION = "0.27.1"
+ESBUILD_LOCK_INTEGRITY = "sha512-yY35KZckJJuVVPXpvjgxiCuVEJT67F6zDeVTv4rizyPrfGBUpZQsvmxnN+C371c2esD/hNMjj4tpBhuueLN7aA=="
+
+APPROVED_ACTIONS = {
+    "actions/checkout": {
+        "tag": "v7.0.1",
+        "sha": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+    },
+    "actions/setup-node": {
+        "tag": "v7.0.0",
+        "sha": "820762786026740c76f36085b0efc47a31fe5020",
+    },
+    "actions/setup-python": {
+        "tag": "v7.0.0",
+        "sha": "5fda3b95a4ea91299a34e894583c3862153e4b97",
+    },
+    "actions/upload-artifact": {
+        "tag": "v7.0.1",
+        "sha": "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+    },
+    "actions/download-artifact": {
+        "tag": "v4.3.0",
+        "sha": "d3f86a106a0bac45b974a628896c90dbdf5c8093",
+    },
+}
+
+SECURITY_GUARD_FILES = (
+    "developer/tests/js/adminFrontendGuard.test.js",
+    "developer/tests/js/appActionsExportGuard.test.js",
+    "developer/tests/js/dataManagementPanel.test.js",
+    "developer/tests/js/examActionsExportGuard.test.js",
+    "developer/tests/js/examSessionReplayCloneGuard.test.js",
+    "developer/tests/js/localDataRenderingGuard.test.js",
+    "developer/tests/js/practiceRecordExportServerGuard.test.js",
+    "developer/tests/js/privacyLoggingGuard.test.js",
+    "developer/tests/js/remotePracticeDataSource.test.js",
+    "developer/tests/js/resourceCoreProbeBypassGuard.test.js",
+    "developer/tests/js/secureIdentifierGuard.test.js",
+    "developer/tests/js/suiteBackGuardSecurity.test.js",
+    "developer/tests/js/vocabSessionExportGuard.test.js",
+)
+
+VITEST_SECURITY_GUARD = "developer/tests/js/messageOriginGuard.test.js"
+DEPENDENCY_BACKED_TOOL_ROLES = frozenset(
+    {
+        "node-test",
+        "node-security-test",
+        "node-vitest-security-test",
+        "npm-backend-test",
+    }
+)
+
+
+def expected_command_authority(
+    profile: str,
+    observations: Sequence[Mapping[str, Any]] = (),
+    *,
+    tools: Mapping[str, str] | None = None,
+    candidate_paths: Sequence[str] | None = None,
+    baseline: Mapping[str, Any] | None = None,
+    current_platform: str | None = None,
+    static_invocation_id: str | None = None,
+    repo_root: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Return authority reconstructed without consulting observations/evidence."""
+
+    del observations  # Observed results are facts, never command authority.
+    root = REPO_ROOT if repo_root is None else repo_root
+    if candidate_paths is None:
+        candidate_paths, path_errors = deterministic_candidate_paths(root)
+        if path_errors:
+            candidate_paths = []
+    if baseline is None:
+        baseline = read_json(BASELINE_PATH)
+    if tools is None:
+        required_tools = required_tool_names(profile)
+        tools, _errors = resolve_trusted_tools(required_tools, repo_root=root)
+    bash_lease: TrustedBashLease | None = None
+    try:
+        if os.name == "nt" and tools.get("bash") and tools.get("git"):
+            bash_lease = TrustedBashLease(tools["bash"], tools["git"])
+        return build_profile_command_plan(
+            profile,
+            tools=tools,
+            candidate_paths=candidate_paths,
+            baseline=baseline,
+            current_platform=current_platform or platform_key(),
+            static_invocation_id=static_invocation_id or deterministic_static_invocation_id(root),
+            repo_root=root,
+            bash_lease=bash_lease,
+        )
+    finally:
+        if bash_lease is not None:
+            bash_lease.close()
+
+LOCAL_IMPLEMENTATION_ALLOWLIST = {
+    ".github/workflows/ci.yml",
+    "developer/tests/ci/phase1-ci-baseline.json",
+    "developer/tests/ci/run_ci_foundation.py",
+    "developer/tests/ci/run_static_suite.py",
+    "developer/tests/ci/test_ci_foundation.py",
+    "developer/tests/ci/test_standalone_packaging.py",
+    "docs/CI_POLICY.md",
+}
+
+# Each digest canonically frames the collection plus every security-relevant
+# field listed in BASELINE_SEMANTIC_FIELDS. The candidate-local map is read-only
+# during one invocation and is stored separately from the JSON it validates.
+BASELINE_SEMANTIC_FIELDS = (
+    "category",
+    "gate",
+    "commandClass",
+    "testOrPathScope",
+    "expectedOutcome",
+    "allowedNormalizedSignature",
+    "maximumOccurrences",
+    "platforms",
+    "checkpointDisposition",
+    "targetStage",
+    "securityImpact",
+)
+
+BASELINE_SEMANTIC_AUTHORITY = MappingProxyType(
+    {
+        "B-SKIP-CHECKLIST-CONSISTENCY": "c395052b382f7a7a8ef95670fa59d4b5e3876ba608c5758df38a8d6a9e8f6131",
+        "B-SKIP-PDF-RECONCILIATION": "454f4b92f1b32087b5a9d826c7b6621468a14b3863af5cef8b7e0c1716c48097",
+        "B-SKIP-RELEASE-ZIP": "86031c7887a5adcf3a21aa1998494b255da4f952395c9c056f68b346891a884f",
+        "B-STATIC-E2E-SNAPSHOT-SCRIPT-DRIFT": "1aa50ddd4ad9d0abd6f7d465a3a25df2ec1efec6062e1b1127435d42c91d6203",
+        "B-STATIC-NAVIGATION-VIEW-COVERAGE": "3682457a705f80e911caa7230028e31588f412d53a192f1c882d3a9afca2fc1e",
+        "B-STATIC-ON-DEMAND-HARNESS-DOM-STUB": "e2a408f09d46ce79a22bb1b3849df252bf00d26e4f35a0088a5352f9c8f0a62e",
+        "B-STATIC-PRACTICE-CUSTOM-CARD-LAYOUT": "a50835a93cdfd1a8d5d4dcd5148c2c6aa4315cc14f7caf86dac7b592297fc79d",
+        "B-STATIC-PRACTICE-RECORDER-SYNTHETIC-GUARD": "f67cd7a45855d3b2978da157d6910edfa2d00bb6bd529e190efe783505cadb2f",
+        "B-STATIC-PRIVATE-LISTENING-BRIDGE-OMISSION": "fd481f951a2a47ba4b114f2c2126f7bd7c95af28c9d50af6e627f36c6934ac3c",
+        "B-STATIC-PRIVATE-LISTENING-INDEX-OMISSION": "603332443e032cafb4042d07a48a5a16eb4ed954c8043fe99cec310bc91f1dbc",
+        "B-STATIC-PY-PLAYWRIGHT-NB-DRAG": "60246ac1dc5c1a839209019653e454a7de6cb1e588c431b148092b4a40e74943",
+        "B-STATIC-PY-PLAYWRIGHT-READING-QUICK-AUDIT": "91ee4036a46606b66cd560f7b33578c6cc89ad9595ffe7a246f6a838b41f237f",
+        "B-STATIC-PY-PLAYWRIGHT-ROUNDTRIP": "85cefb0808ba5145d6c51f21fbc192f98e2b16bf40088b5b77ab05036f2f420c",
+        "B-STATIC-PY-PLAYWRIGHT-UNIFIED-SUBMIT": "869e12a1cb975eef1966a6846ebc1c485efab440bbeadcb05849371c83b6ca3d",
+        "B-STATIC-SETTINGS-BUTTON-COVERAGE": "1c4050f1df40a540b163382e32155d30d9312c561606a83c9b203715bf0d94a9",
+        "B-STATIC-SUITE-SESSION-ROUTING": "20d6d8c714d905dc71b54d71a326ff750680d89a60239d13c19565001b7743b3",
+        "B-SYNTAX-PERFORMANCE-BASELINE": "d9060340e9ac79de7ac3459c7096e441c280659b9bba46bcc220f351122d35ea",
+        "B-SYNTAX-READING-EXPLANATION-P1-HIGH-194": "216d29cb8c043474718e30cd9bd82309f28c07e0233b09eb3e73a751ea7359c4",
+        "B-SYNTAX-READING-EXPLANATION-P3-LOW-151": "eb9b387da577ec938fe47fde088404664338226821b1701782ab4d48ecc86adc",
+        "B-SYNTAX-STATE-SERIALIZER-TEST": "181163c1483202f4fe422df3b70620f006cb43d9ffef2b5624a441ffd9c738f6",
+        "D-WSL-PLAYWRIGHT-BROWSER-UNAVAILABLE": "9162c7c2ec105c0fc4622a915149602f1e338e0ccc37f2138922b95201b5f389",
+        "E-ADMIN-FRONTEND-DOM-STUB": "5155f7bc31dee8e14716778a7313146fbacd8c070c48c947e4f72822fe1e0570",
+        "E-REMOTE-PRACTICE-DISABLE-TOTP-TEST-DRIFT": "62fafd3fd260b069e3d0952a518ecfc4222a45fa3fd8d506ed064e430a15823f",
+        "E-WINDOWS-LOCAL-DATA-CRLF-ASSERTION": "da99e7895af9a5012803b11d96c91592cd0e0d39f766aefafb3f604f596ccb8f",
+        "F-WINDOWS-BACKEND-COMPATIBILITY-RUNNER": "9d59e9e9e57e41fe38105e321c2b4e5572beb375c6f3453e14cf1ff7e9701af3",
+        "G-STANDALONE-SITE-CONTENT-MEMBERSHIP": "a5047505fc1d6fc3f603aec02ac90360ad614bba14a770306b606d75fd6e817e",
+    }
+)
+
+RATIFIED_COUNTS = MappingProxyType(
+    {
+        "productOrPackagingObligations": 4,
+        "validationInfrastructureObligations": 14,
+        "acceptedCheckpointNonblockingDebts": 3,
+        "expectedPrivateResourceOmissions": 2,
+        "releaseOnlySkips": 3,
+        "confirmedSecurityProductDefects": 0,
+        "unresolvedClassifications": 0,
+    }
+)
+
+HARD_GATE_AUTHORITY = (
+    "BASELINE-POLICY-ENFORCEMENT",
+    "REPOSITORY-GIT-BOUNDARY",
+    "TRACKED-PRIVATE-RESOURCE-EXCLUSION",
+    "SECRET-OPERATIONAL-ARTIFACT-EXCLUSION",
+    "LICENSE-GOVERNANCE-CONSISTENCY",
+    "WORKFLOW-SELF-POLICY",
+    "DIRECT-SYNTAX-EXECUTION",
+    "BUNDLE-MANIFEST-GENERATED-BYTE-PARITY",
+    "FOCUSED-LEARNER-RUNTIME-EXECUTION",
+    "FRONTEND-SECURITY-GUARD-EXECUTION",
+    "BACKEND-CANONICAL-EXECUTION",
+    "STANDALONE-PACKAGE-INTEGRITY",
+    "STANDALONE-MEMBERSHIP-AUDIT-EXECUTION",
+    "LOCKFILE-BYTE-INTEGRITY",
+    "UNKNOWN-NONPASS-FAIL-CLOSED",
+)
+
+REQUIRED_BASELINE_FIELDS = {
+    "documentKind",
+    "schemaVersion",
+    "baselineCommit",
+    "baselineTree",
+    "checkpointTag",
+    "policyVersion",
+    "ratifiedCounts",
+    "approvedActions",
+    "hardGates",
+    "knownDebts",
+    "expectedOmissions",
+    "releaseOnlySkips",
+    "observationalChecks",
+}
+
+REQUIRED_DEBT_FIELDS = {
+    "id",
+    "category",
+    "gate",
+    "commandClass",
+    "testOrPathScope",
+    "expectedOutcome",
+    "allowedNormalizedSignature",
+    "maximumOccurrences",
+    "platforms",
+    "checkpointDisposition",
+    "targetStage",
+    "securityImpact",
+    "notes",
+}
+
+TEXT_SCAN_SUFFIXES = {
+    ".cjs",
+    ".css",
+    ".html",
+    ".js",
+    ".json",
+    ".md",
+    ".mjs",
+    ".ps1",
+    ".py",
+    ".sh",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
+
+ANSI_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+ANSI_OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+ISO_TIMESTAMP = re.compile(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b")
+DURATION_VALUE = re.compile(r"(?i)(duration(?:_ms|Milliseconds)?\s*[:=]\s*)\d+(?:\.\d+)?")
+UNITTEST_DURATION = re.compile(r"(?i)(\bRan\s+\d+\s+tests?\s+in\s+)\d+(?:\.\d+)?s\b")
+WINDOWS_ABSOLUTE_PATH = re.compile(
+    r"(?:"
+    r"(?<![A-Za-z0-9_.-])[A-Za-z]:[\\/]"
+    r"|(?<![A-Za-z0-9_.:/-])(?:"
+    r"[\\/]{2}(?:"
+    r"[?][\\/](?:[Uu][Nn][Cc][\\/]"
+    r"[^\s\x00-\x1f\"'<>|\\/]+[\\/]"
+    r"[^\s\x00-\x1f\"'<>|\\/]+|[A-Za-z]:[\\/])"
+    r"|[.][\\/][A-Za-z]:[\\/]"
+    r"|(?!(?:[?.])[\\/])"
+    r"[^\s\x00-\x1f\"'<>|\\/]+[\\/]"
+    r"[^\s\x00-\x1f\"'<>|\\/]+"
+    r")"
+    r"|[\\/][?][?][\\/][A-Za-z]:[\\/]"
+    r")"
+    r")[^\s\x00-\x1f\"'<>|]*"
+)
+KNOWN_UNIX_ABSOLUTE_PATH = re.compile(r"(?<![:\w])/(?:home|opt|private|tmp|usr|__w)/[^\s\"'<>|]+")
+REPO_SOURCE_LOCATION = re.compile(
+    r"(?i)(?:file:///)?(?:[A-Z]:[/\\])?[A-Za-z0-9_ .@()\-+:/\\]+\.(?:cjs|js|mjs|py|ps1|sh)"
+    r"(?::\d+(?::\d+)?)?"
+)
+
+PRIVATE_KEY_BLOCK = re.compile(
+    r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----[\s\S]*?"
+    r"-----END (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----",
+    re.IGNORECASE,
+)
+PRIVATE_KEY_MARKER = re.compile(
+    r"-----(?:BEGIN|END) (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----",
+    re.IGNORECASE,
+)
+
+REDACTION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    PRIVATE_KEY_BLOCK,
+    PRIVATE_KEY_MARKER,
+    re.compile(r"(?i)\bhttps?://[^\s/@:]+:[^\s/@]+@[^\s]+"),
+    re.compile(r"(?im)^\s*(?:authorization|proxy-authorization)\s*:\s*[^\n]*$"),
+    re.compile(r"(?i)\b(?:Bearer|Basic)\s+[A-Za-z0-9+/=_\-.]{4,}"),
+    re.compile(r"(?im)^\s*(?:Cookie|Set-Cookie)\s*:\s*[^\n]*$"),
+    re.compile(r"(?i)\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"(?i)\bgh[pousr]_[A-Za-z0-9]{30,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"(?i)\bxox[baprs]-[A-Za-z0-9-]{20,}\b"),
+    re.compile(r"(?i)\bsk_live_[A-Za-z0-9]{16,}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
+    re.compile(
+        r"(?i)\b(?:authorization|password|passwd|secret|token|session(?:id|_id|token)?|cookie)\b"
+        r"[ \t\n]*[:=][ \t\n]*(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s,;]+)"
+    ),
+    re.compile(r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?)://[^\s]+"),
+)
+
+HIGH_CONFIDENCE_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (PRIVATE_KEY_MARKER, "private-key-marker"),
+    (re.compile(r"(?i)\bgithub_pat_[A-Za-z0-9_]{20,}\b"), "github-token"),
+    (re.compile(r"(?i)\bgh[pousr]_[A-Za-z0-9]{30,}\b"), "github-token"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "aws-access-key"),
+    (re.compile(r"(?i)\bxox[baprs]-[A-Za-z0-9-]{20,}\b"), "slack-token"),
+    (re.compile(r"(?i)\bsk_live_[A-Za-z0-9]{16,}\b"), "live-secret-key"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"), "api-key"),
+)
+
+SECRET_SCAN_BYTE_PATTERNS: tuple[tuple[re.Pattern[bytes], str], ...] = (
+    (re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----", re.I), "private-key-marker"),
+    (re.compile(rb"-----END (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----", re.I), "private-key-marker"),
+    (re.compile(rb"\bgithub_pat_[A-Za-z0-9_]{20,}\b", re.I), "github-token"),
+    (re.compile(rb"\bgh[pousr]_[A-Za-z0-9]{30,}\b", re.I), "github-token"),
+    (re.compile(rb"\bAKIA[0-9A-Z]{16}\b"), "aws-access-key"),
+    (re.compile(rb"\bxox[baprs]-[A-Za-z0-9-]{20,}\b", re.I), "slack-token"),
+    (re.compile(rb"\bsk_live_[A-Za-z0-9]{16,}\b", re.I), "live-secret-key"),
+    (re.compile(rb"\bAIza[0-9A-Za-z_-]{30,}\b"), "api-key"),
+    (
+        re.compile(
+            rb"(?i)\bhttps?://[^\s/@:\x00]{1,512}:[^\s/@\x00]{1,2048}@[^\s\x00]{1,4096}"
+        ),
+        "credential-bearing-url",
+    ),
+    (
+        re.compile(
+            rb"(?im)^[ \t]*(?:authorization|proxy-authorization)[ \t]*:[^\r\n\x00]{4,4096}$"
+        ),
+        "authorization-header",
+    ),
+    (
+        re.compile(rb"(?i)\b(?:Bearer|Basic)[ \t]+[A-Za-z0-9+/=_\-.]{16,4096}"),
+        "authorization-credential",
+    ),
+    (
+        re.compile(rb"(?im)^[ \t]*(?:Cookie|Set-Cookie)[ \t]*:[^\r\n\x00]{4,4096}$"),
+        "cookie-header",
+    ),
+    (
+        re.compile(
+            rb"(?i:\b(?:authorization|password|passwd|secret|token|session(?:id|_id|token)?|cookie)\b)"
+            rb"[ \t\r\n]{0,64}[:=][ \t\r\n]{0,64}"
+            rb"(?:"
+            rb"\"(?=[A-Za-z0-9+/=_\-.]{20,4096}\")(?=[A-Za-z0-9+/=_\-.]*[A-Z])"
+            rb"(?=[A-Za-z0-9+/=_\-.]*[a-z])(?=[A-Za-z0-9+/=_\-.]*[0-9])"
+            rb"[A-Za-z0-9+/=_\-.]{20,4096}\"|"
+            rb"'(?=[A-Za-z0-9+/=_\-.]{20,4096}')(?=[A-Za-z0-9+/=_\-.]*[A-Z])"
+            rb"(?=[A-Za-z0-9+/=_\-.]*[a-z])(?=[A-Za-z0-9+/=_\-.]*[0-9])"
+            rb"[A-Za-z0-9+/=_\-.]{20,4096}'|"
+            rb"(?=[A-Za-z0-9+/=_-]{20,4096}(?![A-Za-z0-9+/=_-]))"
+            rb"(?=[A-Za-z0-9+/=_-]*[A-Z])(?=[A-Za-z0-9+/=_-]*[a-z])"
+            rb"(?=[A-Za-z0-9+/=_-]*[0-9])[A-Za-z0-9+/=_-]{20,4096}"
+            rb")"
+        ),
+        "generic-credential-assignment",
+    ),
+    (
+        re.compile(
+            rb"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?)://"
+            rb"[^\s/@:\x00]{1,512}:"
+            rb"(?!(?:\$\{?|\{\{|postgres@|password@|changeme@|replace-with-[^@\x00]{0,512}@))"
+            rb"[^\s/@\x00]{8,2048}@[^\s\x00]{1,4096}"
+        ),
+        "credential-database-url",
+    ),
+)
+
+SECRET_SCAN_PATTERN_FAMILIES = tuple(
+    sorted(
+        {label for _pattern, label in SECRET_SCAN_BYTE_PATTERNS}
+        | {"operational-obfs4-bridge", "operational-onion-hostname"}
+    )
+)
+
+# The UTF-16 views use the same credential families as the raw-byte pass.  The
+# regular-expression sources are ASCII-only, so converting the compiled byte
+# patterns preserves their exact matching semantics without maintaining a
+# second, weaker pattern list.
+SECRET_SCAN_TEXT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(pattern.pattern.decode("ascii"), pattern.flags), label)
+    for pattern, label in SECRET_SCAN_BYTE_PATTERNS
+)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def platform_key() -> str:
+    if sys.platform.startswith("win"):
+        return "windows"
+    if sys.platform.startswith("linux"):
+        return "ubuntu"
+    return "other"
+
+
+def strip_terminal_controls(value: str) -> str:
+    """Remove terminal escape/control characters before any redaction pass."""
+
+    text = ANSI_OSC.sub("", ANSI_CSI.sub("", value))
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned: list[str] = []
+    for character in text:
+        codepoint = ord(character)
+        if character in {"\n", "\t"}:
+            cleaned.append(character)
+        elif codepoint < 0x20 or codepoint == 0x7F:
+            continue
+        elif unicodedata.category(character) == "Cf":
+            continue
+        else:
+            cleaned.append(character)
+    return "".join(cleaned)
+
+
+def _ascii_authority_fold(character: str) -> str:
+    """Fold one ASCII capital without applying any Unicode case mapping."""
+
+    if "A" <= character <= "Z":
+        return chr(ord(character) + (ord("a") - ord("A")))
+    return character
+
+
+def _ascii_authority_text_equal(left: str, right: str) -> bool:
+    if len(left) != len(right):
+        return False
+    return all(
+        _ascii_authority_fold(left_character)
+        == _ascii_authority_fold(right_character)
+        for left_character, right_character in zip(left, right)
+    )
+
+
+def _ascii_authority_startswith(value: str, prefix: str) -> bool:
+    if len(value) < len(prefix):
+        return False
+    return _ascii_authority_text_equal(value[: len(prefix)], prefix)
+
+
+def _ascii_lower_authority_text(value: str) -> str:
+    return "".join(_ascii_authority_fold(character) for character in value)
+
+
+def windows_authority_component_equal(left: str, right: str) -> bool:
+    """Compare a Windows authority component with conservative equivalence.
+
+    ASCII capitals compare with their ASCII lowercase spelling.  Every
+    non-ASCII scalar, punctuation character, and component boundary remains
+    exact.  This is security authorization equivalence, not an emulation of
+    every Windows filesystem collation rule.
+    """
+
+    return _ascii_authority_text_equal(left, right)
+
+
+@dataclass(frozen=True)
+class WindowsAbsoluteReference:
+    kind: str
+    authority_path: str | None = None
+    authorizable: bool = False
+
+
+def _windows_separator(value: str, index: int) -> bool:
+    return index < len(value) and value[index] in "/\\"
+
+
+def _windows_drive_at(value: str, index: int) -> bool:
+    return (
+        index + 2 < len(value)
+        and ("A" <= value[index] <= "Z" or "a" <= value[index] <= "z")
+        and value[index + 1] == ":"
+        and _windows_separator(value, index + 2)
+    )
+
+
+def _has_invalid_percent_escape(value: str) -> bool:
+    index = 0
+    while index < len(value):
+        if value[index] != "%":
+            index += 1
+            continue
+        if index + 2 >= len(value) or not re.fullmatch(
+            r"[0-9A-Fa-f]{2}", value[index + 1 : index + 3]
+        ):
+            return True
+        index += 3
+    return False
+
+
+def _has_encoded_separator(value: str) -> bool:
+    for match in re.finditer(r"%([0-9A-Fa-f]{2})", value):
+        codepoint = int(match.group(1), 16)
+        if codepoint in {ord("/"), ord("\\")}:
+            return True
+    return False
+
+
+def _file_uri_decoded_text(value: str) -> str | None:
+    if _has_invalid_percent_escape(value) or _has_encoded_separator(value):
+        return None
+    try:
+        decoded = unquote_to_bytes(value).decode("utf-8", errors="strict")
+    except UnicodeError:
+        return None
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in decoded):
+        return None
+    return decoded
+
+
+def _strict_file_uri_reference(value: str) -> WindowsAbsoluteReference | None:
+    if not _ascii_authority_startswith(value, "file:"):
+        return None
+    parsed = urlsplit(value)
+    if not _ascii_authority_text_equal(parsed.scheme, "file"):
+        return None
+    if parsed.query or parsed.fragment:
+        return WindowsAbsoluteReference("unsupported-absolute-windows-namespace")
+    if "@" in parsed.netloc or parsed.username or parsed.password:
+        return WindowsAbsoluteReference("unsupported-absolute-windows-namespace")
+
+    netloc = _file_uri_decoded_text(parsed.netloc)
+    path = _file_uri_decoded_text(parsed.path)
+    if netloc is None or path is None:
+        return WindowsAbsoluteReference("unsupported-absolute-windows-namespace")
+
+    if netloc:
+        if not path.startswith("/") or path == "/":
+            return WindowsAbsoluteReference("unsupported-absolute-windows-namespace")
+        authority_path = "//" + netloc + path
+        if _windows_authority_path_parts(authority_path) is None:
+            return WindowsAbsoluteReference("unsupported-absolute-windows-namespace")
+        return WindowsAbsoluteReference(
+            "file-unc-uri",
+            authority_path.replace("\\", "/"),
+            True,
+        )
+
+    if path.startswith("//"):
+        authority_path = path
+        if _windows_authority_path_parts(authority_path) is None:
+            return WindowsAbsoluteReference("unsupported-absolute-windows-namespace")
+        return WindowsAbsoluteReference(
+            "file-unc-uri",
+            authority_path.replace("\\", "/"),
+            True,
+        )
+
+    if len(path) >= 4 and path[0] == "/" and _windows_drive_at(path, 1):
+        return WindowsAbsoluteReference(
+            "file-drive-uri",
+            path[1:].replace("\\", "/"),
+            True,
+        )
+
+    if path.startswith("/"):
+        return WindowsAbsoluteReference("unsupported-absolute-windows-namespace")
+    return WindowsAbsoluteReference("ordinary-prose")
+
+
+def classify_windows_absolute_reference(value: str) -> WindowsAbsoluteReference:
+    """Classify a complete Windows absolute reference span.
+
+    The classifier is closed: recognized, suspicious, or malformed absolute
+    namespaces are distinguishable from ordinary prose and can be redacted
+    even when they are not valid authorizable drive/UNC roots.
+    """
+
+    if not value:
+        return WindowsAbsoluteReference("ordinary-prose")
+
+    file_uri = _strict_file_uri_reference(value)
+    if file_uri is not None:
+        return file_uri
+
+    if _windows_drive_at(value, 0):
+        return WindowsAbsoluteReference("drive-absolute", value.replace("\\", "/"), True)
+
+    if _windows_separator(value, 0) and _windows_separator(value, 1):
+        if len(value) > 3 and value[2] == "?" and _windows_separator(value, 3):
+            if (
+                len(value) > 7
+                and _ascii_authority_text_equal(value[4:7], "UNC")
+                and _windows_separator(value, 7)
+            ):
+                return WindowsAbsoluteReference(
+                    "extended-unc",
+                    "//" + value[8:].replace("\\", "/"),
+                    True,
+                )
+            if _windows_drive_at(value, 4):
+                return WindowsAbsoluteReference(
+                    "extended-drive",
+                    value[4:].replace("\\", "/"),
+                    True,
+                )
+            if (
+                len(value) > 15
+                and _ascii_authority_text_equal(value[4:14], "GLOBALROOT")
+                and _windows_separator(value, 14)
+            ):
+                return WindowsAbsoluteReference("globalroot")
+            if (
+                len(value) > 12
+                and _ascii_authority_startswith(value[4:], "Volume{")
+                and "}" in value[11:]
+            ):
+                return WindowsAbsoluteReference("volume-guid")
+            return WindowsAbsoluteReference("unsupported-absolute-windows-namespace")
+
+        if len(value) > 3 and value[2] == "." and _windows_separator(value, 3):
+            if _windows_drive_at(value, 4):
+                return WindowsAbsoluteReference("win32-device-drive")
+            return WindowsAbsoluteReference("win32-device-path")
+
+        return WindowsAbsoluteReference("unc", value.replace("\\", "/"), True)
+
+    if (
+        _windows_separator(value, 0)
+        and len(value) > 3
+        and value[1:3] == "??"
+        and _windows_separator(value, 3)
+    ):
+        if _windows_drive_at(value, 4):
+            return WindowsAbsoluteReference("nt-dos-device-path")
+        if (
+            len(value) > 7
+            and _ascii_authority_text_equal(value[4:7], "UNC")
+            and _windows_separator(value, 7)
+        ):
+            return WindowsAbsoluteReference("nt-unc-path")
+        return WindowsAbsoluteReference("unsupported-absolute-windows-namespace")
+
+    if (
+        _windows_separator(value, 0)
+        and len(value) > 8
+        and _ascii_authority_text_equal(value[1:7], "Device")
+        and _windows_separator(value, 7)
+    ):
+        return WindowsAbsoluteReference("nt-device-path")
+
+    if _windows_separator(value, 0):
+        return WindowsAbsoluteReference("relative-path")
+    return WindowsAbsoluteReference("ordinary-prose")
+
+
+def _windows_authority_path_form(value: str) -> str | None:
+    """Identify an absolute Windows namespace without rewriting its text."""
+
+    reference = classify_windows_absolute_reference(value)
+    aliases = {
+        "drive-absolute": "drive",
+        "unc": "unc",
+        "extended-unc": "extended-unc",
+        "extended-drive": "extended-drive",
+        "win32-device-drive": "device-drive",
+        "win32-device-path": "win32-device-path",
+        "globalroot": "globalroot",
+        "volume-guid": "volume-guid",
+        "nt-device-path": "nt-device-path",
+        "nt-dos-device-path": "nt-dos-device-path",
+        "nt-unc-path": "nt-unc-path",
+        "file-drive-uri": "file-drive-uri",
+        "file-unc-uri": "file-unc-uri",
+        "unsupported-absolute-windows-namespace": "unsupported-absolute-windows-namespace",
+    }
+    return aliases.get(reference.kind)
+
+
+def _windows_authority_path_parts(value: str) -> tuple[str, tuple[str, ...]] | None:
+    """Identify form, then parse after separator-only normalization."""
+
+    reference = classify_windows_absolute_reference(value)
+    if not reference.authorizable or reference.authority_path is None:
+        return None
+    form = _windows_authority_path_form(value)
+    if form is None:
+        return None
+    text = reference.authority_path.replace("\\", "/")
+    while len(text) > 3 and text.endswith("/"):
+        text = text[:-1]
+
+    def drive_component(component: str) -> bool:
+        return (
+            len(component) == 2
+            and ("A" <= component[0] <= "Z" or "a" <= component[0] <= "z")
+            and component[1] == ":"
+        )
+
+    if form == "drive":
+        tail = text[3:]
+        components = (text[:2], *(tail.split("/") if tail else ()))
+        if any(not component for component in components):
+            return None
+        return form, components
+
+    if form in {"unc", "extended-unc", "extended-drive", "file-unc-uri", "file-drive-uri"}:
+        if form in {"extended-drive", "file-drive-uri"}:
+            components = text.split("/")
+        else:
+            components = text[2:].split("/")
+        if any(not component for component in components):
+            return None
+        if form in {"unc", "extended-unc", "file-unc-uri"} and len(components) >= 2:
+            return form, tuple(components)
+        if form in {"extended-drive", "file-drive-uri"} and drive_component(components[0]):
+            return form, tuple(components)
+        return None
+    return None
+
+
+def windows_authority_path_prefix(candidate: str, authorized_root: str) -> bool:
+    """Return whether two complete Windows root spellings authorize equally."""
+
+    candidate_parts = _windows_authority_path_parts(candidate)
+    root_parts = _windows_authority_path_parts(authorized_root)
+    if candidate_parts is None or root_parts is None:
+        return False
+    candidate_form, candidate_components = candidate_parts
+    root_form, root_components = root_parts
+    return (
+        candidate_form == root_form
+        and len(candidate_components) == len(root_components)
+        and all(
+            windows_authority_component_equal(candidate_component, root_component)
+            for candidate_component, root_component in zip(
+                candidate_components, root_components
+            )
+        )
+    )
+
+
+def _normalization_root_record(value: str | Path, token: str) -> tuple[str, str, bool]:
+    text = str(value)
+    windows = _windows_authority_path_parts(text) is not None
+    if windows:
+        normalized = text.replace("\\", "/")
+        while len(normalized) > 3 and normalized.endswith("/"):
+            normalized = normalized[:-1]
+    else:
+        normalized = text
+        while len(normalized) > 1 and normalized.endswith("/"):
+            normalized = normalized[:-1]
+    return normalized, token, windows
+
+
+def _normalization_root_records(
+    value: str | Path, token: str
+) -> list[tuple[str, str, bool]]:
+    """Return native and narrowly derived file-URI path spellings for one root."""
+
+    native = _normalization_root_record(value, token)
+    records = [native]
+    root, _token, windows = native
+    if not windows:
+        return records
+    reference = classify_windows_absolute_reference(root)
+    authority_path = reference.authority_path
+    if authority_path is None:
+        return records
+    normalized_authority = authority_path.replace("\\", "/")
+    parts = _windows_authority_path_parts(root)
+    if parts is None:
+        return records
+    form = parts[0]
+    if form in {"drive", "extended-drive"}:
+        try:
+            uri_path = quote(
+                normalized_authority,
+                safe="/:",
+                encoding="utf-8",
+                errors="strict",
+            )
+        except UnicodeEncodeError:
+            return records
+        records.append(("file:///" + uri_path, token, windows))
+    if form in {"unc", "extended-unc"} and normalized_authority.startswith("//"):
+        try:
+            uri_path = quote(
+                normalized_authority[2:],
+                safe="/:",
+                encoding="utf-8",
+                errors="strict",
+            )
+        except UnicodeEncodeError:
+            return records
+        records.append(("file://" + uri_path, token, windows))
+        records.append(("file:////" + uri_path, token, windows))
+    return records
+
+
+def _authorized_root_pattern(root: str, *, windows: bool) -> re.Pattern[str]:
+    """Match one POSIX root only at exact path-component boundaries."""
+
+    if windows:
+        raise ValueError("Windows authority roots use the conservative comparator")
+    if not root.startswith("/"):
+        raise ValueError("POSIX normalization roots must be absolute")
+    components = [part for part in root.split("/") if part]
+    body = "/" + "/".join(re.escape(part) for part in components)
+    return re.compile(r"(?<![A-Za-z0-9_.-])" + body + r"(?=$|/)")
+
+
+TOKENIZED_AUTHORIZED_PATH = re.compile(
+    r"(?P<token><(?:repo|task-root)>)"
+    r"(?P<suffix>(?:[\\/][^\s\x00-\x1f\"'<>|]+)*)"
+)
+
+
+def _replace_windows_authorized_root(text: str, root: str, token: str) -> str:
+    """Replace conservative, component-bounded Windows authority matches."""
+
+    if not root:
+        return text
+    output: list[str] = []
+    cursor = 0
+    index = 0
+    root_length = len(root)
+    root_parts = _windows_authority_path_parts(root)
+    if root_parts is None:
+        return text
+    root_form = root_parts[0]
+    while index + root_length <= len(text):
+        previous = text[index - 1] if index else ""
+        if previous and (
+            "A" <= previous <= "Z"
+            or "a" <= previous <= "z"
+            or "0" <= previous <= "9"
+            or previous in "_.-"
+        ):
+            index += 1
+            continue
+        if previous and previous in ":/\\" and root_form != "drive":
+            index += 1
+            continue
+        end = index + root_length
+        following = text[end] if end < len(text) else ""
+        if following and following not in "/\\":
+            index += 1
+            continue
+        if root_form in {"file-drive-uri", "file-unc-uri"}:
+            span_end = _windows_reference_span_end(text, index)
+            reference = classify_windows_absolute_reference(text[index:span_end])
+            if reference.kind != root_form or not reference.authorizable:
+                index += 1
+                continue
+        if windows_authority_path_prefix(text[index:end], root):
+            output.append(text[cursor:index])
+            output.append(token)
+            cursor = end
+            index = end
+            continue
+        index += 1
+    output.append(text[cursor:])
+    return "".join(output)
+
+
+def _windows_reference_start(text: str, index: int) -> bool:
+    previous = text[index - 1] if index else ""
+    if _ascii_authority_startswith(text[index:], "file:"):
+        return not previous or not (
+            "A" <= previous <= "Z"
+            or "a" <= previous <= "z"
+            or "0" <= previous <= "9"
+            or previous in "_.-"
+        )
+    if _windows_drive_at(text, index):
+        return not previous or not (
+            "A" <= previous <= "Z"
+            or "a" <= previous <= "z"
+            or "0" <= previous <= "9"
+            or previous in "_.-"
+        )
+    if _windows_separator(text, index) and _windows_separator(text, index + 1):
+        if previous and previous in ":/\\._-":
+            return False
+        return True
+    if _windows_separator(text, index):
+        if previous and (
+            "A" <= previous <= "Z"
+            or "a" <= previous <= "z"
+            or "0" <= previous <= "9"
+            or previous in "_.:/\\-"
+        ):
+            return False
+        tail = text[index:]
+        return (
+            len(tail) > 7
+            and _ascii_authority_text_equal(tail[1:7], "Device")
+            and _windows_separator(tail, 7)
+        ) or (
+            len(tail) > 3
+            and tail[1:3] == "??"
+            and _windows_separator(tail, 3)
+        )
+    return False
+
+
+def _windows_reference_span_end(text: str, index: int) -> int:
+    end = index
+    while end < len(text):
+        character = text[end]
+        if character.isspace() or ord(character) < 0x20 or character in "\"'<>|":
+            break
+        end += 1
+    while end > index and text[end - 1] in ".,;":
+        end -= 1
+    return end
+
+
+def redact_windows_absolute_references(text: str) -> str:
+    output: list[str] = []
+    cursor = 0
+    index = 0
+    while index < len(text):
+        if not _windows_reference_start(text, index):
+            index += 1
+            continue
+        end = _windows_reference_span_end(text, index)
+        if end <= index:
+            index += 1
+            continue
+        reference = classify_windows_absolute_reference(text[index:end])
+        if reference.kind in {"ordinary-prose", "relative-path"}:
+            index += 1
+            continue
+        output.append(text[cursor:index])
+        output.append("<abs-path>")
+        cursor = end
+        index = end
+    output.append(text[cursor:])
+    return "".join(output)
+
+
+def normalize_authorized_path_text(
+    value: str,
+    *,
+    repository_root: str | Path | None = None,
+    task_roots: Sequence[str | Path] | None = None,
+) -> str:
+    """Tokenize recognized roots before any decoded backslash can look like an escape.
+
+    Windows roots use explicit ASCII-only case equivalence and accept either
+    separator; non-ASCII scalars remain exact.  POSIX roots compare
+    case-sensitively.  Every match is component-bounded, and the longest
+    authorized root wins.  Other drive, UNC, and device absolute paths are
+    reduced to the closed absolute-path token.
+    """
+
+    selected_repository_root = REPO_ROOT if repository_root is None else repository_root
+    selected_task_roots: list[str | Path] = []
+    if task_roots is None:
+        for name in ("TEMP", "TMP", "TMPDIR"):
+            candidate = os.environ.get(name)
+            if candidate:
+                selected_task_roots.append(candidate)
+        try:
+            selected_task_roots.append(tempfile.gettempdir())
+        except (OSError, RuntimeError):
+            pass
+    else:
+        selected_task_roots.extend(task_roots)
+
+    records = _normalization_root_records(selected_repository_root, "<repo>")
+    for candidate in selected_task_roots:
+        if str(candidate):
+            records.extend(
+                _normalization_root_records(candidate, "<task-root>")
+            )
+    unique: list[tuple[str, str, bool]] = []
+    for root, token, windows in records:
+        if not root or (not windows and not root.startswith("/")):
+            continue
+        root_parts = _windows_authority_path_parts(root) if windows else None
+        duplicate = any(
+            existing_windows == windows
+            and (
+                (
+                    root == existing_root
+                    if (
+                        root_parts is not None
+                        and root_parts[0] in {"file-drive-uri", "file-unc-uri"}
+                    )
+                    else windows_authority_path_prefix(root, existing_root)
+                )
+                if windows
+                else root == existing_root
+            )
+            for existing_root, _existing_token, existing_windows in unique
+        )
+        if duplicate:
+            continue
+        unique.append((root, token, windows))
+    unique.sort(
+        key=lambda item: (len(item[0]), item[1] == "<repo>"),
+        reverse=True,
+    )
+
+    text = value
+    for root, token, windows in unique:
+        if windows:
+            text = _replace_windows_authorized_root(text, root, token)
+        else:
+            text = _authorized_root_pattern(root, windows=False).sub(token, text)
+    # Once an authorized root has been recognized, every following separator
+    # in that path is unambiguously path syntax.  Normalize that relative
+    # suffix here, before JSON-looking sequences such as ``\repo`` or
+    # ``\u1234`` can be protected as text escapes by the raw-observation pass.
+    text = TOKENIZED_AUTHORIZED_PATH.sub(
+        lambda match: match.group("token")
+        + match.group("suffix").replace("\\", "/"),
+        text,
+    )
+    text = redact_windows_absolute_references(text)
+    text = KNOWN_UNIX_ABSOLUTE_PATH.sub("<abs-path>", text)
+    return text
+
+
+def normalize_text(value: str) -> str:
+    """Narrowly normalize platform paths, line endings, timestamps, and timings."""
+
+    text = normalize_authorized_path_text(value)
+    text = strip_terminal_controls(text)
+    text = text.replace("\\", "/")
+    text = redact_windows_absolute_references(text)
+    text = KNOWN_UNIX_ABSOLUTE_PATH.sub("<abs-path>", text)
+    text = ISO_TIMESTAMP.sub("<timestamp>", text)
+    text = DURATION_VALUE.sub(r"\1<duration>", text)
+    text = UNITTEST_DURATION.sub(r"\1<duration>s", text)
+    text = re.sub(r"Node\.js v\d+\.\d+\.\d+", "Node.js v<version>", text)
+    return "\n".join(line.rstrip() for line in text.split("\n")).strip()
+
+
+def sanitize_text(value: str) -> str:
+    text = normalize_text(value)
+    for pattern in REDACTION_PATTERNS:
+        text = pattern.sub("[REDACTED]", text)
+    return text
+
+
+def contains_high_confidence_secret(value: str) -> list[str]:
+    hits: list[str] = []
+    for pattern, label in HIGH_CONFIDENCE_SECRET_PATTERNS:
+        if pattern.search(value):
+            hits.append(label)
+    bridge_pattern = re.compile(
+        r"(?im)^\s*obfs4\s+\S+:\d+\s+[A-F0-9]{40}\s+cert=\S+\s+iat-mode=\d+\s*$"
+    )
+    if bridge_pattern.search(value):
+        hits.append("operational-obfs4-bridge")
+    onion_pattern = re.compile(r"(?i)\b[a-z2-7]{56}\.onion\b")
+    if onion_pattern.search(value):
+        hits.append("operational-onion-hostname")
+    return sorted(set(hits))
+
+
+def sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def normalized_json_value(value: Any) -> Any:
+    volatile_keys = {
+        "generatedAt",
+        "generated_at",
+        "timestamp",
+        "duration",
+        "durationMs",
+        "durationMilliseconds",
+        "duration_ms",
+    }
+    if isinstance(value, Mapping):
+        return {
+            str(key): normalized_json_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key) not in volatile_keys
+        }
+    if isinstance(value, list):
+        return [normalized_json_value(item) for item in value]
+    if isinstance(value, str):
+        return sanitize_text(value)
+    return value
+
+
+def raw_observation_json_value(value: Any) -> Any:
+    """Normalize producer text without corrupting JSON escapes embedded in it."""
+
+    volatile_keys = {
+        "generatedAt",
+        "generated_at",
+        "timestamp",
+        "duration",
+        "durationMs",
+        "durationMilliseconds",
+        "duration_ms",
+    }
+    if isinstance(value, Mapping):
+        return {
+            str(key): raw_observation_json_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key) not in volatile_keys
+        }
+    if isinstance(value, list):
+        return [raw_observation_json_value(item) for item in value]
+    if not isinstance(value, str):
+        return value
+
+    # Root tokenization deliberately precedes protection of JSON-looking text.
+    # A decoded ``\\repo`` or ``\\u1234`` path component is therefore a path,
+    # never a second opportunity to interpret JSON/Python escape syntax.
+    text = strip_terminal_controls(normalize_authorized_path_text(value))
+    prefix = "__CI_RAW_JSON_ESCAPE__"
+    while prefix in text:
+        prefix += "_"
+    escapes: list[str] = []
+
+    def protect(match: re.Match[str]) -> str:
+        escapes.append(match.group(0))
+        return f"{prefix}{len(escapes) - 1}__"
+
+    protected = re.sub(
+        r'(?<!\\)\\(?:["/bfnrt]|u[0-9A-Fa-f]{4})',
+        protect,
+        text,
+    )
+    normalized = normalize_text(protected)
+    for index, escaped in enumerate(escapes):
+        normalized = normalized.replace(f"{prefix}{index}__", escaped)
+    for pattern in REDACTION_PATTERNS:
+        normalized = pattern.sub("[REDACTED]", normalized)
+    return normalized
+
+
+def structured_signature(value: Any) -> str:
+    canonical = json.dumps(
+        normalized_json_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"sha256:{sha256_text(canonical)}"
+
+
+def _canonical_frame(value: Any) -> bytes:
+    """Encode JSON-compatible values with stable, type-aware length framing."""
+
+    def frame(tag: bytes, payload: bytes) -> bytes:
+        return tag + len(payload).to_bytes(
+            CANONICAL_FRAME_LENGTH_WIDTH_BYTES,
+            CANONICAL_FRAME_BYTE_ORDER,
+            signed=False,
+        ) + payload
+
+    def count(value: int) -> bytes:
+        return value.to_bytes(
+            CANONICAL_FRAME_COUNT_WIDTH_BYTES,
+            CANONICAL_FRAME_BYTE_ORDER,
+            signed=False,
+        )
+
+    if value is None:
+        return frame(CANONICAL_FRAME_TAGS["null"], b"")
+    if type(value) is bool:
+        return frame(CANONICAL_FRAME_TAGS["boolean"], b"1" if value else b"0")
+    if type(value) is int:
+        return frame(CANONICAL_FRAME_TAGS["integer"], str(value).encode("ascii"))
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("canonical failure material forbids non-finite numbers")
+        return frame(CANONICAL_FRAME_TAGS["float"], value.hex().encode("ascii"))
+    if isinstance(value, str):
+        normalized = unicodedata.normalize(CANONICAL_FRAME_UNICODE_NORMALIZATION, value)
+        return frame(
+            CANONICAL_FRAME_TAGS["text"],
+            normalized.encode(CANONICAL_FRAME_TEXT_ENCODING, errors="strict"),
+        )
+    if isinstance(value, bytes):
+        return frame(CANONICAL_FRAME_TAGS["bytes"], value)
+    if isinstance(value, (list, tuple)):
+        payload = count(len(value)) + b"".join(
+            _canonical_frame(item) for item in value
+        )
+        return frame(CANONICAL_FRAME_TAGS["list"], payload)
+    if isinstance(value, Mapping):
+        items: list[tuple[bytes, Any]] = []
+        seen: set[bytes] = set()
+        for raw_key, item in value.items():
+            if not isinstance(raw_key, str):
+                raise TypeError("canonical failure material object keys must be strings")
+            key = unicodedata.normalize(
+                CANONICAL_FRAME_UNICODE_NORMALIZATION, raw_key
+            ).encode(CANONICAL_FRAME_TEXT_ENCODING, errors="strict")
+            if key in seen:
+                raise ValueError("canonical failure material contains a duplicate normalized key")
+            seen.add(key)
+            items.append((key, item))
+        items.sort(key=lambda pair: pair[0])
+        payload = count(len(items))
+        for key, item in items:
+            payload += frame(CANONICAL_FRAME_TAGS["map-key"], key) + _canonical_frame(
+                item
+            )
+        return frame(CANONICAL_FRAME_TAGS["map"], payload)
+    raise TypeError(f"unsupported canonical failure material type: {type(value).__name__}")
+
+
+def canonical_failure_digest(value: Any) -> str:
+    return "sha256:" + hashlib.sha256(_canonical_frame(value)).hexdigest()
+
+
+FROZEN_V1_RELEASE_SKIP_DETAIL_FIELDS = MappingProxyType(
+    {
+        "Release ZIP 运行时内容守卫": frozenset({"reason", "skipped"}),
+        "PDF 对账与回归审计": frozenset(
+            {
+                "invalidStatusRows",
+                "missingEvidenceForVerified",
+                "monaAnswerMismatches",
+                "monaBannedPatternHits",
+                "monaCoverageOk",
+                "onlyInChecklist",
+                "onlyInMapping",
+                "reason",
+                "status",
+            }
+        ),
+        "Checklist 对账一致性校验": frozenset(
+            {
+                "claimMismatches",
+                "claims",
+                "freshnessMismatches",
+                "issueStatusCount",
+                "reason",
+                "reportFreshness",
+                "status",
+                "summaryMismatches",
+                "summaryStatusCount",
+            }
+        ),
+    }
+)
+
+
+def _frozen_v1_normalized_value(value: Any, *, path: str) -> Any:
+    """Normalize one frozen-v1 value without accepting ambiguous JSON shapes."""
+
+    if value is None or type(value) in {bool, int}:
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{path} contains a non-finite number")
+        return value
+    if isinstance(value, str):
+        return unicodedata.normalize("NFC", normalize_text(value))
+    if isinstance(value, list):
+        normalized = [
+            _frozen_v1_normalized_value(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+        framed_members: set[bytes] = set()
+        for item in normalized:
+            framed = _canonical_frame(item)
+            if framed in framed_members:
+                raise ValueError(f"{path} contains a duplicate normalized member")
+            framed_members.add(framed)
+        return normalized
+    if isinstance(value, Mapping):
+        normalized_items: list[tuple[bytes, str, Any]] = []
+        normalized_keys: set[bytes] = set()
+        for raw_key, item in value.items():
+            if not isinstance(raw_key, str):
+                raise TypeError(f"{path} contains a non-string object key")
+            key_text = unicodedata.normalize("NFC", raw_key)
+            key_bytes = key_text.encode("utf-8", errors="strict")
+            if key_bytes in normalized_keys:
+                raise ValueError(f"{path} contains a duplicate normalized key")
+            normalized_keys.add(key_bytes)
+            normalized_items.append(
+                (
+                    key_bytes,
+                    key_text,
+                    _frozen_v1_normalized_value(item, path=f"{path}.{key_text}"),
+                )
+            )
+        normalized_items.sort(key=lambda item: item[0])
+        return {key: item for _key_bytes, key, item in normalized_items}
+    raise TypeError(f"{path} contains unsupported type {type(value).__name__}")
+
+
+def frozen_v1_release_skip_comparison_material(
+    validated_raw_observation: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the fixed frozen-v1 release-skip schema from validated raw facts."""
+
+    source_result_id = validated_raw_observation.get("sourceResultId")
+    expected_fields = FROZEN_V1_RELEASE_SKIP_DETAIL_FIELDS.get(str(source_result_id))
+    if expected_fields is None:
+        raise ValueError("raw observation is not a frozen-v1 release-only skip")
+    raw_fields = validated_raw_observation.get("rawStructuredFields")
+    if not isinstance(raw_fields, Mapping):
+        raise TypeError("frozen-v1 release-only skip fields must be an object")
+    detail = raw_fields.get("detail")
+    if not isinstance(detail, Mapping):
+        raise TypeError("frozen-v1 release-only skip detail must be an object")
+    normalized_detail = _frozen_v1_normalized_value(
+        detail,
+        path=f"releaseSkip:{source_result_id}.detail",
+    )
+    assert isinstance(normalized_detail, dict)
+    detail_members = [
+        {
+            "field": field_name,
+            "presence": "present" if field_name in normalized_detail else "absent",
+            "value": normalized_detail.get(field_name),
+        }
+        for field_name in sorted(expected_fields)
+    ]
+    unexpected_detail_members = [
+        {"field": field_name, "value": normalized_detail[field_name]}
+        for field_name in sorted(set(normalized_detail) - set(expected_fields))
+    ]
+    unexpected_outer_members = [
+        {
+            "field": field_name,
+            "value": _frozen_v1_normalized_value(
+                raw_fields[field_name],
+                path=f"releaseSkip:{source_result_id}.{field_name}",
+            ),
+        }
+        for field_name in sorted(set(raw_fields) - {"name", "status", "detail"})
+    ]
+    material = {
+        "schemaVersion": FROZEN_V1_RELEASE_SKIP_SIGNATURE_SCHEMA_VERSION,
+        "wireEncoding": "phase1-normalized-json-v1",
+        "commandId": validated_raw_observation.get("commandId"),
+        "observationKind": validated_raw_observation.get("observationKind"),
+        "sourceResultId": source_result_id,
+        "sourcePath": validated_raw_observation.get("sourcePath"),
+        "outerName": _frozen_v1_normalized_value(
+            raw_fields.get("name"),
+            path=f"releaseSkip:{source_result_id}.name",
+        ),
+        "outerStatus": _frozen_v1_normalized_value(
+            raw_fields.get("status"),
+            path=f"releaseSkip:{source_result_id}.status",
+        ),
+        "detailMembers": detail_members,
+        "unexpectedDetailMembers": unexpected_detail_members,
+        "unexpectedOuterMembers": unexpected_outer_members,
+        "historicalCanonicalDetail": normalized_detail,
+    }
+    # This validation frame is the unambiguous, type-aware representation used
+    # to reject duplicate/ambiguous material. The returned comparison digest
+    # below retains the Phase 1 JSON wire bytes because those bytes are frozen.
+    _canonical_frame(material)
+    return material
+
+
+def derive_frozen_v1_release_skip_signature(
+    validated_raw_observation: Mapping[str, Any],
+) -> str:
+    """Reproduce a frozen Phase 1 release-skip signature from raw facts only."""
+
+    material = frozen_v1_release_skip_comparison_material(validated_raw_observation)
+    exact_shape = (
+        material["commandId"] == "static-suite"
+        and material["observationKind"] == "static-producer-v1"
+        and material["sourcePath"] == STATIC_SUITE_RELATIVE_PATH
+        and material["outerName"] == material["sourceResultId"]
+        and material["outerStatus"] == "pass"
+        and not material["unexpectedDetailMembers"]
+        and not material["unexpectedOuterMembers"]
+        and all(member["presence"] == "present" for member in material["detailMembers"])
+    )
+    if not exact_shape:
+        # Invalid, omitted, expanded, or misplaced material gets a deterministic
+        # non-baseline digest so comparison fails closed without hiding members.
+        return canonical_failure_digest(material)
+    canonical = json.dumps(
+        material["historicalCanonicalDetail"],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return f"sha256:{sha256_text(canonical)}"
+
+
+_DERIVED_FAILURE_FIELD_NAMES = frozenset(
+    {
+        "allowedNormalizedSignature",
+        "baselineId",
+        "baselineSignature",
+        "canonicalFailureMaterialVersion",
+        "derivedFailureDigest",
+        "derivedFailureMembers",
+        "expectedDisposition",
+        "failureDigest",
+        "failureIdentity",
+        "failureIdentityHash",
+        "legacyBaselineComparisonDigest",
+        "normalizedSignature",
+        "signature",
+        "structuredFailureSet",
+        "currentFullContextDigest",
+    }
+)
+
+
+def _raw_observation_forbidden_fields(value: Any, *, path: str = "rawStructuredFields") -> list[str]:
+    errors: list[str] = []
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            key_text = str(key)
+            if key_text in _DERIVED_FAILURE_FIELD_NAMES:
+                errors.append(f"{path}.{key_text} is a derived or baseline-authority field")
+            errors.extend(_raw_observation_forbidden_fields(child, path=f"{path}.{key_text}"))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            errors.extend(_raw_observation_forbidden_fields(child, path=f"{path}[{index}]"))
+    return errors
+
+
+def _producer_record_digest(record_without_digest: Mapping[str, Any]) -> str:
+    return canonical_failure_digest(record_without_digest)
+
+
+def make_raw_observation(
+    command_id: str,
+    command_ordinal: int,
+    observation_ordinal: int,
+    observation_kind: str,
+    source_result_id: str,
+    source_path: str | None,
+    raw_structured_fields: Any,
+    source_output_digest: str,
+    occurrences: int = 1,
+) -> dict[str, Any]:
+    """Create one baseline-blind producer observation with a self-checking frame."""
+
+    record = {
+        "schemaVersion": RAW_OBSERVATION_SCHEMA_VERSION,
+        "commandId": command_id,
+        "commandOrdinal": command_ordinal,
+        "observationOrdinal": observation_ordinal,
+        "observationKind": observation_kind,
+        "sourceResultId": source_result_id,
+        "sourcePath": source_path,
+        "rawStructuredFields": raw_observation_json_value(raw_structured_fields),
+        "sourceOutputDigest": source_output_digest,
+        "occurrences": occurrences,
+    }
+    record["producerRecordDigest"] = _producer_record_digest(record)
+    return record
+
+
+def producer_observation_set_digest(observations: Sequence[Mapping[str, Any]]) -> str:
+    return canonical_failure_digest(list(observations))
+
+
+def _truncate_utf8(value: str, byte_limit: int, *, keep_tail: bool = False) -> str:
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= byte_limit:
+        return value
+    selected = encoded[-byte_limit:] if keep_tail else encoded[:byte_limit]
+    return selected.decode("utf-8", errors="ignore")
+
+
+def bounded_preview(
+    value: str,
+    *,
+    max_lines: int = 24,
+    max_bytes: int = MAX_EVIDENCE_PREVIEW_BYTES,
+) -> str:
+    safe_lines = [
+        _truncate_utf8(line, MAX_OUTPUT_LINE_BYTES)
+        for line in sanitize_text(value).splitlines()
+    ]
+    if len(safe_lines) > max_lines:
+        head_count = max(1, max_lines // 2)
+        tail_count = max(1, max_lines - head_count - 1)
+        safe_lines = safe_lines[:head_count] + ["[DIAGNOSTIC-TRUNCATED]"] + safe_lines[-tail_count:]
+    preview = "\n".join(safe_lines)
+    if len(preview.encode("utf-8", errors="replace")) > max_bytes:
+        half = max(1, (max_bytes - 32) // 2)
+        preview = (
+            _truncate_utf8(preview, half)
+            + "\n[DIAGNOSTIC-TRUNCATED]\n"
+            + _truncate_utf8(preview, half, keep_tail=True)
+        )
+        preview = _truncate_utf8(preview, max_bytes)
+    return preview
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_reparse_point(metadata: os.stat_result) -> bool:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag)
+
+
+def _secure_regular_file(path: Path) -> tuple[bool, str]:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        return False, f"{type(exc).__name__}: cannot stat executable"
+    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
+        return False, "symbolic links and reparse points are not trusted"
+    if not stat.S_ISREG(metadata.st_mode):
+        return False, "tool is not a regular file"
+    return True, ""
+
+
+def _unsafe_tool_path_reason(path: Path, repo_root: Path) -> str | None:
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        return "path does not resolve"
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return "path cannot be inspected"
+    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
+        return "path is a symbolic link or reparse point"
+    repo_resolved = repo_root.resolve(strict=True)
+    if _path_is_within(resolved, repo_resolved):
+        return "path is controlled by the repository workspace"
+    if any(part.casefold() == "node_modules" for part in resolved.parts):
+        return "path is beneath node_modules"
+    try:
+        temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+    except OSError:
+        temp_root = Path(tempfile.gettempdir()).resolve()
+    if _path_is_within(resolved, temp_root):
+        return "path is beneath the task temporary directory"
+    return None
+
+
+def _trusted_tool_roots(source_environment: Mapping[str, str]) -> tuple[Path, ...]:
+    roots: list[Path] = []
+    python_path = Path(sys.executable).resolve()
+    if len(python_path.parents) >= 2:
+        roots.append(python_path.parents[1])
+    for key in ("SystemRoot", "WINDIR", "ProgramFiles", "ProgramFiles(x86)", "RUNNER_TOOL_CACHE"):
+        value = source_environment.get(key)
+        if value:
+            roots.append(Path(value))
+    roots.extend(Path(value) for value in ("/bin", "/usr", "/usr/local", "/opt", "/nix/store"))
+    normalized: list[Path] = []
+    for root in roots:
+        try:
+            resolved = root.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved not in normalized:
+            normalized.append(resolved)
+    return tuple(normalized)
+
+
+def _tool_location_is_allowlisted(path: Path, source_environment: Mapping[str, str]) -> bool:
+    resolved = path.resolve(strict=True)
+    if any(_path_is_within(resolved, root) for root in _trusted_tool_roots(source_environment)):
+        return True
+    normalized = str(resolved).replace("\\", "/")
+    return bool(re.match(r"(?i)^[A-Z]:/Git(?:/|$)", normalized))
+
+
+def _windows_system_launcher_path(path: Path, source_environment: Mapping[str, str]) -> bool:
+    """Return whether *path* is beneath a Windows WSL-launcher directory."""
+
+    normalized = str(path.resolve(strict=True)).replace("\\", "/").casefold()
+    roots = {
+        str(Path(value).resolve(strict=True)).replace("\\", "/").casefold()
+        for key in ("SystemRoot", "WINDIR")
+        if (value := source_environment.get(key))
+    }
+    if any(
+        normalized.startswith(root.rstrip("/") + suffix)
+        for root in roots
+        for suffix in ("/system32/", "/sysnative/")
+    ):
+        return True
+    return bool(re.search(r"(?i)/(?:windows/)?(?:system32|sysnative)/", normalized + "/"))
+
+
+def _trusted_git_installation_root(git: Path) -> tuple[Path | None, str | None]:
+    try:
+        resolved = git.resolve(strict=True)
+    except OSError:
+        return None, "trusted Git path does not resolve"
+    if not resolved.is_absolute() or resolved.name.casefold() != "git.exe":
+        return None, "trusted Git must be an absolute git.exe path"
+    if resolved.parent.name.casefold() not in {"cmd", "bin"}:
+        return None, "trusted Git is not rooted in a canonical Git for Windows installation"
+    root = resolved.parent.parent
+    try:
+        metadata = root.lstat()
+    except OSError:
+        return None, "trusted Git installation root cannot be inspected"
+    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        return None, "trusted Git installation root is a link, reparse point, or non-directory"
+    return root, None
+
+
+def _non_reparse_directory_chain(path: Path, stop: Path) -> bool:
+    current = path
+    stop_resolved = stop.resolve(strict=True)
+    while True:
+        metadata = current.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
+            return False
+        if current.resolve(strict=True) == stop_resolved:
+            return True
+        if current.parent == current:
+            return False
+        current = current.parent
+
+
+def resolve_trusted_git_bash(
+    git: str,
+    *,
+    source_environment: Mapping[str, str] | None = None,
+    repo_root: Path = REPO_ROOT,
+) -> tuple[str | None, list[str]]:
+    """Derive Git Bash from the already trusted Git for Windows installation."""
+
+    source = dict(os.environ if source_environment is None else source_environment)
+    git_path = Path(git)
+    okay, reason = _secure_regular_file(git_path)
+    if not okay:
+        return None, [f"trusted Git cannot authorize Bash: {reason}"]
+    git_root, root_error = _trusted_git_installation_root(git_path)
+    if git_root is None:
+        return None, [root_error or "trusted Git installation root is unavailable"]
+    git_root_resolved = git_root.resolve(strict=True)
+    errors: list[str] = []
+    for candidate in (git_root / "bin" / "bash.exe", git_root / "usr" / "bin" / "bash.exe"):
+        if not candidate.exists():
+            continue
+        okay, reason = _secure_regular_file(candidate)
+        if not okay:
+            errors.append(f"untrusted Git Bash candidate {candidate}: {reason}")
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(git_root_resolved)
+        except (OSError, ValueError):
+            errors.append(f"Git Bash candidate escapes the trusted Git installation root: {candidate}")
+            continue
+        try:
+            chain_ok = _non_reparse_directory_chain(candidate.parent, git_root)
+        except OSError:
+            chain_ok = False
+        if not chain_ok:
+            errors.append(f"Git Bash candidate has a link or reparse point in its installation chain: {candidate}")
+            continue
+        unsafe_reason = _unsafe_tool_path_reason(candidate, repo_root)
+        if unsafe_reason:
+            errors.append(f"untrusted Git Bash candidate {candidate}: {unsafe_reason}")
+            continue
+        if _windows_system_launcher_path(candidate, source):
+            errors.append(f"Windows System32/Sysnative Bash launcher is forbidden: {candidate}")
+            continue
+        if not _tool_location_is_allowlisted(candidate, source):
+            errors.append(f"Git Bash is outside the sanitized system/toolcache roots: {candidate}")
+            continue
+        return str(resolved), []
+    if not errors:
+        errors.append("required trusted Git Bash executable is unavailable")
+    return None, sorted(set(errors))
+
+
+def resolve_trusted_tools(
+    required: Iterable[str],
+    *,
+    source_environment: Mapping[str, str] | None = None,
+    repo_root: Path = REPO_ROOT,
+) -> tuple[dict[str, str], list[str]]:
+    """Resolve tools once from a filtered PATH and reject caller/workspace shadowing."""
+
+    source = dict(os.environ if source_environment is None else source_environment)
+    errors: list[str] = []
+    for override in (
+        "NODE_EXE",
+        "NPM_EXE",
+        "PYTHON_EXE",
+        "GIT_EXE",
+        "POWERSHELL_EXE",
+        "BASH_EXE",
+    ):
+        if source.get(override):
+            errors.append(f"caller-controlled executable override is forbidden: {override}")
+
+    raw_path = source.get("PATH", source.get("Path", ""))
+    raw_entries = raw_path.split(os.pathsep) if raw_path else []
+    safe_entries: list[str] = []
+    unsafe_indices: list[int] = []
+    resolved_entries: list[Path | None] = []
+    for index, raw_entry in enumerate(raw_entries):
+        if not raw_entry or not Path(raw_entry).is_absolute():
+            unsafe_indices.append(index)
+            resolved_entries.append(None)
+            continue
+        entry = Path(raw_entry)
+        reason = _unsafe_tool_path_reason(entry, repo_root)
+        if reason:
+            unsafe_indices.append(index)
+            resolved_entries.append(None)
+            continue
+        try:
+            resolved_entry = entry.resolve(strict=True)
+        except OSError:
+            unsafe_indices.append(index)
+            resolved_entries.append(None)
+            continue
+        resolved_entries.append(resolved_entry)
+        safe_entries.append(str(resolved_entry))
+
+    sanitized_path = os.pathsep.join(safe_entries)
+    requested = set(required)
+    windows_git_bash = os.name == "nt" and "bash" in requested
+    path_resolved_names = requested - ({"bash"} if windows_git_bash else set())
+    captured_runtime_variables = {
+        "python": "CI_TRUSTED_PYTHON",
+        "node": "CI_TRUSTED_NODE",
+        "npm": "CI_TRUSTED_NPM_ENTRY",
+    }
+    resolved_tools: dict[str, str] = {}
+    for name in sorted(path_resolved_names):
+        captured_name = captured_runtime_variables.get(name)
+        captured_value = source.get(captured_name, "") if captured_name else ""
+        candidate = (
+            captured_value
+            if captured_value
+            else sys.executable
+            if name == "python"
+            else shutil.which(name, path=sanitized_path)
+        )
+        if candidate and name == "npm" and not captured_value:
+            candidate_path = Path(candidate)
+            if candidate_path.suffix.casefold() in {".cmd", ".ps1"}:
+                npm_entry = (
+                    candidate_path.parent
+                    / "node_modules"
+                    / "npm"
+                    / "bin"
+                    / "npm-cli.js"
+                )
+                if npm_entry.is_file():
+                    candidate = str(npm_entry)
+        if not candidate and name == "node":
+            python_runtime_root = Path(sys.executable).resolve(strict=True).parent.parent
+            bundled_candidates = (
+                python_runtime_root / "node" / "bin" / ("node.exe" if os.name == "nt" else "node"),
+                python_runtime_root / "node" / ("node.exe" if os.name == "nt" else "bin/node"),
+            )
+            candidate = next(
+                (str(value) for value in bundled_candidates if value.is_file()),
+                None,
+            )
+        if not candidate:
+            errors.append(f"required trusted executable is unavailable: {name}")
+            continue
+        candidate_path = Path(candidate)
+        if not candidate_path.is_absolute():
+            errors.append(f"resolved executable is not absolute: {name}")
+            continue
+        try:
+            canonical_candidate = candidate_path.resolve(strict=True)
+        except OSError:
+            errors.append(f"resolved executable does not exist: {name}")
+            continue
+        okay, reason = _secure_regular_file(canonical_candidate)
+        if not okay:
+            errors.append(f"untrusted executable {name}: {reason}")
+            continue
+        unsafe_reason = _unsafe_tool_path_reason(canonical_candidate, repo_root)
+        if (
+            name == "npm"
+            and unsafe_reason == "path is beneath node_modules"
+            and not _path_is_within(canonical_candidate, repo_root.resolve(strict=True))
+        ):
+            unsafe_reason = None
+        if unsafe_reason:
+            errors.append(f"untrusted executable {name}: {unsafe_reason}")
+            continue
+        if not _tool_location_is_allowlisted(canonical_candidate, source):
+            errors.append(f"executable is outside the sanitized system/toolcache roots: {name}")
+            continue
+        candidate_parent = canonical_candidate.parent
+        candidate_index = next(
+            (index for index, entry in enumerate(resolved_entries) if entry == candidate_parent),
+            -1,
+        )
+        if candidate_index >= 0 and any(index < candidate_index for index in unsafe_indices):
+            errors.append(f"workspace-controlled or unsafe PATH entry precedes trusted {name}")
+            continue
+        if name == "python" and captured_value and canonical_candidate != Path(sys.executable).resolve(strict=True):
+            errors.append("captured trusted Python path does not equal the running verifier executable")
+            continue
+        resolved_tools[name] = str(canonical_candidate)
+    if windows_git_bash:
+        git = resolved_tools.get("git")
+        if git is None:
+            errors.append("trusted Git Bash cannot be derived because trusted Git is unavailable")
+        else:
+            bash, bash_errors = resolve_trusted_git_bash(
+                git,
+                source_environment=source,
+                repo_root=repo_root,
+            )
+            errors.extend(bash_errors)
+            if bash is not None:
+                resolved_tools["bash"] = bash
+    return resolved_tools, sorted(set(errors))
+
+
+CHILD_ENVIRONMENT_ALLOWLIST = frozenset(
+    {
+        "SYSTEMROOT",
+        "WINDIR",
+        "HOME",
+        "USERPROFILE",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "CI",
+        "GITHUB_ACTIONS",
+        "RUNNER_OS",
+        "RUNNER_ARCH",
+        "LANG",
+        "LC_ALL",
+        "COMSPEC",
+        "PATHEXT",
+    }
+)
+
+
+def child_process_environment(
+    tools: Mapping[str, str],
+    *,
+    source_environment: Mapping[str, str] | None = None,
+    private_temp_root: Path | None = None,
+) -> dict[str, str]:
+    source = os.environ if source_environment is None else source_environment
+    environment = {
+        key: value
+        for key, value in source.items()
+        if key.upper() in CHILD_ENVIRONMENT_ALLOWLIST
+    }
+    tool_directories: list[str] = []
+    for executable in tools.values():
+        parent = str(Path(executable).resolve(strict=True).parent)
+        if parent not in tool_directories:
+            tool_directories.append(parent)
+    environment["PATH"] = os.pathsep.join(tool_directories)
+    environment["PYTHONIOENCODING"] = "utf-8"
+    environment["PYTHONUTF8"] = "1"
+    if private_temp_root is not None:
+        private_temp = private_temp_root.resolve(strict=True)
+        for name in ("TEMP", "TMP", "TMPDIR"):
+            environment[name] = str(private_temp)
+    powershell = tools.get("powershell") or tools.get("pwsh")
+    if powershell:
+        environment["POWERSHELL_EXE"] = str(Path(powershell).resolve(strict=True))
+    if tools.get("bash"):
+        environment["BASH_EXE"] = str(Path(tools["bash"]).resolve(strict=True))
+    if tools.get("git"):
+        environment["GIT_CONFIG_COUNT"] = "1"
+        environment["GIT_CONFIG_KEY_0"] = "safe.directory"
+        environment["GIT_CONFIG_VALUE_0"] = str(REPO_ROOT.resolve())
+    return environment
+
+
+def trusted_git_arguments(git: str, *arguments: str) -> list[str]:
+    """Use only the exact repository as safe, independent of mutable user Git config."""
+
+    return [git, "-c", f"safe.directory={REPO_ROOT.resolve()}", *arguments]
+
+
+@dataclass
+class _BoundedStream:
+    byte_limit: int
+    line_limit: int
+    buffer: bytearray = field(default_factory=bytearray)
+    tail: bytearray = field(default_factory=bytearray)
+    total_bytes: int = 0
+    current_line_bytes: int = 0
+    limit_reason: str | None = None
+
+    def feed(self, chunk: bytes) -> None:
+        self.total_bytes += len(chunk)
+        for byte in chunk:
+            self.current_line_bytes = 0 if byte in (0x00, 0x0A, 0x0D) else self.current_line_bytes + 1
+            if self.current_line_bytes > self.line_limit and self.limit_reason is None:
+                self.limit_reason = "maximum line length exceeded"
+        if len(self.buffer) < self.byte_limit:
+            remaining = self.byte_limit - len(self.buffer)
+            self.buffer.extend(chunk[:remaining])
+        tail_limit = max(1, self.byte_limit // 2)
+        self.tail.extend(chunk)
+        if len(self.tail) > tail_limit:
+            del self.tail[:-tail_limit]
+        if self.total_bytes > self.byte_limit and self.limit_reason is None:
+            self.limit_reason = "maximum stream bytes exceeded"
+
+    def text(self) -> str:
+        if self.total_bytes <= self.byte_limit:
+            data = bytes(self.buffer)
+        else:
+            head_limit = max(1, self.byte_limit // 2)
+            data = bytes(self.buffer[:head_limit]) + b"\n[OUTPUT-LIMIT-EXCEEDED]\n" + bytes(self.tail)
+        return data.decode("utf-8", errors="replace")
+
+    def data(self) -> bytes:
+        """Return exact captured bytes when the stream remained within bounds."""
+
+        if self.total_bytes > self.byte_limit:
+            raise ValueError("bounded stream data is unavailable after an output-limit failure")
+        return bytes(self.buffer)
+
+
+@dataclass
+class CommandCapture:
+    command_id: str
+    command_class: str
+    argv: list[str]
+    executed: bool
+    exit_code: int | None
+    duration_seconds: float
+    stdout: str = field(repr=False)
+    stderr: str = field(repr=False)
+    required: bool = True
+    cwd: str = "."
+    stdout_raw: bytes | None = field(default=None, repr=False)
+    stderr_raw: bytes | None = field(default=None, repr=False)
+    stdout_byte_limit: int = MAX_STDOUT_BYTES
+    stderr_byte_limit: int = MAX_STDERR_BYTES
+    error: str | None = None
+    include_preview: bool = True
+    timed_out: bool = False
+    output_limited: bool = False
+    limit_reason: str | None = None
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
+    failure_summary: dict[str, Any] | None = None
+    containment: str = "not-started"
+    process_tree_status: str = "not-started"
+    descendants_terminated: int = 0
+    process_tree_error: str | None = None
+    logical_argv: list[str] | None = None
+    execution_input_mode: str = "NONE"
+    execution_input_size: int | None = None
+    execution_input_sha256: str | None = None
+    producer_observations: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    target_execution_lease: dict[str, Any] | None = None
+
+    def execution_passed(self) -> bool:
+        return (
+            self.executed
+            and self.exit_code == 0
+            and not self.timed_out
+            and not self.output_limited
+            and self.process_tree_status == "contained-clean"
+            and self.process_tree_error is None
+        )
+
+    def evidence(self) -> dict[str, Any]:
+        stdout_bytes = (
+            self.stdout_raw
+            if self.stdout_raw is not None
+            else self.stdout.encode("utf-8", errors="strict")
+        )
+        stderr_bytes = (
+            self.stderr_raw
+            if self.stderr_raw is not None
+            else self.stderr.encode("utf-8", errors="strict")
+        )
+        target_lease = (
+            copy.deepcopy(self.target_execution_lease)
+            if self.target_execution_lease is not None
+            else None
+        )
+        execution_inputs = []
+        if target_lease is not None:
+            execution_inputs = [
+                {
+                    "logicalPath": target_lease.get("logicalTargetPath"),
+                    "canonicalSourcePath": target_lease.get("canonicalSourcePath"),
+                    "plannedByteLength": target_lease.get("plannedByteLength"),
+                    "plannedSha256": target_lease.get("plannedSha256"),
+                    "plannedStableIdentity": target_lease.get("plannedStableFileIdentity"),
+                    "actualByteLength": target_lease.get("executedInputByteLength"),
+                    "actualSha256": target_lease.get("executedInputSha256"),
+                    "inputMode": target_lease.get("executionAdapter"),
+                }
+            ]
+        record: dict[str, Any] = {
+            "commandId": self.command_id,
+            "commandClass": self.command_class,
+            "executable": Path(self.argv[0]).name if self.argv else "internal",
+            "required": self.required,
+            "executed": self.executed,
+            "started": self.executed,
+            "setupFailure": not self.executed or self.process_tree_status == "setup-failed",
+            "exitCode": self.exit_code,
+            "durationSeconds": round(self.duration_seconds, 3),
+            "executionDurationClass": "bounded" if self.executed else "not-started",
+            "timeoutStatus": "TIMED-OUT" if self.timed_out else "within-limit",
+            "outputLimitStatus": "OUTPUT-LIMIT-EXCEEDED" if self.output_limited else "within-limit",
+            "stdoutBytesObserved": self.stdout_bytes,
+            "stderrBytesObserved": self.stderr_bytes,
+            "stdoutByteLimit": self.stdout_byte_limit,
+            "stderrByteLimit": self.stderr_byte_limit,
+            "containment": self.containment,
+            "processTreeStatus": self.process_tree_status,
+            "descendantsTerminated": self.descendants_terminated,
+            "actualExecutionArgv": list(self.argv),
+            "actualExecutionInputMode": self.execution_input_mode,
+            "actualExecutionInputSize": self.execution_input_size,
+            "actualExecutionInputSha256": self.execution_input_sha256,
+            "stdoutSha256": hashlib.sha256(stdout_bytes).hexdigest(),
+            "stderrSha256": hashlib.sha256(stderr_bytes).hexdigest(),
+            "producerObservations": normalized_json_value(self.producer_observations),
+            "producerObservationSetDigest": producer_observation_set_digest(
+                self.producer_observations
+            ),
+            "completedCommandClass": None,
+            "executionInputs": execution_inputs,
+            "executionInputBundleDigest": (
+                execution_input_bundle_digest(execution_inputs) if execution_inputs else None
+            ),
+            "targetExecutionLease": target_lease,
+            "protectedTargetBundle": None,
+        }
+        if self.error:
+            record["error"] = sanitize_text(self.error)
+        if self.limit_reason:
+            record["limitReason"] = sanitize_text(self.limit_reason)
+        if self.process_tree_error:
+            record["processTreeError"] = sanitize_text(self.process_tree_error)
+        if self.include_preview and (self.exit_code not in (0, None) or self.output_limited or self.timed_out):
+            record["diagnosticPreview"] = bounded_preview(
+                "\n".join(part for part in (self.stdout, self.stderr) if part)
+            )
+        failure_summary = self.failure_summary
+        if failure_summary is None and self.executed and self.exit_code not in (0, None):
+            failure_summary = extract_failure_identity(
+                f"command:{self.command_id}",
+                stdout=self.stdout,
+                stderr=self.stderr,
+            )
+        if failure_summary:
+            record["parsedFailureSummary"] = normalized_json_value(failure_summary)
+        return record
+
+    def authoritative_stdout_bytes(self) -> bytes:
+        if self.stdout_raw is not None:
+            return self.stdout_raw
+        return self.stdout.encode("utf-8", errors="strict")
+
+
+_ACTIVE_CONTAINMENTS: set[str] = set()
+_ACTIVE_CONTAINMENTS_LOCK = threading.Lock()
+
+
+def _register_containment(identity: str) -> None:
+    with _ACTIVE_CONTAINMENTS_LOCK:
+        _ACTIVE_CONTAINMENTS.add(identity)
+
+
+def _unregister_containment(identity: str) -> None:
+    with _ACTIVE_CONTAINMENTS_LOCK:
+        _ACTIVE_CONTAINMENTS.discard(identity)
+
+
+def active_containment_count() -> int:
+    with _ACTIVE_CONTAINMENTS_LOCK:
+        return len(_ACTIVE_CONTAINMENTS)
+
+
+@dataclass(frozen=True)
+class PosixProcessIdentity:
+    pid: int
+    starttime: int
+    parent_pid: int
+    process_group: int
+    session_id: int
+    discovery_generation: int
+
+    def key(self) -> tuple[int, int]:
+        return self.pid, self.starttime
+
+
+class PosixContainmentStateMachine:
+    """Pure descendant-registry model shared by live and simulated backends."""
+
+    def __init__(self, supervisor_pid: int) -> None:
+        self.supervisor_pid = supervisor_pid
+        self.generation = 0
+        self.registry: dict[tuple[int, int], PosixProcessIdentity] = {}
+        self.active_keys: set[tuple[int, int]] = set()
+        self.reaped_keys: set[tuple[int, int]] = set()
+        self.failures: list[str] = []
+
+    def fail(self, reason: str) -> None:
+        if reason not in self.failures:
+            self.failures.append(reason)
+
+    def observe(self, snapshot: Mapping[int, PosixProcessIdentity]) -> list[PosixProcessIdentity]:
+        self.generation += 1
+        by_pid = dict(snapshot)
+        domain_pids = {self.supervisor_pid}
+        changed = True
+        while changed:
+            changed = False
+            for identity in by_pid.values():
+                if identity.parent_pid in domain_pids and identity.pid not in domain_pids:
+                    domain_pids.add(identity.pid)
+                    changed = True
+        discovered: list[PosixProcessIdentity] = []
+        active: set[tuple[int, int]] = set()
+        for pid in sorted(domain_pids - {self.supervisor_pid}):
+            identity = by_pid[pid]
+            prior_keys = [key for key in self.registry if key[0] == pid]
+            if prior_keys and identity.key() not in prior_keys and any(
+                key in self.active_keys for key in prior_keys
+            ):
+                self.fail(f"PID reuse ambiguity for active PID {pid}")
+            if identity.key() not in self.registry:
+                self.registry[identity.key()] = identity
+                discovered.append(identity)
+            active.add(identity.key())
+        # A known descendant is not allowed to become "clean" merely by
+        # changing session/parent or racing between proc scans.  Only an
+        # explicit waitpid reap retires its stable PID/starttime identity.
+        for key in self.active_keys:
+            if key in self.reaped_keys or key in active:
+                continue
+            known = self.registry[key]
+            current = by_pid.get(known.pid)
+            if current is None:
+                active.add(key)
+                continue
+            if current.key() != key:
+                self.fail(f"PID reuse ambiguity for active PID {known.pid}")
+                active.add(key)
+                continue
+            self.fail(f"known descendant escaped supervisor ancestry: PID {known.pid}")
+            active.add(key)
+        if len(self.registry) > 4096:
+            self.fail("descendant registry overflow")
+        self.active_keys = active
+        return discovered
+
+    def mark_reaped(self, pid: int) -> None:
+        candidates = [key for key in self.active_keys if key[0] == pid]
+        if len(candidates) > 1:
+            self.fail(f"reap identity ambiguity for PID {pid}")
+            return
+        if candidates:
+            self.reaped_keys.add(candidates[0])
+            self.active_keys.discard(candidates[0])
+
+    def active_identities(self) -> list[PosixProcessIdentity]:
+        return [self.registry[key] for key in sorted(self.active_keys)]
+
+    def clean(self) -> bool:
+        return not self.failures and not self.active_keys
+
+
+_MAIN_SUBREAPER_CONFIGURED = False
+_MAIN_SUBREAPER_LOCK = threading.Lock()
+
+
+def _set_linux_child_subreaper() -> None:
+    if not sys.platform.startswith("linux"):
+        raise OSError("PR_SET_CHILD_SUBREAPER is available only on Linux")
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = (
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    )
+    prctl.restype = ctypes.c_int
+    if prctl(36, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER failed")
+    value = ctypes.c_ulong()
+    if prctl(37, ctypes.addressof(value), 0, 0, 0) != 0 or value.value != 1:
+        raise OSError(ctypes.get_errno(), "PR_GET_CHILD_SUBREAPER verification failed")
+
+
+def ensure_main_linux_subreaper() -> None:
+    global _MAIN_SUBREAPER_CONFIGURED
+    if not sys.platform.startswith("linux"):
+        return
+    with _MAIN_SUBREAPER_LOCK:
+        if not _MAIN_SUBREAPER_CONFIGURED:
+            _set_linux_child_subreaper()
+            _MAIN_SUBREAPER_CONFIGURED = True
+
+
+def _read_linux_process_identity(pid: int, generation: int) -> PosixProcessIdentity:
+    raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="strict")
+    close_paren = raw.rfind(")")
+    if close_paren <= 0:
+        raise ValueError("/proc stat command name framing is invalid")
+    fields = raw[close_paren + 2 :].split()
+    if len(fields) < 20:
+        raise ValueError("/proc stat record is truncated")
+    return PosixProcessIdentity(
+        pid=pid,
+        starttime=int(fields[19]),
+        parent_pid=int(fields[1]),
+        process_group=int(fields[2]),
+        session_id=int(fields[3]),
+        discovery_generation=generation,
+    )
+
+
+def _read_linux_proc_snapshot(generation: int) -> dict[int, PosixProcessIdentity]:
+    snapshot: dict[int, PosixProcessIdentity] = {}
+    try:
+        entries = list(os.scandir("/proc"))
+    except OSError as exc:
+        raise OSError(f"/proc enumeration failed: {type(exc).__name__}") from exc
+    for entry in entries:
+        if not entry.name.isdecimal():
+            continue
+        pid = int(entry.name)
+        try:
+            snapshot[pid] = _read_linux_process_identity(pid, generation)
+        except FileNotFoundError:
+            continue
+        except ProcessLookupError:
+            continue
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise OSError(f"/proc/{pid}/stat read failed: {type(exc).__name__}") from exc
+    return snapshot
+
+
+def _pidfd_capability_check() -> None:
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise OSError("pidfd_open/pidfd_send_signal capability is unavailable")
+
+
+def _pidfd_send_checked(
+    identity: PosixProcessIdentity,
+    pidfd: int,
+    signal_number: int,
+) -> None:
+    try:
+        current = _read_linux_process_identity(identity.pid, identity.discovery_generation)
+    except FileNotFoundError:
+        return
+    if current.starttime != identity.starttime:
+        raise OSError(f"PID/starttime identity changed before signal: {identity.pid}")
+    try:
+        signal.pidfd_send_signal(pidfd, signal_number, None, 0)
+    except ProcessLookupError:
+        return
+    except OSError as exc:
+        raise OSError(f"pidfd signal failed for PID {identity.pid}: {type(exc).__name__}") from exc
+
+
+def _wait_status_exit_code(status: int) -> int:
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return -os.WTERMSIG(status)
+    return PROCESS_TREE_FAILURE_EXIT
+
+
+def _linux_supervisor_write(fd: int, value: Mapping[str, Any]) -> None:
+    data = json.dumps(
+        dict(value),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("ascii") + b"\n"
+    os.write(fd, data)
+
+
+def _linux_containment_supervisor_entrypoint(arguments: Sequence[str]) -> int:
+    """Run in a dedicated trusted Python process; never called on Windows."""
+
+    if len(arguments) != 5 or any(not re.fullmatch(r"-?[0-9]+", item) for item in arguments):
+        return PROCESS_TREE_FAILURE_EXIT
+    stdin_fd, stdout_fd, stderr_fd, result_fd, control_fd = map(int, arguments)
+    root_pid: int | None = None
+    pidfds: dict[tuple[int, int], int] = {}
+    state = PosixContainmentStateMachine(os.getpid())
+    root_exit_code: int | None = None
+    command_started = False
+    terminated_count = 0
+    error_text: str | None = None
+    try:
+        _set_linux_child_subreaper()
+        _pidfd_capability_check()
+        config_text = os.environ.pop("CI_LINUX_SUPERVISOR_CONFIG", "")
+        config = strict_json_loads(config_text, label="Linux containment supervisor config")
+        if not isinstance(config, dict) or set(config) != {"argv", "cwd", "environment"}:
+            raise ValueError("Linux supervisor configuration schema is invalid")
+        argv = config["argv"]
+        cwd = config["cwd"]
+        environment = config["environment"]
+        if (
+            not isinstance(argv, list)
+            or not argv
+            or any(not isinstance(item, str) or not item for item in argv)
+            or not isinstance(cwd, str)
+            or not Path(cwd).is_absolute()
+            or not isinstance(environment, dict)
+            or any(not isinstance(key, str) or not isinstance(value, str) for key, value in environment.items())
+        ):
+            raise ValueError("Linux supervisor command authority is invalid")
+        initial = _read_linux_proc_snapshot(0)
+        preexisting_children = [
+            item for item in initial.values() if item.parent_pid == os.getpid()
+        ]
+        if preexisting_children:
+            raise OSError("unexpected concurrent child exists in supervisor domain")
+        gate_r, gate_w = os.pipe()
+        root_pid = os.fork()
+        if root_pid == 0:
+            try:
+                os.close(gate_w)
+                os.close(result_fd)
+                os.close(control_fd)
+                os.setsid()
+                if os.read(gate_r, 1) != b"G":
+                    os._exit(PROCESS_TREE_FAILURE_EXIT)
+                os.close(gate_r)
+                if stdin_fd >= 0:
+                    os.dup2(stdin_fd, 0)
+                else:
+                    devnull = os.open(os.devnull, os.O_RDONLY)
+                    os.dup2(devnull, 0)
+                    os.close(devnull)
+                os.dup2(stdout_fd, 1)
+                os.dup2(stderr_fd, 2)
+                for fd in (stdin_fd, stdout_fd, stderr_fd):
+                    if fd > 2:
+                        os.close(fd)
+                os.chdir(cwd)
+                os.execve(argv[0], argv, environment)
+            except BaseException as exc:
+                try:
+                    os.write(2, f"containment exec failed: {type(exc).__name__}\n".encode("ascii"))
+                except OSError:
+                    pass
+                os._exit(127)
+        os.close(gate_r)
+        for fd in (stdin_fd, stdout_fd, stderr_fd):
+            if fd >= 0:
+                os.close(fd)
+        root_identity = _read_linux_process_identity(root_pid, 1)
+        root_pidfd = os.pidfd_open(root_pid, 0)
+        pidfds[root_identity.key()] = root_pidfd
+        state.registry[root_identity.key()] = root_identity
+        state.active_keys.add(root_identity.key())
+        _linux_supervisor_write(
+            result_fd,
+            {
+                "event": "started",
+                "pid": root_pid,
+                "starttime": root_identity.starttime,
+                "supervisorPid": os.getpid(),
+            },
+        )
+        os.write(gate_w, b"G")
+        os.close(gate_w)
+        command_started = True
+        os.set_blocking(control_fd, False)
+        cancellation_requested = False
+        while not cancellation_requested and root_exit_code is None:
+            try:
+                if os.read(control_fd, 1):
+                    cancellation_requested = True
+            except BlockingIOError:
+                pass
+            except OSError as exc:
+                if exc.errno != errno.EINTR:
+                    raise
+            snapshot = _read_linux_proc_snapshot(state.generation + 1)
+            for identity in state.observe(snapshot):
+                try:
+                    pidfds[identity.key()] = os.pidfd_open(identity.pid, 0)
+                except OSError as exc:
+                    state.fail(f"pidfd_open failed for PID {identity.pid}: {type(exc).__name__}")
+            while True:
+                try:
+                    reaped_pid, status = os.waitpid(-1, os.WNOHANG)
+                except ChildProcessError:
+                    break
+                if reaped_pid == 0:
+                    break
+                if reaped_pid == root_pid:
+                    root_exit_code = _wait_status_exit_code(status)
+                state.mark_reaped(reaped_pid)
+            if state.failures:
+                cancellation_requested = True
+            if not cancellation_requested and root_exit_code is None:
+                time.sleep(LINUX_CONTAINMENT_SCAN_SECONDS)
+
+        cleanup_deadline = time.monotonic() + LINUX_CONTAINMENT_SETTLE_SECONDS
+        stable_count = 0
+        term_sent = False
+        kill_sent = False
+        phase_started = time.monotonic()
+        while time.monotonic() < cleanup_deadline:
+            snapshot = _read_linux_proc_snapshot(state.generation + 1)
+            for identity in state.observe(snapshot):
+                try:
+                    pidfds[identity.key()] = os.pidfd_open(identity.pid, 0)
+                except OSError as exc:
+                    state.fail(f"pidfd_open failed for PID {identity.pid}: {type(exc).__name__}")
+            active = state.active_identities()
+            if active:
+                stable_count = 0
+                for identity in active:
+                    pidfd = pidfds.get(identity.key())
+                    if pidfd is None:
+                        state.fail(f"active PID lacks pidfd: {identity.pid}")
+                        continue
+                    _pidfd_send_checked(identity, pidfd, signal.SIGSTOP)
+                if not term_sent:
+                    for identity in active:
+                        pidfd = pidfds.get(identity.key())
+                        if pidfd is not None:
+                            _pidfd_send_checked(identity, pidfd, signal.SIGTERM)
+                            _pidfd_send_checked(identity, pidfd, signal.SIGCONT)
+                    term_sent = True
+                if time.monotonic() - phase_started >= PROCESS_TREE_GRACE_SECONDS:
+                    for identity in active:
+                        pidfd = pidfds.get(identity.key())
+                        if pidfd is not None:
+                            _pidfd_send_checked(identity, pidfd, signal.SIGKILL)
+                    kill_sent = True
+                    terminated_count = max(terminated_count, len(active))
+            else:
+                stable_count += 1
+            while True:
+                try:
+                    reaped_pid, status = os.waitpid(-1, os.WNOHANG)
+                except ChildProcessError:
+                    break
+                if reaped_pid == 0:
+                    break
+                if reaped_pid == root_pid and root_exit_code is None:
+                    root_exit_code = _wait_status_exit_code(status)
+                state.mark_reaped(reaped_pid)
+            if stable_count >= LINUX_CONTAINMENT_STABLE_SCANS:
+                break
+            time.sleep(LINUX_CONTAINMENT_SCAN_SECONDS)
+        if stable_count < LINUX_CONTAINMENT_STABLE_SCANS:
+            state.fail("descendant cleanup settle timeout")
+        final_snapshot = _read_linux_proc_snapshot(state.generation + 1)
+        state.observe(final_snapshot)
+        if state.active_keys:
+            state.fail("command-domain descendant registry is not empty")
+        if root_exit_code is None:
+            state.fail("root process was not reaped")
+        if state.failures:
+            error_text = "; ".join(state.failures)
+        _linux_supervisor_write(
+            result_fd,
+            {
+                "event": "final",
+                "commandStarted": command_started,
+                "rootExitCode": root_exit_code,
+                "cleanupOk": not state.failures and state.clean(),
+                "descendantsTerminated": terminated_count,
+                "registrySize": len(state.registry),
+                "discoveryGenerations": state.generation,
+                "termSent": term_sent,
+                "killSent": kill_sent,
+                "error": error_text,
+            },
+        )
+        return EXIT_SUCCESS if not state.failures else PROCESS_TREE_FAILURE_EXIT
+    except BaseException as exc:
+        error_text = f"Linux containment supervisor failure: {type(exc).__name__}: {exc}"
+        try:
+            _linux_supervisor_write(
+                result_fd,
+                {
+                    "event": "final",
+                    "commandStarted": command_started,
+                    "rootExitCode": root_exit_code,
+                    "cleanupOk": False,
+                    "descendantsTerminated": terminated_count,
+                    "registrySize": len(state.registry),
+                    "discoveryGenerations": state.generation,
+                    "termSent": False,
+                    "killSent": False,
+                    "error": error_text,
+                },
+            )
+        except OSError:
+            pass
+        return PROCESS_TREE_FAILURE_EXIT
+    finally:
+        for pidfd in pidfds.values():
+            try:
+                os.close(pidfd)
+            except OSError:
+                pass
+        for fd in (result_fd, control_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+class _WindowsJob:
+    """Minimal kill-on-close Windows Job Object wrapper using only ctypes."""
+
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3
+    CREATE_SUSPENDED = 0x00000004
+    ERROR_MORE_DATA = 234
+    SYNCHRONIZE = 0x00100000
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x00001000
+    WAIT_OBJECT_0 = 0
+    WAIT_TIMEOUT = 258
+
+    def __init__(self) -> None:
+        if os.name != "nt":
+            raise OSError("Windows Job Objects are available only on Windows")
+        import ctypes
+        from ctypes import wintypes
+
+        self.ctypes = ctypes
+        self.wintypes = wintypes
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        self.kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+        self.kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        self.kernel32.SetInformationJobObject.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        )
+        self.kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        self.kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        self.kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        self.kernel32.QueryInformationJobObject.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        self.kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+        self.kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        self.kernel32.CloseHandle.restype = wintypes.BOOL
+        self.kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        self.kernel32.OpenProcess.restype = wintypes.HANDLE
+        self.kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        self.kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        self.ntdll.NtResumeProcess.argtypes = (wintypes.HANDLE,)
+        self.ntdll.NtResumeProcess.restype = ctypes.c_long
+
+        self.handle = self.kernel32.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        information.BasicLimitInformation.LimitFlags = self.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not self.kernel32.SetInformationJobObject(
+            self.handle,
+            self.JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            error = ctypes.WinError(ctypes.get_last_error())
+            self.kernel32.CloseHandle(self.handle)
+            self.handle = None
+            raise error
+
+    def assign_and_resume(self, process: subprocess.Popen[bytes]) -> None:
+        process_handle = self.wintypes.HANDLE(int(process._handle))  # type: ignore[attr-defined]
+        if not self.kernel32.AssignProcessToJobObject(self.handle, process_handle):
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+        status = int(self.ntdll.NtResumeProcess(process_handle))
+        if status != 0:
+            raise OSError(f"NtResumeProcess failed with NTSTATUS 0x{status & 0xFFFFFFFF:08x}")
+
+    def active_process_ids(self) -> list[int]:
+        pointer_size = self.ctypes.sizeof(self.ctypes.c_size_t)
+        capacity = 64
+        while capacity <= 4096:
+            size = 8 + pointer_size * capacity
+            buffer = self.ctypes.create_string_buffer(size)
+            returned = self.wintypes.DWORD()
+            okay = self.kernel32.QueryInformationJobObject(
+                self.handle,
+                self.JOB_OBJECT_BASIC_PROCESS_ID_LIST,
+                buffer,
+                size,
+                self.ctypes.byref(returned),
+            )
+            if okay:
+                count = self.ctypes.c_uint32.from_buffer_copy(buffer.raw[4:8]).value
+                array_type = self.ctypes.c_size_t * count
+                values = array_type.from_buffer_copy(buffer.raw[8 : 8 + pointer_size * count])
+                return [int(value) for value in values]
+            error = self.ctypes.get_last_error()
+            if error != self.ERROR_MORE_DATA:
+                raise self.ctypes.WinError(error)
+            capacity *= 2
+        raise OSError("Windows Job Object process list exceeded the fixed safety bound")
+
+    def _wait_for_pids(self, process_ids: Sequence[int]) -> tuple[bool, str | None]:
+        deadline = time.monotonic() + PROCESS_TREE_KILL_SECONDS
+        for process_id in process_ids:
+            handle = self.kernel32.OpenProcess(
+                self.SYNCHRONIZE | self.PROCESS_QUERY_LIMITED_INFORMATION,
+                False,
+                process_id,
+            )
+            if not handle:
+                continue
+            try:
+                remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+                result = int(self.kernel32.WaitForSingleObject(handle, remaining_ms))
+                if result == self.WAIT_TIMEOUT:
+                    return False, "Windows Job Object member remained alive after kill-on-close"
+                if result != self.WAIT_OBJECT_0:
+                    return False, f"Windows process wait failed with result={result}"
+            finally:
+                self.kernel32.CloseHandle(handle)
+        return True, None
+
+    def close_and_kill(self) -> tuple[bool, int, str | None]:
+        if not self.handle:
+            return False, 0, "Windows Job Object handle was already closed"
+        try:
+            process_ids = self.active_process_ids()
+        except OSError as exc:
+            process_ids = []
+            query_error = f"Windows Job Object membership query failed: {type(exc).__name__}"
+        else:
+            query_error = None
+        handle = self.handle
+        self.handle = None
+        if not self.kernel32.CloseHandle(handle):
+            return False, len(process_ids), "Windows Job Object close failed"
+        wait_ok, wait_error = self._wait_for_pids(process_ids)
+        if query_error:
+            return False, len(process_ids), query_error
+        if not wait_ok:
+            return False, len(process_ids), wait_error
+        return True, len(process_ids), None
+
+    def close_without_members(self) -> None:
+        if self.handle:
+            self.kernel32.CloseHandle(self.handle)
+            self.handle = None
+
+
+class TrustedBashLease:
+    """Hold a non-write/non-delete-shared handle to one trusted Git Bash file."""
+
+    GENERIC_READ = 0x80000000
+    FILE_SHARE_READ = 0x00000001
+    OPEN_EXISTING = 3
+    FILE_ATTRIBUTE_NORMAL = 0x00000080
+    FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+
+    def __init__(self, bash_path: str, git_path: str) -> None:
+        if os.name != "nt":
+            raise OSError("trusted Bash leases are Windows-only")
+        import ctypes
+        from ctypes import wintypes
+
+        self.ctypes = ctypes
+        self.wintypes = wintypes
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("dwFileAttributes", wintypes.DWORD),
+                ("ftCreationTime", wintypes.FILETIME),
+                ("ftLastAccessTime", wintypes.FILETIME),
+                ("ftLastWriteTime", wintypes.FILETIME),
+                ("dwVolumeSerialNumber", wintypes.DWORD),
+                ("nFileSizeHigh", wintypes.DWORD),
+                ("nFileSizeLow", wintypes.DWORD),
+                ("nNumberOfLinks", wintypes.DWORD),
+                ("nFileIndexHigh", wintypes.DWORD),
+                ("nFileIndexLow", wintypes.DWORD),
+            ]
+
+        self.info_type = BY_HANDLE_FILE_INFORMATION
+        self.kernel32.CreateFileW.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        self.kernel32.CreateFileW.restype = wintypes.HANDLE
+        self.kernel32.GetFileInformationByHandle.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(BY_HANDLE_FILE_INFORMATION),
+        )
+        self.kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+        self.kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        self.kernel32.CloseHandle.restype = wintypes.BOOL
+        self.invalid_handle_value = ctypes.c_void_p(-1).value
+
+        path = Path(bash_path)
+        okay, reason = _secure_regular_file(path)
+        if not okay:
+            raise OSError(f"trusted Git Bash lease rejected the executable: {reason}")
+        git_root, root_error = _trusted_git_installation_root(Path(git_path))
+        if git_root is None:
+            raise OSError(root_error or "trusted Git root is unavailable")
+        canonical = path.resolve(strict=True)
+        try:
+            canonical.relative_to(git_root.resolve(strict=True))
+        except ValueError as exc:
+            raise OSError("trusted Git Bash escapes its Git installation root") from exc
+        if not _non_reparse_directory_chain(canonical.parent, git_root):
+            raise OSError("trusted Git Bash directory chain contains a reparse point")
+
+        handle = self.kernel32.CreateFileW(
+            str(canonical),
+            self.GENERIC_READ,
+            self.FILE_SHARE_READ,
+            None,
+            self.OPEN_EXISTING,
+            self.FILE_ATTRIBUTE_NORMAL | self.FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        if not handle or int(handle) == self.invalid_handle_value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        self.handle = handle
+        self.path = str(canonical)
+        self.trusted_git_root = str(git_root.resolve(strict=True))
+        try:
+            self._initial_info = self._information(self.handle)
+            if self._initial_info["reparsePoint"]:
+                raise OSError("trusted Git Bash handle resolves to a reparse point")
+            self.expected_sha256 = _sha256_file(canonical)
+            self.identity = {
+                "canonicalPath": self.path,
+                "trustedGitRoot": self.trusted_git_root,
+                **self._initial_info,
+                "sha256": self.expected_sha256,
+            }
+            okay, verify_error = self.verify()
+            if not okay:
+                raise OSError(verify_error or "trusted Git Bash lease verification failed")
+        except Exception:
+            self.close()
+            raise
+
+    @staticmethod
+    def _filetime(value: Any) -> str:
+        return str((int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime))
+
+    def _information(self, handle: Any) -> dict[str, Any]:
+        information = self.info_type()
+        if not self.kernel32.GetFileInformationByHandle(handle, self.ctypes.byref(information)):
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+        attributes = int(information.dwFileAttributes)
+        return {
+            "size": (int(information.nFileSizeHigh) << 32) | int(information.nFileSizeLow),
+            "volumeSerial": str(int(information.dwVolumeSerialNumber)),
+            "fileIndex": str((int(information.nFileIndexHigh) << 32) | int(information.nFileIndexLow)),
+            "creationTime": self._filetime(information.ftCreationTime),
+            "writeTime": self._filetime(information.ftLastWriteTime),
+            "reparsePoint": bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)),
+        }
+
+    def _open_path_identity(self) -> dict[str, Any]:
+        handle = self.kernel32.CreateFileW(
+            self.path,
+            self.GENERIC_READ,
+            self.FILE_SHARE_READ,
+            None,
+            self.OPEN_EXISTING,
+            self.FILE_ATTRIBUTE_NORMAL | self.FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        if not handle or int(handle) == self.invalid_handle_value:
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+        try:
+            return self._information(handle)
+        finally:
+            self.kernel32.CloseHandle(handle)
+
+    def verify(self) -> tuple[bool, str | None]:
+        if not getattr(self, "handle", None):
+            return False, "trusted Git Bash lease handle is closed"
+        try:
+            path = Path(self.path)
+            okay, reason = _secure_regular_file(path)
+            if not okay:
+                return False, f"trusted Git Bash path drifted: {reason}"
+            if str(path.resolve(strict=True)) != self.path:
+                return False, "trusted Git Bash canonical path drifted"
+            handle_info = self._information(self.handle)
+            path_info = self._open_path_identity()
+            if handle_info != self._initial_info or path_info != self._initial_info:
+                return False, "trusted Git Bash stable file identity drifted"
+            if _sha256_file(path) != self.expected_sha256:
+                return False, "trusted Git Bash SHA-256 drifted"
+        except OSError as exc:
+            return False, f"trusted Git Bash lease verification failed: {type(exc).__name__}"
+        return True, None
+
+    def close(self) -> None:
+        handle = getattr(self, "handle", None)
+        if handle:
+            self.kernel32.CloseHandle(handle)
+            self.handle = None
+
+    def __del__(self) -> None:  # pragma: no cover - last-resort OS handle cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def _execute_linux_supervised(
+    command_id: str,
+    command_class: str,
+    argv: Sequence[str],
+    *,
+    timeout: int,
+    env: Mapping[str, str],
+    include_preview: bool,
+    required: bool,
+    cwd: Path,
+    max_stdout_bytes: int,
+    max_stderr_bytes: int,
+    max_line_bytes: int,
+    executable_lease: Any | None,
+    stdin_data: bytes | None,
+    logical_argv: Sequence[str] | None,
+    execution_input_mode: str,
+    process_started_hook: Any | None,
+) -> CommandCapture:
+    start = time.monotonic()
+    containment = "linux-subreaper-pidfd-proc-supervisor"
+    try:
+        ensure_main_linux_subreaper()
+        _pidfd_capability_check()
+    except OSError as exc:
+        return CommandCapture(
+            command_id=command_id,
+            command_class=command_class,
+            argv=list(argv),
+            executed=False,
+            exit_code=None,
+            duration_seconds=time.monotonic() - start,
+            stdout="",
+            stderr="",
+            required=required,
+            error=f"process containment unavailable: {type(exc).__name__}: {exc}",
+            containment=containment,
+            process_tree_status="setup-failed",
+            process_tree_error="Linux subreaper/pidfd/proc setup failed",
+        )
+    if executable_lease is not None:
+        lease_ok, lease_error = executable_lease.verify()
+        if not lease_ok:
+            return CommandCapture(
+                command_id=command_id,
+                command_class=command_class,
+                argv=list(argv),
+                executed=False,
+                exit_code=None,
+                duration_seconds=time.monotonic() - start,
+                stdout="",
+                stderr="",
+                required=required,
+                error=lease_error or "trusted executable lease verification failed",
+                containment=containment,
+                process_tree_status="setup-failed",
+            )
+    stdout_sink = _BoundedStream(max_stdout_bytes, max_line_bytes)
+    stderr_sink = _BoundedStream(max_stderr_bytes, max_line_bytes)
+    limit_event = threading.Event()
+    result_buffer = bytearray()
+    result_error: list[str] = []
+    stdin_error: list[str] = []
+
+    stdin_r = stdin_w = -1
+    if stdin_data is not None:
+        stdin_r, stdin_w = os.pipe()
+    stdout_r, stdout_w = os.pipe()
+    stderr_r, stderr_w = os.pipe()
+    result_r, result_w = os.pipe()
+    control_r, control_w = os.pipe()
+    config = {
+        "argv": [str(value) for value in argv],
+        "cwd": str(cwd.resolve(strict=True)),
+        "environment": dict(env),
+    }
+    supervisor_environment = dict(env)
+    supervisor_environment["CI_LINUX_SUPERVISOR_CONFIG"] = json.dumps(
+        config,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    pass_fds = [stdout_w, stderr_w, result_w, control_r]
+    if stdin_r >= 0:
+        pass_fds.append(stdin_r)
+    supervisor_argv = [
+        str(Path(sys.executable).resolve(strict=True)),
+        "-B",
+        str(Path(__file__).resolve(strict=True)),
+        "--internal-linux-containment-supervisor",
+        str(stdin_r),
+        str(stdout_w),
+        str(stderr_w),
+        str(result_w),
+        str(control_r),
+    ]
+    try:
+        supervisor = subprocess.Popen(
+            supervisor_argv,
+            cwd=cwd,
+            env=supervisor_environment,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            pass_fds=tuple(pass_fds),
+        )
+    except (OSError, ValueError) as exc:
+        for fd in {stdin_r, stdin_w, stdout_r, stdout_w, stderr_r, stderr_w, result_r, result_w, control_r, control_w}:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        return CommandCapture(
+            command_id=command_id,
+            command_class=command_class,
+            argv=list(argv),
+            executed=False,
+            exit_code=None,
+            duration_seconds=time.monotonic() - start,
+            stdout="",
+            stderr="",
+            required=required,
+            error=f"Linux containment supervisor launch failed: {type(exc).__name__}: {exc}",
+            containment=containment,
+            process_tree_status="setup-failed",
+        )
+    for fd in (stdin_r, stdout_w, stderr_w, result_w, control_r):
+        if fd >= 0:
+            os.close(fd)
+    containment_identity = f"{containment}:{supervisor.pid}:{time.monotonic_ns()}"
+    _register_containment(containment_identity)
+
+    def consume(fd: int, sink: _BoundedStream) -> None:
+        try:
+            while True:
+                chunk = os.read(fd, OUTPUT_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                sink.feed(chunk)
+                if sink.limit_reason:
+                    limit_event.set()
+                    break
+        except OSError:
+            pass
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def read_result() -> None:
+        try:
+            while len(result_buffer) <= 1_048_576:
+                chunk = os.read(result_r, 16_384)
+                if not chunk:
+                    return
+                result_buffer.extend(chunk)
+            result_error.append("Linux supervisor result protocol exceeded its byte limit")
+        except OSError as exc:
+            result_error.append(f"Linux supervisor result read failed: {type(exc).__name__}")
+        finally:
+            try:
+                os.close(result_r)
+            except OSError:
+                pass
+
+    def write_stdin() -> None:
+        assert stdin_data is not None and stdin_w >= 0
+        try:
+            view = memoryview(stdin_data)
+            offset = 0
+            while offset < len(view):
+                written = os.write(stdin_w, view[offset : offset + OUTPUT_READ_CHUNK_BYTES])
+                if written <= 0:
+                    raise OSError("supervised stdin accepted no bytes")
+                offset += written
+        except (BrokenPipeError, OSError) as exc:
+            stdin_error.append(f"{type(exc).__name__}: {exc}")
+        finally:
+            try:
+                os.close(stdin_w)
+            except OSError:
+                pass
+
+    threads = [
+        threading.Thread(target=consume, args=(stdout_r, stdout_sink), daemon=True),
+        threading.Thread(target=consume, args=(stderr_r, stderr_sink), daemon=True),
+        threading.Thread(target=read_result, daemon=True),
+    ]
+    if stdin_data is not None:
+        threads.append(threading.Thread(target=write_stdin, daemon=True))
+    for thread in threads:
+        thread.start()
+    hook_error: str | None = None
+    if process_started_hook is not None:
+        try:
+            process_started_hook(supervisor)
+        except Exception as exc:
+            hook_error = f"process-start hook failed: {type(exc).__name__}: {exc}"
+    deadline = start + timeout
+    timed_out = False
+    output_limited = False
+    cancellation_sent = False
+    try:
+        while supervisor.poll() is None:
+            if hook_error is not None:
+                break
+            if limit_event.wait(0.02):
+                output_limited = True
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+        if supervisor.poll() is None:
+            try:
+                os.write(control_w, b"X")
+                cancellation_sent = True
+            except OSError:
+                pass
+        try:
+            supervisor.wait(timeout=LINUX_CONTAINMENT_SETTLE_SECONDS + PROCESS_TREE_KILL_SECONDS)
+        except subprocess.TimeoutExpired:
+            supervisor.kill()
+            supervisor.wait(timeout=PROCESS_TREE_KILL_SECONDS)
+            result_error.append("Linux containment supervisor did not reach its cleanup fixed point")
+    finally:
+        try:
+            os.close(control_w)
+        except OSError:
+            pass
+        _unregister_containment(containment_identity)
+    for thread in threads:
+        thread.join(timeout=PROCESS_TREE_KILL_SECONDS)
+    if any(thread.is_alive() for thread in threads):
+        result_error.append("supervisor pipe worker did not terminate")
+    messages: list[dict[str, Any]] = []
+    if not result_error:
+        try:
+            for line in bytes(result_buffer).splitlines():
+                value = strict_json_loads(line, label="Linux supervisor result")
+                if not isinstance(value, dict):
+                    raise ValueError("result record is not an object")
+                messages.append(value)
+        except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            result_error.append(f"Linux supervisor result protocol is invalid: {type(exc).__name__}")
+    started = next((item for item in messages if item.get("event") == "started"), None)
+    final = next((item for item in reversed(messages) if item.get("event") == "final"), None)
+    if final is None:
+        result_error.append("Linux containment supervisor omitted its final record")
+        final = {}
+    cleanup_ok = bool(final.get("cleanupOk")) and not result_error and not stdin_error and hook_error is None
+    process_tree_error = str(final.get("error") or "") or None
+    if result_error or stdin_error or hook_error:
+        extra = "; ".join([*result_error, *stdin_error, *([hook_error] if hook_error else [])])
+        process_tree_error = ((process_tree_error + "; ") if process_tree_error else "") + extra
+    output_limited = output_limited or bool(stdout_sink.limit_reason or stderr_sink.limit_reason)
+    if timed_out:
+        exit_code = 124
+        error = f"command timed out after {timeout} seconds"
+    elif output_limited:
+        exit_code = 125
+        reason_parts = [part for part in (stdout_sink.limit_reason, stderr_sink.limit_reason) if part]
+        error = "OUTPUT-LIMIT-EXCEEDED: " + "; ".join(reason_parts)
+    else:
+        root_exit = final.get("rootExitCode")
+        exit_code = root_exit if type(root_exit) is int else PROCESS_TREE_FAILURE_EXIT
+        error = None
+    if not cleanup_ok:
+        if not timed_out and not output_limited:
+            exit_code = PROCESS_TREE_FAILURE_EXIT
+        error = ((error + "; ") if error else "") + "PROCESS-TREE-ERROR: " + (
+            process_tree_error or "unknown Linux supervisor failure"
+        )
+    if executable_lease is not None:
+        lease_ok, lease_error = executable_lease.verify()
+        if not lease_ok:
+            cleanup_ok = False
+            exit_code = PROCESS_TREE_FAILURE_EXIT
+            process_tree_error = lease_error or "trusted executable lease identity drifted"
+            error = ((error + "; ") if error else "") + f"EXECUTABLE-LEASE-ERROR: {process_tree_error}"
+    return CommandCapture(
+        command_id=command_id,
+        command_class=command_class,
+        argv=list(argv),
+        executed=bool(final.get("commandStarted")) or started is not None,
+        exit_code=exit_code,
+        duration_seconds=time.monotonic() - start,
+        stdout=stdout_sink.text(),
+        stderr=stderr_sink.text(),
+        required=required,
+        stdout_raw=None if output_limited else stdout_sink.data(),
+        stderr_raw=None if output_limited else stderr_sink.data(),
+        stdout_byte_limit=max_stdout_bytes,
+        stderr_byte_limit=max_stderr_bytes,
+        error=error,
+        include_preview=include_preview,
+        timed_out=timed_out,
+        output_limited=output_limited,
+        limit_reason="; ".join(
+            part for part in (stdout_sink.limit_reason, stderr_sink.limit_reason) if part
+        ) or None,
+        stdout_bytes=stdout_sink.total_bytes,
+        stderr_bytes=stderr_sink.total_bytes,
+        containment=containment,
+        process_tree_status="contained-clean" if cleanup_ok else "cleanup-failed",
+        descendants_terminated=int(final.get("descendantsTerminated", 0) or 0),
+        process_tree_error=process_tree_error,
+        logical_argv=list(logical_argv) if logical_argv is not None else list(argv),
+        execution_input_mode=execution_input_mode,
+        execution_input_size=len(stdin_data) if stdin_data is not None else None,
+        execution_input_sha256=(
+            hashlib.sha256(stdin_data).hexdigest() if stdin_data is not None else None
+        ),
+    )
+
+
+def run_linux_containment_live_self_test(
+    *,
+    python_executable: str,
+    environment: Mapping[str, str],
+    temp_root: Path,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Exercise setsid/double-fork/orphan escapes before artifact acceptance."""
+
+    if not sys.platform.startswith("linux"):
+        return [], ["Linux live containment self-test requested on a non-Linux platform"]
+    normal_codes = {
+        "setsid-escape": "import os,sys,time\np=os.fork()\nif p==0:\n os.setsid(); time.sleep(.6); open(sys.argv[1],'w').write('escape'); os._exit(0)\nos._exit(0)",
+        "double-fork-escape": "import os,sys,time\np=os.fork()\nif p==0:\n q=os.fork()\n if q==0:\n  os.setsid(); time.sleep(.6); open(sys.argv[1],'w').write('double'); os._exit(0)\n os._exit(0)\nos._exit(0)",
+        "setsid-sleeping-grandchild": "import os,sys,time\np=os.fork()\nif p==0:\n os.setsid(); q=os.fork()\n if q==0:\n  time.sleep(.6); open(sys.argv[1],'w').write('grandchild'); os._exit(0)\n os._exit(0)\nos._exit(0)",
+        "double-fork-sentinel": "import os,sys,time\nif os.fork()==0:\n if os.fork()==0:\n  time.sleep(.6); open(sys.argv[1],'w').write('sentinel'); os._exit(0)\n os._exit(0)\nos._exit(0)",
+        "parent-exits-first": "import os,sys,time\nif os.fork()==0:\n time.sleep(.6); open(sys.argv[1],'w').write('orphan'); os._exit(0)\nos._exit(0)",
+        "sigterm-ignored": "import os,signal,sys,time\nif os.fork()==0:\n signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(.6); open(sys.argv[1],'w').write('ignored'); os._exit(0)\nos._exit(0)",
+        "rapid-fork-exit": "import os\nfor _ in range(32):\n p=os.fork()\n if p==0: os._exit(0)\nos._exit(0)",
+        "normal-success-daemon": "import os,sys,time\nif os.fork()==0:\n time.sleep(.6); open(sys.argv[1],'w').write('daemon'); os._exit(0)\nos._exit(0)",
+    }
+    scenarios: list[tuple[str, str, int, int, int]] = [
+        (name, code, 5, MAX_STDOUT_BYTES, MAX_STDERR_BYTES)
+        for name, code in normal_codes.items()
+    ]
+    timeout_code = "import os,signal,time\nif os.fork()==0:\n signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(30); os._exit(0)\ntime.sleep(30)"
+    scenarios.append(("timeout-daemon", timeout_code, 1, MAX_STDOUT_BYTES, MAX_STDERR_BYTES))
+    stdout_code = "import os,sys,time\nif os.fork()==0:\n time.sleep(.6); open(sys.argv[1],'w').write('stdout'); os._exit(0)\nwhile True: os.write(1,b'x'*4096)"
+    stderr_code = stdout_code.replace("os.write(1", "os.write(2").replace("'stdout'", "'stderr'")
+    scenarios.append(("stdout-limit-daemon", stdout_code, 5, 4096, MAX_STDERR_BYTES))
+    scenarios.append(("stderr-limit-daemon", stderr_code, 5, MAX_STDOUT_BYTES, 4096))
+    results: list[dict[str, Any]] = []
+    errors: list[str] = []
+    sentinels: list[Path] = []
+    for name, code, timeout, stdout_limit, stderr_limit in scenarios:
+        sentinel = temp_root / f"linux-containment-{name}.sentinel"
+        sentinels.append(sentinel)
+        capture = execute_command(
+            f"linux-containment-self-test:{name}",
+            "linux-containment-live-self-test",
+            [python_executable, "-B", "-c", code, str(sentinel)],
+            timeout=timeout,
+            env=environment,
+            include_preview=False,
+            required=True,
+            cwd=temp_root,
+            max_stdout_bytes=stdout_limit,
+            max_stderr_bytes=stderr_limit,
+        )
+        expected_exit = 124 if name == "timeout-daemon" else 125 if name in {"stdout-limit-daemon", "stderr-limit-daemon"} else 0
+        passed = (
+            capture.executed
+            and capture.exit_code == expected_exit
+            and capture.process_tree_status == "contained-clean"
+            and capture.containment == "linux-subreaper-pidfd-proc-supervisor"
+        )
+        results.append(
+            {
+                "scenario": name,
+                "status": "pass" if passed else "fail",
+                "exitCode": capture.exit_code,
+                "processTreeStatus": capture.process_tree_status,
+                "descendantsTerminated": capture.descendants_terminated,
+            }
+        )
+        if not passed:
+            errors.append(
+                f"Linux containment scenario failed: {name} exit={capture.exit_code} "
+                f"tree={capture.process_tree_status}"
+            )
+    time.sleep(0.8)
+    for sentinel in sentinels:
+        if sentinel.exists():
+            errors.append(f"Linux containment survivor wrote sentinel: {sentinel.name}")
+            try:
+                sentinel.unlink()
+            except OSError:
+                pass
+    if active_containment_count() != 0:
+        errors.append("Linux containment active count did not return to zero")
+    return results, sorted(set(errors))
+
+
+def execute_command(
+    command_id: str,
+    command_class: str,
+    argv: Sequence[str],
+    *,
+    timeout: int,
+    env: Mapping[str, str] | None = None,
+    include_preview: bool = True,
+    required: bool = True,
+    cwd: Path = REPO_ROOT,
+    max_stdout_bytes: int = MAX_STDOUT_BYTES,
+    max_stderr_bytes: int = MAX_STDERR_BYTES,
+    max_line_bytes: int = MAX_OUTPUT_LINE_BYTES,
+    executable_lease: TrustedBashLease | None = None,
+    stdin_data: bytes | None = None,
+    logical_argv: Sequence[str] | None = None,
+    execution_input_mode: str = "NONE",
+    process_started_hook: Any | None = None,
+) -> CommandCapture:
+    """Execute without a shell inside an independently terminable process tree."""
+
+    start = time.monotonic()
+    stdout_sink = _BoundedStream(max_stdout_bytes, max_line_bytes)
+    stderr_sink = _BoundedStream(max_stderr_bytes, max_line_bytes)
+    limit_event = threading.Event()
+    stdin_error: list[str] = []
+
+    if executable_lease is not None:
+        if not argv or str(Path(argv[0]).resolve()) != executable_lease.path:
+            return CommandCapture(
+                command_id=command_id,
+                command_class=command_class,
+                argv=list(argv),
+                executed=False,
+                exit_code=None,
+                duration_seconds=time.monotonic() - start,
+                stdout="",
+                stderr="",
+                required=required,
+                error="trusted executable lease does not authorize argv[0]",
+                containment="not-started",
+                process_tree_status="setup-failed",
+            )
+        lease_ok, lease_error = executable_lease.verify()
+        if not lease_ok:
+            return CommandCapture(
+                command_id=command_id,
+                command_class=command_class,
+                argv=list(argv),
+                executed=False,
+                exit_code=None,
+                duration_seconds=time.monotonic() - start,
+                stdout="",
+                stderr="",
+                required=required,
+                error=lease_error or "trusted executable lease verification failed",
+                containment="not-started",
+                process_tree_status="setup-failed",
+            )
+
+    if sys.platform.startswith("linux"):
+        effective_environment = (
+            dict(env)
+            if env is not None
+            else child_process_environment(
+                {"command": str(Path(argv[0]).resolve(strict=True))}
+            )
+        )
+        return _execute_linux_supervised(
+            command_id,
+            command_class,
+            argv,
+            timeout=timeout,
+            env=effective_environment,
+            include_preview=include_preview,
+            required=required,
+            cwd=cwd,
+            max_stdout_bytes=max_stdout_bytes,
+            max_stderr_bytes=max_stderr_bytes,
+            max_line_bytes=max_line_bytes,
+            executable_lease=executable_lease,
+            stdin_data=stdin_data,
+            logical_argv=logical_argv,
+            execution_input_mode=execution_input_mode,
+            process_started_hook=process_started_hook,
+        )
+    if os.name != "nt":
+        return CommandCapture(
+            command_id=command_id,
+            command_class=command_class,
+            argv=list(argv),
+            executed=False,
+            exit_code=None,
+            duration_seconds=time.monotonic() - start,
+            stdout="",
+            stderr="",
+            required=required,
+            error="process containment is unsupported on this platform",
+            containment="not-started",
+            process_tree_status="setup-failed",
+        )
+
+    def consume(pipe: Any, sink: _BoundedStream) -> None:
+        try:
+            while True:
+                chunk = pipe.read(OUTPUT_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                sink.feed(chunk)
+                if sink.limit_reason:
+                    limit_event.set()
+                    break
+        finally:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+    def write_stdin(pipe: Any, data: bytes) -> None:
+        try:
+            view = memoryview(data)
+            offset = 0
+            while offset < len(view):
+                written = pipe.write(view[offset : offset + OUTPUT_READ_CHUNK_BYTES])
+                if written is None:
+                    written = 0
+                if written <= 0:
+                    raise OSError("child stdin accepted no bytes")
+                offset += written
+            pipe.flush()
+        except (BrokenPipeError, OSError) as exc:
+            stdin_error.append(f"{type(exc).__name__}: {exc}")
+        finally:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+    windows_job: _WindowsJob | None = None
+    containment = "windows-job-object" if os.name == "nt" else "unsupported-posix"
+    if os.name == "nt":
+        try:
+            windows_job = _WindowsJob()
+        except OSError as exc:
+            return CommandCapture(
+                command_id=command_id,
+                command_class=command_class,
+                argv=list(argv),
+                executed=False,
+                exit_code=None,
+                duration_seconds=time.monotonic() - start,
+                stdout="",
+                stderr="",
+                required=required,
+                error=f"process containment unavailable: {type(exc).__name__}: {exc}",
+                include_preview=include_preview,
+                stdout_byte_limit=max_stdout_bytes,
+                stderr_byte_limit=max_stderr_bytes,
+                containment=containment,
+                process_tree_status="setup-failed",
+                process_tree_error=f"Windows Job Object setup failed: {type(exc).__name__}",
+            )
+
+    try:
+        popen_kwargs: dict[str, Any] = {}
+        popen_kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | _WindowsJob.CREATE_SUSPENDED
+        )
+        process = subprocess.Popen(
+            list(argv),
+            cwd=cwd,
+            env=dict(env) if env is not None else child_process_environment(
+                {"command": str(Path(argv[0]).resolve(strict=True))}
+            ),
+            shell=False,
+            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            **popen_kwargs,
+        )
+    except (FileNotFoundError, PermissionError, OSError) as exc:
+        if windows_job is not None:
+            windows_job.close_without_members()
+        return CommandCapture(
+            command_id=command_id,
+            command_class=command_class,
+            argv=list(argv),
+            executed=False,
+            exit_code=None,
+            duration_seconds=time.monotonic() - start,
+            stdout="",
+            stderr="",
+            required=required,
+            error=f"{type(exc).__name__}: {exc}",
+            include_preview=include_preview,
+            stdout_byte_limit=max_stdout_bytes,
+            stderr_byte_limit=max_stderr_bytes,
+            containment=containment,
+            process_tree_status="not-started",
+        )
+
+    if windows_job is not None:
+        try:
+            windows_job.assign_and_resume(process)
+        except OSError as exc:
+            try:
+                process.kill()
+                process.wait(timeout=PROCESS_TREE_KILL_SECONDS)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            cleanup_ok, _terminated, cleanup_error = windows_job.close_and_kill()
+            detail = f"Windows Job Object assignment/resume failed: {type(exc).__name__}"
+            if not cleanup_ok and cleanup_error:
+                detail += f"; {cleanup_error}"
+            return CommandCapture(
+                command_id=command_id,
+                command_class=command_class,
+                argv=list(argv),
+                executed=False,
+                exit_code=None,
+                duration_seconds=time.monotonic() - start,
+                stdout="",
+                stderr="",
+                required=required,
+                error=detail,
+                include_preview=include_preview,
+                stdout_byte_limit=max_stdout_bytes,
+                stderr_byte_limit=max_stderr_bytes,
+                containment=containment,
+                process_tree_status="setup-failed",
+                process_tree_error=detail,
+            )
+
+    containment_identity = f"{containment}:{process.pid}:{time.monotonic_ns()}"
+    _register_containment(containment_identity)
+
+    assert process.stdout is not None and process.stderr is not None
+    readers = (
+        threading.Thread(target=consume, args=(process.stdout, stdout_sink), daemon=True),
+        threading.Thread(target=consume, args=(process.stderr, stderr_sink), daemon=True),
+    )
+    for reader in readers:
+        reader.start()
+    stdin_writer: threading.Thread | None = None
+    if stdin_data is not None:
+        assert process.stdin is not None
+        stdin_writer = threading.Thread(
+            target=write_stdin,
+            args=(process.stdin, stdin_data),
+            daemon=True,
+        )
+        stdin_writer.start()
+    hook_error: str | None = None
+    if process_started_hook is not None:
+        try:
+            process_started_hook(process)
+        except Exception as exc:  # test/lease hooks must fail the command closed
+            hook_error = f"process-start hook failed: {type(exc).__name__}: {exc}"
+
+    deadline = start + timeout
+    timed_out = False
+    output_limited = False
+    try:
+        while process.poll() is None:
+            if hook_error is not None:
+                break
+            if limit_event.wait(0.02):
+                output_limited = True
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+
+        assert windows_job is not None
+        cleanup_ok, descendants_terminated, process_tree_error = windows_job.close_and_kill()
+    finally:
+        _unregister_containment(containment_identity)
+
+    try:
+        process.wait(timeout=PROCESS_TREE_KILL_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            process.wait(timeout=PROCESS_TREE_KILL_SECONDS)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            cleanup_ok = False
+            process_tree_error = (
+                (process_tree_error + "; ") if process_tree_error else ""
+            ) + f"direct parent reap failed: {type(exc).__name__}"
+    for reader in readers:
+        reader.join(timeout=PROCESS_TREE_KILL_SECONDS)
+    if any(reader.is_alive() for reader in readers):
+        cleanup_ok = False
+        process_tree_error = (
+            (process_tree_error + "; ") if process_tree_error else ""
+        ) + "bounded output reader did not reach EOF after process-tree cleanup"
+    if stdin_writer is not None:
+        stdin_writer.join(timeout=PROCESS_TREE_KILL_SECONDS)
+        if stdin_writer.is_alive():
+            cleanup_ok = False
+            stdin_error.append("bounded stdin writer did not finish")
+    if hook_error is not None:
+        cleanup_ok = False
+        process_tree_error = ((process_tree_error + "; ") if process_tree_error else "") + hook_error
+    if stdin_error:
+        cleanup_ok = False
+        process_tree_error = (
+            (process_tree_error + "; ") if process_tree_error else ""
+        ) + "STDIN-ERROR: " + "; ".join(stdin_error)
+
+    output_limited = output_limited or bool(stdout_sink.limit_reason or stderr_sink.limit_reason)
+    if timed_out:
+        exit_code = 124
+        error = f"command timed out after {timeout} seconds"
+    elif output_limited:
+        exit_code = 125
+        reason_parts = [part for part in (stdout_sink.limit_reason, stderr_sink.limit_reason) if part]
+        error = "OUTPUT-LIMIT-EXCEEDED: " + "; ".join(reason_parts)
+    else:
+        exit_code = process.returncode
+        error = None
+    if not cleanup_ok:
+        if not timed_out and not output_limited:
+            exit_code = PROCESS_TREE_FAILURE_EXIT
+        cleanup_detail = process_tree_error or "unknown process-tree cleanup failure"
+        error = ((error + "; ") if error else "") + f"PROCESS-TREE-ERROR: {cleanup_detail}"
+    if executable_lease is not None:
+        lease_ok, lease_error = executable_lease.verify()
+        if not lease_ok:
+            cleanup_ok = False
+            exit_code = PROCESS_TREE_FAILURE_EXIT
+            process_tree_error = lease_error or "trusted executable lease identity drifted"
+            error = ((error + "; ") if error else "") + f"EXECUTABLE-LEASE-ERROR: {process_tree_error}"
+    return CommandCapture(
+        command_id=command_id,
+        command_class=command_class,
+        argv=list(argv),
+        executed=True,
+        exit_code=exit_code,
+        duration_seconds=time.monotonic() - start,
+        stdout=stdout_sink.text(),
+        stderr=stderr_sink.text(),
+        required=required,
+        stdout_raw=None if output_limited else stdout_sink.data(),
+        stderr_raw=None if output_limited else stderr_sink.data(),
+        stdout_byte_limit=max_stdout_bytes,
+        stderr_byte_limit=max_stderr_bytes,
+        error=error,
+        include_preview=include_preview,
+        timed_out=timed_out,
+        output_limited=output_limited,
+        limit_reason="; ".join(
+            part for part in (stdout_sink.limit_reason, stderr_sink.limit_reason) if part
+        ) or None,
+        stdout_bytes=stdout_sink.total_bytes,
+        stderr_bytes=stderr_sink.total_bytes,
+        containment=containment,
+        process_tree_status="contained-clean" if cleanup_ok else "cleanup-failed",
+        descendants_terminated=descendants_terminated,
+        process_tree_error=process_tree_error,
+        logical_argv=list(logical_argv) if logical_argv is not None else list(argv),
+        execution_input_mode=execution_input_mode,
+        execution_input_size=len(stdin_data) if stdin_data is not None else None,
+        execution_input_sha256=(
+            hashlib.sha256(stdin_data).hexdigest() if stdin_data is not None else None
+        ),
+    )
+
+
+def make_internal_result(
+    command_id: str,
+    command_class: str,
+    passed: bool,
+    detail: str,
+    *,
+    required: bool = True,
+) -> dict[str, Any]:
+    safe_detail = sanitize_text(detail)
+    empty_digest = hashlib.sha256(b"").hexdigest()
+    return {
+        "commandId": command_id,
+        "commandClass": command_class,
+        "executable": "internal",
+        "required": required,
+        "executed": True,
+        "started": True,
+        "setupFailure": False,
+        "exitCode": 0 if passed else 1,
+        "durationSeconds": 0.0,
+        "executionDurationClass": "bounded",
+        "timeoutStatus": "within-limit",
+        "outputLimitStatus": "within-limit",
+        "stdoutBytesObserved": len(detail.encode("utf-8", errors="replace")),
+        "stderrBytesObserved": 0,
+        "stdoutByteLimit": MAX_RECORDED_STREAM_BYTES,
+        "stderrByteLimit": MAX_RECORDED_STREAM_BYTES,
+        "containment": "internal",
+        "processTreeStatus": "not-applicable",
+        "descendantsTerminated": 0,
+        "actualExecutionArgv": [sys.executable, "<internal>", command_id],
+        "actualExecutionInputMode": "NONE",
+        "actualExecutionInputSize": None,
+        "actualExecutionInputSha256": None,
+        "stdoutSha256": empty_digest,
+        "stderrSha256": empty_digest,
+        "producerObservations": [],
+        "producerObservationSetDigest": producer_observation_set_digest([]),
+        "completedCommandClass": None,
+        "executionInputs": [],
+        "executionInputBundleDigest": None,
+        "targetExecutionLease": None,
+        "protectedTargetBundle": None,
+        "parsedFailureSummary": {
+            "status": "pass" if passed else "fail",
+            "diagnostic": bounded_preview(safe_detail, max_lines=4, max_bytes=512),
+        },
+    }
+
+
+class DuplicateJsonKeyError(ValueError):
+    """Raised when a JSON object repeats a decoded member name."""
+
+
+def _reject_duplicate_json_pairs(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise DuplicateJsonKeyError(f"duplicate JSON object key: {key!r}")
+        value[key] = item
+    return value
+
+
+def _strict_json_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("non-finite JSON number")
+    return number
+
+
+def strict_json_loads(
+    source: str | bytes | bytearray,
+    *,
+    label: str = "JSON document",
+    enforce_bounds: bool = True,
+) -> Any:
+    """Decode strict JSON, rejecting duplicate keys and non-finite numbers."""
+
+    if isinstance(source, (bytes, bytearray)):
+        raw = bytes(source)
+        if raw.startswith((b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff")):
+            raise ValueError(f"{label}: JSON must not contain a BOM")
+        text = raw.decode("utf-8", errors="strict")
+    elif isinstance(source, str):
+        if source.startswith("\ufeff"):
+            raise ValueError(f"{label}: JSON must not contain a BOM")
+        text = source
+    else:
+        raise TypeError(f"{label}: JSON source must be text or bytes")
+    value = json.loads(
+        text,
+        object_pairs_hook=_reject_duplicate_json_pairs,
+        parse_constant=_reject_json_constant,
+        parse_float=_strict_json_float,
+    )
+    if enforce_bounds:
+        numeric_errors = _bounded_evidence_json(value, label=label)
+        if numeric_errors:
+            raise ValueError("; ".join(numeric_errors))
+    return value
+
+
+def strict_json_load_file(path: Path, *, enforce_bounds: bool = True) -> Any:
+    return strict_json_loads(
+        path.read_bytes(),
+        label=str(path),
+        enforce_bounds=enforce_bounds,
+    )
+
+
+def read_json(path: Path) -> Any:
+    """Compatibility name for the sole security-critical JSON file loader."""
+
+    return strict_json_load_file(path)
+
+
+def baseline_semantic_digest(collection: str, entry: Mapping[str, Any]) -> str:
+    semantic = {"collection": collection}
+    for field_name in BASELINE_SEMANTIC_FIELDS:
+        semantic[field_name] = entry.get(field_name)
+    canonical = json.dumps(
+        semantic,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return sha256_text(canonical)
+
+
+def validate_baseline_document(document: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(document, dict):
+        return ["baseline root must be an object"]
+    actual_top_level = set(document)
+    missing = sorted(REQUIRED_BASELINE_FIELDS - actual_top_level)
+    extra = sorted(actual_top_level - REQUIRED_BASELINE_FIELDS)
+    if missing:
+        errors.append(f"baseline missing top-level fields: {', '.join(missing)}")
+    if extra:
+        errors.append(f"baseline contains unknown top-level fields: {', '.join(extra)}")
+    if document.get("documentKind") != "ieltmps-phase1-ci-baseline-v1":
+        errors.append("unexpected baseline documentKind")
+    if document.get("schemaVersion") != 1:
+        errors.append("unsupported baseline schemaVersion")
+    if document.get("baselineCommit") != BASELINE_COMMIT:
+        errors.append("baselineCommit does not match the frozen checkpoint")
+    if document.get("baselineTree") != BASELINE_TREE:
+        errors.append("baselineTree does not match the frozen checkpoint")
+    if document.get("checkpointTag") != CHECKPOINT_TAG:
+        errors.append("checkpointTag does not match the frozen checkpoint")
+    if document.get("policyVersion") != POLICY_VERSION:
+        errors.append("policyVersion does not match the candidate-local policy map")
+    if document.get("ratifiedCounts") != dict(RATIFIED_COUNTS):
+        errors.append("ratifiedCounts do not match the exact 4/14/3/2/3 authority")
+    # The ratified Phase 1 baseline predates the CI8 verifier-only download
+    # boundary and is an immutable task input.  It must still match every
+    # ratified pin exactly; the additional candidate-local download pin is
+    # enforced by the exact workflow grammar and remains subject to the next
+    # independent review.
+    ratified_action_pins = {
+        name: value
+        for name, value in APPROVED_ACTIONS.items()
+        if name != "actions/download-artifact"
+    }
+    if document.get("approvedActions") != ratified_action_pins:
+        errors.append("approvedActions must exactly match the ratified Phase 1 action pins")
+
+    hard_gates = document.get("hardGates")
+    if not isinstance(hard_gates, list) or not hard_gates:
+        errors.append("hardGates must be a non-empty array")
+    else:
+        gate_ids: list[Any] = []
+        for index, item in enumerate(hard_gates):
+            if not isinstance(item, dict) or set(item) != {"id", "description"}:
+                errors.append(f"hardGates[{index}] must contain only id and description")
+                continue
+            gate_ids.append(item.get("id"))
+            if not isinstance(item.get("description"), str) or not item["description"].strip():
+                errors.append(f"hardGates[{index}].description must be a non-empty string")
+        if tuple(gate_ids) != HARD_GATE_AUTHORITY:
+            errors.append("hardGates must exactly match the candidate-local hard-gate map")
+
+    collections = ("knownDebts", "expectedOmissions", "releaseOnlySkips")
+    all_ids: list[str] = []
+    for collection_name in collections:
+        entries = document.get(collection_name)
+        if not isinstance(entries, list):
+            errors.append(f"{collection_name} must be an array")
+            continue
+        for index, entry in enumerate(entries):
+            label = f"{collection_name}[{index}]"
+            if not isinstance(entry, dict):
+                errors.append(f"{label} must be an object")
+                continue
+            allowed_fields = REQUIRED_DEBT_FIELDS | {"currentCiDisposition"}
+            unknown_fields = sorted(set(entry) - allowed_fields)
+            if unknown_fields:
+                errors.append(f"{label} contains unknown fields: {', '.join(unknown_fields)}")
+            entry_missing = sorted(REQUIRED_DEBT_FIELDS - set(entry))
+            if entry_missing:
+                errors.append(f"{label} missing fields: {', '.join(entry_missing)}")
+            entry_id = entry.get("id")
+            if not isinstance(entry_id, str) or not entry_id:
+                errors.append(f"{label}.id must be a non-empty string")
+            else:
+                all_ids.append(entry_id)
+                expected_digest = BASELINE_SEMANTIC_AUTHORITY.get(entry_id)
+                if expected_digest is None:
+                    errors.append(f"{label}.id is not approved: {entry_id}")
+                elif baseline_semantic_digest(collection_name, entry) != expected_digest:
+                    errors.append(
+                        f"{label} changes exact candidate-local collection/category/gate/class/scope/outcome/"
+                        "signature/occurrence/platform/disposition/stage/security semantics"
+                    )
+            if not isinstance(entry.get("testOrPathScope"), str) or not entry.get("testOrPathScope"):
+                errors.append(f"{label}.testOrPathScope must be a non-empty string")
+            signatures = entry.get("allowedNormalizedSignature")
+            if not isinstance(signatures, list) or not signatures:
+                errors.append(f"{label}.allowedNormalizedSignature must be a non-empty array")
+            else:
+                for signature in signatures:
+                    if not isinstance(signature, str) or not signature:
+                        errors.append(f"{label} has an empty or non-string signature")
+                    elif ".*" in signature or len(signature) > 256:
+                        errors.append(f"{label} contains an unrestricted or oversized signature")
+            maximum = entry.get("maximumOccurrences")
+            if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 1:
+                errors.append(f"{label}.maximumOccurrences must be a positive integer")
+            platforms = entry.get("platforms")
+            if (
+                not isinstance(platforms, list)
+                or not platforms
+                or any(value not in {"windows", "ubuntu", "all"} for value in platforms)
+            ):
+                errors.append(f"{label}.platforms contains an unsupported value")
+            if not isinstance(entry.get("notes"), str) or not entry.get("notes", "").strip():
+                errors.append(f"{label}.notes must be a non-empty string")
+            expected_current = (
+                "must-execute" if entry_id == "F-WINDOWS-BACKEND-COMPATIBILITY-RUNNER" else None
+            )
+            if entry.get("currentCiDisposition") != expected_current:
+                errors.append(f"{label}.currentCiDisposition does not match the candidate-local disposition map")
+    if len(all_ids) != len(set(all_ids)):
+        errors.append("debt, omission, and release-only IDs must be globally unique")
+    if set(all_ids) != set(BASELINE_SEMANTIC_AUTHORITY):
+        missing_ids = sorted(set(BASELINE_SEMANTIC_AUTHORITY) - set(all_ids))
+        extra_ids = sorted(set(all_ids) - set(BASELINE_SEMANTIC_AUTHORITY))
+        errors.append(f"baseline ID set is not exact; missing={missing_ids} additional={extra_ids}")
+
+    known_debts = document.get("knownDebts", [])
+    category_counts: dict[str, int] = {}
+    if isinstance(known_debts, list):
+        for entry in known_debts:
+            if isinstance(entry, dict):
+                category = str(entry.get("category", ""))
+                category_counts[category] = category_counts.get(category, 0) + 1
+    expected_counts = {
+        "product-or-packaging": 4,
+        "validation-infrastructure": 14,
+        "accepted-checkpoint-nonblocking": 3,
+    }
+    if category_counts != expected_counts:
+        errors.append(
+            "known-debt category counts must be exactly "
+            "product-or-packaging=4, validation-infrastructure=14, "
+            "accepted-checkpoint-nonblocking=3"
+        )
+    if isinstance(document.get("expectedOmissions"), list) and len(document["expectedOmissions"]) != 2:
+        errors.append("expectedOmissions must contain exactly two entries")
+    if isinstance(document.get("releaseOnlySkips"), list) and len(document["releaseOnlySkips"]) != 3:
+        errors.append("releaseOnlySkips must contain exactly three entries")
+    if document.get("observationalChecks") != []:
+        errors.append("observationalChecks must be exactly empty in policy version 1.0.0")
+    return sorted(set(errors))
+
+
+class CanonicalYamlError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class _YamlToken:
+    line_number: int
+    indent: int
+    text: str
+    block_value: str | None = None
+
+
+def _strip_yaml_comment(value: str) -> str:
+    quote: str | None = None
+    escaped = False
+    for index, character in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if quote == '"' and character == "\\":
+            escaped = True
+            continue
+        if character in {"'", '"'}:
+            if quote is None:
+                quote = character
+            elif quote == character:
+                quote = None
+            continue
+        if character == "#" and quote is None and (index == 0 or value[index - 1].isspace()):
+            return value[:index].rstrip()
+    return value.rstrip()
+
+
+def _tokenize_canonical_yaml(text: str) -> list[_YamlToken]:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if normalized.startswith("\ufeff"):
+        raise CanonicalYamlError("UTF-8 BOM is unsupported")
+    if "\x00" in normalized:
+        raise CanonicalYamlError("NUL bytes are unsupported")
+    raw_lines = normalized.split("\n")
+    tokens: list[_YamlToken] = []
+    index = 0
+    while index < len(raw_lines):
+        raw_line = raw_lines[index]
+        line_number = index + 1
+        prefix = raw_line[: len(raw_line) - len(raw_line.lstrip(" \t"))]
+        if "\t" in prefix:
+            raise CanonicalYamlError(f"line {line_number}: tabs may not be used for indentation")
+        if "\t" in raw_line:
+            raise CanonicalYamlError(f"line {line_number}: tabs are unsupported in the canonical subset")
+        indent = len(prefix)
+        if indent % 2:
+            raise CanonicalYamlError(f"line {line_number}: indentation must use two-space increments")
+        content = _strip_yaml_comment(raw_line[indent:])
+        if not content:
+            index += 1
+            continue
+        if re.search(r"(?:^|\s)(?:&|\*)[A-Za-z0-9_-]+(?:\s|$)", content) or content.startswith("<<:"):
+            raise CanonicalYamlError(f"line {line_number}: anchors, aliases, and merge keys are forbidden")
+        block_match = re.fullmatch(r"([^:]+):\s*\|", content)
+        if block_match:
+            block_lines: list[str] = []
+            index += 1
+            while index < len(raw_lines):
+                candidate = raw_lines[index]
+                candidate_prefix = candidate[: len(candidate) - len(candidate.lstrip(" \t"))]
+                if "\t" in candidate_prefix:
+                    raise CanonicalYamlError(f"line {index + 1}: tabs may not be used for indentation")
+                candidate_indent = len(candidate_prefix)
+                if candidate.strip() and candidate_indent <= indent:
+                    break
+                if candidate.strip() and candidate_indent < indent + 2:
+                    raise CanonicalYamlError(f"line {index + 1}: malformed literal scalar indentation")
+                block_lines.append(candidate[indent + 2 :] if len(candidate) >= indent + 2 else "")
+                index += 1
+            tokens.append(
+                _YamlToken(
+                    line_number=line_number,
+                    indent=indent,
+                    text=f"{block_match.group(1)}: |",
+                    block_value="\n".join(block_lines).rstrip("\n"),
+                )
+            )
+            continue
+        tokens.append(_YamlToken(line_number, indent, content))
+        index += 1
+    return tokens
+
+
+def _split_mapping_token(token: _YamlToken, text: str | None = None) -> tuple[str, str, str | None]:
+    value = token.text if text is None else text
+    if not value or value[0] in {'"', "'"}:
+        raise CanonicalYamlError(f"line {token.line_number}: quoted mapping keys are forbidden")
+    quote: str | None = None
+    escaped = False
+    colon_index = -1
+    for index, character in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if quote == '"' and character == "\\":
+            escaped = True
+            continue
+        if character in {"'", '"'}:
+            quote = None if quote == character else character if quote is None else quote
+            continue
+        if character == ":" and quote is None:
+            colon_index = index
+            break
+    if colon_index < 1:
+        raise CanonicalYamlError(f"line {token.line_number}: expected a plain mapping key")
+    key = value[:colon_index].strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", key):
+        raise CanonicalYamlError(f"line {token.line_number}: unsupported mapping key syntax: {key}")
+    remainder = value[colon_index + 1 :].strip()
+    block_value = token.block_value if remainder == "|" else None
+    return key, remainder, block_value
+
+
+def _parse_yaml_scalar(value: str, token: _YamlToken) -> str:
+    if value.startswith(("[", "{")):
+        raise CanonicalYamlError(f"line {token.line_number}: inline maps and sequences are forbidden")
+    if value.startswith((">", "|")):
+        raise CanonicalYamlError(f"line {token.line_number}: unsupported folded or literal scalar")
+    if value.startswith("!"):
+        raise CanonicalYamlError(f"line {token.line_number}: custom tags are forbidden")
+    if re.search(r"(?:^|\s)(?:&|\*)[A-Za-z0-9_-]+(?:\s|$)", value):
+        raise CanonicalYamlError(f"line {token.line_number}: anchors and aliases are forbidden")
+    if value.startswith('"'):
+        try:
+            decoded = strict_json_loads(
+                value,
+                label=f"workflow scalar at line {token.line_number}",
+            )
+        except json.JSONDecodeError as exc:
+            raise CanonicalYamlError(f"line {token.line_number}: invalid double-quoted scalar") from exc
+        if not isinstance(decoded, str):
+            raise CanonicalYamlError(f"line {token.line_number}: quoted scalar must decode to text")
+        return decoded
+    if value.startswith("'"):
+        if len(value) < 2 or not value.endswith("'"):
+            raise CanonicalYamlError(f"line {token.line_number}: invalid single-quoted scalar")
+        return value[1:-1].replace("''", "'")
+    return value
+
+
+def _parse_canonical_yaml_node(
+    tokens: Sequence[_YamlToken], index: int, indent: int
+) -> tuple[Any, int]:
+    if index >= len(tokens) or tokens[index].indent != indent:
+        line = tokens[index].line_number if index < len(tokens) else "EOF"
+        raise CanonicalYamlError(f"line {line}: unexpected indentation")
+    if tokens[index].text.startswith("- "):
+        result_list: list[Any] = []
+        while index < len(tokens) and tokens[index].indent == indent:
+            token = tokens[index]
+            if not token.text.startswith("- "):
+                raise CanonicalYamlError(f"line {token.line_number}: mixed mapping and sequence")
+            remainder = token.text[2:].strip()
+            if not remainder:
+                raise CanonicalYamlError(f"line {token.line_number}: empty sequence items are unsupported")
+            if re.match(r"[A-Za-z_][A-Za-z0-9_-]*\s*:", remainder):
+                key, scalar_text, block_value = _split_mapping_token(token, remainder)
+                item: dict[str, Any] = {}
+                if block_value is not None:
+                    if key not in {"run", "path"}:
+                        raise CanonicalYamlError(f"line {token.line_number}: literal scalar is not allowed for {key}")
+                    item[key] = block_value
+                    index += 1
+                elif scalar_text:
+                    item[key] = _parse_yaml_scalar(scalar_text, token)
+                    index += 1
+                else:
+                    index += 1
+                    if index < len(tokens) and tokens[index].indent > indent:
+                        if tokens[index].indent != indent + 4:
+                            raise CanonicalYamlError(f"line {tokens[index].line_number}: invalid nested sequence mapping")
+                        item[key], index = _parse_canonical_yaml_node(tokens, index, indent + 4)
+                    else:
+                        item[key] = None
+                if index < len(tokens) and tokens[index].indent == indent + 2:
+                    continuation, index = _parse_canonical_yaml_node(tokens, index, indent + 2)
+                    if not isinstance(continuation, dict):
+                        raise CanonicalYamlError(f"line {tokens[index - 1].line_number}: sequence mapping continuation must be a mapping")
+                    duplicates = set(item) & set(continuation)
+                    if duplicates:
+                        raise CanonicalYamlError(f"line {token.line_number}: duplicate key {sorted(duplicates)[0]}")
+                    item.update(continuation)
+                result_list.append(item)
+            else:
+                result_list.append(_parse_yaml_scalar(remainder, token))
+                index += 1
+            if index < len(tokens) and tokens[index].indent > indent:
+                raise CanonicalYamlError(f"line {tokens[index].line_number}: unexpected sequence indentation")
+        return result_list, index
+
+    result: dict[str, Any] = {}
+    while index < len(tokens) and tokens[index].indent == indent:
+        token = tokens[index]
+        if token.text.startswith("- "):
+            raise CanonicalYamlError(f"line {token.line_number}: mixed sequence and mapping")
+        key, scalar_text, block_value = _split_mapping_token(token)
+        if key in result:
+            raise CanonicalYamlError(f"line {token.line_number}: duplicate key {key}")
+        if block_value is not None:
+            if key not in {"run", "path"}:
+                raise CanonicalYamlError(f"line {token.line_number}: literal scalar is not allowed for {key}")
+            result[key] = block_value
+            index += 1
+        elif scalar_text:
+            result[key] = _parse_yaml_scalar(scalar_text, token)
+            index += 1
+        else:
+            index += 1
+            if index < len(tokens) and tokens[index].indent > indent:
+                if tokens[index].indent != indent + 2:
+                    raise CanonicalYamlError(f"line {tokens[index].line_number}: invalid nested mapping indentation")
+                result[key], index = _parse_canonical_yaml_node(tokens, index, indent + 2)
+            else:
+                result[key] = None
+        if index < len(tokens) and tokens[index].indent > indent:
+            raise CanonicalYamlError(f"line {tokens[index].line_number}: unexpected mapping indentation")
+    return result, index
+
+
+def parse_canonical_workflow_yaml(text: str) -> dict[str, Any]:
+    tokens = _tokenize_canonical_yaml(text)
+    if not tokens:
+        raise CanonicalYamlError("workflow is empty")
+    if tokens[0].indent != 0:
+        raise CanonicalYamlError("top-level mapping must start at column zero")
+    result, index = _parse_canonical_yaml_node(tokens, 0, 0)
+    if index != len(tokens):
+        raise CanonicalYamlError(f"line {tokens[index].line_number}: trailing unsupported syntax")
+    if not isinstance(result, dict):
+        raise CanonicalYamlError("workflow root must be a mapping")
+    return result
+
+
+EXACT_EVIDENCE_PATH_BLOCK = "\n".join(f".ci-results/{name}" for name in EVIDENCE_FILE_NAMES)
+POLICY_COMMAND = "python -B developer/tests/ci/run_ci_foundation.py --profile policy"
+SELF_TEST_COMMAND = "python -B developer/tests/ci/test_ci_foundation.py"
+ALL_COMMAND = "python -B developer/tests/ci/run_ci_foundation.py --profile all"
+PRODUCER_DEVELOPER_INSTALL_COMMAND = (
+    "npm --prefix developer ci --ignore-scripts --no-audit --no-fund"
+)
+PRODUCER_BACKEND_INSTALL_COMMAND = (
+    "npm --prefix backend ci --ignore-scripts --no-audit --no-fund"
+)
+LINUX_FRESH_DEVELOPER_INSTALL_COMMAND = (
+    '"$CI_TRUSTED_NODE" "$CI_TRUSTED_NPM_ENTRY" --prefix developer ci '
+    "--ignore-scripts --no-audit --no-fund"
+)
+LINUX_FRESH_BACKEND_INSTALL_COMMAND = (
+    '"$CI_TRUSTED_NODE" "$CI_TRUSTED_NPM_ENTRY" --prefix backend ci '
+    "--ignore-scripts --no-audit --no-fund"
+)
+WINDOWS_FRESH_DEVELOPER_INSTALL_COMMAND = (
+    "& $env:CI_TRUSTED_NODE $env:CI_TRUSTED_NPM_ENTRY --prefix developer ci "
+    "--ignore-scripts --no-audit --no-fund"
+)
+WINDOWS_FRESH_BACKEND_INSTALL_COMMAND = (
+    "& $env:CI_TRUSTED_NODE $env:CI_TRUSTED_NPM_ENTRY --prefix backend ci "
+    "--ignore-scripts --no-audit --no-fund"
+)
+LINUX_RUNTIME_CAPTURE = '''python_path="$pythonLocation/bin/python"
+node_path="$(command -v node)"
+npm_path="$(command -v npm)"
+test -x "$python_path"
+test -x "$node_path"
+test -e "$npm_path"
+printf 'CI_TRUSTED_PYTHON=%s\\n' "$(realpath "$python_path")" >> "$GITHUB_ENV"
+printf 'CI_TRUSTED_NODE=%s\\n' "$(realpath "$node_path")" >> "$GITHUB_ENV"
+printf 'CI_TRUSTED_NPM_ENTRY=%s\\n' "$(realpath "$npm_path")" >> "$GITHUB_ENV"'''
+LINUX_RUNTIME_CAPTURE_FRESH = LINUX_RUNTIME_CAPTURE + '''
+printf 'CI_FRESH_DEPENDENCY_INSTALL=1\\n' >> "$GITHUB_ENV"'''
+WINDOWS_RUNTIME_CAPTURE = '''$pythonPath = (Resolve-Path -LiteralPath (Join-Path $env:pythonLocation 'python.exe')).Path
+$nodePath = (Get-Command node.exe -CommandType Application).Source
+$npmEntry = (Resolve-Path -LiteralPath (Join-Path (Split-Path $nodePath -Parent) 'node_modules\\npm\\bin\\npm-cli.js')).Path
+if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) { throw 'trusted Python is unavailable' }
+if (-not (Test-Path -LiteralPath $nodePath -PathType Leaf)) { throw 'trusted Node is unavailable' }
+if (-not (Test-Path -LiteralPath $npmEntry -PathType Leaf)) { throw 'trusted npm entry is unavailable' }
+"CI_TRUSTED_PYTHON=$pythonPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+"CI_TRUSTED_NODE=$nodePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+"CI_TRUSTED_NPM_ENTRY=$npmEntry" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+"CI_FRESH_DEPENDENCY_INSTALL=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8'''
+LINUX_ABSENT_DEPENDENCY_ROOTS = '''test ! -e developer/node_modules
+test ! -e backend/node_modules'''
+WINDOWS_ABSENT_DEPENDENCY_ROOTS = '''if (Test-Path -LiteralPath 'developer/node_modules') { throw 'developer/node_modules was not fresh' }
+if (Test-Path -LiteralPath 'backend/node_modules') { throw 'backend/node_modules was not fresh' }'''
+FINAL_VERIFIER_COMMANDS = MappingProxyType(
+    {
+        "repository-policy": (
+            '"$CI_TRUSTED_PYTHON" -B developer/tests/ci/run_ci_foundation.py '
+            "--verify-evidence --expected-profile policy "
+            "--expected-producer-job repository-policy-producer "
+            "--expected-verifier-job repository-policy --expected-runner-os Linux "
+            "--untrusted-evidence-root .ci-untrusted/repository-policy "
+            "--require-linux-containment-self-test"
+        ),
+        "ubuntu-canonical": (
+            '"$CI_TRUSTED_PYTHON" -B developer/tests/ci/run_ci_foundation.py '
+            "--verify-evidence --expected-profile all "
+            "--expected-producer-job ubuntu-canonical-producer "
+            "--expected-verifier-job ubuntu-canonical --expected-runner-os Linux "
+            "--untrusted-evidence-root .ci-untrusted/ubuntu-canonical "
+            "--require-linux-containment-self-test --require-fresh-runtime-closure"
+        ),
+        "windows-compatibility": (
+            "& $env:CI_TRUSTED_PYTHON -B developer/tests/ci/run_ci_foundation.py "
+            "--verify-evidence --expected-profile all "
+            "--expected-producer-job windows-compatibility-producer "
+            "--expected-verifier-job windows-compatibility --expected-runner-os Windows "
+            "--untrusted-evidence-root .ci-untrusted/windows-compatibility "
+            "--require-fresh-runtime-closure"
+        ),
+    }
+)
+
+STATIC_SUITE_RELATIVE_PATH = "developer/tests/ci/run_static_suite.py"
+
+FINAL_RESULT_SCRIPT = '''echo "SELF-VALIDATOR TRUST: candidate-controlled" | tee -a "$GITHUB_STEP_SUMMARY"
+echo "MERGE AUTHORIZATION: not provided by this workflow" | tee -a "$GITHUB_STEP_SUMMARY"
+echo "INDEPENDENT REVIEW: required for CI trust-file changes" | tee -a "$GITHUB_STEP_SUMMARY"
+if [[ "${{ needs.repository-policy.result }}" != "success" ]]; then
+  echo "Repository policy verifier did not succeed."
+  exit 1
+fi
+if [[ "${{ needs.ubuntu-canonical.result }}" != "success" ]]; then
+  echo "Ubuntu canonical verifier did not succeed."
+  exit 1
+fi
+if [[ "${{ needs.windows-compatibility.result }}" != "success" ]]; then
+  echo "Windows compatibility verifier did not succeed."
+  exit 1
+fi
+echo "Fresh candidate-local verifier jobs succeeded; merge authorization is not provided." >> "$GITHUB_STEP_SUMMARY"'''
+
+
+def _walk_workflow_scalars(value: Any, path: tuple[str, ...] = ()) -> Iterable[tuple[tuple[str, ...], str]]:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            yield from _walk_workflow_scalars(child, path + (str(key),))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from _walk_workflow_scalars(child, path + (str(index),))
+    elif isinstance(value, str):
+        yield path, value
+
+
+def _canonical_expression(value: str) -> str:
+    normalized = value.casefold()
+    normalized = re.sub(r"\[\s*['\"]([a-z0-9_-]+)['\"]\s*\]", r".\1", normalized)
+    return re.sub(r"\s+", "", normalized)
+
+
+def _validate_scalar_token_policy(workflow: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    forbidden_environment_tokens = (
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        "ACTIONS_RUNTIME_TOKEN",
+    )
+    for path, scalar in _walk_workflow_scalars(workflow):
+        canonical = _canonical_expression(scalar)
+        if "secrets." in canonical or "github.token" in canonical:
+            errors.append(f"secret or GitHub token expression is forbidden at {'.'.join(path)}")
+        for token in forbidden_environment_tokens:
+            if re.search(rf"(?i)(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])", scalar):
+                errors.append(f"credential/control token {token} is forbidden at {'.'.join(path)}")
+        if path and path[-1] == "run":
+            for expression in re.findall(r"\$\{\{([\s\S]*?)\}\}", scalar):
+                if _canonical_expression(expression).startswith("github."):
+                    errors.append(f"attacker-controlled github context is forbidden in shell source at {'.'.join(path)}")
+            for match in re.findall(r"(?i)\$env:GITHUB_[A-Z0-9_]+|\$GITHUB_[A-Z0-9_]+", scalar):
+                if match.casefold() not in {
+                    "$github_step_summary",
+                    "$env:github_step_summary",
+                    "$github_env",
+                    "$env:github_env",
+                }:
+                    errors.append(f"GitHub control environment is forbidden in shell source: {match}")
+    return errors
+
+
+def _validate_run_command_policy(script: str, label: str) -> list[str]:
+    errors: list[str] = []
+    assigned_forbidden: set[str] = set()
+    forbidden_command = re.compile(
+        r"(?i)(?:^|\s)(?:git\s+push|docker(?:-compose)?\b|ssh\b|gpg\b|curl\b|wget\b|"
+        r"npm\s+publish|npx\b|npm\s+install\b|gh\s+(?:release|repo|pr|issue|api)\b|"
+        r"deploy(?:ment)?\b|release\s+publish|--force(?:-with-lease)?\b)"
+    )
+    for raw_line in script.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        assignment = re.match(r"(?:\$)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*['\"]?(.+?)['\"]?$", line)
+        if assignment and forbidden_command.search(assignment.group(2)):
+            assigned_forbidden.add(assignment.group(1).casefold())
+        if re.match(r"(?i)^(?:&\s*)?(?:\$\{?[A-Za-z_]|%[A-Za-z_])", line):
+            errors.append(f"environment-variable command indirection is forbidden in {label}")
+        if re.search(r"(?i)\b(?:eval|invoke-expression|iex)\b", line):
+            errors.append(f"dynamic command evaluation is forbidden in {label}")
+        try:
+            tokens = shlex.split(line, posix=True)
+        except ValueError:
+            errors.append(f"shell command cannot be canonically tokenized in {label}")
+            continue
+        if tokens and tokens[0].casefold() not in {"echo", "if", "fi", "}"}:
+            if forbidden_command.search(" ".join(tokens)):
+                errors.append(f"forbidden command in {label}: {tokens[0]}")
+        for variable in assigned_forbidden:
+            if re.search(rf"(?i)(?:^|[;&|]\s*)(?:&\s*)?\$\{{?{re.escape(variable)}\}}?\b", line):
+                errors.append(f"forbidden command assigned and later executed through {variable} in {label}")
+    return errors
+
+
+def _require_exact_keys(mapping: Any, expected: Sequence[str], label: str, errors: list[str]) -> bool:
+    if not isinstance(mapping, dict):
+        errors.append(f"{label} must be a mapping")
+        return False
+    if tuple(mapping) != tuple(expected):
+        errors.append(f"{label} keys/order must be exactly {list(expected)}")
+        return False
+    return True
+
+
+def _validate_action_step(step: Mapping[str, Any], label: str, errors: list[str]) -> str | None:
+    uses = step.get("uses")
+    if not isinstance(uses, str) or "@" not in uses:
+        return None
+    repository, reference = uses.split("@", 1)
+    approved = APPROVED_ACTIONS.get(repository)
+    if approved is None:
+        errors.append(f"unapproved action repository in {label}: {repository}")
+        return repository
+    if not re.fullmatch(r"[0-9a-f]{40}", reference):
+        errors.append(f"action reference is not a 40-character lowercase SHA in {label}")
+    elif reference != approved["sha"]:
+        errors.append(f"action SHA does not match the approved pin in {label}")
+    return repository
+
+
+def _validate_workflow_steps(job_name: str, steps: Any, errors: list[str]) -> None:
+    if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
+        errors.append(f"{job_name}.steps must be a sequence of mappings")
+        return
+    expected_names = {
+        "repository-policy-producer": [
+            "Check out repository",
+            "Set up Python",
+            "Set up Node.js",
+            "Run CI foundation self-tests",
+            "Generate untrusted policy evidence",
+            "Upload untrusted policy evidence",
+        ],
+        "ubuntu-canonical-producer": [
+            "Check out repository",
+            "Set up Python",
+            "Set up Node.js",
+            "Install locked developer dependencies for untrusted production",
+            "Install locked backend dependencies for untrusted production",
+            "Generate untrusted Ubuntu evidence",
+            "Upload untrusted Ubuntu evidence",
+        ],
+        "windows-compatibility-producer": [
+            "Check out repository",
+            "Set up Python",
+            "Set up Node.js",
+            "Install locked developer dependencies for untrusted production",
+            "Install locked backend dependencies for untrusted production",
+            "Generate untrusted Windows evidence",
+            "Upload untrusted Windows evidence",
+        ],
+        "repository-policy": [
+            "Check out repository",
+            "Set up Python",
+            "Set up Node.js",
+            "Capture trusted runtime paths",
+            "Download untrusted policy evidence",
+            "Verify untrusted policy evidence by fresh replay",
+        ],
+        "ubuntu-canonical": [
+            "Check out repository",
+            "Set up Python",
+            "Set up Node.js",
+            "Capture trusted runtime paths",
+            "Require initially absent dependency roots",
+            "Install fresh locked developer dependencies",
+            "Install fresh locked backend dependencies",
+            "Download untrusted Ubuntu evidence",
+            "Verify untrusted Ubuntu evidence by fresh replay",
+        ],
+        "windows-compatibility": [
+            "Check out repository",
+            "Set up Python",
+            "Set up Node.js",
+            "Capture trusted runtime paths",
+            "Require initially absent dependency roots",
+            "Install fresh locked developer dependencies",
+            "Install fresh locked backend dependencies",
+            "Download untrusted Windows evidence",
+            "Verify untrusted Windows evidence by fresh replay",
+        ],
+        "final-result": [
+            "Require every fresh verifier to succeed",
+        ],
+    }[job_name]
+    names = [step.get("name") for step in steps]
+    if names != expected_names:
+        errors.append(f"{job_name} step graph/order is not exact")
+    trusted_scripts = {
+        LINUX_RUNTIME_CAPTURE,
+        LINUX_RUNTIME_CAPTURE_FRESH,
+        WINDOWS_RUNTIME_CAPTURE,
+        LINUX_ABSENT_DEPENDENCY_ROOTS,
+        WINDOWS_ABSENT_DEPENDENCY_ROOTS,
+        LINUX_FRESH_DEVELOPER_INSTALL_COMMAND,
+        LINUX_FRESH_BACKEND_INSTALL_COMMAND,
+        WINDOWS_FRESH_DEVELOPER_INSTALL_COMMAND,
+        WINDOWS_FRESH_BACKEND_INSTALL_COMMAND,
+        *FINAL_VERIFIER_COMMANDS.values(),
+        FINAL_RESULT_SCRIPT,
+    }
+    for index, step in enumerate(steps):
+        unknown = set(step) - {"name", "id", "if", "shell", "uses", "with", "run"}
+        if unknown:
+            errors.append(f"{job_name} step contains unsupported keys: {sorted(unknown)}")
+        if "run" in step:
+            if not isinstance(step["run"], str):
+                errors.append(f"{job_name} run step must be a scalar")
+            elif step["run"] not in trusted_scripts:
+                errors.extend(_validate_run_command_policy(step["run"], f"{job_name}:{step.get('name')}"))
+        if "uses" in step:
+            _validate_action_step(step, f"{job_name}:{step.get('name')}", errors)
+
+    by_name = {str(step.get("name")): step for step in steps}
+    if len(by_name) != len(steps):
+        errors.append(f"{job_name} contains duplicate step names")
+    checkout = by_name.get("Check out repository", {})
+    if job_name != "final-result":
+        if tuple(checkout) != ("name", "uses", "with") or checkout.get("with") != {
+            "persist-credentials": "false",
+            "fetch-depth": "1",
+            "ref": "${{ github.sha }}",
+        }:
+            errors.append(f"{job_name} checkout must bind the exact github.sha without credentials")
+        if checkout.get("uses") != f"actions/checkout@{APPROVED_ACTIONS['actions/checkout']['sha']}":
+            errors.append(f"{job_name} checkout action is not exact")
+
+    setup_python = by_name.get("Set up Python", {})
+    if job_name != "final-result":
+        if tuple(setup_python) != ("name", "uses", "with") or setup_python.get("with") != {"python-version": "3.12"}:
+            errors.append(f"{job_name} Python setup is not exact")
+        if setup_python.get("uses") != f"actions/setup-python@{APPROVED_ACTIONS['actions/setup-python']['sha']}":
+            errors.append(f"{job_name} Python action pin is not exact")
+
+    setup_node = by_name.get("Set up Node.js", {})
+    if job_name != "final-result":
+        if tuple(setup_node) != ("name", "uses", "with") or setup_node.get("with") != {"node-version": "24.x"}:
+            errors.append(f"{job_name} Node setup is not exact")
+        if setup_node.get("uses") != f"actions/setup-node@{APPROVED_ACTIONS['actions/setup-node']['sha']}":
+            errors.append(f"{job_name} Node action pin is not exact")
+
+    exact_simple_runs = {
+        "Run CI foundation self-tests": SELF_TEST_COMMAND,
+        "Generate untrusted policy evidence": POLICY_COMMAND,
+        "Install locked developer dependencies for untrusted production": PRODUCER_DEVELOPER_INSTALL_COMMAND,
+        "Install locked backend dependencies for untrusted production": PRODUCER_BACKEND_INSTALL_COMMAND,
+        "Generate untrusted Ubuntu evidence": ALL_COMMAND,
+        "Generate untrusted Windows evidence": ALL_COMMAND,
+    }
+    for name, run in exact_simple_runs.items():
+        if name in by_name and by_name[name] != {"name": name, "run": run}:
+            errors.append(f"{job_name}:{name} command/schema is not exact")
+
+    upload_names = {
+        "repository-policy-producer": ("Upload untrusted policy evidence", "repository-policy"),
+        "ubuntu-canonical-producer": ("Upload untrusted Ubuntu evidence", "ubuntu-canonical"),
+        "windows-compatibility-producer": ("Upload untrusted Windows evidence", "windows-compatibility"),
+    }
+    if job_name in upload_names:
+        step_name, authority_name = upload_names[job_name]
+        artifact_name = WORKFLOW_JOB_PROFILE_AUTHORITY[authority_name]["artifactIdentity"]
+        expected_upload = {
+            "name": step_name,
+            "if": "${{ always() }}",
+            "uses": f"actions/upload-artifact@{APPROVED_ACTIONS['actions/upload-artifact']['sha']}",
+            "with": {
+                "name": artifact_name,
+                "path": EXACT_EVIDENCE_PATH_BLOCK,
+                "if-no-files-found": "error",
+                "retention-days": "7",
+            },
+        }
+        if by_name.get(step_name) != expected_upload:
+            errors.append(f"{job_name} untrusted artifact upload must name exactly five evidence files")
+        if any("verify" in str(name).casefold() for name in names):
+            errors.append(f"{job_name} producer must not verify evidence before upload")
+
+    verifier_downloads = {
+        "repository-policy": "Download untrusted policy evidence",
+        "ubuntu-canonical": "Download untrusted Ubuntu evidence",
+        "windows-compatibility": "Download untrusted Windows evidence",
+    }
+    if job_name in verifier_downloads:
+        authority = WORKFLOW_JOB_PROFILE_AUTHORITY[job_name]
+        download_name = verifier_downloads[job_name]
+        expected_download = {
+            "name": download_name,
+            "uses": f"actions/download-artifact@{APPROVED_ACTIONS['actions/download-artifact']['sha']}",
+            "with": {
+                "name": authority["artifactIdentity"],
+                "path": authority["evidenceRoot"],
+            },
+        }
+        if by_name.get(download_name) != expected_download:
+            errors.append(f"{job_name} untrusted artifact source/name/path is not exact")
+        expected_capture = (
+            WINDOWS_RUNTIME_CAPTURE
+            if job_name == "windows-compatibility"
+            else LINUX_RUNTIME_CAPTURE_FRESH
+            if job_name == "ubuntu-canonical"
+            else LINUX_RUNTIME_CAPTURE
+        )
+        expected_shell = "pwsh" if job_name == "windows-compatibility" else "bash"
+        if by_name.get("Capture trusted runtime paths") != {
+            "name": "Capture trusted runtime paths",
+            "shell": expected_shell,
+            "run": expected_capture,
+        }:
+            errors.append(f"{job_name} trusted runtime-path capture is not exact")
+        if job_name in {"ubuntu-canonical", "windows-compatibility"}:
+            absent = WINDOWS_ABSENT_DEPENDENCY_ROOTS if job_name == "windows-compatibility" else LINUX_ABSENT_DEPENDENCY_ROOTS
+            developer_install = WINDOWS_FRESH_DEVELOPER_INSTALL_COMMAND if job_name == "windows-compatibility" else LINUX_FRESH_DEVELOPER_INSTALL_COMMAND
+            backend_install = WINDOWS_FRESH_BACKEND_INSTALL_COMMAND if job_name == "windows-compatibility" else LINUX_FRESH_BACKEND_INSTALL_COMMAND
+            for step_name, script in (
+                ("Require initially absent dependency roots", absent),
+                ("Install fresh locked developer dependencies", developer_install),
+                ("Install fresh locked backend dependencies", backend_install),
+            ):
+                if by_name.get(step_name) != {
+                    "name": step_name,
+                    "shell": expected_shell,
+                    "run": script,
+                }:
+                    errors.append(f"{job_name}:{step_name} is not exact")
+        final_name = expected_names[-1]
+        if by_name.get(final_name) != {
+            "name": final_name,
+            "shell": expected_shell,
+            "run": FINAL_VERIFIER_COMMANDS[job_name],
+        }:
+            errors.append(f"{job_name} absolute trusted verifier command is not exact")
+        if not steps or steps[-1].get("name") != final_name:
+            errors.append(f"{job_name} authoritative verifier must be the terminal workflow step")
+        if any(step.get("uses", "").startswith("actions/upload-artifact@") for step in steps):
+            errors.append(f"{job_name} verifier must not upload artifacts")
+
+    if job_name == "final-result" and by_name.get("Require every fresh verifier to succeed") != {
+        "name": "Require every fresh verifier to succeed",
+        "shell": "bash",
+        "run": FINAL_RESULT_SCRIPT,
+    }:
+        errors.append("final-result exact fail-closed script is missing")
+
+
+def _validate_final_result_semantics(job: Mapping[str, Any], errors: list[str]) -> None:
+    if _canonical_expression(str(job.get("if", ""))).replace("${{", "").replace("}}", "") != "always()":
+        errors.append("final-result must use exact always() semantics")
+    required_needs = ["repository-policy", "ubuntu-canonical", "windows-compatibility"]
+    if job.get("needs") != required_needs:
+        errors.append("final-result needs set/order is not exact")
+    steps = job.get("steps") if isinstance(job.get("steps"), list) else []
+    final_step = next(
+        (
+            step
+            for step in steps
+            if isinstance(step, dict)
+            and step.get("name") == "Require every fresh verifier to succeed"
+        ),
+        None,
+    )
+    script = final_step.get("run", "") if isinstance(final_step, dict) else ""
+    if script != FINAL_RESULT_SCRIPT:
+        errors.append("final-result script is not the exact fail-closed script")
+    for dependency in required_needs:
+        expression = f"${{{{ needs.{dependency}.result }}}}"
+        if script.count(expression) != 1:
+            errors.append(f"final-result must inspect {dependency} exactly once")
+        pattern = re.compile(
+            rf'if \[\[ "\$\{{\{{ needs\.{re.escape(dependency)}\.result \}}\}}" != "success" \]\]; then\n'
+            rf'  echo "[^"]+"\n  exit 1\nfi'
+        )
+        if not pattern.search(script):
+            errors.append(f"final-result does not fail closed for {dependency}")
+    if re.search(r"(?m)^\s*(?:exit\s+0|:)\s*$", script):
+        errors.append("final-result contains an always-success neutralizer")
+
+
+def check_workflow_text(text: str) -> list[str]:
+    """Parse and validate the deliberately limited canonical YAML subset."""
+
+    try:
+        workflow = parse_canonical_workflow_yaml(text)
+    except CanonicalYamlError as exc:
+        return [f"workflow syntax rejected: {exc}"]
+    errors: list[str] = []
+    if not _require_exact_keys(workflow, ("name", "on", "permissions", "concurrency", "jobs"), "workflow", errors):
+        return sorted(set(errors + _validate_scalar_token_policy(workflow)))
+    if workflow.get("name") != "Baseline-aware CI":
+        errors.append("workflow name is not exact")
+    triggers = workflow.get("on")
+    if not _require_exact_keys(triggers, ("pull_request", "push", "workflow_dispatch"), "workflow.on", errors):
+        pass
+    elif triggers != {
+        "pull_request": {"branches": ["main"]},
+        "push": {"branches": ["main", "ci/phase2-foundation"]},
+        "workflow_dispatch": None,
+    }:
+        errors.append("workflow triggers are not the exact approved trigger set")
+    if workflow.get("permissions") != {"contents": "read"}:
+        errors.append("top-level permissions must contain only contents: read")
+    if workflow.get("concurrency") != {
+        "group": "ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
+        "cancel-in-progress": "true",
+    }:
+        errors.append("workflow concurrency block is not exact")
+    jobs = workflow.get("jobs")
+    if not _require_exact_keys(
+        jobs,
+        (
+            "repository-policy-producer",
+            "ubuntu-canonical-producer",
+            "windows-compatibility-producer",
+            "repository-policy",
+            "ubuntu-canonical",
+            "windows-compatibility",
+            "final-result",
+        ),
+        "workflow.jobs",
+        errors,
+    ):
+        return sorted(set(errors + _validate_scalar_token_policy(workflow)))
+
+    job_schemas = {
+        "repository-policy-producer": (("name", "runs-on", "timeout-minutes", "steps"), "Repository policy producer (untrusted evidence)", None, "ubuntu-latest", "20"),
+        "ubuntu-canonical-producer": (("name", "runs-on", "timeout-minutes", "steps"), "Ubuntu canonical producer (untrusted evidence)", None, "ubuntu-latest", "45"),
+        "windows-compatibility-producer": (("name", "runs-on", "timeout-minutes", "steps"), "Windows compatibility producer (untrusted evidence)", None, "windows-latest", "45"),
+        "repository-policy": (("name", "needs", "runs-on", "timeout-minutes", "steps"), "Repository policy", ["repository-policy-producer"], "ubuntu-latest", "25"),
+        "ubuntu-canonical": (("name", "needs", "runs-on", "timeout-minutes", "steps"), "Ubuntu canonical validation", ["ubuntu-canonical-producer"], "ubuntu-latest", "55"),
+        "windows-compatibility": (("name", "needs", "runs-on", "timeout-minutes", "steps"), "Windows compatibility validation", ["windows-compatibility-producer"], "windows-latest", "55"),
+        "final-result": (("name", "if", "needs", "runs-on", "timeout-minutes", "steps"), "Final result", ["repository-policy", "ubuntu-canonical", "windows-compatibility"], "ubuntu-latest", "10"),
+    }
+    for job_name, (keys, display_name, needs, runner_name, timeout_value) in job_schemas.items():
+        job = jobs.get(job_name)
+        if not _require_exact_keys(job, keys, f"job {job_name}", errors):
+            continue
+        if job.get("name") != display_name or job.get("runs-on") != runner_name or job.get("timeout-minutes") != timeout_value:
+            errors.append(f"job {job_name} metadata is not exact")
+        if needs is not None and job.get("needs") != needs:
+            errors.append(f"job {job_name} needs graph is not exact")
+        _validate_workflow_steps(job_name, job.get("steps"), errors)
+    _validate_final_result_semantics(jobs["final-result"], errors)
+    errors.extend(_validate_scalar_token_policy(workflow))
+    for warning in TRUST_WARNING_LINES:
+        if warning not in text:
+            errors.append(f"workflow final result is missing bootstrap warning: {warning}")
+    lowered = text.casefold()
+    for phrase in PROHIBITED_AUTHORITY_PHRASES:
+        if phrase.casefold() in lowered:
+            errors.append(f"workflow contains prohibited authority overclaim: {phrase}")
+    return sorted(set(errors))
+
+
+def check_governance_language(workflow_text: str, policy_text: str) -> list[str]:
+    errors: list[str] = []
+    for warning in TRUST_WARNING_LINES:
+        if warning not in workflow_text:
+            errors.append(f"workflow is missing trust warning: {warning}")
+        if warning not in policy_text:
+            errors.append(f"CI policy is missing trust warning: {warning}")
+    required_policy_statements = (
+        "ACCEPTED-INHERENT-LIMITATION-WITH-EXPLICIT-EXTERNAL-REVIEW-BOUNDARY",
+        "A pull request can modify the workflow, validator, baseline, and validator tests together.",
+        "A successful run proves only the behavior of the exact candidate bytes that ran.",
+        "Changes to any CI trust file require independent review outside the candidate implementation worktree.",
+        "Until CODEOWNERS, required reviewer rules, and branch protection are separately configured and verified, CI success is not sufficient merge authorization.",
+        "Even after repository governance is configured, those controls—not this self-validator—provide the external bootstrap boundary.",
+        ".gitignore changes affecting CI evidence must also receive review.",
+        "`--verify-evidence` without `--expected-profile` is a configuration error",
+        "`ExternallyExpectedVerificationContext`",
+        "`ProducerExecutionBinding`",
+        "`VerifierExecutionBinding`",
+        "`WORKFLOW_JOB_PROFILE_AUTHORITY`",
+        "`CITrustFileSetDigest`",
+        "`RuntimeDependencyClosure`",
+        "`RuntimeDependencyClosureGuard`",
+        "`linux-subreaper-pidfd-proc-supervisor`",
+        "`REMOTE-LIVE-VALIDATION-PENDING`",
+        "The full producer closure claim is stored in `command-results.json`, but it is untrusted",
+        "There is no workflow step after it.",
+    )
+    for statement in required_policy_statements:
+        if statement not in policy_text:
+            errors.append(f"CI policy is missing bootstrap-boundary statement: {statement}")
+    for relative in CI_TRUST_FILE_PATHS:
+        if f"`{relative}`" not in policy_text:
+            errors.append(f"CI policy is missing trust-file inventory entry: {relative}")
+    for label, source in (("workflow", workflow_text), ("CI policy", policy_text)):
+        lowered = source.casefold()
+        for phrase in PROHIBITED_AUTHORITY_PHRASES:
+            if phrase.casefold() in lowered:
+                errors.append(f"{label} contains prohibited authority overclaim: {phrase}")
+    return sorted(set(errors))
+
+
+def git_candidate_paths(
+    *,
+    git: str,
+    env: Mapping[str, str],
+) -> tuple[list[str], list[str], CommandCapture]:
+    capture = execute_command(
+        "git-candidate-paths",
+        "repository-boundary",
+        trusted_git_arguments(git, "ls-files", "-z", "--cached", "--others", "--exclude-standard"),
+        timeout=60,
+        env=env,
+        include_preview=False,
+    )
+    if not capture.executed or capture.exit_code != 0:
+        return [], ["git ls-files did not execute successfully"], capture
+    paths = sorted(path for path in capture.stdout.split("\0") if path)
+    return paths, [], capture
+
+
+def private_or_operational_path_reason(path: str) -> str | None:
+    normalized = path.replace("\\", "/")
+    lower = normalized.lower()
+    name = Path(normalized).name.lower()
+    if lower.startswith(".codex/"):
+        return "tracked local Codex state"
+    if lower.startswith("readingpractice/"):
+        return "tracked private Reading resource"
+    if re.match(r"(?i)^ListeningPractice/P[1-4](?:/|$)", normalized):
+        return "tracked private Listening resource"
+    if lower.startswith("deploy-artifacts/") or lower.startswith("dist/"):
+        return "tracked release or deployment artifact"
+    if name == ".env" or (name.startswith(".env.") and not name.endswith(".example")):
+        return "tracked secret environment file"
+    if lower.startswith("backend/tor/") and (
+        name.endswith((".auth", ".age", ".agekey", ".identity", ".key", ".pem", ".pub"))
+        or any(
+            fragment in lower
+            for fragment in (
+                "hidden_service/",
+                "admin_hidden_service/",
+                "auth_hidden_service/",
+                "transports/",
+                "volume-backups/",
+                "bridges.local",
+                "webtunnel.local",
+                "bridges.decrypted",
+            )
+        )
+    ):
+        return "tracked Tor/client-auth operational artifact"
+    if name.endswith((".dump", ".sql.gz")):
+        return "tracked database or backup artifact"
+    if name.endswith(".sql") and not lower.startswith("backend/migrations/"):
+        return "tracked database artifact outside migrations"
+    return None
+
+
+BINARY_MAGIC_ALLOWLIST: Mapping[str, tuple[bytes, ...]] = MappingProxyType(
+    {
+        ".gif": (b"GIF87a", b"GIF89a"),
+        ".gz": (b"\x1f\x8b",),
+        ".ico": (b"\x00\x00\x01\x00",),
+        ".jpeg": (b"\xff\xd8\xff",),
+        ".jpg": (b"\xff\xd8\xff",),
+        ".mp3": (b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"),
+        ".ogg": (b"OggS",),
+        ".otf": (b"OTTO",),
+        ".pdf": (b"%PDF-",),
+        ".png": (b"\x89PNG\r\n\x1a\n",),
+        ".ttf": (b"\x00\x01\x00\x00",),
+        ".webm": (b"\x1a\x45\xdf\xa3",),
+        ".woff": (b"wOFF",),
+        ".woff2": (b"wOF2",),
+        ".zip": (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"),
+    }
+)
+
+
+def _recognized_binary_magic(path: Path, sample: bytes) -> bool:
+    suffix = path.suffix.casefold()
+    if suffix == ".webp":
+        return sample.startswith(b"RIFF") and sample[8:12] == b"WEBP"
+    if suffix == ".wav":
+        return sample.startswith(b"RIFF") and sample[8:12] == b"WAVE"
+    if suffix in {".mp4", ".m4a"}:
+        return len(sample) >= 12 and sample[4:8] == b"ftyp"
+    return any(sample.startswith(magic) for magic in BINARY_MAGIC_ALLOWLIST.get(suffix, ()))
+
+
+def _secret_scan_record(
+    *,
+    passed: bool,
+    file_size: int | None,
+    raw_bytes_scanned: int,
+    classification: str,
+    hits: Iterable[str],
+    encoding_views: Sequence[str] = ("raw-bytes",),
+    utf16le_units: int = 0,
+    utf16be_units: int = 0,
+) -> dict[str, Any]:
+    normalized_hits = sorted(set(hits))
+    return {
+        "passed": passed,
+        "fileSize": file_size,
+        "scannedBytes": raw_bytes_scanned,
+        "rawBytesScanned": raw_bytes_scanned,
+        "classification": classification,
+        "encodingViewsApplied": list(encoding_views),
+        "utf16LeDecodedUnits": utf16le_units,
+        "utf16BeDecodedUnits": utf16be_units,
+        "patternFamiliesApplied": list(SECRET_SCAN_PATTERN_FAMILIES),
+        "hitCount": len(normalized_hits),
+        "hits": normalized_hits,
+    }
+
+
+def _scan_decoded_secret_window(window: str, hits: set[str]) -> None:
+    for pattern, label in SECRET_SCAN_TEXT_PATTERNS:
+        if pattern.search(window):
+            hits.add(label)
+    if re.search(
+        r"(?im)^\s*obfs4\s+\S{1,2048}:\d{1,5}\s+[A-F0-9]{40}\s+cert=\S{1,4096}\s+iat-mode=\d+\s*$",
+        window,
+    ):
+        hits.add("operational-obfs4-bridge")
+    if re.search(r"(?i)\b[a-z2-7]{56}\.onion\b", window):
+        hits.add("operational-onion-hostname")
+
+
+@dataclass
+class _Utf16AsciiViewScanner:
+    """Stream one endian/alignment view without decoding arbitrary binary text."""
+
+    endian: str
+    alignment: int
+    carry: bytes = b""
+    overlap: str = ""
+    decoded_units: int = 0
+    raw_bytes_seen: int = 0
+    first_chunk: bool = True
+    hits: set[str] = field(default_factory=set)
+
+    @property
+    def name(self) -> str:
+        return f"utf-16{self.endian}-offset-{self.alignment}"
+
+    def feed(self, chunk: bytes) -> None:
+        self.raw_bytes_seen += len(chunk)
+        if self.first_chunk:
+            data = chunk[self.alignment :]
+            self.first_chunk = False
+        else:
+            data = self.carry + chunk
+        paired_length = len(data) - (len(data) % 2)
+        paired = data[:paired_length]
+        self.carry = data[paired_length:]
+        characters: list[str] = []
+        little_endian = self.endian == "le"
+        for index in range(0, paired_length, 2):
+            first, second = paired[index], paired[index + 1]
+            code_unit = first | (second << 8) if little_endian else (first << 8) | second
+            if code_unit in (0x09, 0x0A, 0x0D) or 0x20 <= code_unit <= 0x7E:
+                characters.append(chr(code_unit))
+            else:
+                # A separator prevents ASCII tokens on opposite sides of an
+                # unrelated code unit from being concatenated into a finding.
+                characters.append("\uffff")
+        self.decoded_units += len(characters)
+        window = self.overlap + "".join(characters)
+        _scan_decoded_secret_window(window, self.hits)
+        self.overlap = window[-SECRET_SCAN_OVERLAP_BYTES:]
+
+    def finish(self) -> None:
+        # An unmatched final byte cannot form a UTF-16 code unit. Every
+        # complete unit in the final raw chunk has already been scanned.
+        _scan_decoded_secret_window(self.overlap, self.hits)
+
+
+def scan_file_for_secrets(path: Path) -> dict[str, Any]:
+    """Stream raw bytes plus all LE/BE UTF-16 ASCII views for the full file."""
+
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        return _secret_scan_record(
+            passed=False,
+            file_size=None,
+            raw_bytes_scanned=0,
+            classification="read-error",
+            hits=[f"read-error:{type(exc).__name__}"],
+        )
+    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
+        return _secret_scan_record(
+            passed=False,
+            file_size=int(metadata.st_size),
+            raw_bytes_scanned=0,
+            classification="rejected-special-file",
+            hits=["tracked-link-or-reparse"],
+        )
+    if not stat.S_ISREG(metadata.st_mode):
+        return _secret_scan_record(
+            passed=False,
+            file_size=int(metadata.st_size),
+            raw_bytes_scanned=0,
+            classification="rejected-special-file",
+            hits=["tracked-special-file"],
+        )
+
+    hits: set[str] = set()
+    scanned_bytes = 0
+    overlap = b""
+    sample = bytearray()
+    utf16_scanners = tuple(
+        _Utf16AsciiViewScanner(endian, alignment)
+        for endian in ("le", "be")
+        for alignment in (0, 1)
+    )
+    classification = "text-scanned"
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0),
+        )
+        if _stat_identity(os.fstat(descriptor)) != _stat_identity(metadata):
+            raise OSError("file changed between lstat and open")
+        while True:
+            chunk = os.read(descriptor, SECRET_SCAN_CHUNK_BYTES)
+            if not chunk:
+                break
+            scanned_bytes += len(chunk)
+            if len(sample) < SECRET_SCAN_CLASSIFICATION_SAMPLE_BYTES:
+                sample.extend(chunk[: SECRET_SCAN_CLASSIFICATION_SAMPLE_BYTES - len(sample)])
+            window = overlap + chunk
+            for pattern, label in SECRET_SCAN_BYTE_PATTERNS:
+                if pattern.search(window):
+                    hits.add(label)
+            if re.search(
+                rb"(?im)^\s*obfs4\s+\S{1,2048}:\d{1,5}\s+[A-F0-9]{40}\s+cert=\S{1,4096}\s+iat-mode=\d+\s*$",
+                window,
+            ):
+                hits.add("operational-obfs4-bridge")
+            if re.search(rb"(?i)\b[a-z2-7]{56}\.onion\b", window):
+                hits.add("operational-onion-hostname")
+            overlap = window[-SECRET_SCAN_OVERLAP_BYTES:]
+            for scanner in utf16_scanners:
+                scanner.feed(chunk)
+    except OSError as exc:
+        hits.add(f"read-error:{type(exc).__name__}")
+        return _secret_scan_record(
+            passed=False,
+            file_size=int(metadata.st_size),
+            raw_bytes_scanned=scanned_bytes,
+            classification="read-error",
+            hits=hits,
+            encoding_views=("raw-bytes", *UTF16_ASCII_CREDENTIAL_VIEWS),
+            utf16le_units=sum(
+                scanner.decoded_units for scanner in utf16_scanners if scanner.endian == "le"
+            ),
+            utf16be_units=sum(
+                scanner.decoded_units for scanner in utf16_scanners if scanner.endian == "be"
+            ),
+        )
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    sample_bytes = bytes(sample)
+    if b"\x00" in sample_bytes or _recognized_binary_magic(path, sample_bytes):
+        classification = "binary-scanned"
+    try:
+        after = path.lstat()
+    except OSError as exc:
+        hits.add(f"read-error:{type(exc).__name__}")
+        classification = "read-error"
+    else:
+        if _stat_identity(after) != _stat_identity(metadata) or scanned_bytes != metadata.st_size:
+            hits.add("file-changed-or-short-read")
+            classification = "read-error"
+
+    for scanner in utf16_scanners:
+        scanner.finish()
+        hits.update(scanner.hits)
+        if scanner.raw_bytes_seen != scanned_bytes:
+            hits.add(f"{scanner.name}-short-read")
+            classification = "read-error"
+    utf16le_units = sum(
+        scanner.decoded_units for scanner in utf16_scanners if scanner.endian == "le"
+    )
+    utf16be_units = sum(
+        scanner.decoded_units for scanner in utf16_scanners if scanner.endian == "be"
+    )
+    encoding_views = ("raw-bytes", *UTF16_ASCII_CREDENTIAL_VIEWS)
+    return _secret_scan_record(
+        passed=not hits,
+        file_size=int(metadata.st_size),
+        raw_bytes_scanned=scanned_bytes,
+        classification=classification,
+        hits=hits,
+        encoding_views=encoding_views,
+        utf16le_units=utf16le_units,
+        utf16be_units=utf16be_units,
+    )
+
+
+def scan_bytes_for_secrets(logical_path: str, data: bytes) -> dict[str, Any]:
+    """Apply the complete secret scanner to already protected immutable bytes."""
+
+    path = Path(logical_path)
+    hits: set[str] = set()
+    overlap = b""
+    sample = bytearray()
+    utf16_scanners = tuple(
+        _Utf16AsciiViewScanner(endian, alignment)
+        for endian in ("le", "be")
+        for alignment in (0, 1)
+    )
+    for offset in range(0, len(data), SECRET_SCAN_CHUNK_BYTES):
+        chunk = data[offset : offset + SECRET_SCAN_CHUNK_BYTES]
+        if len(sample) < SECRET_SCAN_CLASSIFICATION_SAMPLE_BYTES:
+            sample.extend(chunk[: SECRET_SCAN_CLASSIFICATION_SAMPLE_BYTES - len(sample)])
+        window = overlap + chunk
+        for pattern, label in SECRET_SCAN_BYTE_PATTERNS:
+            if pattern.search(window):
+                hits.add(label)
+        if re.search(
+            rb"(?im)^\s*obfs4\s+\S{1,2048}:\d{1,5}\s+[A-F0-9]{40}\s+cert=\S{1,4096}\s+iat-mode=\d+\s*$",
+            window,
+        ):
+            hits.add("operational-obfs4-bridge")
+        if re.search(rb"(?i)\b[a-z2-7]{56}\.onion\b", window):
+            hits.add("operational-onion-hostname")
+        overlap = window[-SECRET_SCAN_OVERLAP_BYTES:]
+        for scanner in utf16_scanners:
+            scanner.feed(chunk)
+    for scanner in utf16_scanners:
+        scanner.finish()
+        hits.update(scanner.hits)
+        if scanner.raw_bytes_seen != len(data):
+            hits.add(f"{scanner.name}-short-read")
+    sample_bytes = bytes(sample)
+    classification = (
+        "binary-scanned"
+        if b"\x00" in sample_bytes or _recognized_binary_magic(path, sample_bytes)
+        else "text-scanned"
+    )
+    return _secret_scan_record(
+        passed=not hits,
+        file_size=len(data),
+        raw_bytes_scanned=len(data),
+        classification=classification,
+        hits=hits,
+        encoding_views=("raw-bytes", *UTF16_ASCII_CREDENTIAL_VIEWS),
+        utf16le_units=sum(
+            scanner.decoded_units for scanner in utf16_scanners if scanner.endian == "le"
+        ),
+        utf16be_units=sum(
+            scanner.decoded_units for scanner in utf16_scanners if scanner.endian == "be"
+        ),
+    )
+
+
+def build_expected_static_machine_command_plan(
+    invocation_id: str,
+    *,
+    python_executable: str | Path,
+    repo_root: Path | None = None,
+    current_platform: str | None = None,
+) -> list[dict[str, Any]]:
+    """Independently reconstruct the static producer's immutable self-plan."""
+
+    executable = Path(python_executable).resolve(strict=True)
+    root = REPO_ROOT if repo_root is None else repo_root
+    target = (root / STATIC_SUITE_RELATIVE_PATH).resolve(strict=True)
+    return [
+        {
+            "commandId": "static-check-registry",
+            "ordinal": 0,
+            "commandClass": "static-machine-producer",
+            "required": True,
+            "profile": "static",
+            "platform": current_platform or platform_key(),
+            "argv": [
+                str(executable),
+                "-B",
+                STATIC_SUITE_RELATIVE_PATH,
+                "--ci-machine-json-stdout",
+                "--ci-invocation-id",
+                invocation_id,
+            ],
+            "cwd": ".",
+            "toolRole": "python-static-producer",
+            "resolvedExecutablePath": str(executable),
+            "resolvedExecutableSize": executable.stat().st_size,
+            "resolvedExecutableSha256": _sha256_file(executable),
+            "targets": [
+                {
+                    "path": STATIC_SUITE_RELATIVE_PATH,
+                    "size": target.stat().st_size,
+                    "sha256": _sha256_file(target),
+                }
+            ],
+            "resultSemantics": "complete-registry-execution-with-native-observations",
+            "allowedExecutionExits": [0],
+        }
+    ]
+
+
+def _portable_command_plan_value(plan: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    portable: list[dict[str, Any]] = []
+    repo_spellings = {
+        str(REPO_ROOT.resolve()),
+        str(REPO_ROOT.resolve()).replace("\\", "/"),
+    }
+    for source in plan:
+        record = copy.deepcopy(dict(source))
+        tool_role = str(record.get("toolRole", "unknown"))
+        for field_name in ("argv", "logicalArgv", "executionArgv"):
+            values = record.get(field_name)
+            if not isinstance(values, list):
+                continue
+            normalized: list[Any] = []
+            for index, value in enumerate(values):
+                if index == 0:
+                    normalized.append(f"<TRUSTED-TOOL:{tool_role}>")
+                    continue
+                if not isinstance(value, str):
+                    normalized.append(value)
+                    continue
+                item = value
+                for spelling in repo_spellings:
+                    item = item.replace(spelling, "<REPO>")
+                normalized.append(item.replace("\\", "/"))
+            record[field_name] = normalized
+        record["resolvedExecutablePath"] = f"<TRUSTED-TOOL:{tool_role}>"
+        record["resolvedExecutableFileIdentity"] = None
+        lease = record.get("executionLease")
+        if isinstance(lease, dict):
+            record["executionLease"] = {
+                "sha256": lease.get("sha256"),
+                "size": lease.get("size"),
+            }
+        targets = record.get("targets")
+        if isinstance(targets, list):
+            for target in targets:
+                if isinstance(target, dict):
+                    target["canonicalSourcePath"] = None
+                    target["fileIdentity"] = None
+        portable.append(record)
+    return portable
+
+
+def command_plan_digest(plan: Sequence[Mapping[str, Any]]) -> str:
+    canonical = json.dumps(
+        _portable_command_plan_value(plan),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def static_machine_command_plan_digest(plan: Sequence[Mapping[str, Any]]) -> str:
+    """Match the immutable static producer's exact, non-portable plan digest."""
+
+    canonical = json.dumps(
+        list(plan),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def execution_binding_digest(binding: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_canonical_frame(binding)).hexdigest()
+
+
+AUTHORIZATION_CONTEXT_BINDING_KEYS = frozenset(
+    {
+        "bindingSchemaVersion",
+        "bindingKind",
+        "bindingMode",
+        "expectedProfile",
+        "producerJobId",
+        "expectedVerifierJobId",
+        "runnerOS",
+        "runId",
+        "runAttempt",
+        "eventName",
+        "repository",
+        "checkoutCommit",
+        "checkoutTree",
+        "baselineCommit",
+        "baselineTree",
+        "trustFileDigest",
+        "commandPlanDigest",
+        "producerInvocationId",
+    }
+)
+
+VERIFIER_REPLAY_CONTEXT_BINDING_KEYS = frozenset(
+    {
+        "bindingSchemaVersion",
+        "bindingKind",
+        "actualVerifierJobId",
+        "actualVerifierRunnerOS",
+        "verifierInvocationId",
+        "freshRuntimeClosureDigest",
+        "freshDependencyClosureDigest",
+        "linuxContainmentLiveTestResultDigest",
+        "replayTranscriptDigest",
+        "cleanupResult",
+    }
+)
+
+
+def _require_authorization_context_binding(
+    binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(binding, Mapping) or set(binding) != AUTHORIZATION_CONTEXT_BINDING_KEYS:
+        raise ValueError("AuthorizationContextBinding field set is not exact")
+    value = dict(binding)
+    if value.get("bindingSchemaVersion") != AUTHORIZATION_CONTEXT_BINDING_SCHEMA_VERSION:
+        raise ValueError("AuthorizationContextBinding schema version is invalid")
+    if value.get("bindingKind") != "AuthorizationContextBinding":
+        raise ValueError("AuthorizationContextBinding kind is invalid")
+    if value.get("bindingMode") not in {"github-actions", "local"}:
+        raise ValueError("AuthorizationContextBinding mode is invalid")
+    if value.get("expectedProfile") not in PROFILES:
+        raise ValueError("AuthorizationContextBinding profile is invalid")
+    if value.get("runnerOS") not in {"Linux", "Windows"}:
+        raise ValueError("AuthorizationContextBinding runner OS is invalid")
+    for key in (
+        "producerJobId",
+        "expectedVerifierJobId",
+        "runId",
+        "runAttempt",
+        "eventName",
+        "repository",
+    ):
+        item = value.get(key)
+        if (
+            not isinstance(item, str)
+            or not item
+            or item != item.strip()
+            or len(item.encode("utf-8", errors="strict")) > 512
+        ):
+            raise ValueError(f"AuthorizationContextBinding {key} is invalid")
+    for key in ("checkoutCommit", "checkoutTree", "baselineCommit", "baselineTree"):
+        if not re.fullmatch(r"[0-9a-f]{40}", str(value.get(key, ""))):
+            raise ValueError(f"AuthorizationContextBinding {key} is invalid")
+    for key in ("trustFileDigest", "commandPlanDigest", "producerInvocationId"):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(value.get(key, ""))):
+            raise ValueError(f"AuthorizationContextBinding {key} is invalid")
+    # Framing here also rejects duplicate NFC-normalized object keys.
+    _canonical_frame(value)
+    return value
+
+
+def authorization_context_binding_digest(binding: Mapping[str, Any]) -> str:
+    value = _require_authorization_context_binding(binding)
+    return hashlib.sha256(
+        _canonical_frame(
+            {
+                "digestDomain": AUTHORIZATION_CONTEXT_BINDING_DIGEST_DOMAIN,
+                "binding": value,
+            }
+        )
+    ).hexdigest()
+
+
+def authorization_context_binding_from_execution_binding(
+    execution_binding: Mapping[str, Any],
+    *,
+    expected_verifier_job_id: str | None = None,
+) -> dict[str, Any]:
+    if not isinstance(execution_binding, Mapping):
+        raise ValueError("producer execution binding is unavailable")
+    binding_mode = str(execution_binding.get("bindingMode", ""))
+    producer_job_id = str(execution_binding.get("producerJobId", ""))
+    if expected_verifier_job_id is None:
+        if binding_mode == "local":
+            expected_verifier_job_id = "local-verifier"
+        else:
+            authority = _workflow_authority_for_producer(producer_job_id)
+            if authority is None:
+                raise ValueError("producer job cannot derive fixed verifier authority")
+            expected_verifier_job_id = str(authority["verifierJobId"])
+    binding = {
+        "bindingSchemaVersion": AUTHORIZATION_CONTEXT_BINDING_SCHEMA_VERSION,
+        "bindingKind": "AuthorizationContextBinding",
+        "bindingMode": binding_mode,
+        "expectedProfile": execution_binding.get("producerProfile"),
+        "producerJobId": producer_job_id,
+        "expectedVerifierJobId": expected_verifier_job_id,
+        "runnerOS": execution_binding.get("producerRunnerOS"),
+        "runId": execution_binding.get("runId"),
+        "runAttempt": execution_binding.get("runAttempt"),
+        "eventName": execution_binding.get("eventName"),
+        "repository": execution_binding.get("repository"),
+        "checkoutCommit": execution_binding.get("checkoutCommit"),
+        "checkoutTree": execution_binding.get("checkoutTree"),
+        "baselineCommit": execution_binding.get("baselineCommit"),
+        "baselineTree": execution_binding.get("baselineTree"),
+        "trustFileDigest": execution_binding.get("trustFileDigest"),
+        "commandPlanDigest": execution_binding.get("commandPlanDigest"),
+        "producerInvocationId": execution_binding.get("producerInvocationId"),
+    }
+    return _require_authorization_context_binding(binding)
+
+
+def authorization_context_binding_errors(
+    binding: Any,
+    digest: Any,
+    *,
+    execution_binding: Mapping[str, Any] | None = None,
+    expected_context: ExternallyExpectedVerificationContext | None = None,
+) -> list[str]:
+    errors: list[str] = []
+    try:
+        value = _require_authorization_context_binding(binding)
+        expected_digest = authorization_context_binding_digest(value)
+    except (TypeError, ValueError) as exc:
+        return [f"authorization context binding is invalid: {exc}"]
+    if digest != expected_digest:
+        errors.append("authorizationContextBindingDigest is invalid")
+    if execution_binding is not None:
+        try:
+            derived = authorization_context_binding_from_execution_binding(
+                execution_binding
+            )
+        except (TypeError, ValueError) as exc:
+            errors.append(
+                f"producer execution binding cannot derive authorization context: {exc}"
+            )
+        else:
+            if value != derived:
+                errors.append(
+                    "authorization context differs from fixed producer/verifier authority"
+                )
+    if expected_context is not None:
+        externally_expected = expected_context.authorization_context_binding()
+        if value != externally_expected:
+            errors.append(
+                "authorization context differs from externally reconstructed authority"
+            )
+        if digest != authorization_context_binding_digest(externally_expected):
+            errors.append(
+                "authorization-context digest differs from external authority"
+            )
+    return sorted(set(errors))
+
+
+def _require_verifier_replay_context_binding(
+    binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(binding, Mapping) or set(binding) != VERIFIER_REPLAY_CONTEXT_BINDING_KEYS:
+        raise ValueError("VerifierReplayContextBinding field set is not exact")
+    value = dict(binding)
+    if value.get("bindingSchemaVersion") != VERIFIER_REPLAY_CONTEXT_BINDING_SCHEMA_VERSION:
+        raise ValueError("VerifierReplayContextBinding schema version is invalid")
+    if value.get("bindingKind") != "VerifierReplayContextBinding":
+        raise ValueError("VerifierReplayContextBinding kind is invalid")
+    if value.get("actualVerifierRunnerOS") not in {"Linux", "Windows"}:
+        raise ValueError("VerifierReplayContextBinding runner OS is invalid")
+    for key in ("actualVerifierJobId",):
+        item = value.get(key)
+        if not isinstance(item, str) or not item or item != item.strip():
+            raise ValueError(f"VerifierReplayContextBinding {key} is invalid")
+    for key in (
+        "verifierInvocationId",
+        "freshRuntimeClosureDigest",
+        "freshDependencyClosureDigest",
+    ):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(value.get(key, ""))):
+            raise ValueError(f"VerifierReplayContextBinding {key} is invalid")
+    for key in (
+        "linuxContainmentLiveTestResultDigest",
+        "replayTranscriptDigest",
+    ):
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value.get(key, ""))):
+            raise ValueError(f"VerifierReplayContextBinding {key} is invalid")
+    if value.get("cleanupResult") not in {"closed-clean", "cleanup-incomplete"}:
+        raise ValueError("VerifierReplayContextBinding cleanup result is invalid")
+    _canonical_frame(value)
+    return value
+
+
+def verifier_replay_context_digest(binding: Mapping[str, Any]) -> str:
+    value = _require_verifier_replay_context_binding(binding)
+    return hashlib.sha256(
+        _canonical_frame(
+            {
+                "digestDomain": VERIFIER_REPLAY_CONTEXT_BINDING_DIGEST_DOMAIN,
+                "binding": value,
+            }
+        )
+    ).hexdigest()
+
+
+def current_full_context_digest_set_digest(
+    observations: Sequence[Mapping[str, Any]],
+) -> str:
+    projection: list[dict[str, str]] = []
+    for item in observations:
+        digest = str(item.get("currentFullContextDigest", ""))
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            raise ValueError("replay observation has an invalid currentFullContextDigest")
+        projection.append(
+            {
+                "commandId": str(item.get("commandId", "")),
+                "testOrPathScope": str(item.get("testOrPathScope", "")),
+                "currentFullContextDigest": digest,
+            }
+        )
+    return canonical_failure_digest(
+        {
+            "schemaVersion": REPLAY_AUTHORIZATION_ENVELOPE_SCHEMA_VERSION,
+            "orderedCurrentFullContexts": projection,
+        }
+    )
+
+
+def replay_authorization_envelope_digest(
+    *,
+    current_full_context_set_digest: str,
+    authorization_context_binding_digest_value: str,
+    verifier_replay_context_digest_value: str,
+) -> str:
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", current_full_context_set_digest):
+        raise ValueError("current full-context set digest is invalid")
+    for label, value in (
+        ("authorization context", authorization_context_binding_digest_value),
+        ("verifier replay context", verifier_replay_context_digest_value),
+    ):
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError(f"{label} digest is invalid")
+    material = {
+        "schemaVersion": REPLAY_AUTHORIZATION_ENVELOPE_SCHEMA_VERSION,
+        "bindingKind": "ReplayAuthorizationEnvelope",
+        "currentFullContextDigestSetDigest": current_full_context_set_digest,
+        "authorizationContextBindingDigest": (
+            authorization_context_binding_digest_value
+        ),
+        "verifierReplayContextDigest": verifier_replay_context_digest_value,
+    }
+    return hashlib.sha256(
+        _canonical_frame(
+            {
+                "digestDomain": REPLAY_AUTHORIZATION_ENVELOPE_DIGEST_DOMAIN,
+                "envelope": material,
+            }
+        )
+    ).hexdigest()
+
+
+def _canonical_runner_os() -> str:
+    if sys.platform.startswith("win"):
+        return "Windows"
+    if sys.platform.startswith("linux"):
+        return "Linux"
+    raise ValueError("execution binding supports only Linux and Windows runners")
+
+
+def _local_repository_identity_projection(repo_root: Path) -> bytes:
+    resolved = str(repo_root.resolve(strict=True))
+    if os.name == "nt":
+        resolved = _ascii_lower_authority_text(resolved.replace("\\", "/"))
+    return (
+        LOCAL_REPOSITORY_IDENTITY_PROJECTION_DOMAIN.encode("ascii")
+        + b"\0"
+        + resolved.encode("utf-8", errors="strict")
+    )
+
+
+def _local_repository_identity(repo_root: Path) -> str:
+    return "local-root-sha256:" + hashlib.sha256(
+        _local_repository_identity_projection(repo_root)
+    ).hexdigest()
+
+
+def _binding_git_stdout(
+    git: str,
+    arguments: Sequence[str],
+    *,
+    environment: Mapping[str, str],
+    repo_root: Path,
+) -> str:
+    capture = execute_command(
+        "execution-binding-git",
+        "execution-binding-authority",
+        [
+            git,
+            "-c",
+            f"safe.directory={repo_root.resolve(strict=True)}",
+            "-C",
+            str(repo_root.resolve(strict=True)),
+            *arguments,
+        ],
+        timeout=60,
+        env=environment,
+        include_preview=False,
+        cwd=repo_root,
+    )
+    if not capture.execution_passed():
+        raise ValueError("trusted Git could not construct execution-binding authority")
+    return capture.stdout
+
+
+def current_checkout_identity(
+    *,
+    git: str,
+    environment: Mapping[str, str],
+    repo_root: Path = REPO_ROOT,
+) -> tuple[str, str]:
+    output = _binding_git_stdout(
+        git,
+        ("rev-parse", "HEAD", "HEAD^{tree}"),
+        environment=environment,
+        repo_root=repo_root,
+    )
+    values = output.replace("\r\n", "\n").splitlines()
+    if len(values) != 2 or any(not re.fullmatch(r"[0-9a-f]{40}", value) for value in values):
+        raise ValueError("checkout commit/tree authority is not exact")
+    return values[0], values[1]
+
+
+def ci_trust_file_set_authority(
+    *,
+    git: str,
+    environment: Mapping[str, str],
+    repo_root: Path = REPO_ROOT,
+) -> tuple[list[dict[str, Any]], str]:
+    output = _binding_git_stdout(
+        git,
+        ("ls-files", "--stage", "-z", "--", *CI_TRUST_FILE_PATHS),
+        environment=environment,
+        repo_root=repo_root,
+    )
+    indexed_modes: dict[str, str] = {}
+    for raw_record in output.split("\0"):
+        if not raw_record:
+            continue
+        try:
+            header, relative = raw_record.split("\t", 1)
+            mode, object_id, stage = header.split(" ", 2)
+        except ValueError as exc:
+            raise ValueError("CI trust-file Git mode authority is malformed") from exc
+        if (
+            relative not in CI_TRUST_FILE_PATHS
+            or mode not in {"100644", "100755"}
+            or not re.fullmatch(r"[0-9a-f]{40,64}", object_id)
+            or stage != "0"
+            or relative in indexed_modes
+        ):
+            raise ValueError("CI trust-file Git mode authority is invalid")
+        indexed_modes[relative] = mode
+
+    root_resolved = repo_root.resolve(strict=True)
+    records: list[dict[str, Any]] = []
+    for relative in CI_TRUST_FILE_PATHS:
+        path = repo_root.joinpath(*relative.split("/"))
+        try:
+            metadata = path.lstat()
+            resolved = path.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(f"CI trust file is unavailable: {relative}") from exc
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or _is_reparse_point(metadata)
+            or not stat.S_ISREG(metadata.st_mode)
+            or not _path_is_within(resolved, root_resolved)
+        ):
+            raise ValueError(f"CI trust file is not a repository regular file: {relative}")
+        before = _stat_identity(metadata)
+        digest = _sha256_file(path)
+        after = path.lstat()
+        if _stat_identity(after) != before:
+            raise ValueError(f"CI trust file changed during digest construction: {relative}")
+        git_mode = indexed_modes.get(relative)
+        if git_mode is None:
+            git_mode = "100755" if os.name != "nt" and bool(metadata.st_mode & stat.S_IXUSR) else "100644"
+        records.append(
+            {
+                "relativePath": relative,
+                "gitMode": git_mode,
+                "byteLength": int(metadata.st_size),
+                "sha256": digest,
+            }
+        )
+    digest = hashlib.sha256(
+        _canonical_frame(
+            {
+                "schemaVersion": CI_TRUST_FILE_SET_SCHEMA_VERSION,
+                "files": records,
+            }
+        )
+    ).hexdigest()
+    return records, digest
+
+
+def _github_binding_invocation_id(
+    binding_without_invocation: Mapping[str, Any],
+    *,
+    role: str = "producer",
+) -> str:
+    return hashlib.sha256(
+        _canonical_frame(
+            {
+                "purpose": f"github-actions-{role}-execution-binding-v2",
+                "binding": binding_without_invocation,
+            }
+        )
+    ).hexdigest()
+
+
+def _workflow_authority_for_producer(producer_job_id: str) -> Mapping[str, Any] | None:
+    return next(
+        (
+            authority
+            for authority in WORKFLOW_JOB_PROFILE_AUTHORITY.values()
+            if authority["producerJobId"] == producer_job_id
+        ),
+        None,
+    )
+
+
+def _producer_binding_without_invocation(
+    *,
+    binding_mode: str,
+    producer_job_id: str,
+    runner_os: str,
+    profile: str,
+    run_id: str,
+    run_attempt: str,
+    event_name: str,
+    repository: str,
+    checkout_commit: str,
+    checkout_tree: str,
+    baseline_commit: str,
+    baseline_tree: str,
+    trust_file_digest: str,
+    command_plan_digest_value: str,
+) -> dict[str, Any]:
+    return {
+        "bindingSchemaVersion": EVIDENCE_EXECUTION_BINDING_SCHEMA_VERSION,
+        "bindingKind": "ProducerExecutionBinding",
+        "bindingMode": binding_mode,
+        "producerJobId": producer_job_id,
+        "producerRunnerOS": runner_os,
+        "producerProfile": profile,
+        "runId": run_id,
+        "runAttempt": run_attempt,
+        "eventName": event_name,
+        "repository": repository,
+        "checkoutCommit": checkout_commit,
+        "checkoutTree": checkout_tree,
+        "baselineCommit": baseline_commit,
+        "baselineTree": baseline_tree,
+        "trustFileDigest": trust_file_digest,
+        "commandPlanDigest": command_plan_digest_value,
+    }
+
+
+def build_externally_expected_verification_context(
+    *,
+    expected_profile: str,
+    expected_producer_job: str | None,
+    expected_verifier_job: str | None,
+    expected_runner_os: str | None,
+    expected_invocation_id: str | None,
+    command_plan_digest_value: str,
+    fresh_runtime_closure_digest: str,
+    baseline: Mapping[str, Any],
+    git: str,
+    child_environment: Mapping[str, str],
+    source_environment: Mapping[str, str] | None = None,
+    repo_root: Path = REPO_ROOT,
+) -> ExternallyExpectedVerificationContext:
+    """Construct all replay selectors without consulting the evidence root."""
+
+    source = os.environ if source_environment is None else source_environment
+    if expected_profile not in PROFILES:
+        raise ValueError("expected profile is not in the fixed profile registry")
+    if not re.fullmatch(r"[0-9a-f]{64}", command_plan_digest_value):
+        raise ValueError("expected command-plan digest is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", fresh_runtime_closure_digest):
+        raise ValueError("fresh runtime-closure digest is invalid")
+    checkout_commit, checkout_tree = current_checkout_identity(
+        git=git,
+        environment=child_environment,
+        repo_root=repo_root,
+    )
+    _trust_manifest, trust_digest = ci_trust_file_set_authority(
+        git=git,
+        environment=child_environment,
+        repo_root=repo_root,
+    )
+    baseline_commit = str(baseline.get("baselineCommit", ""))
+    baseline_tree = str(baseline.get("baselineTree", ""))
+    if baseline_commit != BASELINE_COMMIT or baseline_tree != BASELINE_TREE:
+        raise ValueError("baseline commit/tree cannot construct execution-binding authority")
+
+    github_actions_value = source.get("GITHUB_ACTIONS")
+    if github_actions_value not in {None, "", "false", "true"}:
+        raise ValueError("GITHUB_ACTIONS has an invalid execution-binding value")
+    github_actions = github_actions_value == "true"
+    if github_actions:
+        if (
+            expected_producer_job is None
+            or expected_verifier_job is None
+            or expected_runner_os is None
+        ):
+            raise ValueError(
+                "GitHub Actions verification requires literal producer job, verifier job, and runner OS"
+            )
+        if expected_invocation_id is not None:
+            raise ValueError("GitHub Actions run identity must come from GitHub-controlled context")
+        required_names = (
+            "GITHUB_JOB",
+            "RUNNER_OS",
+            "GITHUB_RUN_ID",
+            "GITHUB_RUN_ATTEMPT",
+            "GITHUB_EVENT_NAME",
+            "GITHUB_REPOSITORY",
+            "GITHUB_SHA",
+        )
+        values: dict[str, str] = {}
+        for name in required_names:
+            value = source.get(name)
+            if not isinstance(value, str) or not value or value != value.strip():
+                raise ValueError(f"GitHub Actions execution binding is missing {name}")
+            values[name] = value
+        authority = WORKFLOW_JOB_PROFILE_AUTHORITY.get(expected_verifier_job)
+        if authority is None:
+            raise ValueError("expected verifier workflow job is outside fixed authority")
+        if authority["producerJobId"] != expected_producer_job:
+            raise ValueError("producer/verifier workflow authority mismatch")
+        if values["GITHUB_JOB"] != expected_verifier_job:
+            raise ValueError("external expected verifier job does not equal GITHUB_JOB")
+        if values["RUNNER_OS"] != expected_runner_os:
+            raise ValueError("external expected runner OS does not equal RUNNER_OS")
+        if _canonical_runner_os() != expected_runner_os:
+            raise ValueError("external expected runner OS does not equal the current platform")
+        if authority["verifierJobId"] != expected_verifier_job:
+            raise ValueError("verifier workflow job authority identity mismatch")
+        if authority["runnerOS"] != expected_runner_os:
+            raise ValueError("job/runner-OS authority mismatch")
+        if authority["verificationProfile"] != expected_profile:
+            raise ValueError("job/profile authority mismatch")
+        if not re.fullmatch(r"[1-9][0-9]*", values["GITHUB_RUN_ID"]):
+            raise ValueError("GITHUB_RUN_ID is invalid")
+        if not re.fullmatch(r"[1-9][0-9]*", values["GITHUB_RUN_ATTEMPT"]):
+            raise ValueError("GITHUB_RUN_ATTEMPT is invalid")
+        if not re.fullmatch(r"[A-Za-z0-9_]+", values["GITHUB_EVENT_NAME"]):
+            raise ValueError("GITHUB_EVENT_NAME is invalid")
+        if not re.fullmatch(r"[^/\s]+/[^/\s]+", values["GITHUB_REPOSITORY"]):
+            raise ValueError("GITHUB_REPOSITORY is invalid")
+        if values["GITHUB_SHA"] != checkout_commit:
+            raise ValueError("GITHUB_SHA does not equal the current checkout commit")
+        producer_partial = _producer_binding_without_invocation(
+            binding_mode="github-actions",
+            producer_job_id=expected_producer_job,
+            runner_os=expected_runner_os,
+            profile=expected_profile,
+            run_id=values["GITHUB_RUN_ID"],
+            run_attempt=values["GITHUB_RUN_ATTEMPT"],
+            event_name=values["GITHUB_EVENT_NAME"],
+            repository=values["GITHUB_REPOSITORY"],
+            checkout_commit=checkout_commit,
+            checkout_tree=checkout_tree,
+            baseline_commit=baseline_commit,
+            baseline_tree=baseline_tree,
+            trust_file_digest=trust_digest,
+            command_plan_digest_value=command_plan_digest_value,
+        )
+        producer_invocation_id = _github_binding_invocation_id(producer_partial)
+        verifier_partial = {
+            "bindingSchemaVersion": EVIDENCE_EXECUTION_BINDING_SCHEMA_VERSION,
+            "bindingKind": "VerifierExecutionBinding",
+            "bindingMode": "github-actions",
+            "verifierJobId": expected_verifier_job,
+            "verifierRunnerOS": expected_runner_os,
+            "expectedProfile": expected_profile,
+            "expectedProducerJobId": expected_producer_job,
+            "runId": values["GITHUB_RUN_ID"],
+            "runAttempt": values["GITHUB_RUN_ATTEMPT"],
+            "eventName": values["GITHUB_EVENT_NAME"],
+            "repository": values["GITHUB_REPOSITORY"],
+            "checkoutCommit": checkout_commit,
+            "checkoutTree": checkout_tree,
+            "baselineCommit": baseline_commit,
+            "baselineTree": baseline_tree,
+            "trustFileDigest": trust_digest,
+            "independentlyRebuiltCommandPlanDigest": command_plan_digest_value,
+            "freshRuntimeClosureDigest": fresh_runtime_closure_digest,
+        }
+        verifier_invocation_id = _github_binding_invocation_id(
+            verifier_partial,
+            role="verifier",
+        )
+        binding_mode = "github-actions"
+        producer_job_id = expected_producer_job
+        verifier_job_id = expected_verifier_job
+        runner_os = expected_runner_os
+        run_id = values["GITHUB_RUN_ID"]
+        run_attempt = values["GITHUB_RUN_ATTEMPT"]
+        event_name = values["GITHUB_EVENT_NAME"]
+        repository = values["GITHUB_REPOSITORY"]
+    else:
+        if (
+            expected_producer_job is not None
+            or expected_verifier_job is not None
+            or expected_runner_os is not None
+        ):
+            raise ValueError("local verification cannot claim GitHub workflow jobs or runner OS")
+        if not isinstance(expected_invocation_id, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", expected_invocation_id
+        ):
+            raise ValueError("local verification requires a 64-hex external invocation identity")
+        binding_mode = "local"
+        producer_job_id = "local-producer"
+        verifier_job_id = "local-verifier"
+        runner_os = _canonical_runner_os()
+        run_id = "local"
+        run_attempt = "1"
+        event_name = "local"
+        repository = _local_repository_identity(repo_root)
+        producer_invocation_id = expected_invocation_id
+        verifier_invocation_id = _github_binding_invocation_id(
+            {
+                "bindingMode": "local",
+                "expectedProfile": expected_profile,
+                "producerInvocationId": producer_invocation_id,
+                "commandPlanDigest": command_plan_digest_value,
+                "freshRuntimeClosureDigest": fresh_runtime_closure_digest,
+            },
+            role="verifier",
+        )
+
+    return ExternallyExpectedVerificationContext(
+        binding_mode=binding_mode,
+        expected_profile=expected_profile,
+        producer_job_id=producer_job_id,
+        verifier_job_id=verifier_job_id,
+        runner_os=runner_os,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        event_name=event_name,
+        repository=repository,
+        checkout_commit=checkout_commit,
+        checkout_tree=checkout_tree,
+        baseline_commit=baseline_commit,
+        baseline_tree=baseline_tree,
+        trust_file_digest=trust_digest,
+        command_plan_digest=command_plan_digest_value,
+        producer_invocation_id=producer_invocation_id,
+        fresh_runtime_closure_digest=fresh_runtime_closure_digest,
+        verifier_invocation_id=verifier_invocation_id,
+    )
+
+
+def build_generation_execution_binding(
+    runner: Any,
+    *,
+    source_environment: Mapping[str, str] | None = None,
+    repo_root: Path = REPO_ROOT,
+) -> dict[str, Any]:
+    source = os.environ if source_environment is None else source_environment
+    checkout_commit, checkout_tree = current_checkout_identity(
+        git=str(runner.tools["git"]),
+        environment=runner.child_environment,
+        repo_root=repo_root,
+    )
+    _manifest, trust_digest = ci_trust_file_set_authority(
+        git=str(runner.tools["git"]),
+        environment=runner.child_environment,
+        repo_root=repo_root,
+    )
+    if source.get("GITHUB_ACTIONS") == "true":
+        producer_job_id = str(source.get("GITHUB_JOB", ""))
+        authority = _workflow_authority_for_producer(producer_job_id)
+        if authority is None:
+            raise ValueError("generation job is outside fixed producer authority")
+        runner_os = str(source.get("RUNNER_OS", ""))
+        if authority["runnerOS"] != runner_os or authority["profile"] != runner.profile:
+            raise ValueError("producer job/profile/OS authority mismatch")
+        values = {
+            key: str(source.get(key, ""))
+            for key in (
+                "GITHUB_RUN_ID",
+                "GITHUB_RUN_ATTEMPT",
+                "GITHUB_EVENT_NAME",
+                "GITHUB_REPOSITORY",
+                "GITHUB_SHA",
+            )
+        }
+        if values["GITHUB_SHA"] != checkout_commit:
+            raise ValueError("producer GITHUB_SHA does not equal checkout commit")
+        binding_mode = "github-actions"
+        run_id = values["GITHUB_RUN_ID"]
+        run_attempt = values["GITHUB_RUN_ATTEMPT"]
+        event_name = values["GITHUB_EVENT_NAME"]
+        repository = values["GITHUB_REPOSITORY"]
+    else:
+        producer_job_id = "local-producer"
+        runner_os = _canonical_runner_os()
+        binding_mode = "local"
+        run_id = "local"
+        run_attempt = "1"
+        event_name = "local"
+        repository = _local_repository_identity(repo_root)
+    partial = _producer_binding_without_invocation(
+        binding_mode=binding_mode,
+        producer_job_id=producer_job_id,
+        runner_os=runner_os,
+        profile=str(runner.profile),
+        run_id=run_id,
+        run_attempt=run_attempt,
+        event_name=event_name,
+        repository=repository,
+        checkout_commit=checkout_commit,
+        checkout_tree=checkout_tree,
+        baseline_commit=str(runner.baseline["baselineCommit"]),
+        baseline_tree=str(runner.baseline["baselineTree"]),
+        trust_file_digest=trust_digest,
+        command_plan_digest_value=str(runner.command_plan_digest),
+    )
+    partial["producerInvocationId"] = (
+        _github_binding_invocation_id(partial)
+        if binding_mode == "github-actions"
+        else hashlib.sha256(uuid.uuid4().bytes + os.urandom(32)).hexdigest()
+    )
+    return partial
+
+
+def rebuild_external_verification_context(
+    context: ExternallyExpectedVerificationContext,
+    runner: Any,
+    *,
+    source_environment: Mapping[str, str] | None = None,
+    repo_root: Path = REPO_ROOT,
+) -> ExternallyExpectedVerificationContext:
+    return build_externally_expected_verification_context(
+        expected_profile=context.expected_profile,
+        expected_producer_job=(
+            context.producer_job_id if context.binding_mode == "github-actions" else None
+        ),
+        expected_verifier_job=(
+            context.verifier_job_id if context.binding_mode == "github-actions" else None
+        ),
+        expected_runner_os=(context.runner_os if context.binding_mode == "github-actions" else None),
+        expected_invocation_id=(
+            context.producer_invocation_id if context.binding_mode == "local" else None
+        ),
+        command_plan_digest_value=str(runner.command_plan_digest),
+        fresh_runtime_closure_digest=str(runner.runtime_closure_digest),
+        baseline=runner.baseline,
+        git=str(runner.tools["git"]),
+        child_environment=runner.child_environment,
+        source_environment=source_environment,
+        repo_root=repo_root,
+    )
+
+
+def parse_static_machine_report(
+    data: bytes,
+    *,
+    expected_invocation_id: str,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Parse one producer-bound UTF-8 JSON document with exact framing."""
+
+    errors: list[str] = []
+    if data.startswith(b"\xef\xbb\xbf"):
+        return None, ["static machine stdout must not contain a BOM"]
+    if not data.endswith(b"\n") or data.endswith(b"\r\n"):
+        return None, ["static machine stdout must end in exactly one LF"]
+    body = data[:-1]
+    if not body or body[:1] != b"{" or body.endswith((b" ", b"\t", b"\r", b"\n")):
+        return None, ["static machine stdout has a prefix or suffix outside the JSON document"]
+    try:
+        value = strict_json_loads(body, label="static machine stdout")
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        return None, [f"static machine stdout is not strict UTF-8 JSON: {type(exc).__name__}"]
+    expected_keys = {
+        "documentKind",
+        "schemaVersion",
+        "invocationId",
+        "executionStatus",
+        "commandPlanDigest",
+        "commandResults",
+        "observations",
+        "nativeNonPassCount",
+        "internalRunnerFailures",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        return None, ["static machine report top-level schema is not exact"]
+    if value.get("documentKind") != STATIC_MACHINE_DOCUMENT_KIND:
+        errors.append("static machine report documentKind is invalid")
+    if value.get("schemaVersion") != STATIC_MACHINE_SCHEMA_VERSION:
+        errors.append("static machine report schemaVersion is invalid")
+    if value.get("invocationId") != expected_invocation_id:
+        errors.append("static machine report invocationId does not match the parent invocation")
+    if value.get("executionStatus") != "COMPLETE":
+        errors.append("static machine report executionStatus is not COMPLETE")
+    digest = value.get("commandPlanDigest")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        errors.append("static machine report commandPlanDigest is invalid")
+    observations = value.get("observations")
+    if not isinstance(observations, list) or len(observations) > 10_000:
+        errors.append("static machine report observations must be a bounded array")
+        observations = []
+    malformed: list[int] = []
+    for index, result in enumerate(observations):
+        if (
+            not isinstance(result, dict)
+            or set(result) != {"name", "status", "detail"}
+            or not isinstance(result.get("name"), str)
+            or result.get("status") not in {"pass", "fail"}
+        ):
+            malformed.append(index)
+    if malformed:
+        errors.append(f"static machine report contains malformed observations: {malformed[:10]}")
+    native_non_pass_count = value.get("nativeNonPassCount")
+    if type(native_non_pass_count) is not int or not 0 <= native_non_pass_count <= 10_000:
+        errors.append("static machine report nativeNonPassCount is invalid")
+        native_non_pass_count = -1
+    internal_failures = value.get("internalRunnerFailures")
+    if not isinstance(internal_failures, list) or internal_failures:
+        errors.append("COMPLETE static machine report must have no internalRunnerFailures")
+    command_results = value.get("commandResults")
+    command_required = {
+        "commandId",
+        "ordinal",
+        "commandClass",
+        "required",
+        "profile",
+        "platform",
+        "argv",
+        "cwd",
+        "toolRole",
+        "resolvedExecutablePath",
+        "resolvedExecutableSize",
+        "resolvedExecutableSha256",
+        "targets",
+        "resultSemantics",
+        "allowedExecutionExits",
+        "started",
+        "executed",
+        "exitCode",
+        "timeoutStatus",
+        "outputLimitStatus",
+        "containmentStatus",
+    }
+    if not isinstance(command_results, list) or not 1 <= len(command_results) <= MAX_PROFILE_COMMANDS:
+        errors.append("static machine report commandResults must be a non-empty bounded array")
+        command_results = []
+    for index, record in enumerate(command_results):
+        label = f"static machine commandResults[{index}]"
+        if not isinstance(record, dict) or set(record) != command_required:
+            errors.append(f"{label} schema is not exact")
+            continue
+        if record.get("ordinal") != index:
+            errors.append(f"{label} ordinal is invalid")
+        if record.get("required") is not True or record.get("started") is not True or record.get("executed") is not True:
+            errors.append(f"{label} did not execute as required")
+        if record.get("exitCode") not in record.get("allowedExecutionExits", []):
+            errors.append(f"{label} exitCode is outside immutable authority")
+        if record.get("timeoutStatus") != "within-limit" or record.get("outputLimitStatus") != "within-limit":
+            errors.append(f"{label} has an execution-limit failure")
+        if record.get("containmentStatus") != "parent-contained":
+            errors.append(f"{label} containment state is invalid")
+    errors.extend(_bounded_evidence_json(value, label="static-machine-report"))
+    if not malformed:
+        result_failures = sum(result.get("status") != "pass" for result in observations)
+        if native_non_pass_count != result_failures:
+            errors.append("static machine nativeNonPassCount contradicts observations")
+    return (value if not errors else None), sorted(set(errors))
+
+
+def nested_skip(detail: Any) -> bool:
+    if isinstance(detail, Mapping):
+        if detail.get("skipped") is True or str(detail.get("status", "")).lower() == "skipped":
+            return True
+        return any(nested_skip(value) for value in detail.values())
+    if isinstance(detail, list):
+        return any(nested_skip(value) for value in detail)
+    return False
+
+
+def node_failure_count(text: str) -> int | None:
+    normalized = normalize_text(text)
+    matches = re.findall(r"(?im)^[#ℹ]\s*fail\s+(\d+)\s*$", normalized)
+    if matches:
+        return int(matches[-1])
+    return None
+
+
+def _normalize_failure_path(value: str) -> str:
+    normalized = strip_terminal_controls(value).replace("\\", "/").strip()
+    normalized = re.sub(r"(?i)^.*?\((?=(?:file:///)?(?:[A-Z]:/|/))", "", normalized)
+    normalized = re.sub(r"(?i)^(?:test\s+at|at)\s+", "", normalized)
+    normalized = re.sub(r"(?i)^file:///", "", normalized)
+    normalized = re.sub(r"(?i)^([A-Z]):/+", r"\1:/", normalized)
+    normalized = re.sub(r"/+", "/", normalized)
+    repo = str(REPO_ROOT.resolve()).replace("\\", "/")
+    normalized = re.sub(rf"(?i)^{re.escape(repo)}/?", "", normalized)
+    normalized = normalized.lstrip("./")
+    if normalized.casefold() == "node.js":
+        return ""
+    if re.match(r"(?i)^[A-Z]:/", normalized):
+        drive_removed = normalized[3:]
+        normalized = f"<external>/{drive_removed}"
+    return normalized
+
+
+def _deduplicate_locations(values: Iterable[str]) -> list[str]:
+    unique = sorted(set(values))
+    result: list[str] = []
+    for value in unique:
+        if ":" not in value and any(candidate.startswith(value + ":") for candidate in unique):
+            continue
+        if re.search(r":\d+$", value) and any(candidate.startswith(value + ":") for candidate in unique):
+            continue
+        result.append(value)
+    return result
+
+
+def extract_failure_identity(
+    scope: str,
+    *,
+    stdout: str = "",
+    stderr: str = "",
+    structured: Any | None = None,
+) -> dict[str, Any]:
+    if structured is not None:
+        return {
+            "scope": scope,
+            "structuredFailureSet": structured_signature(structured),
+        }
+
+    source = strip_terminal_controls("\n".join(part for part in (stdout, stderr) if part))
+    source = source.replace("\\", "/")
+    test_ids: set[str] = set()
+    locations: list[str] = []
+    assertion_names: set[str] = set()
+    expected_values: set[str] = set()
+    observed_values: set[str] = set()
+    error_classes: set[str] = set()
+    error_messages: set[str] = set()
+
+    for match in REPO_SOURCE_LOCATION.finditer(source):
+        normalized = _normalize_failure_path(match.group(0))
+        if normalized:
+            locations.append(normalized)
+    for match in re.finditer(
+        r"(?im)^[✖x]\s+([^\n(]+\.(?:cjs|js|mjs|py|ps1|sh))(?:\s+\(|\s*$)",
+        source,
+    ):
+        test_ids.add(_normalize_failure_path(match.group(1)))
+    for match in re.finditer(r"(?im)^not ok\s+\d+\s+-\s+(.+?)\s*$", source):
+        test_ids.add(sanitize_text(match.group(1)).strip())
+
+    for match in re.finditer(
+        r"(?m)\b([A-Za-z][A-Za-z0-9_]*(?:Error|Exception))(?:\s*\[([A-Z0-9_]+)\])?\s*:\s*([^\n]+)",
+        source,
+    ):
+        class_name = match.group(1)
+        if match.group(2):
+            class_name += f"[{match.group(2)}]"
+        error_classes.add(class_name)
+        message = sanitize_text(match.group(3)).strip()
+        if message:
+            error_messages.add(message)
+            assertion_names.add(message)
+    for match in re.finditer(r'(?i)"detail"\s*:\s*"([^"\n]+)"', source):
+        detail = sanitize_text(match.group(1)).strip()
+        if detail:
+            error_messages.add(detail)
+            assertion_names.add(detail)
+    for match in re.finditer(r"(?im)^\s*(?:assertion|assertion name)\s*[:=]\s*(.+?)\s*$", source):
+        assertion_names.add(sanitize_text(match.group(1)).strip())
+    for label, target in (
+        (r"actual|observed|received", observed_values),
+        (r"expected", expected_values),
+    ):
+        for match in re.finditer(rf"(?im)^\s*(?:{label})\s*:\s*(.+?)\s*,?\s*$", source):
+            target.add(sanitize_text(match.group(1)).strip().strip("',\""))
+    for match in re.finditer(r"(?m)^\s*(.+?)\s*!==\s*(.+?)\s*$", source):
+        observed_values.add(sanitize_text(match.group(1)).strip().strip("',\""))
+        expected_values.add(sanitize_text(match.group(2)).strip().strip("',\""))
+
+    identity = {
+        "scope": scope,
+        "testIds": sorted(value for value in test_ids if value),
+        "fileLocations": _deduplicate_locations(locations),
+        "assertionNames": sorted(value for value in assertion_names if value),
+        "expectedValues": sorted(value for value in expected_values if value),
+        "observedValues": sorted(value for value in observed_values if value),
+        "errorClasses": sorted(error_classes),
+        "errorMessages": sorted(error_messages),
+    }
+    return identity
+
+
+def _structured_failure_fragments(value: Any) -> list[str]:
+    if isinstance(value, Mapping):
+        return [
+            fragment
+            for key in sorted(value, key=lambda item: str(item))
+            for fragment in _structured_failure_fragments(value[key])
+        ]
+    if isinstance(value, list):
+        return [fragment for item in value for fragment in _structured_failure_fragments(item)]
+    if not isinstance(value, str):
+        return [str(value)]
+
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(value):
+        if character not in "[{":
+            continue
+        try:
+            decoded, end = decoder.raw_decode(value[index:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(decoded, (Mapping, list)):
+            continue
+        outer = (value[:index] + value[index + end :]).strip()
+        fragments = _structured_failure_fragments(decoded)
+        if outer:
+            fragments.append(outer)
+        return fragments
+    return [value]
+
+
+def structured_failure_identity(scope: str, detail: Any) -> dict[str, Any]:
+    identity = extract_failure_identity(
+        scope,
+        stdout="\n".join(_structured_failure_fragments(detail)),
+    )
+    test_ids = set(identity["testIds"])
+    for location in identity["fileLocations"]:
+        path = re.sub(r":\d+(?::\d+)?$", "", location)
+        if re.search(r"(?i)(?:^|/)tests?/.*(?:test|spec)\.(?:cjs|js|mjs|py)$", path):
+            test_ids.add(path)
+    identity["testIds"] = sorted(test_ids)
+    identity["structuredFailureSet"] = structured_signature(detail)
+    return identity
+
+
+def failure_identity_hash(identity: Mapping[str, Any]) -> str:
+    canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return f"sha256:{sha256_text(canonical)}"
+
+
+KNOWN_SYNTAX_FAILURES = MappingProxyType(
+    {
+        "assets/generated/reading-explanations/p1-high-194.js": (
+            24,
+            "SyntaxError",
+            "Unexpected identifier '行会'",
+            "SyntaxError: Unexpected identifier '行会'",
+        ),
+        "assets/generated/reading-explanations/p3-low-151.js": (
+            125,
+            "SyntaxError",
+            "Unexpected identifier 'Ice'",
+            "SyntaxError: Unexpected identifier 'Ice'",
+        ),
+        "developer/tests/js/performanceBaseline.js": (
+            426,
+            "SyntaxError",
+            "Unexpected identifier 'testDataProcessingPerformance'",
+            "SyntaxError: Unexpected identifier 'testDataProcessingPerformance'",
+        ),
+        "developer/tests/js/stateSerializerTest.js": (
+            443,
+            "SyntaxError",
+            "Unexpected token 'class'",
+            "SyntaxError: Unexpected token 'class'",
+        ),
+    }
+)
+
+
+KNOWN_STATIC_FAILURES = MappingProxyType(
+    {
+        "result:套题模式状态机回归测试": {
+            "testIds": ["developer/tests/js/suiteModeRegression.test.js"],
+            "fileLocations": ["developer/tests/js/suiteModeRegression.test.js:667:16"],
+            "assertionNames": ["sessionId 不一致时仍应路由模拟导航"],
+            "expectedValues": ["1"],
+            "observedValues": ["0"],
+            "errorClasses": ["AssertionError[ERR_ASSERTION]"],
+            "errorMessages": ["sessionId 不一致时仍应路由模拟导航"],
+            "signature": "sha256:238122c8a9d7f99eb1767d2656038644234a3d0f8d2492a573740eadbb635817",
+        }
+    }
+)
+
+
+KNOWN_NODE_FAILURES = MappingProxyType(
+    {
+        "file:developer/tests/js/adminFrontendGuard.test.js": {
+            "testIds": ["developer/tests/js/adminFrontendGuard.test.js"],
+            "fileLocations": [
+                "backend/admin/admin.js:83:44",
+                "backend/admin/admin.js:874:3",
+                "developer/tests/js/adminFrontendGuard.test.js:113:4",
+                "developer/tests/js/adminFrontendGuard.test.js:1:1",
+            ],
+            "assertionNames": ["document.querySelectorAll is not a function"],
+            "expectedValues": [],
+            "observedValues": [],
+            "errorClasses": ["TypeError"],
+            "errorMessages": ["document.querySelectorAll is not a function"],
+            "signature": "TypeError:document.querySelectorAll-is-not-a-function",
+        },
+        "file:developer/tests/js/remotePracticeDataSource.test.js": {
+            "testIds": ["developer/tests/js/remotePracticeDataSource.test.js"],
+            "fileLocations": ["developer/tests/js/remotePracticeDataSource.test.js:1:1"],
+            "assertionNames": ["apiClient.disableTotp is not a function"],
+            "expectedValues": [],
+            "observedValues": [],
+            "errorClasses": [],
+            "errorMessages": ["apiClient.disableTotp is not a function"],
+            "signature": "TypeError:apiClient.disableTotp-is-not-a-function",
+        },
+        "file:developer/tests/js/localDataRenderingGuard.test.js": {
+            "testIds": ["developer/tests/js/localDataRenderingGuard.test.js"],
+            "fileLocations": [
+                "developer/tests/js/localDataRenderingGuard.test.js:1:1",
+                "developer/tests/js/localDataRenderingGuard.test.js:566:1",
+            ],
+            "assertionNames": [
+                "vocab store must cap stored list size, normalize long imported word fields, and return defensive clones"
+            ],
+            "expectedValues": ["true"],
+            "observedValues": ["false"],
+            "errorClasses": ["AssertionError[ERR_ASSERTION]"],
+            "errorMessages": [
+                "vocab store must cap stored list size, normalize long imported word fields, and return defensive clones"
+            ],
+            "signature": "AssertionError:vocab-store-source-CRLF-assertion",
+        },
+    }
+)
+
+
+def static_failure_signature(
+    scope: str,
+    detail: Any,
+    identity: Mapping[str, Any],
+) -> str:
+    known = KNOWN_STATIC_FAILURES.get(scope)
+    if known is not None:
+        comparable = {key: value for key, value in identity.items() if key != "structuredFailureSet"}
+        expected = {"scope": scope, **{key: value for key, value in known.items() if key != "signature"}}
+        if comparable == expected:
+            return str(known["signature"])
+    return structured_signature(detail)
+
+
+def node_failure_signature(scope: str, output: str) -> str:
+    identity = extract_failure_identity(scope, stdout=output)
+    known = KNOWN_NODE_FAILURES.get(scope)
+    if known is not None and node_failure_count(output) == 1:
+        expected_identity = {"scope": scope, **{key: value for key, value in known.items() if key != "signature"}}
+        if identity == expected_identity:
+            return str(known["signature"])
+    return failure_identity_hash(identity)
+
+
+def learner_failure_signature(output: str) -> str:
+    normalized = sanitize_text(output)
+    lower = normalized.lower()
+    identity = extract_failure_identity("command:learner-focused-runtime", stdout=output)
+    fail_count = node_failure_count(normalized)
+    if (
+        "executable doesn't exist" in lower
+        or "browser executable" in lower
+        or ("playwright install" in lower and "browsertype.launch" in lower)
+    ) and fail_count in (None, 1) and len(identity["testIds"]) <= 1 and len(identity["errorMessages"]) <= 1:
+        return "learner-browser-executable-unavailable"
+    return failure_identity_hash(identity)
+
+
+def syntax_failure_signature(scope: str, stderr: str, stdout: str) -> str:
+    identity = extract_failure_identity(scope, stdout=stdout, stderr=stderr)
+    known = KNOWN_SYNTAX_FAILURES.get(scope)
+    if known is not None:
+        line_number, error_class, message, signature = known
+        expected = {
+            "scope": scope,
+            "testIds": [],
+            "fileLocations": [f"{scope}:{line_number}"],
+            "assertionNames": [message],
+            "expectedValues": [],
+            "observedValues": [],
+            "errorClasses": [error_class],
+            "errorMessages": [message],
+        }
+        if identity == expected:
+            return signature
+    return failure_identity_hash(identity)
+
+
+def command_output_digest(record: Mapping[str, Any]) -> str:
+    return canonical_failure_digest(
+        {
+            "stdoutSha256": record.get("stdoutSha256"),
+            "stderrSha256": record.get("stderrSha256"),
+            "stdoutBytesObserved": record.get("stdoutBytesObserved"),
+            "stderrBytesObserved": record.get("stderrBytesObserved"),
+        }
+    )
+
+
+def command_capture_output_digest(capture: CommandCapture) -> str:
+    return command_output_digest(capture.evidence())
+
+
+def _normalize_node_stdin_diagnostics(scope: str, value: str) -> str:
+    normalized = strip_terminal_controls(value)
+    return normalized.replace("[stdin]", scope).replace("file:///[stdin]", scope)
+
+
+def _failure_members(identity: Mapping[str, Any]) -> list[dict[str, Any]]:
+    fixed_kinds = (
+        "scope",
+        "testIds",
+        "fileLocations",
+        "assertionNames",
+        "expectedValues",
+        "observedValues",
+        "errorClasses",
+        "errorMessages",
+        "structuredFailureSet",
+        "resultStatus",
+        "missingIndexScripts",
+    )
+    members: list[dict[str, Any]] = []
+    member_kinds = [*fixed_kinds, *sorted(set(identity) - set(fixed_kinds))]
+    for member_kind in member_kinds:
+        if member_kind not in identity:
+            members.append(
+                {
+                    "memberKind": member_kind,
+                    "memberOrdinal": 0,
+                    "presence": "absent",
+                    "value": None,
+                }
+            )
+            continue
+        raw_value = identity[member_kind]
+        values = raw_value if isinstance(raw_value, list) else [raw_value]
+        if not values:
+            members.append(
+                {
+                    "memberKind": member_kind,
+                    "memberOrdinal": 0,
+                    "presence": "absent",
+                    "value": None,
+                }
+            )
+            continue
+        for ordinal, value in enumerate(values):
+            members.append(
+                {
+                    "memberKind": member_kind,
+                    "memberOrdinal": ordinal,
+                    "presence": "present",
+                    "value": normalized_json_value(value),
+                }
+            )
+    return members
+
+
+def _raw_failure_outputs(
+    raw: Mapping[str, Any],
+    command_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    kind = str(raw.get("observationKind", ""))
+    fields = raw.get("rawStructuredFields")
+    command_class = str(command_record.get("commandClass", ""))
+    source_result_id = str(raw.get("sourceResultId", ""))
+    parser_semantics = ""
+    identity: dict[str, Any] | None = None
+
+    if kind == "static-producer-v1" and isinstance(fields, Mapping):
+        parser_semantics = "static-machine-result-v1"
+        name = str(fields.get("name", ""))
+        scope = f"result:{name}"
+        status = fields.get("status")
+        detail = fields.get("detail")
+        if status == "pass" and nested_skip(detail):
+            outcome = "skip"
+        else:
+            outcome = "pass" if status == "pass" else "fail"
+        if outcome == "pass":
+            identity = {"scope": scope, "resultStatus": "pass"}
+            signature = "pass"
+        else:
+            identity = structured_failure_identity(scope, detail)
+            if outcome == "skip" and source_result_id in FROZEN_V1_RELEASE_SKIP_DETAIL_FIELDS:
+                signature = derive_frozen_v1_release_skip_signature(raw)
+            else:
+                signature = static_failure_signature(scope, detail, identity)
+    elif kind == "process-output-v1" and isinstance(fields, Mapping):
+        parser_semantics = f"{command_class}-process-result-v1"
+        scope = source_result_id
+        stdout = str(fields.get("stdout", ""))
+        stderr = str(fields.get("stderr", ""))
+        executed = fields.get("executed") is True
+        exit_code = fields.get("exitCode")
+        if command_class == "direct-syntax":
+            stdout = _normalize_node_stdin_diagnostics(scope, stdout)
+            stderr = _normalize_node_stdin_diagnostics(scope, stderr)
+            if not executed:
+                outcome = "unavailable"
+                signature = "required-executable-unavailable:node"
+            elif exit_code == 0:
+                outcome = "pass"
+                signature = "pass"
+            else:
+                outcome = "syntax-error"
+                signature = syntax_failure_signature(scope, stderr, stdout)
+        elif command_class == "frontend-security":
+            if not executed:
+                outcome = "unavailable"
+                signature = "required-executable-unavailable:node"
+            elif exit_code == 0:
+                outcome = "pass"
+                signature = "pass"
+            else:
+                outcome = "fail"
+                signature = node_failure_signature(scope, stdout + "\n" + stderr)
+        elif command_class == "learner-focused":
+            if not executed:
+                outcome = "unavailable"
+                signature = "required-executable-unavailable:node"
+            elif exit_code == 0:
+                outcome = "pass"
+                signature = "pass"
+            else:
+                signature = learner_failure_signature(stdout + "\n" + stderr)
+                outcome = "unavailable" if signature == "learner-browser-executable-unavailable" else "fail"
+        elif command_class == "backend-canonical":
+            if not executed:
+                outcome = "unavailable"
+                signature = "required-executable-unavailable:npm"
+            elif exit_code == 0:
+                outcome = "pass"
+                signature = "pass"
+            else:
+                outcome = "fail"
+                identity = extract_failure_identity(scope, stdout=stdout, stderr=stderr)
+                signature = failure_identity_hash(identity)
+        else:
+            outcome = "pass" if executed and exit_code == 0 else "fail"
+            identity = extract_failure_identity(scope, stdout=stdout, stderr=stderr)
+            signature = "pass" if outcome == "pass" else failure_identity_hash(identity)
+        if identity is None:
+            identity = (
+                {"scope": scope, "resultStatus": "pass"}
+                if outcome == "pass"
+                else extract_failure_identity(scope, stdout=stdout, stderr=stderr)
+            )
+    elif kind == "standalone-membership-v1" and isinstance(fields, Mapping):
+        parser_semantics = "standalone-positive-membership-v1"
+        relative = str(fields.get("relative", ""))
+        missing = fields.get("missing") is True
+        scope = f"membership:index.html::{relative}"
+        outcome = "fail" if missing else "pass"
+        signature = f"missing:index-script:{relative}" if missing else "pass"
+        identity = {
+            "scope": scope,
+            "missingIndexScripts": [relative] if missing else [],
+        }
+    elif kind == "normalized-fields-v1" and isinstance(fields, Mapping):
+        parser_semantics = "normalized-test-fields-v1"
+        scope = source_result_id
+        outcome = str(fields.get("outcome", "fail"))
+        if outcome == "pass":
+            identity = {"scope": scope, "resultStatus": "pass"}
+            signature = "pass"
+        else:
+            identity = {
+                str(key): normalized_json_value(value)
+                for key, value in fields.items()
+                if key not in {"outcome", "message"}
+            }
+            identity["scope"] = scope
+            known_static = KNOWN_STATIC_FAILURES.get(scope)
+            known_expected = _known_identity_expected(scope)
+            if known_static is not None:
+                comparable = {
+                    key: value for key, value in identity.items()
+                    if key != "structuredFailureSet"
+                }
+                expected = {
+                    "scope": scope,
+                    **{key: value for key, value in known_static.items() if key != "signature"},
+                }
+                signature = (
+                    str(known_static["signature"])
+                    if comparable == expected
+                    else failure_identity_hash(identity)
+                )
+            elif known_expected is not None and identity == known_expected:
+                known_syntax = KNOWN_SYNTAX_FAILURES.get(scope)
+                if known_syntax is not None:
+                    signature = str(known_syntax[3])
+                else:
+                    known_node = KNOWN_NODE_FAILURES.get(scope)
+                    signature = str(known_node["signature"]) if known_node else failure_identity_hash(identity)
+            else:
+                message = fields.get("message")
+                signature = str(message) if isinstance(message, str) and not message.startswith("sha256:") else failure_identity_hash(identity)
+    else:
+        raise ValueError("raw observation kind or structured fields are invalid")
+
+    if identity is None:
+        raise ValueError("raw observation parser did not derive a failure identity")
+    members = _failure_members(identity)
+    return {
+        "commandClass": command_class,
+        "testOrPathScope": scope,
+        "outcome": outcome,
+        "signature": signature,
+        "failureIdentity": identity,
+        "failureIdentityHash": failure_identity_hash(identity),
+        "parserSemantics": parser_semantics,
+        "derivedFailureMembers": members,
+    }
+
+
+def derive_canonical_failure_material(
+    validated_command_record: Mapping[str, Any],
+    validated_raw_observation: Mapping[str, Any],
+    parser_semantics: str,
+    derived_failure_members: Sequence[Mapping[str, Any]],
+    derived_signature: str,
+    derived_outcome: str,
+    profile_context: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build baseline-blind failure material from command facts and one raw observation."""
+
+    targets = []
+    for target in validated_command_record.get("targets", []):
+        if isinstance(target, Mapping):
+            targets.append(
+                {
+                    "path": target.get("path"),
+                    "canonicalSourcePath": target.get("canonicalSourcePath"),
+                    "size": target.get("size"),
+                    "sha256": target.get("sha256"),
+                    "fileIdentity": target.get("fileIdentity"),
+                    "modeType": target.get("modeType"),
+                    "reparsePoint": target.get("reparsePoint"),
+                }
+            )
+    context = dict(profile_context or {})
+    return {
+        "version": CANONICAL_FAILURE_MATERIAL_VERSION,
+        "command": {
+            "commandId": validated_command_record.get("commandId"),
+            "commandClass": validated_command_record.get("commandClass"),
+            "ordinal": validated_command_record.get("ordinal"),
+            "platform": validated_command_record.get("platform"),
+            "profile": validated_command_record.get("profile"),
+            "logicalArgv": validated_command_record.get(
+                "logicalArgv", validated_command_record.get("argv")
+            ),
+            "executionArgv": validated_command_record.get("executionArgv"),
+            "cwd": validated_command_record.get("cwd"),
+            "toolRole": validated_command_record.get("toolRole"),
+            "rawExitCode": validated_command_record.get("exitCode"),
+            "resultSemantics": validated_command_record.get("resultSemantics"),
+            "executionInputMode": validated_command_record.get("actualExecutionInputMode"),
+            "executionInputSize": validated_command_record.get("actualExecutionInputSize"),
+            "executionInputSha256": validated_command_record.get("actualExecutionInputSha256"),
+            "executionInputs": validated_command_record.get("executionInputs"),
+            "executionInputBundleDigest": validated_command_record.get(
+                "executionInputBundleDigest"
+            ),
+            "producerObservationSetDigest": validated_command_record.get(
+                "producerObservationSetDigest"
+            ),
+            "completedCommandClass": validated_command_record.get(
+                "completedCommandClass"
+            ),
+            "targets": targets,
+        },
+        "observation": dict(validated_raw_observation),
+        "producerObservationUniverseDigest": context.get(
+            "producerObservationUniverseDigest"
+        ),
+        "producerTranscriptDigest": context.get("producerTranscriptDigest"),
+        "profileCompletedCommandClassSetDigest": context.get(
+            "profileCompletedCommandClassSetDigest"
+        ),
+        "authorizationContextBindingDigest": context.get(
+            "authorizationContextBindingDigest"
+        ),
+        "parserSemantics": parser_semantics,
+        "derivedOutcome": derived_outcome,
+        "legacyBaselineComparisonDigest": derived_signature,
+        "derivedFailureMembers": list(derived_failure_members),
+    }
+
+
+def _rederive_observation_record(
+    item: Mapping[str, Any],
+    command_record: Mapping[str, Any],
+    *,
+    profile_context: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    raw = item.get("rawObservation")
+    if not isinstance(raw, Mapping):
+        raise ValueError("observation lacks a raw producer observation")
+    outputs = _raw_failure_outputs(raw, command_record)
+    context = dict(
+        profile_context
+        or {
+            "producerObservationUniverseDigest": item.get(
+                "producerObservationUniverseDigest"
+            ),
+            "producerTranscriptDigest": item.get("producerTranscriptDigest"),
+            "profileCompletedCommandClassSetDigest": item.get(
+                "profileCompletedCommandClassSetDigest"
+            ),
+        }
+    )
+    material = derive_canonical_failure_material(
+        command_record,
+        raw,
+        str(outputs["parserSemantics"]),
+        outputs["derivedFailureMembers"],
+        str(outputs["signature"]),
+        str(outputs["outcome"]),
+        context,
+    )
+    current_full_context_digest = canonical_failure_digest(material)
+    return {
+        "commandClass": outputs["commandClass"],
+        "testOrPathScope": outputs["testOrPathScope"],
+        "outcome": outputs["outcome"],
+        "signature": outputs["signature"],
+        "legacyBaselineComparisonDigest": outputs["signature"],
+        "commandId": raw.get("commandId"),
+        "occurrences": raw.get("occurrences"),
+        "rawObservation": dict(raw),
+        "producerObservationSetDigest": command_record.get(
+            "producerObservationSetDigest"
+        ),
+        "producerObservationUniverseDigest": context.get(
+            "producerObservationUniverseDigest"
+        ),
+        "producerTranscriptDigest": context.get("producerTranscriptDigest"),
+        "completedCommandClass": command_record.get("completedCommandClass"),
+        "profileCompletedCommandClassSetDigest": context.get(
+            "profileCompletedCommandClassSetDigest"
+        ),
+        "canonicalFailureMaterialVersion": CANONICAL_FAILURE_MATERIAL_VERSION,
+        "derivedFailureDigest": current_full_context_digest,
+        "currentFullContextDigest": current_full_context_digest,
+        "derivedFailureMembers": outputs["derivedFailureMembers"],
+        "failureIdentity": outputs["failureIdentity"],
+        "failureIdentityHash": outputs["failureIdentityHash"],
+    }
+
+
+def observation(
+    command_class: str,
+    scope: str,
+    outcome: str,
+    signature: str,
+    command_id: str,
+    *,
+    occurrences: int = 1,
+    failure_identity: Mapping[str, Any] | None = None,
+    raw_observation: Mapping[str, Any] | None = None,
+    observation_kind: str = "normalized-fields-v1",
+    raw_structured_fields: Any | None = None,
+    source_result_id: str | None = None,
+    source_path: str | None = None,
+    source_output_digest: str | None = None,
+    command_ordinal: int = 0,
+    observation_ordinal: int = 0,
+    command_record: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if raw_observation is None:
+        if raw_structured_fields is None:
+            identity = dict(failure_identity or {"scope": scope})
+            raw_structured_fields = {
+                key: value
+                for key, value in identity.items()
+                if key not in _DERIVED_FAILURE_FIELD_NAMES
+            }
+            raw_structured_fields["scope"] = scope
+            raw_structured_fields["outcome"] = outcome
+            if not signature.startswith("sha256:") and signature not in {"pass", ""}:
+                raw_structured_fields["message"] = signature
+        if source_output_digest is None:
+            source_output_digest = canonical_failure_digest(raw_structured_fields)
+        raw_observation = make_raw_observation(
+            command_id,
+            command_ordinal,
+            observation_ordinal,
+            observation_kind,
+            source_result_id or scope,
+            source_path,
+            raw_structured_fields,
+            source_output_digest,
+            occurrences,
+        )
+    source = dict(command_record or {})
+    source.setdefault("commandId", command_id)
+    source.setdefault("commandClass", command_class)
+    source.setdefault("ordinal", command_ordinal)
+    source.setdefault("profile", "static" if command_class in {"static-suite", "direct-syntax"} else "all")
+    source.setdefault("platform", platform_key())
+    source.setdefault("argv", ["<unknown>"])
+    source.setdefault("logicalArgv", source["argv"])
+    source.setdefault("executionArgv", source["argv"])
+    source.setdefault("cwd", ".")
+    source.setdefault("toolRole", "unit-observation")
+    source.setdefault("exitCode", 0 if outcome == "pass" else 1)
+    source.setdefault("resultSemantics", "fixed-parser-observation")
+    source.setdefault("actualExecutionInputMode", "NONE")
+    source.setdefault("actualExecutionInputSize", None)
+    source.setdefault("actualExecutionInputSha256", None)
+    source.setdefault("targets", [])
+    return _rederive_observation_record({"rawObservation": dict(raw_observation)}, source)
+
+
+def entry_applies(entry: Mapping[str, Any], current_platform: str) -> bool:
+    platforms = entry.get("platforms", [])
+    return "all" in platforms or current_platform in platforms
+
+
+def _known_identity_expected(scope: str) -> dict[str, Any] | None:
+    known_node = KNOWN_NODE_FAILURES.get(scope)
+    if known_node is not None:
+        return {"scope": scope, **{key: value for key, value in known_node.items() if key != "signature"}}
+    known_syntax = KNOWN_SYNTAX_FAILURES.get(scope)
+    if known_syntax is not None:
+        line_number, error_class, message, _signature = known_syntax
+        return {
+            "scope": scope,
+            "testIds": [],
+            "fileLocations": [f"{scope}:{line_number}"],
+            "assertionNames": [message],
+            "expectedValues": [],
+            "observedValues": [],
+            "errorClasses": [error_class],
+            "errorMessages": [message],
+        }
+    return None
+
+
+def _failure_identity_authorizes(
+    entry: Mapping[str, Any],
+    item: Mapping[str, Any],
+    source_command: Mapping[str, Any] | None = None,
+    *,
+    authorization_context_binding_digest_value: str | None = None,
+) -> bool:
+    raw = item.get("rawObservation")
+    if not isinstance(raw, dict):
+        return False
+    expected_source = _baseline_source_command_id(entry)
+    if expected_source is not None and item.get("commandId") != expected_source:
+        return False
+    synthetic_source: Mapping[str, Any] = source_command or {
+        "commandId": item.get("commandId"),
+        "commandClass": item.get("commandClass"),
+        "ordinal": raw.get("commandOrdinal"),
+        "profile": "static" if item.get("commandClass") in {"static-suite", "direct-syntax"} else "all",
+        "platform": "unknown",
+        "argv": ["<unknown>"],
+        "logicalArgv": ["<unknown>"],
+        "executionArgv": ["<unknown>"],
+        "cwd": ".",
+        "toolRole": "baseline-comparison",
+        "exitCode": 0 if item.get("outcome") == "pass" else 1,
+        "resultSemantics": "fixed-parser-observation",
+        "actualExecutionInputMode": "NONE",
+        "actualExecutionInputSize": None,
+        "actualExecutionInputSha256": None,
+        "targets": [],
+    }
+    try:
+        derived = _rederive_observation_record(
+            item,
+            synthetic_source,
+            profile_context={
+                "producerObservationUniverseDigest": item.get(
+                    "producerObservationUniverseDigest"
+                ),
+                "producerTranscriptDigest": item.get("producerTranscriptDigest"),
+                "profileCompletedCommandClassSetDigest": item.get(
+                    "profileCompletedCommandClassSetDigest"
+                ),
+                "authorizationContextBindingDigest": (
+                    authorization_context_binding_digest_value
+                ),
+            },
+        )
+    except (TypeError, ValueError):
+        return False
+    for field_name in (
+        "commandClass",
+        "testOrPathScope",
+        "outcome",
+        "signature",
+        "legacyBaselineComparisonDigest",
+        "commandId",
+        "occurrences",
+        "failureIdentity",
+        "failureIdentityHash",
+        "canonicalFailureMaterialVersion",
+        "derivedFailureMembers",
+    ):
+        if item.get(field_name) != derived.get(field_name):
+            return False
+    if source_command is not None:
+        if item.get("derivedFailureDigest") != derived.get("derivedFailureDigest"):
+            return False
+        if item.get("currentFullContextDigest") != derived.get("currentFullContextDigest"):
+            return False
+    if item.get("signature") != item.get("legacyBaselineComparisonDigest"):
+        return False
+    identity = derived["failureIdentity"]
+    known_static = KNOWN_STATIC_FAILURES.get(str(entry.get("testOrPathScope", "")))
+    if known_static is not None:
+        comparable = {key: value for key, value in identity.items() if key != "structuredFailureSet"}
+        expected = {
+            "scope": entry.get("testOrPathScope"),
+            **{key: value for key, value in known_static.items() if key != "signature"},
+        }
+        return (
+            derived.get("legacyBaselineComparisonDigest") == known_static["signature"]
+            and comparable == expected
+        )
+    expected = _known_identity_expected(str(entry.get("testOrPathScope", "")))
+    if expected is not None:
+        return identity == expected
+    signature = str(item.get("legacyBaselineComparisonDigest", ""))
+    if signature.startswith("sha256:"):
+        return (
+            raw.get("observationKind") == "static-producer-v1"
+            and derived.get("legacyBaselineComparisonDigest") == signature
+        )
+    if signature == "learner-browser-executable-unavailable":
+        messages = " ".join(
+            str(value)
+            for key in ("assertionNames", "errorMessages")
+            for value in identity.get(key, [])
+        ).casefold()
+        return (
+            identity.get("scope") == "command:learner-focused-runtime"
+            and len(identity.get("testIds", [])) <= 1
+            and any(marker in messages for marker in ("browser executable", "executable doesn't exist", "playwright install"))
+        )
+    return (
+        raw.get("observationKind")
+        in {"process-output-v1", "standalone-membership-v1"}
+        and derived.get("legacyBaselineComparisonDigest") == signature
+        and derived.get("testOrPathScope") == entry.get("testOrPathScope")
+    )
+
+
+def _baseline_bound_record(
+    collection: str,
+    entry: Mapping[str, Any],
+    *,
+    current_platform: str,
+    source_command_id: str,
+    observed_outcome: str,
+    observed_signature: str,
+    failure_identity_hash_value: str,
+    derived_failure_digest: str,
+    derived_failure_members: Sequence[Mapping[str, Any]],
+    occurrences: int,
+    status: str | None = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "baselineId": entry["id"],
+        "id": entry["id"],
+        "collection": collection,
+        "category": entry["category"],
+        "gate": entry["gate"],
+        "commandClass": entry["commandClass"],
+        "testOrPathScope": entry["testOrPathScope"],
+        "expectedOutcome": entry["expectedOutcome"],
+        "allowedNormalizedSignature": list(entry["allowedNormalizedSignature"]),
+        "maximumOccurrences": entry["maximumOccurrences"],
+        "platforms": list(entry["platforms"]),
+        "checkpointDisposition": entry["checkpointDisposition"],
+        "targetStage": entry["targetStage"],
+        "securityImpact": entry["securityImpact"],
+        "platform": current_platform,
+        "sourceCommandId": source_command_id,
+        "observedOutcome": observed_outcome,
+        "observedSignature": observed_signature,
+        "legacyBaselineComparisonDigest": observed_signature,
+        "failureIdentityHash": failure_identity_hash_value,
+        "canonicalFailureMaterialVersion": CANONICAL_FAILURE_MATERIAL_VERSION,
+        "derivedFailureDigest": derived_failure_digest,
+        "currentFullContextDigest": derived_failure_digest,
+        "derivedFailureMembers": list(derived_failure_members),
+        "occurrences": occurrences,
+    }
+    if status is not None:
+        record["status"] = status
+    return record
+
+
+def compare_observations(
+    baseline: Mapping[str, Any],
+    observations: Sequence[Mapping[str, Any]],
+    completed_classes: set[str],
+    current_platform: str,
+    *,
+    release_gate_required: bool = False,
+    command_records: Sequence[Mapping[str, Any]] | None = None,
+    authorization_context_binding_digest_value: str | None = None,
+) -> dict[str, Any]:
+    collections = {
+        "knownDebts": baseline.get("knownDebts", []),
+        "expectedOmissions": baseline.get("expectedOmissions", []),
+        "releaseOnlySkips": baseline.get("releaseOnlySkips", []),
+    }
+    indexed: dict[tuple[str, str], list[tuple[str, Mapping[str, Any]]]] = {}
+    for collection_name, entries in collections.items():
+        for entry in entries:
+            if not entry_applies(entry, current_platform):
+                continue
+            key = (entry["commandClass"], entry["testOrPathScope"])
+            indexed.setdefault(key, []).append((collection_name, entry))
+
+    result: dict[str, Any] = {
+        "observedDebts": [],
+        "resolvedCandidates": [],
+        "expectedOmissions": [],
+        "releaseOnlySkips": [],
+        "violations": [],
+    }
+    command_by_id = {
+        str(record.get("commandId", "")): record
+        for record in (command_records or [])
+        if isinstance(record, Mapping) and record.get("commandId")
+    }
+    observations_by_key: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    aggregates: dict[
+        tuple[str, str, str, str, str, str, str, str, str],
+        dict[str, Any],
+    ] = {}
+    for item in observations:
+        try:
+            key = (str(item["commandClass"]), str(item["testOrPathScope"]))
+            raw_occurrences = item.get("occurrences", 1)
+            if type(raw_occurrences) is not int:
+                raise TypeError("occurrences is not an integer")
+            occurrences = raw_occurrences
+        except (KeyError, TypeError, ValueError):
+            result["violations"].append({"id": "MALFORMED-OBSERVATION"})
+            continue
+        observations_by_key.setdefault(key, []).append(item)
+        if item["outcome"] == "pass":
+            continue
+        if occurrences < 1:
+            result["violations"].append(
+                {"id": "MALFORMED-OBSERVATION", "commandClass": key[0], "scope": key[1]}
+            )
+            continue
+        candidates = indexed.get(key, [])
+        matched: tuple[str, Mapping[str, Any]] | None = None
+        for collection_name, entry in candidates:
+            if (
+                item["outcome"] == entry["expectedOutcome"]
+                and item["legacyBaselineComparisonDigest"]
+                in entry["allowedNormalizedSignature"]
+                and _failure_identity_authorizes(
+                    entry,
+                    item,
+                    command_by_id.get(str(item.get("commandId", ""))),
+                    authorization_context_binding_digest_value=(
+                        authorization_context_binding_digest_value
+                    ),
+                )
+            ):
+                matched = (collection_name, entry)
+                break
+        if matched is None:
+            result["violations"].append(
+                {
+                    "id": "UNKNOWN-NONPASS",
+                    "commandClass": key[0],
+                    "scope": key[1],
+                    "outcome": item["outcome"],
+                    "signature": item["signature"],
+                    "failureIdentityHash": item.get("failureIdentityHash"),
+                }
+            )
+            continue
+        collection_name, entry = matched
+        aggregate_key = (
+            str(entry["id"]),
+            key[0],
+            key[1],
+            current_platform,
+            str(item["failureIdentityHash"]),
+            str(item["outcome"]),
+            str(item["legacyBaselineComparisonDigest"]),
+            str(item.get("commandId", "")),
+            str(item.get("currentFullContextDigest", "")),
+        )
+        aggregate = aggregates.setdefault(
+            aggregate_key,
+            {
+                "collection": collection_name,
+                "entry": entry,
+                "occurrences": 0,
+                "derivedFailureMembers": item.get("derivedFailureMembers", []),
+            },
+        )
+        aggregate["occurrences"] += occurrences
+
+    entry_totals: dict[str, int] = defaultdict(int)
+    for aggregate_key, aggregate in aggregates.items():
+        entry = aggregate["entry"]
+        occurrences = int(aggregate["occurrences"])
+        entry_totals[str(entry["id"])] += occurrences
+        if occurrences > int(entry["maximumOccurrences"]):
+            result["violations"].append(
+                {
+                    "id": "BASELINE-OCCURRENCE-LIMIT",
+                    "debtId": entry["id"],
+                    "scope": aggregate_key[2],
+                    "occurrences": occurrences,
+                    "maximumOccurrences": entry["maximumOccurrences"],
+                }
+            )
+            continue
+        record = _baseline_bound_record(
+            aggregate["collection"],
+            entry,
+            current_platform=aggregate_key[3],
+            source_command_id=aggregate_key[7],
+            observed_outcome=aggregate_key[5],
+            observed_signature=aggregate_key[6],
+            failure_identity_hash_value=aggregate_key[4],
+            derived_failure_digest=aggregate_key[8],
+            derived_failure_members=aggregate["derivedFailureMembers"],
+            occurrences=occurrences,
+        )
+        if entry.get("currentCiDisposition") == "must-execute" and record["observedOutcome"] == "unavailable":
+            result["violations"].append(
+                {
+                    "id": "REQUIRED-COMMAND-UNAVAILABLE",
+                    "debtId": entry["id"],
+                    "commandClass": aggregate_key[1],
+                    "scope": aggregate_key[2],
+                }
+            )
+        elif aggregate["collection"] == "knownDebts":
+            result["observedDebts"].append(record)
+        elif aggregate["collection"] == "expectedOmissions":
+            result["expectedOmissions"].append(record)
+        else:
+            result["releaseOnlySkips"].append(record)
+            if release_gate_required:
+                result["violations"].append(
+                    {
+                        "id": "RELEASE-ONLY-SKIP-IN-REQUIRED-GATE",
+                        "baselineId": entry["id"],
+                        "commandClass": aggregate_key[1],
+                        "scope": aggregate_key[2],
+                    }
+                )
+
+    source_ids_by_entry: dict[str, set[str]] = defaultdict(set)
+    for aggregate_key in aggregates:
+        source_ids_by_entry[aggregate_key[0]].add(aggregate_key[7])
+    for entry_id, source_ids in source_ids_by_entry.items():
+        if len(source_ids) > 1:
+            result["violations"].append(
+                {
+                    "id": "BASELINE-SOURCE-COMMAND-SPLIT",
+                    "baselineId": entry_id,
+                    "sourceCommandIds": sorted(source_ids),
+                }
+            )
+
+    for entry_id, total in entry_totals.items():
+        maximum = next(
+            int(entry["maximumOccurrences"])
+            for entries in collections.values()
+            for entry in entries
+            if entry["id"] == entry_id
+        )
+        if total > maximum and not any(
+            violation.get("id") == "BASELINE-OCCURRENCE-LIMIT" and violation.get("debtId") == entry_id
+            for violation in result["violations"]
+        ):
+            result["violations"].append(
+                {
+                    "id": "BASELINE-OCCURRENCE-LIMIT",
+                    "debtId": entry_id,
+                    "occurrences": total,
+                    "maximumOccurrences": maximum,
+                }
+            )
+
+    for entry in baseline.get("knownDebts", []):
+        if not entry_applies(entry, current_platform):
+            continue
+        command_class = entry["commandClass"]
+        if command_class not in completed_classes:
+            continue
+        key = (command_class, entry["testOrPathScope"])
+        scoped = observations_by_key.get(key, [])
+        if not scoped:
+            result["violations"].append(
+                {
+                    "id": "KNOWN-SCOPE-NOT-OBSERVED",
+                    "debtId": entry["id"],
+                    "commandClass": command_class,
+                    "scope": entry["testOrPathScope"],
+                }
+            )
+        elif all(item["outcome"] == "pass" for item in scoped):
+            source_ids = {str(item.get("commandId", "")) for item in scoped}
+            if len(source_ids) != 1 or "" in source_ids:
+                result["violations"].append(
+                    {
+                        "id": "RESOLVED-CANDIDATE-SOURCE-INVALID",
+                        "baselineId": entry["id"],
+                    }
+                )
+            else:
+                result["resolvedCandidates"].append(
+                    _baseline_bound_record(
+                        "knownDebts",
+                        entry,
+                        current_platform=current_platform,
+                        source_command_id=next(iter(source_ids)),
+                        observed_outcome="pass",
+                        observed_signature="pass",
+                        failure_identity_hash_value=str(scoped[0].get("failureIdentityHash", "")),
+                        derived_failure_digest=str(scoped[0].get("derivedFailureDigest", "")),
+                        derived_failure_members=scoped[0].get("derivedFailureMembers", []),
+                        occurrences=sum(int(item.get("occurrences", 1)) for item in scoped),
+                        status="RESOLVED-CANDIDATE",
+                    )
+                )
+
+    for collection_name, result_name in (
+        ("expectedOmissions", "expectedOmissions"),
+        ("releaseOnlySkips", "releaseOnlySkips"),
+    ):
+        for entry in baseline.get(collection_name, []):
+            if not entry_applies(entry, current_platform):
+                continue
+            if entry["commandClass"] not in completed_classes:
+                continue
+            key = (entry["commandClass"], entry["testOrPathScope"])
+            if key not in observations_by_key:
+                result["violations"].append(
+                    {
+                        "id": "REQUIRED-POLICY-SCOPE-NOT-OBSERVED",
+                        "recordId": entry["id"],
+                        "commandClass": key[0],
+                        "scope": key[1],
+                    }
+                )
+    for key in ("observedDebts", "resolvedCandidates", "expectedOmissions", "releaseOnlySkips"):
+        result[key] = sorted(result[key], key=lambda item: item["id"])
+    return result
+
+
+def _required_command_execution_passed(record: Mapping[str, Any]) -> bool:
+    return _command_execution_completed(record) and record.get("exitCode") == 0
+
+
+def _command_execution_completed(record: Mapping[str, Any]) -> bool:
+    return (
+        record.get("executed") is True
+        and record.get("started") is True
+        and record.get("setupFailure") is False
+        and record.get("timeoutStatus") == "within-limit"
+        and record.get("outputLimitStatus") == "within-limit"
+        and record.get("processTreeStatus") in {"contained-clean", "not-applicable"}
+    )
+
+
+def _plan_command_requires_completion(record: Mapping[str, Any]) -> bool:
+    return bool(record.get("required")) or record.get("commandRole") == "observation-producing"
+
+
+def _command_completed_for_class(record: Mapping[str, Any]) -> bool:
+    if not _command_execution_completed(record):
+        return False
+    allowed = record.get("allowedExecutionExits")
+    if not isinstance(allowed, list) or record.get("exitCode") not in allowed:
+        return False
+    if record.get("commandRole") == "required-execution" and record.get("exitCode") != 0:
+        return False
+    return True
+
+
+def expected_completed_command_classes(
+    command_plan: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    return sorted(
+        {
+            str(record.get("commandClass"))
+            for record in command_plan
+            if _plan_command_requires_completion(record) and record.get("commandClass")
+        }
+    )
+
+
+def actual_completed_command_classes(
+    command_plan: Sequence[Mapping[str, Any]],
+    command_records: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    records_by_id: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for record in command_records:
+        records_by_id[str(record.get("commandId", ""))].append(record)
+    completed: list[str] = []
+    for command_class in expected_completed_command_classes(command_plan):
+        relevant = [
+            planned
+            for planned in command_plan
+            if planned.get("commandClass") == command_class
+            and _plan_command_requires_completion(planned)
+        ]
+        if relevant and all(
+            len(records_by_id[str(planned.get("commandId", ""))]) == 1
+            and _command_completed_for_class(
+                records_by_id[str(planned.get("commandId", ""))][0]
+            )
+            for planned in relevant
+        ):
+            completed.append(command_class)
+    return completed
+
+
+def completed_command_class_set_digest(classes: Sequence[str]) -> str:
+    return canonical_failure_digest(sorted(set(classes)))
+
+
+def producer_observation_universe(
+    command_records: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "commandId": record.get("commandId"),
+            "ordinal": record.get("ordinal"),
+            "commandClass": record.get("commandClass"),
+            "producerObservations": copy.deepcopy(record.get("producerObservations", [])),
+            "producerObservationSetDigest": record.get("producerObservationSetDigest"),
+        }
+        for record in command_records
+    ]
+
+
+def producer_observation_universe_digest(
+    command_records: Sequence[Mapping[str, Any]],
+) -> str:
+    return canonical_failure_digest(producer_observation_universe(command_records))
+
+
+def _canonical_replay_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _canonical_replay_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_replay_value(item) for item in value]
+    if isinstance(value, str):
+        temporary_root = str(Path(tempfile.gettempdir()).resolve())
+        normalized = value
+        for spelling in {
+            temporary_root,
+            temporary_root.replace("\\", "/"),
+            temporary_root.replace("/", "\\"),
+        }:
+            if spelling:
+                normalized = re.sub(
+                    re.escape(spelling),
+                    "<TASK-TEMP>",
+                    normalized,
+                    flags=re.IGNORECASE if os.name == "nt" else 0,
+                )
+        repository_root = str(REPO_ROOT.resolve())
+        for spelling in {
+            repository_root,
+            repository_root.replace("\\", "/"),
+            repository_root.replace("/", "\\"),
+        }:
+            if spelling:
+                normalized = re.sub(
+                    re.escape(spelling),
+                    "<REPO>",
+                    normalized,
+                    flags=re.IGNORECASE if os.name == "nt" else 0,
+                )
+        return normalized
+    return value
+
+
+def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    canonical = _canonical_replay_value(copy.deepcopy(dict(record)))
+    canonical.pop("durationSeconds", None)
+    tool_role = str(canonical.get("toolRole", "unknown"))
+    for field_name in (
+        "argv",
+        "logicalArgv",
+        "executionArgv",
+        "actualExecutionArgv",
+    ):
+        values = canonical.get(field_name)
+        if isinstance(values, list) and values:
+            values[0] = f"<TRUSTED-TOOL:{tool_role}>"
+    canonical["resolvedExecutablePath"] = f"<TRUSTED-TOOL:{tool_role}>"
+    canonical["resolvedExecutableFileIdentity"] = None
+    if canonical.get("dependencyBacked"):
+        canonical["runtimeClosureDigest"] = "<FRESH-RUNTIME-CLOSURE>"
+        if tool_role != "node-vitest-security-test":
+            canonical["resolvedTestRunnerEntrypoint"] = (
+                f"<TRUSTED-TOOL:{tool_role}>"
+            )
+    for target in canonical.get("targets", []):
+        if isinstance(target, dict):
+            target["canonicalSourcePath"] = None
+            target["fileIdentity"] = None
+    for execution_input in canonical.get("executionInputs", []):
+        if isinstance(execution_input, dict):
+            execution_input["canonicalSourcePath"] = None
+            execution_input["plannedStableIdentity"] = None
+    lease = canonical.get("targetExecutionLease")
+    if isinstance(lease, dict):
+        for key in (
+            "canonicalSourcePath",
+            "plannedStableFileIdentity",
+            "heldStableFileIdentity",
+        ):
+            if key in lease:
+                lease[key] = None
+    protected = canonical.get("protectedTargetBundle")
+    if isinstance(protected, dict):
+        for execution_input in protected.get("executionInputs", []):
+            if isinstance(execution_input, dict):
+                execution_input["canonicalSourcePath"] = None
+                execution_input["plannedStableIdentity"] = None
+    canonical["executionDurationClass"] = record.get("executionDurationClass")
+    return canonical
+
+
+def producer_transcript_digest(
+    command_plan_digest_value: str,
+    command_records: Sequence[Mapping[str, Any]],
+    completed_classes: Sequence[str],
+) -> str:
+    universe = producer_observation_universe(command_records)
+    return canonical_failure_digest(
+        {
+            "commandPlanDigest": command_plan_digest_value,
+            "orderedCommandTranscript": [
+                _canonical_transcript_record(record) for record in command_records
+            ],
+            "orderedProducerObservationUniverse": universe,
+            "producerObservationUniverseDigest": canonical_failure_digest(universe),
+            "completedCommandClasses": sorted(set(completed_classes)),
+            "completedCommandClassSetDigest": completed_command_class_set_digest(
+                completed_classes
+            ),
+        }
+    )
+
+
+def command_id_set_differences(
+    command_plan: Sequence[Mapping[str, Any]],
+    command_records: Sequence[Mapping[str, Any]],
+) -> tuple[list[str], list[str], list[str]]:
+    planned_ids = [str(record.get("commandId", "")) for record in command_plan]
+    actual_ids = [str(record.get("commandId", "")) for record in command_records]
+    counts: dict[str, int] = defaultdict(int)
+    for command_id in actual_ids:
+        counts[command_id] += 1
+    return (
+        sorted(set(planned_ids) - set(actual_ids)),
+        sorted(set(actual_ids) - set(planned_ids)),
+        sorted(command_id for command_id, count in counts.items() if count > 1),
+    )
+
+
+def _ensure_runner_authorization_context_binding(
+    runner: Any,
+) -> tuple[dict[str, Any] | None, str | None]:
+    execution_binding = getattr(runner, "execution_binding", None)
+    if not isinstance(execution_binding, Mapping):
+        return None, None
+    expected_verifier_job_id: str | None = None
+    external_context = getattr(runner, "external_verification_context", None)
+    if isinstance(external_context, ExternallyExpectedVerificationContext):
+        expected_verifier_job_id = external_context.verifier_job_id
+    derived = authorization_context_binding_from_execution_binding(
+        execution_binding,
+        expected_verifier_job_id=expected_verifier_job_id,
+    )
+    existing = getattr(runner, "authorization_context_binding", None)
+    if existing is not None and existing != derived:
+        raise ValueError(
+            "runner authorization context differs from producer/verifier authority"
+        )
+    digest = authorization_context_binding_digest(derived)
+    runner.authorization_context_binding = copy.deepcopy(derived)
+    runner.authorization_context_binding_digest = digest
+    return derived, digest
+
+
+def finalize_evidence_transcript(runner: Any) -> dict[str, Any]:
+    """Bind raw producer facts before any baseline-derived evidence is persisted."""
+
+    _authorization_binding, authorization_digest = (
+        _ensure_runner_authorization_context_binding(runner)
+    )
+    records = list(getattr(runner, "command_results", []))
+    plan = list(getattr(runner, "command_plan", []))
+    plan_digest = command_plan_digest(plan)
+    for record in records:
+        producer = record.get("producerObservations", [])
+        if not isinstance(producer, list):
+            producer = []
+            record["producerObservations"] = producer
+        record["producerObservationSetDigest"] = producer_observation_set_digest(producer)
+    expected_classes = expected_completed_command_classes(plan)
+    actual_classes = actual_completed_command_classes(plan, records)
+    for record in records:
+        record["completedCommandClass"] = (
+            record.get("commandClass") if _command_completed_for_class(record) else None
+        )
+    universe_digest = producer_observation_universe_digest(records)
+    transcript_digest = producer_transcript_digest(plan_digest, records, actual_classes)
+    class_digest = completed_command_class_set_digest(actual_classes)
+    expected_class_digest = completed_command_class_set_digest(expected_classes)
+    missing_ids, extra_ids, duplicate_ids = command_id_set_differences(plan, records)
+    context = {
+        "producerObservationUniverseDigest": universe_digest,
+        "producerTranscriptDigest": transcript_digest,
+        "profileCompletedCommandClassSetDigest": class_digest,
+        "authorizationContextBindingDigest": authorization_digest,
+    }
+    rebound: list[dict[str, Any]] = []
+    by_id = {
+        str(record.get("commandId", "")): record
+        for record in records
+        if isinstance(record, Mapping)
+    }
+    for item in list(getattr(runner, "observations", [])):
+        raw = item.get("rawObservation") if isinstance(item, Mapping) else None
+        command_id = str(
+            item.get("commandId", "")
+            if isinstance(item, Mapping)
+            else ""
+        ) or str(raw.get("commandId", "") if isinstance(raw, Mapping) else "")
+        source = by_id.get(command_id)
+        rebound.append(
+            _rederive_observation_record(item, source, profile_context=context)
+            if source is not None and isinstance(item, Mapping)
+            else copy.deepcopy(dict(item))
+        )
+    runner.observations = rebound
+    runner.completed_classes = set(actual_classes)
+    runner.command_plan_digest = plan_digest
+    runner.expected_completed_command_classes = expected_classes
+    runner.actual_completed_command_classes = actual_classes
+    runner.expected_completed_command_class_set_digest = expected_class_digest
+    runner.completed_command_class_set_digest = class_digest
+    runner.producer_observation_universe_digest = universe_digest
+    runner.producer_transcript_digest = transcript_digest
+    runner.producer_observation_count = sum(
+        len(record.get("producerObservations", []))
+        for record in records
+        if isinstance(record.get("producerObservations", []), list)
+    )
+    runner.missing_command_ids = missing_ids
+    runner.extra_command_ids = extra_ids
+    runner.duplicate_command_ids = duplicate_ids
+    return context
+
+
+def _command_authority_violations(
+    profile: str,
+    command_records: Sequence[Mapping[str, Any]],
+    observations: Sequence[Mapping[str, Any]],
+    *,
+    expected_plan: Sequence[Mapping[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    if (
+        len(command_records) == 1
+        and command_records[0].get("commandId") == "command-results-size-limit"
+    ):
+        return [
+            {
+                "id": "COMMAND-RESULT-JSON-LIMIT",
+                "detail": "OUTPUT-LIMIT-EXCEEDED for command-results.json",
+            }
+        ]
+    expected = list(expected_plan or expected_command_authority(profile))
+    authority_fields = set(expected[0]) if expected else set()
+    actual = [
+        {key: record.get(key) for key in authority_fields}
+        for record in command_records
+    ]
+    violations: list[dict[str, Any]] = []
+    if actual != expected:
+        violations.append(
+            {
+                "id": "COMMAND-AUTHORITY-MISMATCH",
+                "expectedCommandIds": [item["commandId"] for item in expected],
+                "observedCommandIds": [item.get("commandId") for item in actual],
+            }
+        )
+    command_ids = [str(record.get("commandId", "")) for record in command_records]
+    if len(command_ids) != len(set(command_ids)):
+        violations.append({"id": "DUPLICATE-COMMAND-ID"})
+    expected_by_id = {item["commandId"]: item for item in expected}
+    observations_by_command: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for item in observations:
+        observations_by_command[str(item.get("commandId", ""))].append(item)
+    for record in command_records:
+        command_id = str(record.get("commandId", ""))
+        authority = expected_by_id.get(command_id)
+        if authority is None:
+            continue
+        if record.get("actualExecutionArgv") != authority.get("executionArgv"):
+            violations.append(
+                {"id": "EXECUTION-ARGV-MISMATCH", "commandId": command_id}
+            )
+        if record.get("actualExecutionInputMode") != authority.get("executionInputMode"):
+            violations.append(
+                {"id": "EXECUTION-INPUT-MODE-MISMATCH", "commandId": command_id}
+            )
+        if authority.get("executionInputMode") == "TARGET-BYTES-STDIN" and (
+            record.get("actualExecutionInputSize") != authority.get("executionInputSize")
+            or record.get("actualExecutionInputSha256") != authority.get("executionInputSha256")
+            or not isinstance(record.get("targetExecutionLease"), Mapping)
+            or record.get("targetExecutionLease", {}).get("mutationDetected") is not False
+        ):
+            violations.append(
+                {"id": "EXECUTION-INPUT-IDENTITY-MISMATCH", "commandId": command_id}
+            )
+        execution_completed = _command_execution_completed(record)
+        if not execution_completed:
+            if authority["required"]:
+                violations.append(
+                    {
+                        "id": "REQUIRED-COMMAND-EXECUTION",
+                        "commandId": command_id,
+                        "exitCode": record.get("exitCode"),
+                    }
+                )
+            continue
+        exit_code = record.get("exitCode")
+        if exit_code not in authority.get("allowedExecutionExits", []):
+            violations.append(
+                {
+                    "id": "COMMAND-EXIT-OUTSIDE-AUTHORITY",
+                    "commandId": command_id,
+                    "exitCode": exit_code,
+                }
+            )
+            continue
+        if authority.get("commandRole") == "required-execution" and exit_code != 0:
+            violations.append(
+                {
+                    "id": "REQUIRED-COMMAND-NONZERO",
+                    "commandId": command_id,
+                    "exitCode": exit_code,
+                }
+            )
+        if authority.get("commandRole") == "observation-producing" and exit_code != 0:
+            sourced = observations_by_command.get(command_id, [])
+            if not sourced or not any(item.get("outcome") not in {"pass", "skip"} for item in sourced):
+                violations.append(
+                    {
+                        "id": "NONZERO-COMMAND-WITHOUT-OBSERVATION",
+                        "commandId": command_id,
+                    }
+                )
+    return violations
+
+
+def _validate_raw_observation(
+    raw: Any,
+    *,
+    label: str,
+    source: Mapping[str, Any] | None,
+) -> list[str]:
+    expected_keys = {
+        "schemaVersion",
+        "commandId",
+        "commandOrdinal",
+        "observationOrdinal",
+        "observationKind",
+        "sourceResultId",
+        "sourcePath",
+        "rawStructuredFields",
+        "sourceOutputDigest",
+        "occurrences",
+        "producerRecordDigest",
+    }
+    if not isinstance(raw, dict) or set(raw) != expected_keys:
+        return [f"{label}: raw observation schema is not exact"]
+    errors: list[str] = []
+    if raw.get("schemaVersion") != RAW_OBSERVATION_SCHEMA_VERSION:
+        errors.append(f"{label}: raw observation schema version is invalid")
+    for key in ("commandId", "observationKind", "sourceResultId", "sourceOutputDigest", "producerRecordDigest"):
+        if not isinstance(raw.get(key), str) or not raw.get(key):
+            errors.append(f"{label}: {key} must be a non-empty string")
+    if raw.get("observationKind") not in {
+        "static-producer-v1",
+        "process-output-v1",
+        "standalone-membership-v1",
+        "normalized-fields-v1",
+    }:
+        errors.append(f"{label}: observationKind is not authorized")
+    for key in ("commandOrdinal", "observationOrdinal"):
+        if type(raw.get(key)) is not int or not 0 <= raw.get(key, -1) < MAX_EVIDENCE_COLLECTION_ITEMS:
+            errors.append(f"{label}: {key} must be a bounded non-negative integer")
+    if type(raw.get("occurrences")) is not int or not 1 <= raw.get("occurrences", 0) <= MAX_EVIDENCE_COLLECTION_ITEMS:
+        errors.append(f"{label}: occurrences must be a bounded positive integer")
+    source_path = raw.get("sourcePath")
+    if source_path is not None and (
+        not isinstance(source_path, str)
+        or not source_path
+        or Path(source_path).is_absolute()
+        or "\\" in source_path
+        or any(part in {"", ".", ".."} for part in source_path.split("/"))
+    ):
+        errors.append(f"{label}: sourcePath must be null or a safe repository-relative path")
+    errors.extend(
+        f"{label}: {error}"
+        for error in _raw_observation_forbidden_fields(raw.get("rawStructuredFields"))
+    )
+    digest_source = {key: value for key, value in raw.items() if key != "producerRecordDigest"}
+    try:
+        expected_digest = _producer_record_digest(digest_source)
+    except (TypeError, ValueError) as exc:
+        errors.append(f"{label}: raw observation cannot be canonically framed ({type(exc).__name__})")
+    else:
+        if raw.get("producerRecordDigest") != expected_digest:
+            errors.append(f"{label}: producerRecordDigest is invalid")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(raw.get("sourceOutputDigest", ""))):
+        errors.append(f"{label}: sourceOutputDigest is invalid")
+    if source is not None:
+        if raw.get("commandId") != source.get("commandId"):
+            errors.append(f"{label}: commandId does not bind the source command")
+        if raw.get("commandOrdinal") != source.get("ordinal"):
+            errors.append(f"{label}: commandOrdinal does not bind the source command")
+        if raw.get("sourceOutputDigest") != command_output_digest(source):
+            errors.append(f"{label}: sourceOutputDigest does not bind the producer command streams")
+    return errors
+
+
+def _decode_protected_utf8(data: bytes, logical_path: str) -> str:
+    if data.startswith(b"\xef\xbb\xbf"):
+        raise UnicodeError(f"{logical_path} must be UTF-8 without BOM")
+    return data.decode("utf-8", errors="strict")
+
+
+def run_workflow_policy(
+    workflow_bytes: bytes,
+    ci_policy_bytes: bytes,
+    baseline_bytes: bytes,
+    expected_target_authority: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Validate workflow governance from protected bytes without reopening paths."""
+
+    logical_inputs = (
+        (".github/workflows/ci.yml", workflow_bytes),
+        ("docs/CI_POLICY.md", ci_policy_bytes),
+        ("developer/tests/ci/phase1-ci-baseline.json", baseline_bytes),
+    )
+    errors: list[str] = []
+    if [target.get("path") for target in expected_target_authority] != [
+        logical_path for logical_path, _data in logical_inputs
+    ]:
+        return ["workflow policy protected target order is not exact"]
+    for (logical_path, data), target in zip(logical_inputs, expected_target_authority):
+        if not isinstance(data, bytes):
+            errors.append(f"{logical_path}: protected input is not bytes")
+            continue
+        digest = hashlib.sha256(data).hexdigest()
+        if len(data) != target.get("size") or digest != target.get("sha256"):
+            errors.append(f"{logical_path}: protected input identity differs from the command plan")
+    if errors:
+        return errors
+    try:
+        workflow_text = _decode_protected_utf8(workflow_bytes, logical_inputs[0][0])
+        policy_text = _decode_protected_utf8(ci_policy_bytes, logical_inputs[1][0])
+        baseline_text = _decode_protected_utf8(baseline_bytes, logical_inputs[2][0])
+        baseline = strict_json_loads(baseline_text, label=logical_inputs[2][0])
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        return [f"protected workflow-policy input cannot be decoded: {type(exc).__name__}: {exc}"]
+    errors.extend(validate_baseline_document(baseline))
+    errors.extend(check_workflow_text(workflow_text))
+    errors.extend(check_governance_language(workflow_text, policy_text))
+    return sorted(set(errors))
+
+
+def _validate_observation_record(
+    item: Any,
+    index: int,
+    command_by_id: Mapping[str, Mapping[str, Any]],
+    *,
+    authorization_context_binding_digest_value: str | None = None,
+) -> list[str]:
+    label = f"command-results.json.observations[{index}]"
+    expected_keys = {
+        "commandClass",
+        "testOrPathScope",
+        "outcome",
+        "signature",
+        "legacyBaselineComparisonDigest",
+        "commandId",
+        "occurrences",
+        "rawObservation",
+        "producerObservationSetDigest",
+        "producerObservationUniverseDigest",
+        "producerTranscriptDigest",
+        "completedCommandClass",
+        "profileCompletedCommandClassSetDigest",
+        "canonicalFailureMaterialVersion",
+        "derivedFailureDigest",
+        "currentFullContextDigest",
+        "derivedFailureMembers",
+        "failureIdentity",
+        "failureIdentityHash",
+    }
+    if not isinstance(item, dict) or set(item) != expected_keys:
+        return [f"{label}: schema is not exact"]
+    errors: list[str] = []
+    for key in (
+        "commandClass",
+        "testOrPathScope",
+        "outcome",
+        "signature",
+        "legacyBaselineComparisonDigest",
+        "commandId",
+        "failureIdentityHash",
+        "derivedFailureDigest",
+        "currentFullContextDigest",
+        "producerObservationSetDigest",
+        "producerObservationUniverseDigest",
+        "producerTranscriptDigest",
+        "profileCompletedCommandClassSetDigest",
+    ):
+        if not isinstance(item.get(key), str) or not item.get(key):
+            errors.append(f"{label}: {key} must be a non-empty string")
+    if type(item.get("occurrences")) is not int or not 1 <= item.get("occurrences", 0) <= MAX_EVIDENCE_COLLECTION_ITEMS:
+        errors.append(f"{label}: occurrences must be a bounded positive integer")
+    identity = item.get("failureIdentity")
+    if not isinstance(identity, dict):
+        errors.append(f"{label}: failureIdentity must be an object")
+    elif item.get("failureIdentityHash") != failure_identity_hash(identity):
+        errors.append(f"{label}: failureIdentityHash is invalid")
+    members = item.get("derivedFailureMembers")
+    if not isinstance(members, list) or not members or len(members) > MAX_EVIDENCE_COLLECTION_ITEMS:
+        errors.append(f"{label}: derivedFailureMembers must be a bounded non-empty array")
+    if item.get("canonicalFailureMaterialVersion") != CANONICAL_FAILURE_MATERIAL_VERSION:
+        errors.append(f"{label}: canonicalFailureMaterialVersion is invalid")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(item.get("derivedFailureDigest", ""))):
+        errors.append(f"{label}: derivedFailureDigest is invalid")
+    if item.get("legacyBaselineComparisonDigest") != item.get("signature"):
+        errors.append(f"{label}: legacy comparison digest alias is inconsistent")
+    if item.get("currentFullContextDigest") != item.get("derivedFailureDigest"):
+        errors.append(f"{label}: current full-context digest alias is inconsistent")
+    source = command_by_id.get(str(item.get("commandId", "")))
+    if source is None:
+        errors.append(f"{label}: source command is missing")
+    elif source.get("commandClass") != item.get("commandClass"):
+        errors.append(f"{label}: source command class is inconsistent")
+    elif (
+        source.get("producerObservationSetDigest")
+        != item.get("producerObservationSetDigest")
+        or source.get("completedCommandClass") != item.get("completedCommandClass")
+    ):
+        errors.append(
+            f"{label}: producer/completed-command context is not independently derived"
+        )
+    elif source.get("executed") is not True or source.get("setupFailure") is not False:
+        errors.append(f"{label}: source command did not execute successfully enough to emit observations")
+    else:
+        raw = item.get("rawObservation")
+        errors.extend(_validate_raw_observation(raw, label=f"{label}.rawObservation", source=source))
+        if isinstance(raw, dict):
+            command_class = str(item.get("commandClass", ""))
+            scope = str(item.get("testOrPathScope", ""))
+            expected_raw_path: str | None = None
+            expected_result_id = scope
+            if command_class == "static-suite" and scope.startswith("result:"):
+                expected_raw_path = STATIC_SUITE_RELATIVE_PATH
+                expected_result_id = scope[len("result:") :]
+            elif command_class == "direct-syntax":
+                expected_raw_path = scope
+            elif command_class == "learner-focused":
+                expected_raw_path = "developer/tests/js/learnerPalette.test.js"
+            elif command_class == "frontend-security" and scope.startswith("file:"):
+                expected_raw_path = scope[len("file:") :]
+            elif command_class == "backend-canonical":
+                expected_raw_path = "backend/package.json"
+            elif command_class == "standalone-membership" and scope.startswith(
+                "membership:index.html::"
+            ):
+                expected_raw_path = scope[len("membership:index.html::") :]
+            if raw.get("sourceResultId") != expected_result_id:
+                errors.append(f"{label}: raw sourceResultId does not match the immutable scope")
+            if expected_raw_path is not None and raw.get("sourcePath") != expected_raw_path:
+                errors.append(f"{label}: raw sourcePath does not match the immutable scope")
+            producer = source.get("producerObservations")
+            matches = (
+                [candidate for candidate in producer if candidate == raw]
+                if isinstance(producer, list)
+                else []
+            )
+            if len(matches) != 1:
+                errors.append(f"{label}: raw observation is not bound exactly once to the producer command")
+            try:
+                derived = _rederive_observation_record(
+                    item,
+                    source,
+                    profile_context={
+                        "producerObservationUniverseDigest": item.get(
+                            "producerObservationUniverseDigest"
+                        ),
+                        "producerTranscriptDigest": item.get(
+                            "producerTranscriptDigest"
+                        ),
+                        "profileCompletedCommandClassSetDigest": item.get(
+                            "profileCompletedCommandClassSetDigest"
+                        ),
+                        "authorizationContextBindingDigest": (
+                            authorization_context_binding_digest_value
+                        ),
+                    },
+                )
+            except (TypeError, ValueError) as exc:
+                errors.append(f"{label}: canonical failure derivation failed ({type(exc).__name__})")
+            else:
+                for derived_key in expected_keys:
+                    if item.get(derived_key) != derived.get(derived_key):
+                        errors.append(f"{label}: {derived_key} does not equal the independently derived value")
+        command_class = str(item.get("commandClass", ""))
+        scope = str(item.get("testOrPathScope", ""))
+        expected_source: str | None = None
+        if command_class == "static-suite":
+            expected_source = "static-suite"
+        elif command_class == "direct-syntax":
+            expected_source = f"node-check:{scope}"
+        elif command_class == "learner-focused":
+            expected_source = "learner-focused"
+        elif command_class == "frontend-security" and scope.startswith("file:"):
+            expected_source = f"frontend-security:{Path(scope[5:]).name}"
+        elif command_class == "backend-canonical":
+            expected_source = "backend-canonical"
+        elif command_class == "standalone-membership":
+            expected_source = "standalone-membership-audit"
+        if expected_source is not None and item.get("commandId") != expected_source:
+            errors.append(f"{label}: source command does not match the immutable scope binding")
+        outcome = item.get("outcome")
+        if outcome == "pass" and not _required_command_execution_passed(source):
+            errors.append(f"{label}: passing observation came from a non-passing command")
+        if (
+            outcome not in {"pass", "skip"}
+            and command_class != "static-suite"
+            and source.get("exitCode") == 0
+        ):
+            errors.append(f"{label}: non-pass observation contradicts a zero-exit source command")
+    return errors
+
+
+def derive_authoritative_evidence(
+    profile: str,
+    observations: Sequence[Mapping[str, Any]],
+    completed_command_classes: Iterable[str],
+    command_records: Sequence[Mapping[str, Any]],
+    immutable_baseline_authority: Mapping[str, Any],
+    current_platform: str,
+    command_plan: Sequence[Mapping[str, Any]] | None = None,
+    authorization_context_binding_digest_value: str | None = None,
+) -> dict[str, Any]:
+    """Recompute all semantic evidence from commands and the frozen baseline map."""
+
+    command_by_id: dict[str, Mapping[str, Any]] = {}
+    derivation_violations: list[dict[str, Any]] = []
+    for record in command_records:
+        command_id = str(record.get("commandId", ""))
+        if not command_id or command_id in command_by_id:
+            continue
+        command_by_id[command_id] = record
+    valid_observations: list[Mapping[str, Any]] = []
+    for index, item in enumerate(observations):
+        item_errors = _validate_observation_record(
+            item,
+            index,
+            command_by_id,
+            authorization_context_binding_digest_value=(
+                authorization_context_binding_digest_value
+            ),
+        )
+        if item_errors:
+            derivation_violations.extend(
+                {"id": "MALFORMED-COMMAND-OBSERVATION", "detail": error}
+                for error in item_errors
+            )
+        else:
+            valid_observations.append(item)
+    evidence_raw = [
+        item.get("rawObservation")
+        for item in valid_observations
+        if isinstance(item.get("rawObservation"), dict)
+    ]
+    producer_raw: list[Mapping[str, Any]] = []
+    producer_identities: set[tuple[str, int]] = set()
+    producer_digests: set[str] = set()
+    for record in command_records:
+        command_id = str(record.get("commandId", ""))
+        records = record.get("producerObservations")
+        if not isinstance(records, list):
+            derivation_violations.append(
+                {"id": "MALFORMED-PRODUCER-OBSERVATION-SET", "commandId": command_id}
+            )
+            continue
+        if record.get("producerObservationSetDigest") != producer_observation_set_digest(records):
+            derivation_violations.append(
+                {"id": "PRODUCER-OBSERVATION-SET-DIGEST-MISMATCH", "commandId": command_id}
+            )
+        observed_ordinals: list[int] = []
+        for index, raw in enumerate(records):
+            raw_errors = _validate_raw_observation(
+                raw,
+                label=f"command:{command_id}.producerObservations[{index}]",
+                source=record,
+            )
+            if raw_errors:
+                derivation_violations.extend(
+                    {"id": "MALFORMED-PRODUCER-OBSERVATION", "detail": error}
+                    for error in raw_errors
+                )
+                continue
+            assert isinstance(raw, dict)
+            identity = (command_id, int(raw["observationOrdinal"]))
+            digest = str(raw["producerRecordDigest"])
+            if identity in producer_identities or digest in producer_digests:
+                derivation_violations.append(
+                    {
+                        "id": "DUPLICATE-PRODUCER-OBSERVATION",
+                        "commandId": command_id,
+                        "observationOrdinal": raw["observationOrdinal"],
+                    }
+                )
+            producer_identities.add(identity)
+            producer_digests.add(digest)
+            observed_ordinals.append(int(raw["observationOrdinal"]))
+            producer_raw.append(raw)
+        if observed_ordinals != list(range(len(observed_ordinals))):
+            derivation_violations.append(
+                {"id": "PRODUCER-OBSERVATION-ORDINAL-GAP", "commandId": command_id}
+            )
+        if record.get("commandRole") != "observation-producing" and records:
+            derivation_violations.append(
+                {"id": "UNAUTHORIZED-PRODUCER-OBSERVATION", "commandId": command_id}
+            )
+    evidence_keys = sorted(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        for value in evidence_raw
+    )
+    producer_keys = sorted(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        for value in producer_raw
+    )
+    if evidence_keys != producer_keys:
+        missing = len([value for value in producer_keys if value not in evidence_keys])
+        additional = len([value for value in evidence_keys if value not in producer_keys])
+        derivation_violations.append(
+            {
+                "id": "PRODUCER-OBSERVATION-COMPLETENESS",
+                "missingFromEvidence": missing,
+                "additionalInEvidence": additional,
+            }
+        )
+    completed = set(completed_command_classes)
+    if any(not isinstance(value, str) or not value for value in completed):
+        derivation_violations.append({"id": "MALFORMED-COMPLETED-COMMAND-CLASS"})
+    comparison = compare_observations(
+        immutable_baseline_authority,
+        valid_observations,
+        completed,
+        current_platform,
+        release_gate_required=profile in {"standalone", "all"},
+        command_records=command_records,
+        authorization_context_binding_digest_value=(
+            authorization_context_binding_digest_value
+        ),
+    )
+    comparison["violations"].extend(
+        _command_authority_violations(
+            profile,
+            command_records,
+            valid_observations,
+            expected_plan=command_plan,
+        )
+    )
+    comparison["violations"].extend(derivation_violations)
+
+    valid_resolved: list[dict[str, Any]] = []
+    for record in comparison["resolvedCandidates"]:
+        source = command_by_id.get(str(record.get("sourceCommandId", "")))
+        if source is None or not _required_command_execution_passed(source):
+            comparison["violations"].append(
+                {
+                    "id": "RESOLVED-CANDIDATE-WITHOUT-SUCCESSFUL-SCOPE",
+                    "baselineId": record.get("baselineId"),
+                }
+            )
+        else:
+            valid_resolved.append(record)
+    comparison["resolvedCandidates"] = valid_resolved
+    comparison["violations"] = sorted(
+        comparison["violations"],
+        key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+    )
+    return comparison
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb", buffering=0) as source:
+        while True:
+            chunk = source.read(65_536)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+class ExecutableIdentityLease:
+    """Hold and revalidate one security-critical executable or entrypoint."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        role: str,
+        *,
+        repo_root: Path = REPO_ROOT,
+        allow_dependency_root: bool = False,
+    ) -> None:
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            raise OSError(f"{role} path is not absolute")
+        okay, reason = _secure_regular_file(candidate)
+        if not okay:
+            raise OSError(f"{role} is not a trusted regular file: {reason}")
+        canonical = candidate.resolve(strict=True)
+        if _path_is_within(canonical, repo_root.resolve(strict=True)) and not allow_dependency_root:
+            raise OSError(f"{role} is inside the repository workspace")
+        if any(part.casefold() == "node_modules" for part in canonical.parts) and not allow_dependency_root:
+            raise OSError(f"{role} is inside node_modules")
+        self.path = str(canonical)
+        self.role = role
+        self.closed = False
+        self._handle: Any | None = None
+        self._fd: int | None = None
+        if os.name == "nt":
+            from ctypes import wintypes
+
+            self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+            class BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("dwFileAttributes", wintypes.DWORD),
+                    ("ftCreationTime", wintypes.FILETIME),
+                    ("ftLastAccessTime", wintypes.FILETIME),
+                    ("ftLastWriteTime", wintypes.FILETIME),
+                    ("dwVolumeSerialNumber", wintypes.DWORD),
+                    ("nFileSizeHigh", wintypes.DWORD),
+                    ("nFileSizeLow", wintypes.DWORD),
+                    ("nNumberOfLinks", wintypes.DWORD),
+                    ("nFileIndexHigh", wintypes.DWORD),
+                    ("nFileIndexLow", wintypes.DWORD),
+                ]
+
+            self._info_type = BY_HANDLE_FILE_INFORMATION
+            self._kernel32.CreateFileW.argtypes = (
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.HANDLE,
+            )
+            self._kernel32.CreateFileW.restype = wintypes.HANDLE
+            self._kernel32.GetFileInformationByHandle.argtypes = (
+                wintypes.HANDLE,
+                ctypes.POINTER(BY_HANDLE_FILE_INFORMATION),
+            )
+            self._kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+            self._kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            self._kernel32.CloseHandle.restype = wintypes.BOOL
+            handle = self._kernel32.CreateFileW(
+                self.path,
+                0x80000000,
+                0x00000001,
+                None,
+                3,
+                0x00200000 | 0x00000080,
+                None,
+            )
+            invalid = ctypes.c_void_p(-1).value
+            if not handle or int(handle) == invalid:
+                raise ctypes.WinError(ctypes.get_last_error())
+            self._handle = handle
+            self._initial_identity = self._windows_identity(handle)
+        else:
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            self._fd = os.open(self.path, flags)
+            self._initial_identity = _stable_file_identity(os.fstat(self._fd))
+        self.expected_sha256 = self._hash_open_identity()
+        self.expected_size = int(Path(self.path).stat().st_size)
+        okay, error = self.verify()
+        if not okay:
+            self.close()
+            raise OSError(error or f"{role} lease verification failed")
+
+    def _windows_identity(self, handle: Any) -> dict[str, Any]:
+        info = self._info_type()
+        if not self._kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return {
+            "volumeSerial": str(int(info.dwVolumeSerialNumber)),
+            "fileIndex": str((int(info.nFileIndexHigh) << 32) | int(info.nFileIndexLow)),
+            "size": (int(info.nFileSizeHigh) << 32) | int(info.nFileSizeLow),
+            "links": int(info.nNumberOfLinks),
+            "writeTime": str(
+                (int(info.ftLastWriteTime.dwHighDateTime) << 32)
+                | int(info.ftLastWriteTime.dwLowDateTime)
+            ),
+            "reparsePoint": bool(int(info.dwFileAttributes) & 0x400),
+        }
+
+    def _hash_open_identity(self) -> str:
+        if self._fd is None:
+            return _sha256_file(Path(self.path))
+        digest = hashlib.sha256()
+        offset = os.lseek(self._fd, 0, os.SEEK_CUR)
+        try:
+            os.lseek(self._fd, 0, os.SEEK_SET)
+            while True:
+                chunk = os.read(self._fd, 65_536)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        finally:
+            os.lseek(self._fd, offset, os.SEEK_SET)
+        return digest.hexdigest()
+
+    def verify(self) -> tuple[bool, str | None]:
+        if self.closed:
+            return False, f"{self.role} lease is closed"
+        try:
+            path = Path(self.path)
+            okay, reason = _secure_regular_file(path)
+            if not okay or str(path.resolve(strict=True)) != self.path:
+                return False, f"{self.role} path drifted: {reason or 'canonical path changed'}"
+            if self._handle is not None:
+                identity = self._windows_identity(self._handle)
+                if identity != self._initial_identity:
+                    return False, f"{self.role} held identity drifted"
+            else:
+                assert self._fd is not None
+                if _stable_file_identity(os.fstat(self._fd)) != self._initial_identity:
+                    return False, f"{self.role} descriptor identity drifted"
+                if _stable_file_identity(path.lstat()) != self._initial_identity:
+                    return False, f"{self.role} path identity drifted"
+            if self._hash_open_identity() != self.expected_sha256:
+                return False, f"{self.role} SHA-256 drifted"
+        except OSError as exc:
+            return False, f"{self.role} lease verification failed: {type(exc).__name__}"
+        return True, None
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "role": self.role,
+            "canonicalPath": self.path,
+            "size": self.expected_size,
+            "sha256": self.expected_sha256,
+            "stableIdentity": copy.deepcopy(self._initial_identity),
+            "leaseHeld": not self.closed,
+        }
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        if self._handle is not None:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+        self.closed = True
+
+    def __del__(self) -> None:  # pragma: no cover - last-resort handle cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def _portable_file_mode(metadata: os.stat_result) -> str:
+    return format(stat.S_IMODE(metadata.st_mode), "04o")
+
+
+def _dependency_member_manifest(root: Path) -> list[dict[str, Any]]:
+    root_resolved = root.resolve(strict=True)
+    records: list[dict[str, Any]] = []
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = sorted(os.scandir(directory), key=lambda item: item.name)
+        except OSError as exc:
+            raise ValueError(
+                f"dependency directory cannot be enumerated: {type(exc).__name__}"
+            ) from exc
+        child_directories: list[Path] = []
+        for entry in entries:
+            path = Path(entry.path)
+            metadata = path.lstat()
+            relative = path.relative_to(root).as_posix()
+            if stat.S_ISLNK(metadata.st_mode):
+                target = os.readlink(path)
+                if Path(target).is_absolute():
+                    raise ValueError(f"dependency symlink target is absolute: {relative}")
+                resolved_target = path.resolve(strict=True)
+                if not _path_is_within(resolved_target, root_resolved):
+                    raise ValueError(f"dependency symlink escapes its root: {relative}")
+                record = {
+                    "relativePath": relative,
+                    "fileType": "symlink",
+                    "mode": _portable_file_mode(metadata),
+                    "size": int(metadata.st_size),
+                    "sha256": None,
+                    "symlinkTarget": target.replace("\\", "/"),
+                }
+            elif _is_reparse_point(metadata):
+                raise ValueError(f"dependency member is a reparse point: {relative}")
+            elif stat.S_ISDIR(metadata.st_mode):
+                record = {
+                    "relativePath": relative,
+                    "fileType": "directory",
+                    "mode": _portable_file_mode(metadata),
+                    "size": 0,
+                    "sha256": None,
+                    "symlinkTarget": None,
+                }
+                child_directories.append(path)
+            elif stat.S_ISREG(metadata.st_mode):
+                before = _stat_identity(metadata)
+                digest = _sha256_file(path)
+                if _stat_identity(path.lstat()) != before:
+                    raise ValueError(f"dependency member changed during measurement: {relative}")
+                record = {
+                    "relativePath": relative,
+                    "fileType": "regular-file",
+                    "mode": _portable_file_mode(metadata),
+                    "size": int(metadata.st_size),
+                    "sha256": digest,
+                    "symlinkTarget": None,
+                }
+            else:
+                raise ValueError(f"dependency member has an unsupported file type: {relative}")
+            records.append(record)
+        pending.extend(reversed(child_directories))
+    return sorted(records, key=lambda item: item["relativePath"])
+
+
+def _runtime_version(argv: Sequence[str], environment: Mapping[str, str]) -> str:
+    completed = subprocess.run(
+        list(argv),
+        cwd=tempfile.gettempdir(),
+        env=dict(environment),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        timeout=30,
+        check=False,
+    )
+    if completed.returncode != 0 or len(completed.stdout) > 4096 or completed.stderr:
+        raise ValueError("trusted runtime product/version verification failed")
+    value = completed.stdout.decode("utf-8", errors="strict").strip()
+    if not value or len(value) > 256:
+        raise ValueError("trusted runtime returned an invalid version")
+    return value
+
+
+@dataclass
+class RuntimeDependencyClosure:
+    document: dict[str, Any]
+    runtime_digest: str
+    dependency_digest: str
+    member_count: int
+    dependency_roots: tuple[Path, ...]
+    leases: dict[str, ExecutableIdentityLease]
+
+    @classmethod
+    def build(
+        cls,
+        profile: str,
+        tools: Mapping[str, str],
+        environment: Mapping[str, str],
+        *,
+        repo_root: Path = REPO_ROOT,
+        require_fresh_dependencies: bool = False,
+        source_environment: Mapping[str, str] | None = None,
+    ) -> "RuntimeDependencyClosure":
+        source = os.environ if source_environment is None else source_environment
+        if source.get("NODE_PATH"):
+            raise ValueError("unplanned NODE_PATH is forbidden")
+        python_path = Path(tools.get("python", sys.executable)).resolve(strict=True)
+        node_value = tools.get("node")
+        npm_value = tools.get("npm")
+        if node_value is None:
+            raise ValueError("runtime closure requires a trusted Node entrypoint")
+        local_npm_omission = (
+            npm_value is None
+            and source.get("GITHUB_ACTIONS") != "true"
+            and not require_fresh_dependencies
+            and profile in {"policy", "static", "standalone"}
+        )
+        if npm_value is None and not local_npm_omission:
+            raise ValueError("runtime closure requires a trusted npm entrypoint")
+        node_path = Path(node_value).resolve(strict=True)
+        npm_path = Path(npm_value).resolve(strict=True) if npm_value is not None else None
+        dependency_logical_roots: list[str] = []
+        if profile in {"frontend", "all"}:
+            dependency_logical_roots.append("developer/node_modules")
+        if profile in {"backend", "all"}:
+            dependency_logical_roots.append("backend/node_modules")
+        dependency_roots: list[Path] = []
+        root_records: list[dict[str, Any]] = []
+        member_count = 0
+        for logical in dependency_logical_roots:
+            root = repo_root.joinpath(*logical.split("/"))
+            if not root.is_dir():
+                raise ValueError(f"required dependency root is missing: {logical}")
+            metadata = root.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
+                raise ValueError(f"dependency root is a link/reparse point: {logical}")
+            members = _dependency_member_manifest(root)
+            member_count += len(members)
+            root_records.append(
+                {
+                    "logicalRoot": logical,
+                    "memberCount": len(members),
+                    "members": members,
+                    "memberManifestDigest": hashlib.sha256(_canonical_frame(members)).hexdigest(),
+                }
+            )
+            dependency_roots.append(root.resolve(strict=True))
+        if require_fresh_dependencies and source.get("CI_FRESH_DEPENDENCY_INSTALL") != "1":
+            raise ValueError("fresh dependency installation marker is absent")
+
+        lockfiles: list[dict[str, Any]] = []
+        for relative in ("developer/package-lock.json", "backend/package-lock.json"):
+            path = repo_root.joinpath(*relative.split("/"))
+            metadata = path.lstat()
+            lockfiles.append(
+                {
+                    "relativePath": relative,
+                    "mode": _portable_file_mode(metadata),
+                    "size": int(metadata.st_size),
+                    "sha256": _sha256_file(path),
+                }
+            )
+
+        leases: dict[str, ExecutableIdentityLease] = {}
+        try:
+            leases["python"] = ExecutableIdentityLease(python_path, "python-verifier")
+            leases["node"] = ExecutableIdentityLease(node_path, "node-runtime")
+            if npm_path is not None:
+                leases["npm"] = ExecutableIdentityLease(
+                    npm_path,
+                    "npm-entrypoint",
+                    allow_dependency_root=True,
+                )
+            git_value = tools.get("git")
+            if git_value:
+                leases["git"] = ExecutableIdentityLease(git_value, "git-authority")
+            vitest_record: dict[str, Any] | None = None
+            if profile in {"frontend", "all"}:
+                vitest_path = repo_root / "developer" / "node_modules" / "vitest" / "vitest.mjs"
+                package_path = repo_root / "developer" / "node_modules" / "vitest" / "package.json"
+                if not vitest_path.is_file() or not package_path.is_file():
+                    raise ValueError("fresh Vitest entrypoint/package metadata is unavailable")
+                package = strict_json_load_file(package_path)
+                if package.get("name") != "vitest" or not isinstance(package.get("version"), str):
+                    raise ValueError("Vitest package identity is invalid")
+                leases["vitest"] = ExecutableIdentityLease(
+                    vitest_path,
+                    "vitest-entrypoint",
+                    allow_dependency_root=True,
+                )
+                vitest_record = {
+                    "resolvedEntrypoint": "developer/node_modules/vitest/vitest.mjs",
+                    "packageVersion": package["version"],
+                    "entrypointSha256": leases["vitest"].expected_sha256,
+                }
+            python_record = {
+                **leases["python"].evidence(),
+                "version": platform.python_version(),
+                "implementation": platform.python_implementation(),
+            }
+            node_record = {
+                **leases["node"].evidence(),
+                "version": _runtime_version([str(node_path), "--version"], environment),
+            }
+            npm_record = (
+                {
+                    **leases["npm"].evidence(),
+                    "available": True,
+                    "version": _runtime_version(
+                        [str(node_path), str(npm_path), "--version"], environment
+                    ),
+                }
+                if npm_path is not None
+                else {
+                    "role": "npm-entrypoint",
+                    "canonicalPath": None,
+                    "size": None,
+                    "sha256": None,
+                    "stableIdentity": None,
+                    "leaseHeld": False,
+                    "available": False,
+                    "version": "unavailable-local-nondependency-profile",
+                }
+            )
+            git_record = (
+                leases["git"].evidence() if "git" in leases else None
+            )
+            semantic_dependency = {
+                "lockfiles": lockfiles,
+                "dependencyRoots": root_records,
+                "vitest": vitest_record,
+                "nodePath": [],
+            }
+            dependency_digest = hashlib.sha256(
+                _canonical_frame(semantic_dependency)
+            ).hexdigest()
+            document = {
+                "closureSchemaVersion": RUNTIME_DEPENDENCY_CLOSURE_SCHEMA_VERSION,
+                "measurementStatus": (
+                    "measured-complete"
+                    if npm_path is not None
+                    else "local-nondependency-npm-unavailable"
+                ),
+                "profile": profile,
+                "runnerOS": _canonical_runner_os(),
+                "pythonExecutable": python_record,
+                "nodeExecutable": node_record,
+                "npmEntrypoint": npm_record,
+                "gitExecutable": git_record,
+                "lockfiles": lockfiles,
+                "dependencyRoots": root_records,
+                "vitest": vitest_record,
+                "nodePath": [],
+                "dependencyClosureDigest": dependency_digest,
+                "dependencyMemberCount": member_count,
+            }
+            runtime_digest = hashlib.sha256(_canonical_frame(document)).hexdigest()
+            document["closureDigest"] = runtime_digest
+            return cls(
+                document=document,
+                runtime_digest=runtime_digest,
+                dependency_digest=dependency_digest,
+                member_count=member_count,
+                dependency_roots=tuple(dependency_roots),
+                leases=leases,
+            )
+        except Exception:
+            for lease in leases.values():
+                lease.close()
+            raise
+
+    def verify_executables(self) -> list[str]:
+        errors: list[str] = []
+        for role, lease in self.leases.items():
+            okay, error = lease.verify()
+            if not okay:
+                errors.append(error or f"{role} executable identity drifted")
+        return errors
+
+    def close(self) -> None:
+        for lease in self.leases.values():
+            lease.close()
+
+
+class _MutationWatcher:
+    def close(self) -> None:
+        raise NotImplementedError
+
+
+class _InotifyMutationWatcher(_MutationWatcher):
+    IN_MODIFY = 0x00000002
+    IN_ATTRIB = 0x00000004
+    IN_CLOSE_WRITE = 0x00000008
+    IN_MOVED_FROM = 0x00000040
+    IN_MOVED_TO = 0x00000080
+    IN_CREATE = 0x00000100
+    IN_DELETE = 0x00000200
+    IN_DELETE_SELF = 0x00000400
+    IN_MOVE_SELF = 0x00000800
+    IN_Q_OVERFLOW = 0x00004000
+    MASK = (
+        IN_MODIFY
+        | IN_ATTRIB
+        | IN_CLOSE_WRITE
+        | IN_MOVED_FROM
+        | IN_MOVED_TO
+        | IN_CREATE
+        | IN_DELETE
+        | IN_DELETE_SELF
+        | IN_MOVE_SELF
+        | IN_Q_OVERFLOW
+    )
+
+    def __init__(self, roots: Sequence[Path], callback: Any) -> None:
+        self.callback = callback
+        self.stop_event = threading.Event()
+        self.libc = ctypes.CDLL(None, use_errno=True)
+        self.libc.inotify_init1.argtypes = (ctypes.c_int,)
+        self.libc.inotify_init1.restype = ctypes.c_int
+        self.libc.inotify_add_watch.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32)
+        self.libc.inotify_add_watch.restype = ctypes.c_int
+        self.fd = self.libc.inotify_init1(os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+        if self.fd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_init1 failed")
+        self.watch_paths: dict[int, str] = {}
+        try:
+            directories: set[Path] = set()
+            for root in roots:
+                resolved = root.resolve(strict=True)
+                if resolved.is_file():
+                    resolved = resolved.parent
+                directories.add(resolved)
+                for current, child_dirs, _files in os.walk(resolved, followlinks=False):
+                    current_path = Path(current)
+                    directories.add(current_path)
+                    child_dirs[:] = [
+                        name
+                        for name in child_dirs
+                        if not (current_path / name).is_symlink()
+                    ]
+            for directory in sorted(directories, key=lambda value: str(value)):
+                wd = self.libc.inotify_add_watch(
+                    self.fd,
+                    os.fsencode(directory),
+                    self.MASK,
+                )
+                if wd < 0:
+                    raise OSError(ctypes.get_errno(), f"inotify_add_watch failed: {directory}")
+                self.watch_paths[int(wd)] = str(directory)
+            if not self.watch_paths:
+                raise OSError("inotify watcher set is empty")
+            self.thread = threading.Thread(target=self._run, name="ci-inotify-closure", daemon=True)
+            self.thread.start()
+        except Exception:
+            os.close(self.fd)
+            raise
+
+    def _run(self) -> None:
+        event_header = struct.Struct("iIII")
+        while not self.stop_event.is_set():
+            try:
+                readable, _writable, _exceptional = select.select([self.fd], [], [], 0.05)
+                if not readable:
+                    continue
+                data = os.read(self.fd, 262_144)
+            except OSError as exc:
+                if self.stop_event.is_set() or exc.errno in {errno.EBADF, errno.EINTR}:
+                    continue
+                self.callback(f"inotify read failure: {type(exc).__name__}", True)
+                return
+            offset = 0
+            while offset + event_header.size <= len(data):
+                wd, mask, _cookie, name_length = event_header.unpack_from(data, offset)
+                offset += event_header.size
+                name_bytes = data[offset : offset + name_length]
+                offset += name_length
+                name = name_bytes.rstrip(b"\x00").decode("utf-8", errors="replace")
+                if mask & self.IN_Q_OVERFLOW:
+                    self.callback("IN_Q_OVERFLOW", True)
+                else:
+                    root = self.watch_paths.get(wd, "<unknown-watch>")
+                    self.callback(f"inotify mutation mask=0x{mask:x} path={root}/{name}", False)
+
+    def close(self) -> None:
+        self.stop_event.set()
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+        self.thread.join(timeout=2.0)
+        if self.thread.is_alive():
+            self.callback("inotify watcher did not stop", True)
+
+
+class _WindowsDirectoryMutationWatcher(_MutationWatcher):
+    def __init__(self, roots: Sequence[Path], callback: Any) -> None:
+        from ctypes import wintypes
+
+        self.callback = callback
+        self.stop_event = threading.Event()
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.kernel32.CreateFileW.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        self.kernel32.CreateFileW.restype = wintypes.HANDLE
+        self.kernel32.ReadDirectoryChangesW.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        )
+        self.kernel32.ReadDirectoryChangesW.restype = wintypes.BOOL
+        self.kernel32.CancelIoEx.argtypes = (wintypes.HANDLE, ctypes.c_void_p)
+        self.kernel32.CancelIoEx.restype = wintypes.BOOL
+        self.kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        self.kernel32.CloseHandle.restype = wintypes.BOOL
+        self.handles: list[tuple[Any, str]] = []
+        self.threads: list[threading.Thread] = []
+        invalid = ctypes.c_void_p(-1).value
+        normalized_roots: set[Path] = set()
+        for root in roots:
+            resolved = root.resolve(strict=True)
+            normalized_roots.add(resolved if resolved.is_dir() else resolved.parent)
+        try:
+            for root in sorted(normalized_roots, key=lambda value: str(value).casefold()):
+                handle = self.kernel32.CreateFileW(
+                    str(root),
+                    0x0001,
+                    0x00000001 | 0x00000002 | 0x00000004,
+                    None,
+                    3,
+                    0x02000000 | 0x40000000,
+                    None,
+                )
+                if not handle or int(handle) == invalid:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                self.handles.append((handle, str(root)))
+            if not self.handles:
+                raise OSError("ReadDirectoryChangesW watcher set is empty")
+            for handle, root in self.handles:
+                thread = threading.Thread(
+                    target=self._run_one,
+                    args=(handle, root),
+                    name="ci-rdcw-closure",
+                    daemon=True,
+                )
+                self.threads.append(thread)
+                thread.start()
+        except Exception:
+            self.close()
+            raise
+
+    def _run_one(self, handle: Any, root: str) -> None:
+        from ctypes import wintypes
+
+        notify_filter = 0x00000001 | 0x00000002 | 0x00000004 | 0x00000008 | 0x00000010 | 0x00000100
+        while not self.stop_event.is_set():
+            buffer = ctypes.create_string_buffer(65_536)
+            returned = wintypes.DWORD()
+            okay = self.kernel32.ReadDirectoryChangesW(
+                handle,
+                buffer,
+                len(buffer),
+                True,
+                notify_filter,
+                ctypes.byref(returned),
+                None,
+                None,
+            )
+            if not okay:
+                error_code = ctypes.get_last_error()
+                if self.stop_event.is_set() and error_code in {6, 995}:
+                    return
+                self.callback(
+                    f"ReadDirectoryChangesW failure={error_code} root={root}",
+                    error_code in {1022, 234},
+                )
+                return
+            if returned.value == 0:
+                self.callback(f"ReadDirectoryChangesW queue overflow root={root}", True)
+            else:
+                self.callback(f"ReadDirectoryChangesW mutation root={root}", False)
+
+    def close(self) -> None:
+        if not hasattr(self, "stop_event"):
+            return
+        self.stop_event.set()
+        for handle, _root in getattr(self, "handles", []):
+            self.kernel32.CancelIoEx(handle, None)
+        for thread in getattr(self, "threads", []):
+            thread.join(timeout=2.0)
+        for handle, _root in getattr(self, "handles", []):
+            self.kernel32.CloseHandle(handle)
+        for thread in getattr(self, "threads", []):
+            if thread.is_alive():
+                self.callback("ReadDirectoryChangesW watcher did not stop", True)
+        self.handles = []
+
+
+class _ModelMutationWatcher(_MutationWatcher):
+    """Deterministic watcher backend used by cross-platform state-machine tests."""
+
+    def __init__(self, roots: Sequence[Path], callback: Any) -> None:
+        self.roots = tuple(roots)
+        self.callback = callback
+        self.closed = False
+
+    def emit(self, reason: str, *, overflow: bool = False) -> None:
+        self.callback(reason, overflow)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _remeasure_dependency_semantics(
+    closure: RuntimeDependencyClosure,
+    *,
+    repo_root: Path = REPO_ROOT,
+) -> tuple[str, int]:
+    root_records: list[dict[str, Any]] = []
+    member_count = 0
+    for original in closure.document["dependencyRoots"]:
+        logical = str(original["logicalRoot"])
+        root = repo_root.joinpath(*logical.split("/"))
+        members = _dependency_member_manifest(root)
+        member_count += len(members)
+        root_records.append(
+            {
+                "logicalRoot": logical,
+                "memberCount": len(members),
+                "members": members,
+                "memberManifestDigest": hashlib.sha256(_canonical_frame(members)).hexdigest(),
+            }
+        )
+    lockfiles: list[dict[str, Any]] = []
+    for original in closure.document["lockfiles"]:
+        relative = str(original["relativePath"])
+        path = repo_root.joinpath(*relative.split("/"))
+        metadata = path.lstat()
+        lockfiles.append(
+            {
+                "relativePath": relative,
+                "mode": _portable_file_mode(metadata),
+                "size": int(metadata.st_size),
+                "sha256": _sha256_file(path),
+            }
+        )
+    vitest = closure.document.get("vitest")
+    if isinstance(vitest, dict):
+        vitest_path = repo_root.joinpath(*str(vitest["resolvedEntrypoint"]).split("/"))
+        package_path = vitest_path.parent / "package.json"
+        package = strict_json_load_file(package_path)
+        vitest = {
+            "resolvedEntrypoint": str(vitest["resolvedEntrypoint"]),
+            "packageVersion": package.get("version"),
+            "entrypointSha256": _sha256_file(vitest_path),
+        }
+    semantic = {
+        "lockfiles": lockfiles,
+        "dependencyRoots": root_records,
+        "vitest": vitest,
+        "nodePath": [],
+    }
+    return hashlib.sha256(_canonical_frame(semantic)).hexdigest(), member_count
+
+
+class RuntimeDependencyClosureGuard:
+    """Sticky native mutation guard for the verifier's fresh runtime closure."""
+
+    def __init__(
+        self,
+        closure: RuntimeDependencyClosure,
+        *,
+        repo_root: Path = REPO_ROOT,
+        watcher_factory: Any | None = None,
+    ) -> None:
+        self.closure = closure
+        self.repo_root = repo_root
+        self.lock = threading.Lock()
+        self.mutation_reasons: list[str] = []
+        self.queue_overflow = False
+        roots = list(closure.dependency_roots)
+        roots.extend(Path(lease.path).parent for lease in closure.leases.values())
+        roots = sorted(set(roots), key=lambda value: str(value).casefold())
+        if watcher_factory is None:
+            watcher_factory = (
+                _WindowsDirectoryMutationWatcher
+                if os.name == "nt"
+                else _InotifyMutationWatcher
+            )
+        self.watcher = watcher_factory(roots, self._record_event)
+        self.active = True
+        self.initial_dependency_digest = closure.dependency_digest
+        self.initial_member_count = closure.member_count
+
+    def _record_event(self, reason: str, overflow: bool) -> None:
+        with self.lock:
+            if overflow:
+                self.queue_overflow = True
+            if len(self.mutation_reasons) < 256:
+                self.mutation_reasons.append(sanitize_text(reason))
+
+    @property
+    def mutated(self) -> bool:
+        with self.lock:
+            return bool(self.mutation_reasons) or self.queue_overflow
+
+    def verify(self, phase: str) -> list[str]:
+        errors = self.closure.verify_executables()
+        try:
+            digest, member_count = _remeasure_dependency_semantics(
+                self.closure,
+                repo_root=self.repo_root,
+            )
+        except Exception as exc:
+            errors.append(
+                f"runtime dependency closure cannot be remeasured after {phase}: {type(exc).__name__}"
+            )
+        else:
+            if digest != self.initial_dependency_digest or member_count != self.initial_member_count:
+                self._record_event(f"pre/post closure manifest drift after {phase}", False)
+        with self.lock:
+            if self.queue_overflow:
+                errors.append("runtime dependency watcher queue overflowed")
+            if self.mutation_reasons:
+                errors.append(
+                    "runtime dependency closure mutation is sticky: "
+                    + "; ".join(self.mutation_reasons[:8])
+                )
+        return sorted(set(errors))
+
+    def evidence(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "guardSchemaVersion": RUNTIME_DEPENDENCY_GUARD_SCHEMA_VERSION,
+                "watcherBackend": type(self.watcher).__name__,
+                "active": self.active,
+                "activeDuringReplay": True,
+                "mutationState": "mutated" if self.mutation_reasons or self.queue_overflow else "clean",
+                "queueOverflow": self.queue_overflow,
+                "mutationEventCount": len(self.mutation_reasons),
+            }
+
+    def close(self) -> list[str]:
+        if not self.active:
+            return []
+        errors = self.verify("verifier-completion")
+        self.watcher.close()
+        self.active = False
+        errors.extend(self.closure.verify_executables())
+        return sorted(set(errors))
+
+
+def required_tool_names(profile: str, *, require_install_tools: bool = False) -> set[str]:
+    required = {"python", "git", "node"}
+    if profile in {"backend", "all"} or require_install_tools:
+        required.add("npm")
+    if profile in {"static", "standalone", "all"}:
+        required.add("bash")
+        required.add("powershell" if os.name == "nt" else "pwsh")
+    return required
+
+
+def _repository_git_index_path(repo_root: Path) -> Path:
+    marker = repo_root / ".git"
+    metadata = marker.lstat()
+    if stat.S_ISDIR(metadata.st_mode):
+        return marker / "index"
+    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata) or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("repository .git marker is not a regular file or directory")
+    raw = marker.read_bytes()
+    if len(raw) > 4096 or b"\x00" in raw:
+        raise ValueError("repository .git marker is not a bounded gitdir record")
+    text = raw.decode("utf-8", errors="strict").strip()
+    if not text.casefold().startswith("gitdir: "):
+        raise ValueError("repository .git marker has an invalid gitdir record")
+    git_dir = Path(text[8:])
+    if not git_dir.is_absolute():
+        git_dir = marker.parent / git_dir
+    return git_dir.resolve(strict=True) / "index"
+
+
+def deterministic_candidate_paths(repo_root: Path = REPO_ROOT) -> tuple[list[str], list[str]]:
+    """Read the Git index directly, then add only the fixed CI untracked allowlist."""
+
+    errors: list[str] = []
+    paths: list[str] = []
+    try:
+        index_path = _repository_git_index_path(repo_root)
+        metadata = index_path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata) or not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("Git index is not a non-reparse regular file")
+        if not 12 <= metadata.st_size <= 128 * 1024 * 1024:
+            raise ValueError("Git index size is outside the fixed authority bound")
+        data = index_path.read_bytes()
+        if len(data) != metadata.st_size or data[:4] != b"DIRC":
+            raise ValueError("Git index framing is invalid")
+        version, entry_count = struct.unpack(">II", data[4:12])
+        if version not in {2, 3} or entry_count > MAX_PROFILE_COMMANDS:
+            raise ValueError("Git index version/count is outside the supported authority contract")
+        offset = 12
+        for _index in range(entry_count):
+            entry_start = offset
+            if offset + 62 > len(data) - 20:
+                raise ValueError("Git index entry is truncated")
+            flags = struct.unpack(">H", data[offset + 60 : offset + 62])[0]
+            offset += 62
+            if version >= 3 and flags & 0x4000:
+                if offset + 2 > len(data) - 20:
+                    raise ValueError("Git index extended flags are truncated")
+                offset += 2
+            name_length = flags & 0x0FFF
+            if name_length < 0x0FFF:
+                name_end = offset + name_length
+                if name_end >= len(data) - 20 or data[name_end] != 0:
+                    raise ValueError("Git index pathname framing is invalid")
+            else:
+                name_end = data.find(b"\x00", offset, len(data) - 20)
+                if name_end < 0:
+                    raise ValueError("Git index long pathname is unterminated")
+            relative = data[offset:name_end].decode("utf-8", errors="strict")
+            if (
+                not relative
+                or relative.startswith(("/", "\\"))
+                or "\\" in relative
+                or any(part in {"", ".", ".."} for part in relative.split("/"))
+            ):
+                raise ValueError("Git index contains an unsafe pathname")
+            stage = (flags >> 12) & 0x3
+            if stage == 0:
+                paths.append(relative)
+            offset = name_end + 1
+            offset += (8 - ((offset - entry_start) % 8)) % 8
+        if hashlib.sha1(data[:-20]).digest() != data[-20:]:
+            raise ValueError("Git index checksum is invalid")
+    except (OSError, UnicodeError, ValueError, struct.error) as exc:
+        errors.append(f"deterministic Git-index enumeration failed: {type(exc).__name__}: {exc}")
+        return [], errors
+    for relative in sorted(LOCAL_IMPLEMENTATION_ALLOWLIST):
+        if (repo_root / relative).is_file() and relative not in paths:
+            paths.append(relative)
+    if len(paths) != len(set(paths)):
+        errors.append("deterministic candidate path inventory contains duplicates")
+    return sorted(paths), sorted(set(errors))
+
+
+_FILE_AUTHORITY_CACHE: dict[
+    tuple[str, int, int, int, int], tuple[int, str, dict[str, Any]]
+] = {}
+_FILE_AUTHORITY_CACHE_LOCK = threading.Lock()
+
+
+def _measured_file_authority(
+    path: Path,
+    *,
+    use_cache: bool = True,
+) -> tuple[int | None, str | None, dict[str, Any] | None]:
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = resolved.lstat()
+    except OSError:
+        return None, None, None
+    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata) or not stat.S_ISREG(metadata.st_mode):
+        return None, None, None
+    key = (
+        str(resolved),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+        int(metadata.st_ino),
+    )
+    if use_cache:
+        with _FILE_AUTHORITY_CACHE_LOCK:
+            cached = _FILE_AUTHORITY_CACHE.get(key)
+        if cached is not None:
+            return cached
+    digest = _sha256_file(resolved)
+    try:
+        after = resolved.lstat()
+    except OSError:
+        return None, None, None
+    if _stat_identity(after) != _stat_identity(metadata):
+        return None, None, None
+    identity = _stable_file_identity(metadata)
+    value = (int(metadata.st_size), digest, identity)
+    if use_cache:
+        with _FILE_AUTHORITY_CACHE_LOCK:
+            _FILE_AUTHORITY_CACHE[key] = value
+    return value
+
+
+def _target_authority(repo_root: Path, relative: str) -> dict[str, Any]:
+    source = repo_root.joinpath(*relative.split("/"))
+    size, digest, identity = _measured_file_authority(source, use_cache=False)
+    try:
+        canonical = str(source.resolve(strict=True))
+        metadata = source.lstat()
+        mode_type = "regular-file" if stat.S_ISREG(metadata.st_mode) else "other"
+        reparse_point = _is_reparse_point(metadata) or stat.S_ISLNK(metadata.st_mode)
+    except OSError:
+        canonical = None
+        mode_type = None
+        reparse_point = None
+    return {
+        "path": relative,
+        "canonicalSourcePath": canonical,
+        "size": size,
+        "sha256": digest,
+        "fileIdentity": identity,
+        "modeType": mode_type,
+        "reparsePoint": reparse_point,
+    }
+
+
+def deterministic_static_invocation_id(repo_root: Path = REPO_ROOT) -> str:
+    """Derive the producer nonce without accepting evidence-controlled input."""
+
+    authority = _target_authority(repo_root, STATIC_SUITE_RELATIVE_PATH)
+    seed = hashlib.sha256(
+        _canonical_frame(
+            {
+                "purpose": "static-machine-invocation-v1",
+                "target": {
+                    "path": authority.get("path"),
+                    "size": authority.get("size"),
+                    "sha256": authority.get("sha256"),
+                },
+            }
+        )
+    ).digest()
+    value = bytearray(seed[:16])
+    value[6] = (value[6] & 0x0F) | 0x40
+    value[8] = (value[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(value)))
+
+
+def _node_stdin_parser_mode(repo_root: Path, relative: str) -> str:
+    suffix = Path(relative).suffix.casefold()
+    if suffix == ".mjs":
+        return "module"
+    if suffix != ".js":
+        raise ValueError("Node stdin syntax adapter supports only .js and .mjs targets")
+    current = repo_root.joinpath(*relative.split("/")).parent
+    root = repo_root.resolve(strict=True)
+    while _path_is_within(current.resolve(strict=True), root):
+        package_path = current / "package.json"
+        if package_path.is_file():
+            try:
+                package = strict_json_load_file(package_path)
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+                return "commonjs"
+            return "module" if package.get("type") == "module" else "commonjs"
+        if current.resolve(strict=True) == root:
+            break
+        current = current.parent
+    return "commonjs"
+
+
+def _baseline_source_command_id(entry: Mapping[str, Any]) -> str | None:
+    command_class = str(entry.get("commandClass", ""))
+    scope = str(entry.get("testOrPathScope", ""))
+    if command_class == "static-suite":
+        return "static-suite"
+    if command_class == "direct-syntax":
+        return f"node-check:{scope}"
+    if command_class == "learner-focused":
+        return "learner-focused"
+    if command_class == "frontend-security" and scope.startswith("file:"):
+        return f"frontend-security:{Path(scope[5:]).name}"
+    if command_class == "backend-canonical":
+        return "backend-canonical"
+    if command_class == "standalone-membership":
+        return "standalone-membership-audit"
+    return None
+
+
+def build_profile_command_plan(
+    profile: str,
+    *,
+    tools: Mapping[str, str],
+    candidate_paths: Sequence[str],
+    baseline: Mapping[str, Any],
+    current_platform: str,
+    static_invocation_id: str,
+    repo_root: Path = REPO_ROOT,
+    bash_lease: TrustedBashLease | None = None,
+) -> list[dict[str, Any]]:
+    """Build the complete ordered plan before profile execution begins."""
+
+    plan: list[dict[str, Any]] = []
+    python = tools.get("python", sys.executable)
+    git = tools.get("git", "<unavailable-git>")
+    node = tools.get("node", "node")
+    npm = tools.get("npm", "npm")
+    bash = tools.get("bash", "bash")
+    baseline_nonpass_commands = {
+        command_id
+        for collection in ("knownDebts", "expectedOmissions", "releaseOnlySkips")
+        for entry in baseline.get(collection, [])
+        if entry_applies(entry, current_platform)
+        if (command_id := _baseline_source_command_id(entry)) is not None
+    }
+    target_authority_cache: dict[str, dict[str, Any]] = {}
+
+    def add(
+        command_id: str,
+        command_class: str,
+        argv: Sequence[str],
+        *,
+        required: bool = True,
+        tool_role: str,
+        targets: Sequence[str] = (),
+        command_role: str = "required-execution",
+        allowed_exits: Sequence[int] = (0,),
+        result_semantics: str = "exit-zero-required",
+        execution_argv: Sequence[str] | None = None,
+        execution_input_mode: str = "NONE",
+    ) -> None:
+        executable_value = str(argv[0]) if argv else str(python)
+        executable_path = Path(executable_value)
+        try:
+            resolved_executable = str(executable_path.resolve(strict=True))
+        except OSError:
+            resolved_executable = executable_value
+        executable_size, executable_hash, executable_identity = _measured_file_authority(
+            Path(resolved_executable)
+        )
+        target_authorities = []
+        for relative in targets:
+            if relative not in target_authority_cache:
+                target_authority_cache[relative] = _target_authority(repo_root, relative)
+            target_authorities.append(copy.deepcopy(target_authority_cache[relative]))
+        actual_execution_argv = [
+            str(value) for value in (argv if execution_argv is None else execution_argv)
+        ]
+        if execution_input_mode == "TARGET-BYTES-STDIN":
+            if len(target_authorities) != 1:
+                raise ValueError("TARGET-BYTES-STDIN commands require exactly one target")
+            execution_input_size = target_authorities[0]["size"]
+            execution_input_sha256 = target_authorities[0]["sha256"]
+        else:
+            execution_input_size = None
+            execution_input_sha256 = None
+        logical_argv = [str(value) for value in argv]
+        plan.append(
+            {
+                "commandId": command_id,
+                "ordinal": len(plan),
+                "commandClass": command_class,
+                "commandRole": command_role,
+                "required": required,
+                "profile": profile,
+                "platform": current_platform,
+                "argv": logical_argv,
+                "logicalArgv": logical_argv,
+                "executionArgv": actual_execution_argv,
+                "executionInputMode": execution_input_mode,
+                "executionInputSize": execution_input_size,
+                "executionInputSha256": execution_input_sha256,
+                "cwd": ".",
+                "toolRole": tool_role,
+                "resolvedExecutablePath": resolved_executable,
+                "resolvedExecutableSize": executable_size,
+                "resolvedExecutableSha256": executable_hash,
+                "resolvedExecutableFileIdentity": executable_identity,
+                "executionLease": (
+                    dict(bash_lease.identity)
+                    if command_id == "git-bash-version" and bash_lease is not None
+                    else None
+                ),
+                "targets": target_authorities,
+                "resultSemantics": result_semantics,
+                "allowedExecutionExits": list(allowed_exits),
+            }
+        )
+
+    def add_internal(
+        command_id: str,
+        command_class: str,
+        *,
+        targets: Sequence[str] = (),
+        command_role: str = "required-execution",
+        allowed_exits: Sequence[int] = (0,),
+        result_semantics: str = "deterministic-in-process-check",
+    ) -> None:
+        add(
+            command_id,
+            command_class,
+            [python, "<internal>", command_id],
+            tool_role="python-in-process",
+            targets=targets,
+            command_role=command_role,
+            allowed_exits=allowed_exits,
+            result_semantics=result_semantics,
+            execution_input_mode=("PROTECTED-TARGET-BUNDLE" if targets else "NONE"),
+        )
+
+    add_internal(
+        "baseline-schema",
+        "baseline-policy",
+        targets=["developer/tests/ci/phase1-ci-baseline.json"],
+    )
+    add("node-version", "runtime-identity", [node, "--version"], tool_role="node-runtime")
+    add(
+        "npm-version",
+        "runtime-identity",
+        [npm, "--version"],
+        required=profile in {"backend", "all"},
+        tool_role="npm-runtime",
+    )
+    if profile in {"static", "standalone", "all"}:
+        add("git-bash-version", "runtime-identity", [bash, "--version"], tool_role="git-bash-runtime")
+    if profile in {"policy", "all"}:
+        add(
+            "git-candidate-paths",
+            "repository-boundary",
+            trusted_git_arguments(git, "ls-files", "-z", "--cached", "--others", "--exclude-standard"),
+            tool_role="git-candidate-enumerator",
+        )
+        add("git-tracked-paths", "repository-boundary", trusted_git_arguments(git, "ls-files", "-z", "--cached"), tool_role="git-tracked-enumerator")
+        add("git-diff-check", "repository-boundary", trusted_git_arguments(git, "diff", "--check"), tool_role="git-worktree-validator")
+        add("git-cached-diff-check", "repository-boundary", trusted_git_arguments(git, "diff", "--cached", "--check"), tool_role="git-index-validator")
+        add("git-stage-modes", "repository-boundary", trusted_git_arguments(git, "ls-files", "-s", "-z"), tool_role="git-mode-enumerator")
+        add("git-dir", "repository-boundary", trusted_git_arguments(git, "rev-parse", "--absolute-git-dir"), tool_role="git-operation-validator")
+        add_internal("tracked-private-resource-scan", "private-resource-exclusion", targets=candidate_paths)
+        add_internal("tracked-secret-scan", "secret-operational-artifact-exclusion", targets=candidate_paths)
+        license_targets = [
+            "LICENSE", "LICENSE.md", "NOTICE.md", "LICENSES/AGPL-3.0-only.txt",
+            "README.md", "docs/CONTENT_POLICY.md", "docs/STATUS.md", "api-contract/README.md",
+            "backend/package.json",
+        ]
+        license_targets.extend(
+            path
+            for path in candidate_paths
+            if (
+                (
+                    path.startswith("backend/src/")
+                    or path.startswith("backend/scripts/")
+                    or path.startswith("backend/test/")
+                )
+                and Path(path).suffix.lower() in {".js", ".mjs"}
+            )
+            or path == "api-contract/README.md"
+        )
+        license_targets = list(dict.fromkeys(license_targets))
+        add_internal("license-governance-consistency", "license-governance", targets=license_targets)
+        add_internal(
+            "workflow-self-policy",
+            "workflow-policy",
+            targets=[
+                ".github/workflows/ci.yml",
+                "docs/CI_POLICY.md",
+                "developer/tests/ci/phase1-ci-baseline.json",
+            ],
+        )
+    if profile in {"static", "all"}:
+        add(
+            "static-suite",
+            "static-suite",
+            [python, "-B", STATIC_SUITE_RELATIVE_PATH, "--ci-machine-json-stdout", "--ci-invocation-id", static_invocation_id],
+            tool_role="python-static-producer",
+            targets=candidate_paths,
+            command_role="observation-producing",
+            result_semantics="machine-v2-complete-execution",
+            execution_input_mode="PROTECTED-TARGET-BUNDLE",
+        )
+        if profile == "static":
+            add(
+                "git-candidate-paths",
+                "repository-boundary",
+                trusted_git_arguments(git, "ls-files", "-z", "--cached", "--others", "--exclude-standard"),
+                tool_role="git-candidate-enumerator",
+            )
+        javascript_paths = sorted(
+            path for path in candidate_paths if Path(path).suffix.casefold() in {".js", ".mjs"}
+        )
+        for relative in javascript_paths:
+            parser_mode = _node_stdin_parser_mode(repo_root, relative)
+            add(
+                f"node-check:{relative}",
+                "direct-syntax",
+                [node, "--check", relative],
+                tool_role="node-syntax-check",
+                targets=[relative],
+                command_role="observation-producing",
+                allowed_exits=(0, 1),
+                result_semantics="exit-zero-pass-exit-one-classified-observation",
+                execution_argv=[node, "--check", f"--input-type={parser_mode}", "-"],
+                execution_input_mode="TARGET-BYTES-STDIN",
+            )
+        python_paths = sorted(path for path in candidate_paths if Path(path).suffix.casefold() == ".py")
+        add_internal("python-source-syntax", "direct-syntax", targets=python_paths)
+    if profile in {"frontend", "all"}:
+        add(
+            "bundle-normalization",
+            "bundle-parity",
+            [node, "--test", "developer/tests/js/bundleNormalization.test.js"],
+            tool_role="node-test",
+            targets=candidate_paths,
+            execution_input_mode="PROTECTED-TARGET-BUNDLE",
+        )
+        add(
+            "learner-focused",
+            "learner-focused",
+            [node, "--test", "developer/tests/js/learnerPalette.test.js", "developer/tests/js/learnerUiRuntimeStabilization.test.js"],
+            tool_role="node-test",
+            targets=candidate_paths,
+            command_role="observation-producing",
+            allowed_exits=(0, 1),
+            result_semantics="exit-zero-pass-exit-one-classified-observation",
+            execution_input_mode="PROTECTED-TARGET-BUNDLE",
+        )
+        for relative in SECURITY_GUARD_FILES:
+            command_id = f"frontend-security:{Path(relative).name}"
+            add(
+                command_id,
+                "frontend-security",
+                [node, "--test", relative],
+                tool_role="node-security-test",
+                targets=candidate_paths,
+                command_role="observation-producing",
+                allowed_exits=(0, 1),
+                result_semantics="exit-zero-pass-exit-one-classified-observation",
+                execution_input_mode="PROTECTED-TARGET-BUNDLE",
+            )
+        vitest = "developer/node_modules/vitest/vitest.mjs"
+        add(
+            "frontend-security:messageOriginGuard.test.js",
+            "frontend-security",
+            [node, str((repo_root / vitest).resolve()), "run", "--root", "developer", "tests/js/messageOriginGuard.test.js"],
+            tool_role="node-vitest-security-test",
+            targets=candidate_paths,
+            command_role="observation-producing",
+            allowed_exits=(0, 1),
+            result_semantics="exit-zero-pass-exit-one-classified-observation",
+            execution_input_mode="PROTECTED-TARGET-BUNDLE",
+        )
+    if profile in {"backend", "all"}:
+        add(
+            "backend-canonical",
+            "backend-canonical",
+            [npm, "--prefix", "backend", "test"],
+            tool_role="npm-backend-test",
+            targets=candidate_paths,
+            command_role="observation-producing" if "backend-canonical" in baseline_nonpass_commands else "required-execution",
+            allowed_exits=(0, 1) if "backend-canonical" in baseline_nonpass_commands else (0,),
+            result_semantics="baseline-classified-test-result",
+            execution_input_mode="PROTECTED-TARGET-BUNDLE",
+        )
+    if profile in {"standalone", "all"}:
+        add(
+            "standalone-packaging",
+            "standalone-packaging",
+            [python, "-B", "developer/tests/ci/test_standalone_packaging.py"],
+            tool_role="python-standalone-test",
+            targets=candidate_paths,
+            execution_input_mode="PROTECTED-TARGET-BUNDLE",
+        )
+        add_internal(
+            "standalone-membership-audit",
+            "standalone-membership",
+            targets=["developer/standalone-release-manifest.json", "index.html"],
+            command_role="observation-producing",
+            allowed_exits=(0, 1),
+            result_semantics="exact-membership-observation",
+        )
+    add_internal(
+        "lockfile-integrity",
+        "lockfile-integrity",
+        targets=list(LOCKED_FILE_SHA256),
+    )
+    if len(plan) > MAX_PROFILE_COMMANDS:
+        raise ValueError("immutable command plan exceeds the fixed command bound")
+    return plan
+
+
+def snapshot_trusted_files(
+    *,
+    repo_root: Path = REPO_ROOT,
+    paths: Sequence[str] = TRUSTED_FILE_PATHS,
+) -> tuple[dict[str, str], list[str]]:
+    snapshot: dict[str, str] = {}
+    errors: list[str] = []
+    for relative in paths:
+        path = repo_root / relative
+        okay, reason = _secure_regular_file(path)
+        if not okay:
+            errors.append(f"{relative}: {reason}")
+            continue
+        try:
+            snapshot[relative] = _sha256_file(path)
+        except OSError as exc:
+            errors.append(f"{relative}: could not hash ({type(exc).__name__})")
+    for relative, expected in LOCKED_FILE_SHA256.items():
+        if relative in paths and snapshot.get(relative) != expected:
+            errors.append(f"{relative}: candidate-local package/lockfile identity changed")
+    return snapshot, errors
+
+
+def compare_trusted_snapshots(
+    before: Mapping[str, str],
+    after: Mapping[str, str],
+) -> list[str]:
+    errors: list[str] = []
+    if set(before) != set(after):
+        errors.append(
+            f"trusted-file set changed: missing={sorted(set(before) - set(after))} "
+            f"additional={sorted(set(after) - set(before))}"
+        )
+    for path in sorted(set(before) & set(after)):
+        if before[path] != after[path]:
+            errors.append(f"trusted file changed: {path}")
+    return errors
+
+
+@dataclass(frozen=True)
+class _FileSnapshot:
+    data: bytes
+    identity: tuple[int, int, int, int, int]
+
+
+def _stat_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        0 if os.name == "nt" else int(metadata.st_ctime_ns),
+    )
+
+
+def _stable_file_identity(metadata: os.stat_result) -> dict[str, Any]:
+    return {
+        "deviceOrVolume": str(int(metadata.st_dev)),
+        "inodeOrFileIndex": str(int(metadata.st_ino)),
+        "creationOrChangeTimeNs": str(int(metadata.st_ctime_ns)),
+        "writeTimeNs": str(int(metadata.st_mtime_ns)),
+        "reparsePoint": _is_reparse_point(metadata),
+    }
+
+
+class TargetExecutionLease:
+    """Hold one planned target identity and materialize only its planned bytes."""
+
+    GENERIC_READ = 0x80000000
+    FILE_SHARE_READ = 0x00000001
+    OPEN_EXISTING = 3
+    FILE_ATTRIBUTE_NORMAL = 0x00000080
+    FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    FILE_BEGIN = 0
+
+    def __init__(
+        self,
+        target_authority: Mapping[str, Any],
+        *,
+        repo_root: Path,
+        execution_adapter: str,
+    ) -> None:
+        self.repo_root = repo_root.resolve(strict=True)
+        self.target_authority = dict(target_authority)
+        self.execution_adapter = execution_adapter
+        self.handle: Any | None = None
+        self.descriptor = -1
+        self._closed = False
+        self._materialized = False
+        self._mutation_detected = False
+        self._pre_execution_identity: dict[str, Any] | None = None
+        self._post_execution_identity: dict[str, Any] | None = None
+        self._opened_held_identity: dict[str, Any] | None = None
+        self._executed_input_size: int | None = None
+        self._executed_input_sha256: str | None = None
+
+        relative = str(target_authority.get("path", ""))
+        relative_path = Path(relative)
+        if (
+            not relative
+            or relative_path.is_absolute()
+            or "\\" in relative
+            or any(part in {"", ".", ".."} for part in relative.split("/"))
+        ):
+            raise OSError("target execution lease rejected an unsafe logical target path")
+        self.relative_path = relative
+        self.source_path = self.repo_root.joinpath(*relative.split("/"))
+        self._validate_parent_chain()
+        self._validate_exact_path_spelling()
+        try:
+            canonical = self.source_path.resolve(strict=True)
+            metadata = self.source_path.lstat()
+        except OSError as exc:
+            raise OSError(f"target source cannot be resolved: {type(exc).__name__}") from exc
+        if canonical != self.source_path.absolute() or not _path_is_within(canonical, self.repo_root):
+            raise OSError("target source canonical path escaped or used an alias")
+        if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata) or not stat.S_ISREG(metadata.st_mode):
+            raise OSError("target source is not a non-reparse regular file")
+        self.canonical_source_path = str(canonical)
+        self.mode_type = "regular-file"
+        self._initial_path_identity = _stable_file_identity(metadata)
+        self._initial_size = int(metadata.st_size)
+        try:
+            self._open_source()
+            self._opened_held_identity = (
+                _stable_file_identity(os.fstat(self.descriptor))
+                if os.name != "nt"
+                else self._windows_information()
+            )
+            self._pre_execution_identity = self._current_source_identity()
+            self._require_planned_identity(self._pre_execution_identity)
+        except Exception:
+            self.close()
+            raise
+
+    def _validate_parent_chain(self) -> None:
+        current = self.source_path.parent
+        while True:
+            try:
+                metadata = current.lstat()
+            except OSError as exc:
+                raise OSError(f"target parent cannot be inspected: {type(exc).__name__}") from exc
+            if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
+                raise OSError("target parent chain contains a link, reparse point, or non-directory")
+            if current.resolve(strict=True) == self.repo_root:
+                return
+            if current.parent == current or not _path_is_within(current.resolve(strict=True), self.repo_root):
+                raise OSError("target parent chain did not terminate at the repository root")
+            current = current.parent
+
+    def _validate_exact_path_spelling(self) -> None:
+        current = self.repo_root
+        for part in self.relative_path.split("/"):
+            try:
+                exact_names = {entry.name for entry in current.iterdir()}
+            except OSError as exc:
+                raise OSError(
+                    f"target path spelling cannot be enumerated: {type(exc).__name__}"
+                ) from exc
+            if part not in exact_names:
+                raise OSError("target logical path uses a case or normalization alias")
+            current = current / part
+
+    def _open_source(self) -> None:
+        if os.name != "nt":
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+            self.descriptor = os.open(self.source_path, flags)
+            opened = os.fstat(self.descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise OSError("opened target source is not a regular file")
+            return
+
+        import ctypes
+        from ctypes import wintypes
+
+        self.ctypes = ctypes
+        self.wintypes = wintypes
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("dwFileAttributes", wintypes.DWORD),
+                ("ftCreationTime", wintypes.FILETIME),
+                ("ftLastAccessTime", wintypes.FILETIME),
+                ("ftLastWriteTime", wintypes.FILETIME),
+                ("dwVolumeSerialNumber", wintypes.DWORD),
+                ("nFileSizeHigh", wintypes.DWORD),
+                ("nFileSizeLow", wintypes.DWORD),
+                ("nNumberOfLinks", wintypes.DWORD),
+                ("nFileIndexHigh", wintypes.DWORD),
+                ("nFileIndexLow", wintypes.DWORD),
+            ]
+
+        self._windows_info_type = BY_HANDLE_FILE_INFORMATION
+        self.kernel32.CreateFileW.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        self.kernel32.CreateFileW.restype = wintypes.HANDLE
+        self.kernel32.GetFileInformationByHandle.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(BY_HANDLE_FILE_INFORMATION),
+        )
+        self.kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+        self.kernel32.SetFilePointerEx.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_longlong,
+            ctypes.POINTER(ctypes.c_longlong),
+            wintypes.DWORD,
+        )
+        self.kernel32.SetFilePointerEx.restype = wintypes.BOOL
+        self.kernel32.ReadFile.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.c_void_p,
+        )
+        self.kernel32.ReadFile.restype = wintypes.BOOL
+        self.kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        self.kernel32.CloseHandle.restype = wintypes.BOOL
+        invalid = ctypes.c_void_p(-1).value
+        handle = self.kernel32.CreateFileW(
+            self.canonical_source_path,
+            self.GENERIC_READ,
+            self.FILE_SHARE_READ,
+            None,
+            self.OPEN_EXISTING,
+            self.FILE_ATTRIBUTE_NORMAL | self.FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        if not handle or int(handle) == invalid:
+            raise ctypes.WinError(ctypes.get_last_error())
+        self.handle = handle
+        information = self._windows_information()
+        if information["reparsePoint"]:
+            raise OSError("target source handle resolves to a reparse point")
+
+    @staticmethod
+    def _filetime(value: Any) -> str:
+        return str((int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime))
+
+    def _windows_information(self) -> dict[str, Any]:
+        information = self._windows_info_type()
+        if not self.kernel32.GetFileInformationByHandle(
+            self.handle, self.ctypes.byref(information)
+        ):
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+        attributes = int(information.dwFileAttributes)
+        return {
+            "volumeSerial": str(int(information.dwVolumeSerialNumber)),
+            "fileIndex": str(
+                (int(information.nFileIndexHigh) << 32) | int(information.nFileIndexLow)
+            ),
+            "size": (int(information.nFileSizeHigh) << 32) | int(information.nFileSizeLow),
+            "creationTime": self._filetime(information.ftCreationTime),
+            "writeTime": self._filetime(information.ftLastWriteTime),
+            "linkCount": int(information.nNumberOfLinks),
+            "reparsePoint": bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)),
+        }
+
+    def _read_held_bytes(self) -> bytes:
+        if os.name != "nt":
+            os.lseek(self.descriptor, 0, os.SEEK_SET)
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(self.descriptor, 65_536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_SCANNED_FILE_BYTES:
+                    raise OSError("target source exceeds the fixed byte bound")
+                chunks.append(chunk)
+            return b"".join(chunks)
+
+        position = self.ctypes.c_longlong()
+        if not self.kernel32.SetFilePointerEx(
+            self.handle, 0, self.ctypes.byref(position), self.FILE_BEGIN
+        ):
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+        chunks = []
+        total = 0
+        while True:
+            buffer = self.ctypes.create_string_buffer(65_536)
+            read = self.wintypes.DWORD()
+            if not self.kernel32.ReadFile(
+                self.handle, buffer, len(buffer), self.ctypes.byref(read), None
+            ):
+                raise self.ctypes.WinError(self.ctypes.get_last_error())
+            count = int(read.value)
+            if count == 0:
+                break
+            total += count
+            if total > MAX_SCANNED_FILE_BYTES:
+                raise OSError("target source exceeds the fixed byte bound")
+            chunks.append(buffer.raw[:count])
+        return b"".join(chunks)
+
+    def _current_source_identity(self) -> dict[str, Any]:
+        self._validate_parent_chain()
+        canonical = self.source_path.resolve(strict=True)
+        if str(canonical) != self.canonical_source_path:
+            raise OSError("target source canonical path drifted")
+        path_metadata = self.source_path.lstat()
+        if stat.S_ISLNK(path_metadata.st_mode) or _is_reparse_point(path_metadata):
+            raise OSError("target source became a link or reparse point")
+        held_metadata = (
+            _stable_file_identity(os.fstat(self.descriptor))
+            if os.name != "nt"
+            else self._windows_information()
+        )
+        return {
+            "pathStableIdentity": _stable_file_identity(path_metadata),
+            "heldStableIdentity": held_metadata,
+            "canonicalPath": str(canonical),
+        }
+
+    def _require_planned_identity(self, current: Mapping[str, Any]) -> None:
+        planned_identity = self.target_authority.get("fileIdentity")
+        if current.get("pathStableIdentity") != planned_identity:
+            self._mutation_detected = True
+            raise OSError("target source stable identity differs from the command plan")
+        held_identity = current.get("heldStableIdentity")
+        if held_identity != self._opened_held_identity:
+            self._mutation_detected = True
+            raise OSError("held target identity drifted after lease acquisition")
+        if os.name != "nt" and held_identity != current.get("pathStableIdentity"):
+            self._mutation_detected = True
+            raise OSError("held target identity does not equal the planned path identity")
+        if self.target_authority.get("size") != self._initial_size:
+            self._mutation_detected = True
+            raise OSError("target source byte length differs from the command plan")
+        expected_canonical = self.target_authority.get("canonicalSourcePath")
+        if expected_canonical is not None and current.get("canonicalPath") != expected_canonical:
+            self._mutation_detected = True
+            raise OSError("target source canonical path differs from the command plan")
+
+    def materialize(self) -> bytes:
+        if self._closed:
+            raise OSError("target execution lease is closed")
+        self._pre_execution_identity = self._current_source_identity()
+        self._require_planned_identity(self._pre_execution_identity)
+        data = self._read_held_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        if len(data) != self.target_authority.get("size") or digest != self.target_authority.get("sha256"):
+            self._mutation_detected = True
+            raise OSError("held target bytes differ from the command plan")
+        self._materialized = True
+        self._executed_input_size = len(data)
+        self._executed_input_sha256 = digest
+        return data
+
+    def verify(self) -> tuple[bool, str | None]:
+        if self._closed:
+            return False, "target execution lease is closed"
+        try:
+            current = self._current_source_identity()
+            self._require_planned_identity(current)
+            data = self._read_held_bytes()
+            digest = hashlib.sha256(data).hexdigest()
+            if len(data) != self.target_authority.get("size") or digest != self.target_authority.get("sha256"):
+                raise OSError("held target bytes drifted from the command plan")
+            self._post_execution_identity = current
+        except OSError as exc:
+            self._mutation_detected = True
+            return False, f"target execution lease verification failed: {exc}"
+        return True, None
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "leaseVersion": TARGET_EXECUTION_LEASE_VERSION,
+            "logicalTargetPath": self.relative_path,
+            "canonicalSourcePath": self.canonical_source_path,
+            "plannedByteLength": self.target_authority.get("size"),
+            "plannedSha256": self.target_authority.get("sha256"),
+            "plannedStableFileIdentity": self.target_authority.get("fileIdentity"),
+            "modeType": self.mode_type,
+            "reparsePoint": False,
+            "executionAdapter": self.execution_adapter,
+            "executedInputByteLength": self._executed_input_size,
+            "executedInputSha256": self._executed_input_sha256,
+            "preExecutionSourceIdentity": self._pre_execution_identity,
+            "postExecutionSourceIdentity": self._post_execution_identity,
+            "mutationDetected": self._mutation_detected,
+            "cleanupState": "closed" if self._closed else "open",
+        }
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        if self.descriptor >= 0:
+            os.close(self.descriptor)
+            self.descriptor = -1
+        handle = getattr(self, "handle", None)
+        if handle:
+            self.kernel32.CloseHandle(handle)
+            self.handle = None
+        self._closed = True
+
+    def __del__(self) -> None:  # pragma: no cover - last-resort handle cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def execution_input_bundle_digest(inputs: Sequence[Mapping[str, Any]]) -> str:
+    return canonical_failure_digest(list(inputs))
+
+
+class ProtectedTargetBundle:
+    """Capture an ordered multi-target command input from hardened held handles."""
+
+    def __init__(
+        self,
+        targets: Sequence[Mapping[str, Any]],
+        *,
+        repo_root: Path,
+        execution_adapter: str = "PROTECTED-TARGET-BUNDLE",
+    ) -> None:
+        if not targets:
+            raise OSError("protected target bundle requires at least one target")
+        logical_paths = [str(target.get("path", "")) for target in targets]
+        if len(logical_paths) != len(set(logical_paths)):
+            raise OSError("protected target bundle contains duplicate logical targets")
+        self.execution_adapter = execution_adapter
+        self.targets = [dict(target) for target in targets]
+        self.leases: list[TargetExecutionLease] = []
+        self._bytes: dict[str, bytes] = {}
+        self._execution_inputs: list[dict[str, Any]] = []
+        self._mutation_detected = False
+        self._closed = False
+        self._materialized = False
+        try:
+            for target in self.targets:
+                self.leases.append(
+                    TargetExecutionLease(
+                        target,
+                        repo_root=repo_root,
+                        execution_adapter=execution_adapter,
+                    )
+                )
+        except Exception:
+            self._mutation_detected = True
+            self.close()
+            raise
+
+    @staticmethod
+    def _execution_input(lease: TargetExecutionLease) -> dict[str, Any]:
+        evidence = lease.evidence()
+        return {
+            "logicalPath": evidence["logicalTargetPath"],
+            "canonicalSourcePath": evidence["canonicalSourcePath"],
+            "plannedByteLength": evidence["plannedByteLength"],
+            "plannedSha256": evidence["plannedSha256"],
+            "plannedStableIdentity": evidence["plannedStableFileIdentity"],
+            "actualByteLength": evidence["executedInputByteLength"],
+            "actualSha256": evidence["executedInputSha256"],
+            "inputMode": evidence["executionAdapter"],
+        }
+
+    def materialize(self) -> Mapping[str, bytes]:
+        if self._closed:
+            raise OSError("protected target bundle is closed")
+        captured: dict[str, bytes] = {}
+        try:
+            for lease in self.leases:
+                captured[lease.relative_path] = lease.materialize()
+            okay, error = self.verify()
+            if not okay:
+                raise OSError(error or "protected target bundle source drifted")
+        except OSError:
+            self._mutation_detected = True
+            raise
+        self._bytes = captured
+        self._execution_inputs = [self._execution_input(lease) for lease in self.leases]
+        self._materialized = True
+        return MappingProxyType(self._bytes)
+
+    def bytes_for(self, relative: str) -> bytes:
+        if not self._materialized or relative not in self._bytes:
+            raise KeyError(f"protected target bytes are unavailable: {relative}")
+        return self._bytes[relative]
+
+    def text_for(self, relative: str) -> str:
+        data = self.bytes_for(relative)
+        if data.startswith(b"\xef\xbb\xbf"):
+            raise UnicodeError(f"protected target must be UTF-8 without BOM: {relative}")
+        return data.decode("utf-8", errors="strict")
+
+    def verify(self) -> tuple[bool, str | None]:
+        if self._closed:
+            return False, "protected target bundle is closed"
+        failures: list[str] = []
+        for lease in self.leases:
+            okay, error = lease.verify()
+            if not okay:
+                failures.append(f"{lease.relative_path}: {error or 'source identity drifted'}")
+        if failures:
+            self._mutation_detected = True
+            return False, "; ".join(failures)
+        if self._materialized:
+            self._execution_inputs = [self._execution_input(lease) for lease in self.leases]
+        return True, None
+
+    @property
+    def execution_inputs(self) -> list[dict[str, Any]]:
+        return copy.deepcopy(self._execution_inputs)
+
+    @property
+    def bundle_digest(self) -> str | None:
+        return (
+            execution_input_bundle_digest(self._execution_inputs)
+            if self._materialized and self._execution_inputs
+            else None
+        )
+
+    def evidence(self) -> dict[str, Any]:
+        lease_evidence = [lease.evidence() for lease in self.leases]
+        inputs = (
+            [self._execution_input(lease) for lease in self.leases]
+            if self._materialized
+            else copy.deepcopy(self._execution_inputs)
+        )
+        mutation_detected = self._mutation_detected or any(
+            item.get("mutationDetected") is True for item in lease_evidence
+        )
+        return {
+            "bundleVersion": PROTECTED_TARGET_BUNDLE_VERSION,
+            "executionAdapter": self.execution_adapter,
+            "orderedLogicalTargetPaths": [item.get("logicalTargetPath") for item in lease_evidence],
+            "canonicalSourcePaths": [item.get("canonicalSourcePath") for item in lease_evidence],
+            "plannedByteLengths": [item.get("plannedByteLength") for item in lease_evidence],
+            "plannedSha256Values": [item.get("plannedSha256") for item in lease_evidence],
+            "plannedStableIdentities": [item.get("plannedStableFileIdentity") for item in lease_evidence],
+            "executionInputs": inputs,
+            "executionInputBundleDigest": (
+                execution_input_bundle_digest(inputs) if inputs else None
+            ),
+            "preExecutionIdentities": [item.get("preExecutionSourceIdentity") for item in lease_evidence],
+            "postExecutionIdentities": [item.get("postExecutionSourceIdentity") for item in lease_evidence],
+            "mutationDetected": mutation_detected,
+            "cleanupState": "closed" if self._closed else "open",
+        }
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        for lease in reversed(self.leases):
+            lease.close()
+        self._closed = True
+
+    def __del__(self) -> None:  # pragma: no cover - last-resort OS handle cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def _failed_protected_target_bundle(
+    targets: Sequence[Mapping[str, Any]],
+    execution_adapter: str,
+) -> dict[str, Any]:
+    return {
+        "bundleVersion": PROTECTED_TARGET_BUNDLE_VERSION,
+        "executionAdapter": execution_adapter,
+        "orderedLogicalTargetPaths": [target.get("path") for target in targets],
+        "canonicalSourcePaths": [target.get("canonicalSourcePath") for target in targets],
+        "plannedByteLengths": [target.get("size") for target in targets],
+        "plannedSha256Values": [target.get("sha256") for target in targets],
+        "plannedStableIdentities": [target.get("fileIdentity") for target in targets],
+        "executionInputs": [],
+        "executionInputBundleDigest": None,
+        "preExecutionIdentities": [],
+        "postExecutionIdentities": [],
+        "mutationDetected": True,
+        "cleanupState": "closed",
+    }
+
+
+def _translate_snapshot_output_paths(value: str, snapshot_root: Path, repo_root: Path) -> str:
+    """Map the task-owned physical snapshot root back to its logical repository root."""
+
+    snapshot = str(snapshot_root.resolve())
+    repository = str(repo_root.resolve())
+    replacements = (
+        (snapshot.replace("\\", "\\\\"), repository.replace("\\", "\\\\")),
+        (snapshot_root.resolve().as_uri(), repo_root.resolve().as_uri()),
+        (snapshot.replace("\\", "/"), repository.replace("\\", "/")),
+        (snapshot, repository),
+    )
+    translated = value
+    for source, target in replacements:
+        translated = translated.replace(source, target)
+    return translated
+
+
+def _translate_snapshot_output_bytes(value: bytes, snapshot_root: Path, repo_root: Path) -> bytes:
+    snapshot = str(snapshot_root.resolve())
+    repository = str(repo_root.resolve())
+    replacements = (
+        (snapshot.replace("\\", "\\\\"), repository.replace("\\", "\\\\")),
+        (snapshot_root.resolve().as_uri(), repo_root.resolve().as_uri()),
+        (snapshot.replace("\\", "/"), repository.replace("\\", "/")),
+        (snapshot, repository),
+    )
+    translated = value
+    for source, target in replacements:
+        translated = translated.replace(source.encode("utf-8"), target.encode("utf-8"))
+    return translated
+
+
+def _canonicalize_static_machine_capture(
+    capture: CommandCapture,
+    report: Mapping[str, Any],
+) -> None:
+    """Bind a validated machine document after removing only replay-volatile values."""
+
+    canonical = _json_bytes(normalized_json_value(report))
+    capture.stdout_raw = canonical
+    capture.stdout = canonical.decode("utf-8", errors="strict")
+    capture.stdout_bytes = len(canonical)
+
+
+def _protected_snapshot_environment(
+    env: Mapping[str, str],
+    *,
+    repo_root: Path,
+) -> dict[str, str]:
+    snapshot_environment = dict(env)
+    snapshot_environment["CI_PROTECTED_TARGET_SNAPSHOT"] = "1"
+    dependency_roots: list[str] = []
+    for relative in ("developer/node_modules", "backend/node_modules"):
+        candidate = repo_root.joinpath(*relative.split("/"))
+        if not candidate.exists():
+            continue
+        resolved = candidate.resolve(strict=True)
+        if not _path_is_within(resolved, repo_root.resolve(strict=True)):
+            raise OSError(f"runtime dependency root escapes repository: {relative}")
+        if not _non_reparse_directory_chain(candidate, repo_root):
+            raise OSError(f"runtime dependency root contains a reparse or link: {relative}")
+        dependency_roots.append(str(resolved))
+    if dependency_roots:
+        snapshot_environment["NODE_PATH"] = os.pathsep.join(dependency_roots)
+    return snapshot_environment
+
+
+def execute_planned_static_suite(
+    plan_record: Mapping[str, Any],
+    *,
+    repo_root: Path,
+    env: Mapping[str, str],
+    timeout: int = 1200,
+    phase_hook: Any | None = None,
+) -> tuple[CommandCapture, dict[str, Any]]:
+    """Run one external command from a task-owned snapshot of held planned bytes."""
+
+    targets = plan_record.get("targets")
+    adapter = str(plan_record.get("executionInputMode", ""))
+    logical_argv = list(plan_record.get("logicalArgv", plan_record.get("argv", [])))
+    execution_argv = list(plan_record.get("executionArgv", []))
+    if adapter != "PROTECTED-TARGET-BUNDLE" or not isinstance(targets, list) or not targets:
+        raise ValueError("static-suite lacks protected workspace-snapshot authority")
+
+    bundle: ProtectedTargetBundle | None = None
+    temporary: tempfile.TemporaryDirectory[str] | None = None
+    capture: CommandCapture | None = None
+    integrity_error: str | None = None
+    if phase_hook is not None:
+        phase_hook("after-plan-before-target-bundle", None)
+    try:
+        bundle = ProtectedTargetBundle(
+            targets,
+            repo_root=repo_root,
+            execution_adapter=adapter,
+        )
+        if phase_hook is not None:
+            phase_hook("after-target-bundle-before-materialization", bundle)
+        bundle.materialize()
+        if phase_hook is not None:
+            phase_hook("after-materialization-before-snapshot", bundle)
+
+        temporary = tempfile.TemporaryDirectory(prefix="cs-")
+        snapshot_root = Path(temporary.name)
+        for relative in bundle.evidence()["orderedLogicalTargetPaths"]:
+            if not isinstance(relative, str):
+                raise OSError("protected static target path is invalid")
+            destination = snapshot_root.joinpath(*relative.split("/"))
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+                0o600,
+            )
+            try:
+                with os.fdopen(descriptor, "wb", closefd=True) as output:
+                    output.write(bundle.bytes_for(relative))
+            except Exception:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                raise
+
+        if phase_hook is not None:
+            phase_hook("after-snapshot-before-process-launch", bundle)
+        okay, error = bundle.verify()
+        if not okay:
+            raise OSError(error or "protected static target bundle drifted before launch")
+        snapshot_environment = _protected_snapshot_environment(
+            env,
+            repo_root=repo_root,
+        )
+        capture = execute_command(
+            str(plan_record.get("commandId", "static-suite")),
+            str(plan_record.get("commandClass", "static-suite")),
+            execution_argv,
+            timeout=timeout,
+            env=snapshot_environment,
+            include_preview=False,
+            required=bool(plan_record.get("required", True)),
+            cwd=snapshot_root,
+            max_stdout_bytes=MAX_STATIC_MACHINE_STDOUT_BYTES,
+            max_stderr_bytes=MAX_STATIC_MACHINE_STDERR_BYTES,
+            max_line_bytes=MAX_OUTPUT_LINE_BYTES,
+            logical_argv=logical_argv,
+            execution_input_mode=adapter,
+        )
+        if capture.stdout_raw is not None:
+            capture.stdout_raw = _translate_snapshot_output_bytes(
+                capture.stdout_raw,
+                snapshot_root,
+                repo_root,
+            )
+            capture.stdout = capture.stdout_raw.decode("utf-8", errors="replace")
+            capture.stdout_bytes = len(capture.stdout_raw)
+        else:
+            capture.stdout = _translate_snapshot_output_paths(
+                capture.stdout,
+                snapshot_root,
+                repo_root,
+            )
+        if capture.stderr_raw is not None:
+            capture.stderr_raw = _translate_snapshot_output_bytes(
+                capture.stderr_raw,
+                snapshot_root,
+                repo_root,
+            )
+            capture.stderr = capture.stderr_raw.decode("utf-8", errors="replace")
+            capture.stderr_bytes = len(capture.stderr_raw)
+        else:
+            capture.stderr = _translate_snapshot_output_paths(
+                capture.stderr,
+                snapshot_root,
+                repo_root,
+            )
+        if capture.error is not None:
+            capture.error = _translate_snapshot_output_paths(
+                capture.error,
+                snapshot_root,
+                repo_root,
+            )
+        if phase_hook is not None:
+            phase_hook("after-process-before-evidence", bundle)
+        okay, error = bundle.verify()
+        if not okay:
+            integrity_error = error or "protected static target bundle drifted during execution"
+    except Exception as exc:
+        integrity_error = f"PROTECTED-STATIC-SNAPSHOT-ERROR: {type(exc).__name__}: {exc}"
+        capture = CommandCapture(
+            command_id=str(plan_record.get("commandId", "static-suite")),
+            command_class=str(plan_record.get("commandClass", "static-suite")),
+            argv=execution_argv,
+            logical_argv=logical_argv,
+            executed=False,
+            exit_code=None,
+            duration_seconds=0.0,
+            stdout="",
+            stderr="",
+            required=bool(plan_record.get("required", True)),
+            error=integrity_error,
+            containment="not-started",
+            process_tree_status="setup-failed",
+            execution_input_mode=adapter,
+        )
+    finally:
+        if bundle is not None:
+            okay, error = bundle.verify()
+            if not okay and integrity_error is None:
+                integrity_error = error or "protected static target bundle drifted before cleanup"
+            bundle.close()
+        if temporary is not None:
+            try:
+                temporary.cleanup()
+            except OSError as exc:
+                if integrity_error is None:
+                    integrity_error = (
+                        f"protected static snapshot cleanup failed: {type(exc).__name__}: {exc}"
+                    )
+
+    assert capture is not None
+    if integrity_error is not None:
+        capture.exit_code = PROCESS_TREE_FAILURE_EXIT if capture.executed else None
+        capture.process_tree_status = "cleanup-failed" if capture.executed else "setup-failed"
+        capture.process_tree_error = integrity_error
+        capture.error = integrity_error
+    bundle_evidence = (
+        bundle.evidence()
+        if bundle is not None
+        else _failed_protected_target_bundle(targets, adapter)
+    )
+    return capture, bundle_evidence
+
+
+def _failed_target_execution_record(
+    target_authority: Mapping[str, Any],
+    execution_adapter: str,
+) -> dict[str, Any]:
+    return {
+        "leaseVersion": TARGET_EXECUTION_LEASE_VERSION,
+        "logicalTargetPath": target_authority.get("path"),
+        "canonicalSourcePath": target_authority.get("canonicalSourcePath"),
+        "plannedByteLength": target_authority.get("size"),
+        "plannedSha256": target_authority.get("sha256"),
+        "plannedStableFileIdentity": target_authority.get("fileIdentity"),
+        "modeType": target_authority.get("modeType", "regular-file"),
+        "reparsePoint": target_authority.get("reparsePoint", False),
+        "executionAdapter": execution_adapter,
+        "executedInputByteLength": None,
+        "executedInputSha256": None,
+        "preExecutionSourceIdentity": None,
+        "postExecutionSourceIdentity": None,
+        "mutationDetected": True,
+        "cleanupState": "closed",
+    }
+
+
+def execute_planned_node_check(
+    plan_record: Mapping[str, Any],
+    *,
+    repo_root: Path,
+    env: Mapping[str, str],
+    timeout: int = 30,
+    phase_hook: Any | None = None,
+) -> tuple[CommandCapture, TargetExecutionLease | None]:
+    """Execute one Node syntax plan from held target bytes through stdin."""
+
+    targets = plan_record.get("targets")
+    if not isinstance(targets, list) or len(targets) != 1:
+        raise ValueError("node-check command plan must contain exactly one target")
+    target = targets[0]
+    logical_argv = list(plan_record.get("logicalArgv", plan_record.get("argv", [])))
+    execution_argv = list(plan_record.get("executionArgv", []))
+    adapter = str(plan_record.get("executionInputMode", ""))
+    if phase_hook is not None:
+        phase_hook("after-plan-before-target-lease", None)
+    try:
+        lease = TargetExecutionLease(
+            target,
+            repo_root=repo_root,
+            execution_adapter=adapter,
+        )
+        if phase_hook is not None:
+            phase_hook("after-target-lease-before-materialization", lease)
+        data = lease.materialize()
+        if phase_hook is not None:
+            phase_hook("after-materialization-before-process-launch", lease)
+        lease_ok, lease_error = lease.verify()
+        if not lease_ok:
+            raise OSError(lease_error or "target source drifted before process launch")
+    except OSError as exc:
+        if "lease" in locals():
+            lease.close()
+        capture = CommandCapture(
+            command_id=str(plan_record.get("commandId", "")),
+            command_class=str(plan_record.get("commandClass", "direct-syntax")),
+            argv=execution_argv,
+            executed=False,
+            exit_code=None,
+            duration_seconds=0.0,
+            stdout="",
+            stderr="",
+            error=f"TARGET-LEASE-ERROR: {type(exc).__name__}: {exc}",
+            containment="not-started",
+            process_tree_status="setup-failed",
+            logical_argv=logical_argv,
+            execution_input_mode=adapter,
+            target_execution_lease=_failed_target_execution_record(target, adapter),
+        )
+        return capture, None
+
+    def started_hook(_process: subprocess.Popen[bytes]) -> None:
+        if phase_hook is not None:
+            phase_hook("during-process-execution", lease)
+
+    capture = execute_command(
+        str(plan_record["commandId"]),
+        str(plan_record["commandClass"]),
+        execution_argv,
+        timeout=timeout,
+        env=env,
+        include_preview=True,
+        cwd=repo_root,
+        stdin_data=data,
+        logical_argv=logical_argv,
+        execution_input_mode=adapter,
+        process_started_hook=started_hook,
+    )
+    if phase_hook is not None:
+        phase_hook("after-process-exit-before-evidence", lease)
+    lease_ok, lease_error = lease.verify()
+    if not lease_ok:
+        capture.exit_code = PROCESS_TREE_FAILURE_EXIT
+        capture.process_tree_status = "cleanup-failed"
+        capture.process_tree_error = lease_error
+        capture.error = ((capture.error + "; ") if capture.error else "") + (
+            "TARGET-LEASE-ERROR: " + (lease_error or "source identity drifted")
+        )
+    capture.target_execution_lease = lease.evidence()
+    return capture, lease
+
+
+class FoundationRunner:
+    def __init__(
+        self,
+        profile: str,
+        baseline: dict[str, Any],
+        *,
+        require_install_tools: bool = False,
+        tools: Mapping[str, str] | None = None,
+        source_environment: Mapping[str, str] | None = None,
+        static_invocation_id: str | None = None,
+        target_phase_hook: Any | None = None,
+        enable_runtime_closure: bool = False,
+        require_fresh_runtime_closure: bool = False,
+    ) -> None:
+        self.profile = profile
+        self.baseline = baseline
+        self.platform = platform_key()
+        self.command_results: list[dict[str, Any]] = []
+        self.observations: list[dict[str, Any]] = []
+        self.completed_classes: set[str] = set()
+        self.hard_gate_results: list[dict[str, Any]] = []
+        self.violations: list[dict[str, Any]] = []
+        self.runtime = self._runtime_identity()
+        self.candidate_paths: list[str] | None = None
+        self.target_phase_hook = target_phase_hook
+        self.source_environment = dict(
+            os.environ if source_environment is None else source_environment
+        )
+        self.enable_runtime_closure = enable_runtime_closure
+        self.require_fresh_runtime_closure = require_fresh_runtime_closure
+        self.private_temp_handle = tempfile.TemporaryDirectory(prefix="cf-")
+        self.private_temp_root = Path(self.private_temp_handle.name).resolve(strict=True)
+        required_tools = required_tool_names(
+            profile,
+            require_install_tools=require_install_tools,
+        )
+        if enable_runtime_closure and (
+            self.source_environment.get("GITHUB_ACTIONS") == "true"
+            or require_fresh_runtime_closure
+            or profile in {"frontend", "backend", "all"}
+        ):
+            required_tools.add("npm")
+        if tools is None:
+            self.tools, self.tool_resolution_errors = resolve_trusted_tools(
+                required_tools,
+                source_environment=source_environment,
+                repo_root=REPO_ROOT,
+            )
+        else:
+            self.tools = dict(tools)
+            self.tool_resolution_errors = []
+        self.bash_lease: TrustedBashLease | None = None
+        if os.name == "nt" and profile in {"static", "standalone", "all"}:
+            bash = self.tools.get("bash")
+            git = self.tools.get("git")
+            if bash is not None and git is not None:
+                try:
+                    self.bash_lease = TrustedBashLease(bash, git)
+                except OSError as exc:
+                    self.tool_resolution_errors.append(
+                        f"trusted Git Bash lease could not be established: {type(exc).__name__}: {exc}"
+                    )
+        self.child_environment = child_process_environment(
+            self.tools,
+            source_environment=source_environment,
+            private_temp_root=self.private_temp_root,
+        )
+        self.runtime_dependency_closure: RuntimeDependencyClosure | None = None
+        self.runtime_dependency_guard: RuntimeDependencyClosureGuard | None = None
+        self.runtime_closure_errors: list[str] = []
+        self.runtime_closure_digest = hashlib.sha256(
+            _canonical_frame(
+                {
+                    "mode": "producer-untrusted-unmeasured",
+                    "profile": profile,
+                    "runnerOS": _canonical_runner_os(),
+                }
+            )
+        ).hexdigest()
+        self.dependency_closure_digest = hashlib.sha256(
+            _canonical_frame({"dependencyRoots": [], "profile": profile})
+        ).hexdigest()
+        self.dependency_member_count = 0
+        self.runtime_closure_document: dict[str, Any] = {
+            "closureSchemaVersion": RUNTIME_DEPENDENCY_CLOSURE_SCHEMA_VERSION,
+            "measurementStatus": "unmeasured-local-producer",
+            "profile": profile,
+            "runnerOS": _canonical_runner_os(),
+            "dependencyClosureDigest": self.dependency_closure_digest,
+            "dependencyMemberCount": 0,
+            "closureDigest": self.runtime_closure_digest,
+        }
+        self.runtime_closure_guard_evidence: dict[str, Any] = {
+            "guardSchemaVersion": RUNTIME_DEPENDENCY_GUARD_SCHEMA_VERSION,
+            "watcherBackend": "not-active",
+            "active": False,
+            "activeDuringReplay": False,
+            "mutationState": "unmeasured",
+            "queueOverflow": False,
+            "mutationEventCount": 0,
+        }
+        if enable_runtime_closure:
+            try:
+                closure = RuntimeDependencyClosure.build(
+                    profile,
+                    self.tools,
+                    self.child_environment,
+                    repo_root=REPO_ROOT,
+                    require_fresh_dependencies=require_fresh_runtime_closure,
+                    source_environment=self.source_environment,
+                )
+                self.runtime_dependency_closure = closure
+                self.runtime_closure_digest = closure.runtime_digest
+                self.dependency_closure_digest = closure.dependency_digest
+                self.dependency_member_count = closure.member_count
+                self.runtime_closure_document = copy.deepcopy(closure.document)
+                self.runtime_dependency_guard = RuntimeDependencyClosureGuard(
+                    closure,
+                    repo_root=REPO_ROOT,
+                )
+                self.runtime_closure_guard_evidence = (
+                    self.runtime_dependency_guard.evidence()
+                )
+            except Exception as exc:
+                if self.runtime_dependency_closure is not None:
+                    self.runtime_dependency_closure.close()
+                    self.runtime_dependency_closure = None
+                self.runtime_closure_errors.append(
+                    f"runtime dependency closure setup failed: {type(exc).__name__}: {exc}"
+                )
+        self.planned_candidate_paths, self.command_plan_errors = deterministic_candidate_paths(
+            REPO_ROOT
+        )
+        self.static_invocation_id = static_invocation_id or deterministic_static_invocation_id(
+            REPO_ROOT
+        )
+        try:
+            self.command_plan = build_profile_command_plan(
+                profile,
+                tools=self.tools,
+                candidate_paths=self.planned_candidate_paths,
+                baseline=baseline,
+                current_platform=self.platform,
+                static_invocation_id=self.static_invocation_id,
+                repo_root=REPO_ROOT,
+                bash_lease=self.bash_lease,
+            )
+        except (OSError, ValueError) as exc:
+            self.command_plan = []
+            self.command_plan_errors.append(
+                f"immutable command plan construction failed: {type(exc).__name__}: {exc}"
+            )
+        self.command_plan_digest = command_plan_digest(self.command_plan)
+        self.command_plan_by_id = {
+            str(record["commandId"]): record for record in self.command_plan
+        }
+        if len(self.command_plan_by_id) != len(self.command_plan):
+            self.command_plan_errors.append("immutable command plan contains duplicate command IDs")
+        self.captures: list[CommandCapture] = []
+        self.target_execution_leases: list[
+            tuple[TargetExecutionLease, dict[str, Any]]
+        ] = []
+        self.static_machine_report: dict[str, Any] | None = None
+        self.initial_trusted_snapshot, self.initial_trusted_errors = snapshot_trusted_files()
+        self.runtime.update(
+            {
+                "runtimeClosureDigest": self.runtime_closure_digest,
+                "dependencyClosureDigest": self.dependency_closure_digest,
+                "dependencyMemberCount": str(self.dependency_member_count),
+            }
+        )
+
+    def _runtime_identity(self) -> dict[str, Any]:
+        return {
+            "platform": self.platform,
+            "os": platform.platform(),
+            "python": platform.python_version(),
+            "pythonImplementation": platform.python_implementation(),
+            "node": "unavailable",
+            "npm": "unavailable",
+            "runtimeClosureDigest": "unavailable",
+            "dependencyClosureDigest": "unavailable",
+            "dependencyMemberCount": "0",
+        }
+
+    def add_hard_gate(self, gate_id: str, passed: bool, detail: str) -> None:
+        record = {"id": gate_id, "status": "pass" if passed else "fail", "detail": sanitize_text(detail)}
+        self.hard_gate_results.append(record)
+        if not passed:
+            self.violations.append({"id": gate_id, "detail": sanitize_text(detail)})
+
+    def _bind_command_record(
+        self,
+        record: Mapping[str, Any],
+        *,
+        actual_argv: Sequence[str] | None = None,
+        cwd: str = ".",
+    ) -> dict[str, Any]:
+        command_id = str(record.get("commandId", ""))
+        expected = getattr(self, "command_plan_by_id", {}).get(command_id)
+        bound = dict(record)
+        if expected is None:
+            return bound
+        for key, value in expected.items():
+            if key not in {"commandId", "commandClass", "required", "argv", "cwd"}:
+                bound[key] = value
+        if actual_argv is None:
+            bound["argv"] = list(expected["argv"])
+            bound["cwd"] = expected["cwd"]
+            bound["required"] = expected["required"]
+            bound["commandClass"] = expected["commandClass"]
+            return bound
+        argv = [str(value) for value in actual_argv]
+        bound["argv"] = list(expected["argv"])
+        bound["logicalArgv"] = list(expected.get("logicalArgv", expected["argv"]))
+        bound["executionArgv"] = list(expected.get("executionArgv", expected["argv"]))
+        bound["cwd"] = expected["cwd"]
+        bound["required"] = expected["required"]
+        bound["commandClass"] = expected["commandClass"]
+        bound["actualExecutionArgv"] = argv
+        if argv:
+            executable_value = argv[0]
+            try:
+                resolved = str(Path(executable_value).resolve(strict=True))
+            except OSError:
+                resolved = executable_value
+            size, digest, identity = _measured_file_authority(Path(resolved))
+            bound["resolvedExecutablePath"] = resolved
+            bound["resolvedExecutableSize"] = size
+            bound["resolvedExecutableSha256"] = digest
+            bound["resolvedExecutableFileIdentity"] = identity
+        dependency_backed = str(bound.get("toolRole", "")) in DEPENDENCY_BACKED_TOOL_ROLES
+        bound["dependencyBacked"] = dependency_backed
+        if dependency_backed:
+            bound["runtimeClosureDigest"] = self.runtime_closure_digest
+            bound["dependencyClosureDigest"] = self.dependency_closure_digest
+            bound["nodePath"] = []
+            if bound.get("toolRole") == "node-vitest-security-test":
+                vitest_lease = (
+                    self.runtime_dependency_closure.leases.get("vitest")
+                    if self.runtime_dependency_closure is not None
+                    else None
+                )
+                bound["resolvedTestRunnerEntrypoint"] = (
+                    "developer/node_modules/vitest/vitest.mjs"
+                )
+                bound["resolvedTestRunnerSha256"] = (
+                    vitest_lease.expected_sha256 if vitest_lease is not None else None
+                )
+            else:
+                bound["resolvedTestRunnerEntrypoint"] = str(
+                    bound.get("resolvedExecutablePath")
+                )
+                bound["resolvedTestRunnerSha256"] = bound.get("resolvedExecutableSha256")
+            guard_evidence = (
+                self.runtime_dependency_guard.evidence()
+                if self.runtime_dependency_guard is not None
+                else {
+                    "guardSchemaVersion": RUNTIME_DEPENDENCY_GUARD_SCHEMA_VERSION,
+                    "watcherBackend": "unavailable",
+                    "active": False,
+                    "activeDuringReplay": False,
+                    "mutationState": "unknown",
+                    "queueOverflow": False,
+                    "mutationEventCount": 0,
+                }
+            )
+            bound["closureWatcherActive"] = guard_evidence["active"]
+            bound["closureMutationState"] = guard_evidence["mutationState"]
+            bound["runtimeClosureGuard"] = guard_evidence
+        return bound
+
+    def add_command(self, capture: CommandCapture) -> dict[str, Any]:
+        self.captures.append(capture)
+        bound = self._bind_command_record(
+            capture.evidence(),
+            actual_argv=capture.argv,
+            cwd=capture.cwd,
+        )
+        self.command_results.append(bound)
+        if bound.get("dependencyBacked"):
+            closure_errors = list(self.runtime_closure_errors)
+            if self.runtime_dependency_closure is None or self.runtime_dependency_guard is None:
+                closure_errors.append("dependency-backed command lacks a fresh runtime closure guard")
+            else:
+                closure_errors.extend(self.runtime_dependency_closure.verify_executables())
+                if self.runtime_dependency_guard.mutated:
+                    closure_errors.append("dependency closure mutation is sticky")
+                guard_evidence = self.runtime_dependency_guard.evidence()
+                bound["closureWatcherActive"] = guard_evidence["active"]
+                bound["closureMutationState"] = guard_evidence["mutationState"]
+                bound["runtimeClosureGuard"] = guard_evidence
+            if closure_errors:
+                bound["exitCode"] = PROCESS_TREE_FAILURE_EXIT
+                bound["processTreeStatus"] = "cleanup-failed"
+                bound["processTreeError"] = "; ".join(sorted(set(closure_errors)))
+                bound["error"] = "RUNTIME-CLOSURE-ERROR: " + bound["processTreeError"]
+                capture.exit_code = PROCESS_TREE_FAILURE_EXIT
+                capture.process_tree_status = "cleanup-failed"
+                capture.process_tree_error = bound["processTreeError"]
+                capture.error = bound["error"]
+                self.add_hard_gate(
+                    "RUNTIME-DEPENDENCY-CLOSURE",
+                    False,
+                    bound["processTreeError"],
+                )
+        return bound
+
+    def add_internal_command(self, record: Mapping[str, Any]) -> dict[str, Any]:
+        bound = self._bind_command_record(record)
+        self.command_results.append(bound)
+        return bound
+
+    def execute_protected_internal(
+        self,
+        command_id: str,
+        evaluator: Any,
+    ) -> tuple[dict[str, Any], Any]:
+        """Execute an in-process command exclusively from its frozen target bundle."""
+
+        plan_record = self.command_plan_by_id[command_id]
+        targets = plan_record.get("targets")
+        adapter = str(plan_record.get("executionInputMode", ""))
+        if adapter != "PROTECTED-TARGET-BUNDLE" or not isinstance(targets, list) or not targets:
+            raise ValueError(f"{command_id} lacks protected target-bundle authority")
+        bundle: ProtectedTargetBundle | None = None
+        payload: Any = None
+        passed = False
+        policy_started = False
+        detail = "protected target bundle was not executed"
+        if self.target_phase_hook is not None:
+            self.target_phase_hook(command_id, "after-plan-before-target-bundle", None)
+        try:
+            bundle = ProtectedTargetBundle(
+                targets,
+                repo_root=REPO_ROOT,
+                execution_adapter=adapter,
+            )
+            if self.target_phase_hook is not None:
+                self.target_phase_hook(
+                    command_id, "after-target-bundle-before-materialization", bundle
+                )
+            bundle.materialize()
+            if self.target_phase_hook is not None:
+                self.target_phase_hook(command_id, "after-materialization-before-policy", bundle)
+            policy_started = True
+            evaluated = evaluator(bundle)
+            if (
+                not isinstance(evaluated, tuple)
+                or len(evaluated) != 3
+                or type(evaluated[0]) is not bool
+                or not isinstance(evaluated[1], str)
+            ):
+                raise ValueError("protected policy evaluator returned an invalid result")
+            passed, detail, payload = evaluated
+            if self.target_phase_hook is not None:
+                self.target_phase_hook(command_id, "after-policy-before-evidence", bundle)
+            bundle_ok, bundle_error = bundle.verify()
+            if not bundle_ok:
+                passed = False
+                detail = bundle_error or "protected target bundle source drifted"
+        except Exception as exc:
+            passed = False
+            detail = f"PROTECTED-TARGET-BUNDLE-ERROR: {type(exc).__name__}: {exc}"
+        finally:
+            if bundle is not None:
+                bundle.close()
+        bundle_evidence = (
+            bundle.evidence()
+            if bundle is not None
+            else _failed_protected_target_bundle(targets, adapter)
+        )
+        record = make_internal_result(
+            command_id,
+            str(plan_record["commandClass"]),
+            passed,
+            detail,
+            required=bool(plan_record["required"]),
+        )
+        if not policy_started:
+            record["executed"] = False
+            record["started"] = False
+            record["setupFailure"] = True
+            record["exitCode"] = None
+            record["executionDurationClass"] = "not-started"
+            record["containment"] = "not-started"
+            record["processTreeStatus"] = "setup-failed"
+        record["actualExecutionInputMode"] = adapter
+        record["executionInputs"] = copy.deepcopy(bundle_evidence["executionInputs"])
+        record["executionInputBundleDigest"] = bundle_evidence[
+            "executionInputBundleDigest"
+        ]
+        record["protectedTargetBundle"] = bundle_evidence
+        return self.add_internal_command(record), payload
+
+    def execute_protected_external(
+        self,
+        command_id: str,
+        *,
+        timeout: int,
+    ) -> tuple[CommandCapture, dict[str, Any]]:
+        plan_record = self.command_plan_by_id[command_id]
+        capture, protected_bundle = execute_planned_static_suite(
+            plan_record,
+            repo_root=REPO_ROOT,
+            env=self.child_environment,
+            timeout=timeout,
+            phase_hook=(
+                (
+                    lambda phase, bundle: self.target_phase_hook(
+                        command_id,
+                        phase,
+                        bundle,
+                    )
+                )
+                if self.target_phase_hook is not None
+                else None
+            ),
+        )
+        command_record = self.add_command(capture)
+        command_record["executionInputs"] = copy.deepcopy(
+            protected_bundle["executionInputs"]
+        )
+        command_record["executionInputBundleDigest"] = protected_bundle[
+            "executionInputBundleDigest"
+        ]
+        command_record["protectedTargetBundle"] = protected_bundle
+        return capture, command_record
+
+    def add_observation(self, item: Mapping[str, Any]) -> dict[str, Any]:
+        raw_item = item.get("rawObservation")
+        command_id = str(
+            item.get("commandId", "")
+            or (raw_item.get("commandId", "") if isinstance(raw_item, Mapping) else "")
+        )
+        source = next(
+            (record for record in self.command_results if record.get("commandId") == command_id),
+            None,
+        )
+        if source is None:
+            derived = dict(item)
+        else:
+            derived = _rederive_observation_record(item, source)
+            raw = derived.get("rawObservation")
+            producer = source.setdefault("producerObservations", [])
+            if isinstance(raw, dict):
+                identity = (raw.get("commandId"), raw.get("observationOrdinal"))
+                if any(
+                    (existing.get("commandId"), existing.get("observationOrdinal")) == identity
+                    for existing in producer
+                    if isinstance(existing, dict)
+                ):
+                    raise ValueError("producer observation identity is duplicated")
+                producer.append(raw)
+                producer.sort(key=lambda value: int(value.get("observationOrdinal", -1)))
+                source["producerObservationSetDigest"] = producer_observation_set_digest(producer)
+        self.observations.append(derived)
+        return derived
+
+    def add_process_observation(
+        self,
+        command_record: Mapping[str, Any],
+        capture: CommandCapture,
+        *,
+        source_result_id: str,
+        source_path: str | None = None,
+        observation_ordinal: int = 0,
+    ) -> dict[str, Any]:
+        """Bind one process result to its command's raw output identity."""
+
+        raw = make_raw_observation(
+            capture.command_id,
+            int(command_record["ordinal"]),
+            observation_ordinal,
+            "process-output-v1",
+            source_result_id,
+            source_path,
+            {
+                "executed": capture.executed,
+                "exitCode": capture.exit_code,
+                "stdout": capture.stdout,
+                "stderr": capture.stderr,
+                "error": capture.error,
+            },
+            command_output_digest(command_record),
+        )
+        return self.add_observation(
+            {"commandId": capture.command_id, "rawObservation": raw}
+        )
+
+    def require_command_success(self, capture: CommandCapture, gate_id: str) -> bool:
+        self.add_command(capture)
+        if not capture.executed:
+            self.add_hard_gate(gate_id, False, f"required command did not execute: {capture.command_id}")
+            return False
+        passed = capture.execution_passed()
+        self.add_hard_gate(
+            gate_id,
+            passed,
+            f"{capture.command_id} exit={capture.exit_code} processTree={capture.process_tree_status}",
+        )
+        return passed
+
+    def ensure_candidate_paths(self) -> list[str]:
+        if self.candidate_paths is None:
+            git = self.tools.get("git")
+            if git is None:
+                paths, errors = [], ["trusted Git executable is unavailable"]
+            else:
+                paths, errors, capture = git_candidate_paths(
+                    git=git,
+                    env=self.child_environment,
+                )
+                self.add_command(capture)
+            if paths != self.planned_candidate_paths:
+                errors.append(
+                    "Git command inventory does not match the precomputed index authority"
+                )
+            self.candidate_paths = paths
+            for error in errors:
+                self.add_hard_gate("REPOSITORY-GIT-BOUNDARY", False, error)
+        return self.candidate_paths
+
+    def run_baseline_policy(self) -> None:
+        def evaluate(bundle: ProtectedTargetBundle) -> tuple[bool, str, Any]:
+            text = bundle.text_for("developer/tests/ci/phase1-ci-baseline.json")
+            parsed = strict_json_loads(
+                text,
+                label="developer/tests/ci/phase1-ci-baseline.json",
+            )
+            errors = validate_baseline_document(parsed)
+            if parsed != self.baseline:
+                errors.append("protected baseline bytes differ from runner baseline authority")
+            return (
+                not errors,
+                "baseline schema and ratified category counts passed"
+                if not errors
+                else "; ".join(errors),
+                parsed,
+            )
+
+        record, _parsed = self.execute_protected_internal("baseline-schema", evaluate)
+        passed = record.get("exitCode") == 0
+        self.add_hard_gate(
+            "BASELINE-POLICY-ENFORCEMENT",
+            passed,
+            "baseline schema passed" if passed else "protected baseline schema failed",
+        )
+
+    def run_runtime_policy(self, *, require_npm: bool = False) -> None:
+        self.add_hard_gate(
+            "RUNTIME-DEPENDENCY-CLOSURE-SETUP",
+            (not self.enable_runtime_closure) or not self.runtime_closure_errors,
+            (
+                f"runtime closure digest={self.runtime_closure_digest} members={self.dependency_member_count}"
+                if not self.runtime_closure_errors
+                else "; ".join(self.runtime_closure_errors)
+            ),
+        )
+        self.add_hard_gate(
+            "IMMUTABLE-COMMAND-AUTHORITY",
+            not self.command_plan_errors and bool(self.command_plan),
+            (
+                f"command plan frozen digest={self.command_plan_digest} commands={len(self.command_plan)}"
+                if not self.command_plan_errors and self.command_plan
+                else "; ".join(self.command_plan_errors) or "immutable command plan is empty"
+            ),
+        )
+        self.add_hard_gate(
+            "TRUSTED-EXECUTABLE-RESOLUTION",
+            not self.tool_resolution_errors,
+            "trusted tools resolved" if not self.tool_resolution_errors else "; ".join(self.tool_resolution_errors),
+        )
+        self.add_hard_gate(
+            "TRUSTED-FILE-MANIFEST",
+            not self.initial_trusted_errors,
+            "trusted-file manifest measured" if not self.initial_trusted_errors else "; ".join(self.initial_trusted_errors),
+        )
+        python_ok = sys.version_info[:2] == (3, 12)
+        self.add_hard_gate(
+            "PYTHON-CI-FAMILY",
+            python_ok,
+            f"Python {platform.python_version()} (required family 3.12)",
+        )
+        node = self.tools.get("node")
+        if node is None:
+            self.add_command(
+                CommandCapture(
+                    command_id="node-version",
+                    command_class="runtime-identity",
+                    argv=["node", "--version"],
+                    executed=False,
+                    exit_code=None,
+                    duration_seconds=0.0,
+                    stdout="",
+                    stderr="",
+                    error="required trusted Node executable is unavailable",
+                )
+            )
+            self.add_hard_gate("NODE-CI-FAMILY", False, "required Node executable is unavailable")
+        else:
+            capture = execute_command(
+                "node-version",
+                "runtime-identity",
+                [node, "--version"],
+                timeout=30,
+                env=self.child_environment,
+            )
+            self.add_command(capture)
+            version = sanitize_text(capture.stdout).strip()
+            self.runtime["node"] = version or "unavailable"
+            self.add_hard_gate(
+                "NODE-CI-FAMILY",
+                capture.executed and capture.exit_code == 0 and bool(re.fullmatch(r"v24\.\d+\.\d+", version)),
+                f"Node {version or 'unavailable'} (required family 24.x)",
+            )
+        npm = self.tools.get("npm")
+        if npm is not None:
+            capture = execute_command(
+                "npm-version",
+                "runtime-identity",
+                [npm, "--version"],
+                timeout=30,
+                env=self.child_environment,
+                required=require_npm,
+            )
+            self.add_command(capture)
+            if capture.executed and capture.exit_code == 0:
+                self.runtime["npm"] = sanitize_text(capture.stdout).strip()
+        else:
+            self.add_command(
+                CommandCapture(
+                    command_id="npm-version",
+                    command_class="runtime-identity",
+                    argv=["npm", "--version"],
+                    executed=False,
+                    exit_code=None,
+                    duration_seconds=0.0,
+                    stdout="",
+                    stderr="",
+                    required=require_npm,
+                    error="trusted npm executable is unavailable",
+                )
+            )
+            if require_npm:
+                self.add_hard_gate("NPM-REQUIRED", False, "required npm executable is unavailable")
+
+        if self.profile in {"static", "standalone", "all"}:
+            bash = self.tools.get("bash")
+            if bash is None or (os.name == "nt" and self.bash_lease is None):
+                bash_capture = CommandCapture(
+                    command_id="git-bash-version",
+                    command_class="runtime-identity",
+                    argv=["bash", "--version"],
+                    executed=False,
+                    exit_code=None,
+                    duration_seconds=0.0,
+                    stdout="",
+                    stderr="",
+                    error="trusted Git Bash executable or identity lease is unavailable",
+                )
+            else:
+                bash_capture = execute_command(
+                    "git-bash-version",
+                    "runtime-identity",
+                    [bash, "--version"],
+                    timeout=30,
+                    env=self.child_environment,
+                    executable_lease=self.bash_lease,
+                )
+            self.add_command(bash_capture)
+            version_text = sanitize_text(bash_capture.stdout + "\n" + bash_capture.stderr)
+            bash_ok = bash_capture.execution_passed() and bool(
+                re.search(r"(?i)GNU bash(?:,|\s)+version\s+\d+", version_text)
+            )
+            self.add_hard_gate(
+                "GIT-BASH-TRUSTED-RUNTIME",
+                bash_ok,
+                "trusted Git Bash product verification passed"
+                if bash_ok
+                else "trusted Git Bash product verification failed closed",
+            )
+
+    def run_repository_boundary(self) -> None:
+        paths = self.ensure_candidate_paths()
+        git = self.tools.get("git", "<unavailable-git>")
+        unexpected_untracked: list[str] = []
+        tracked_capture = execute_command(
+            "git-tracked-paths",
+            "repository-boundary",
+            trusted_git_arguments(git, "ls-files", "-z", "--cached"),
+            timeout=60,
+            env=self.child_environment,
+            include_preview=False,
+        )
+        self.add_command(tracked_capture)
+        tracked = set(tracked_capture.stdout.split("\0")) if tracked_capture.exit_code == 0 else set()
+        for path in paths:
+            if path not in tracked and path not in LOCAL_IMPLEMENTATION_ALLOWLIST:
+                unexpected_untracked.append(path)
+        boundary_errors: list[str] = []
+        if not tracked_capture.executed or tracked_capture.exit_code != 0:
+            boundary_errors.append("tracked-file inventory did not execute")
+        if unexpected_untracked:
+            boundary_errors.append(f"unexpected untracked paths: {unexpected_untracked[:10]}")
+        if any(path.startswith(".ci-results/") for path in tracked):
+            boundary_errors.append(".ci-results output is tracked")
+
+        for command_id, argv in (
+            ("git-diff-check", trusted_git_arguments(git, "diff", "--check")),
+            ("git-cached-diff-check", trusted_git_arguments(git, "diff", "--cached", "--check")),
+        ):
+            capture = execute_command(
+                command_id,
+                "repository-boundary",
+                argv,
+                timeout=60,
+                env=self.child_environment,
+            )
+            self.add_command(capture)
+            if not capture.executed or capture.exit_code != 0:
+                boundary_errors.append(f"{command_id} failed")
+
+        stage_capture = execute_command(
+            "git-stage-modes",
+            "repository-boundary",
+            trusted_git_arguments(git, "ls-files", "-s", "-z"),
+            timeout=60,
+            env=self.child_environment,
+            include_preview=False,
+        )
+        self.add_command(stage_capture)
+        if not stage_capture.executed or stage_capture.exit_code != 0:
+            boundary_errors.append("Git stage-mode inventory failed")
+        elif any(record.startswith("120000 ") for record in stage_capture.stdout.split("\0") if record):
+            boundary_errors.append("tracked symbolic links are forbidden by the public boundary gate")
+
+        git_dir_capture = execute_command(
+            "git-dir",
+            "repository-boundary",
+            trusted_git_arguments(git, "rev-parse", "--absolute-git-dir"),
+            timeout=30,
+            env=self.child_environment,
+            include_preview=False,
+        )
+        self.add_command(git_dir_capture)
+        if git_dir_capture.executed and git_dir_capture.exit_code == 0:
+            git_dir = Path(git_dir_capture.stdout.strip())
+            markers = (
+                "MERGE_HEAD",
+                "CHERRY_PICK_HEAD",
+                "REVERT_HEAD",
+                "BISECT_LOG",
+                "rebase-apply",
+                "rebase-merge",
+                "sequencer",
+            )
+            active = [marker for marker in markers if (git_dir / marker).exists()]
+            if active:
+                boundary_errors.append(f"active Git operation markers: {active}")
+        else:
+            boundary_errors.append("Git directory could not be resolved")
+        self.add_hard_gate(
+            "REPOSITORY-GIT-BOUNDARY",
+            not boundary_errors,
+            "repository boundary passed" if not boundary_errors else "; ".join(boundary_errors),
+        )
+
+    def run_private_and_secret_policy(self) -> None:
+        paths = self.ensure_candidate_paths()
+        path_violations = [
+            f"{relative}: {reason}"
+            for relative in paths
+            if (reason := private_or_operational_path_reason(relative)) is not None
+        ]
+
+        def evaluate_paths(bundle: ProtectedTargetBundle) -> tuple[bool, str, Any]:
+            for relative in paths:
+                bundle.bytes_for(relative)
+            return (
+                not path_violations,
+                f"scannedPaths={len(paths)} violations={len(path_violations)}",
+                None,
+            )
+
+        self.execute_protected_internal("tracked-private-resource-scan", evaluate_paths)
+
+        def evaluate_secrets(bundle: ProtectedTargetBundle) -> tuple[bool, str, Any]:
+            secret_violations: list[str] = []
+            scan_records: list[dict[str, Any]] = []
+            scanned_bytes = 0
+            scanned_text_files = 0
+            scanned_binary_files = 0
+            for relative in paths:
+                scan = scan_bytes_for_secrets(relative, bundle.bytes_for(relative))
+                scan_records.append(
+                    {
+                        "path": relative,
+                        "fileSize": scan.get("fileSize"),
+                        "classification": scan.get("classification"),
+                        "scannedBytes": scan.get("scannedBytes"),
+                        "rawBytesScanned": scan.get("rawBytesScanned"),
+                        "encodingViewsApplied": scan.get("encodingViewsApplied", []),
+                        "utf16LeDecodedUnits": scan.get("utf16LeDecodedUnits", 0),
+                        "utf16BeDecodedUnits": scan.get("utf16BeDecodedUnits", 0),
+                        "patternFamiliesApplied": scan.get("patternFamiliesApplied", []),
+                        "hitCount": scan.get("hitCount", len(scan.get("hits", []))),
+                    }
+                )
+                scanned_bytes += int(scan.get("scannedBytes", 0))
+                if scan.get("classification") == "text-scanned":
+                    scanned_text_files += 1
+                elif scan.get("classification") == "binary-scanned":
+                    scanned_binary_files += 1
+                if not scan.get("passed"):
+                    secret_violations.append(
+                        f"{relative}: {', '.join(str(hit) for hit in scan.get('hits', []))}"
+                    )
+            detail = (
+                f"scannedPaths={len(paths)} textFiles={scanned_text_files} "
+                f"binaryFiles={scanned_binary_files} scannedBytes={scanned_bytes} "
+                f"violations={len(secret_violations)}"
+            )
+            return not secret_violations, detail, (secret_violations, scan_records)
+
+        secret_record, secret_payload = self.execute_protected_internal(
+            "tracked-secret-scan", evaluate_secrets
+        )
+        if isinstance(secret_payload, tuple) and len(secret_payload) == 2:
+            secret_violations, scan_records = secret_payload
+            secret_record["fileScans"] = scan_records
+        else:
+            secret_violations = ["protected secret scan did not produce authoritative results"]
+        self.add_hard_gate(
+            "TRACKED-PRIVATE-RESOURCE-EXCLUSION",
+            not path_violations
+            and next(
+                record for record in self.command_results
+                if record.get("commandId") == "tracked-private-resource-scan"
+            ).get("exitCode") == 0,
+            "no tracked private resources" if not path_violations else "; ".join(path_violations[:10]),
+        )
+        self.add_hard_gate(
+            "SECRET-OPERATIONAL-ARTIFACT-EXCLUSION",
+            not secret_violations and secret_record.get("exitCode") == 0,
+            "all regular-file bytes passed credential scanning"
+            if not secret_violations
+            else "; ".join(secret_violations[:10]),
+        )
+
+    def run_license_policy(self) -> None:
+        required_files = (
+            "LICENSE",
+            "LICENSE.md",
+            "NOTICE.md",
+            "LICENSES/AGPL-3.0-only.txt",
+            "README.md",
+            "docs/CONTENT_POLICY.md",
+            "docs/STATUS.md",
+            "api-contract/README.md",
+            "backend/package.json",
+        )
+        spdx_paths = [
+            path
+            for path in self.ensure_candidate_paths()
+            if (
+                (path.startswith("backend/src/") or path.startswith("backend/scripts/") or path.startswith("backend/test/"))
+                and Path(path).suffix.lower() in {".js", ".mjs"}
+            )
+            or path == "api-contract/README.md"
+        ]
+        content_expectations = (
+            ("LICENSE.md", "LICENSES/AGPL-3.0-only.txt"),
+            ("LICENSE.md", "mixed-license"),
+            ("NOTICE.md", "LICENSE.md"),
+            ("README.md", "docs/STATUS.md#licensing-and-governance"),
+            ("docs/STATUS.md", "## Licensing and governance"),
+            ("docs/CONTENT_POLICY.md", "private resource"),
+        )
+
+        def evaluate(bundle: ProtectedTargetBundle) -> tuple[bool, str, Any]:
+            checks: list[tuple[str, bool]] = []
+            for relative in required_files:
+                checks.append((f"required governance file {relative}", bool(bundle.bytes_for(relative))))
+            try:
+                backend_package = strict_json_loads(
+                    bundle.text_for("backend/package.json"),
+                    label="backend/package.json",
+                )
+                checks.append(
+                    (
+                        "backend package license is AGPL-3.0-only",
+                        backend_package.get("license") == "AGPL-3.0-only",
+                    )
+                )
+            except (UnicodeError, json.JSONDecodeError, ValueError):
+                checks.append(("backend package metadata parses", False))
+            spdx_missing: list[str] = []
+            for relative in spdx_paths:
+                source = bundle.bytes_for(relative).decode("utf-8", errors="replace")
+                if "SPDX-License-Identifier: AGPL-3.0-only" not in "\n".join(
+                    source.splitlines()[:5]
+                ):
+                    spdx_missing.append(relative)
+            checks.append(("authorized server scope has AGPL SPDX headers", not spdx_missing))
+            for relative, expected in content_expectations:
+                source = bundle.bytes_for(relative).decode("utf-8", errors="replace")
+                checks.append(
+                    (
+                        f"{relative} contains governance marker {expected}",
+                        expected.lower() in source.lower(),
+                    )
+                )
+            failures = [name for name, passed in checks if not passed]
+            detail = (
+                f"checks={len(checks)} failures={len(failures)}"
+                if not failures
+                else "; ".join(failures + spdx_missing)
+            )
+            return not failures, detail, failures
+
+        record, failures = self.execute_protected_internal(
+            "license-governance-consistency", evaluate
+        )
+        passed = record.get("exitCode") == 0 and failures == []
+        self.add_hard_gate(
+            "LICENSE-GOVERNANCE-CONSISTENCY",
+            passed,
+            "licence/governance consistency passed"
+            if passed
+            else "protected licence/governance consistency failed",
+        )
+
+    def run_workflow_policy(self) -> None:
+        plan_record = self.command_plan_by_id["workflow-self-policy"]
+
+        def evaluate(bundle: ProtectedTargetBundle) -> tuple[bool, str, Any]:
+            errors = run_workflow_policy(
+                bundle.bytes_for(".github/workflows/ci.yml"),
+                bundle.bytes_for("docs/CI_POLICY.md"),
+                bundle.bytes_for("developer/tests/ci/phase1-ci-baseline.json"),
+                plan_record["targets"],
+            )
+            return (
+                not errors,
+                f"errors={len(errors)}" if not errors else "; ".join(errors),
+                errors,
+            )
+
+        record, errors = self.execute_protected_internal("workflow-self-policy", evaluate)
+        if not isinstance(errors, list):
+            errors = ["protected workflow policy did not return an authoritative result"]
+        passed = record.get("exitCode") == 0 and not errors
+        self.add_hard_gate(
+            "WORKFLOW-SELF-POLICY",
+            passed,
+            "workflow policy passed" if passed else "; ".join(errors),
+        )
+
+    def run_policy_profile(self) -> None:
+        self.run_repository_boundary()
+        self.run_private_and_secret_policy()
+        self.run_license_policy()
+        self.run_workflow_policy()
+
+    def run_static_profile(self) -> None:
+        invocation_id = self.static_invocation_id
+        python_executable = self.tools.get("python", sys.executable)
+        argv = [
+            python_executable,
+            "-B",
+            STATIC_SUITE_RELATIVE_PATH,
+            "--ci-machine-json-stdout",
+            "--ci-invocation-id",
+            invocation_id,
+        ]
+        expected_machine_plan: list[dict[str, Any]] | None = None
+        plan_errors: list[str] = []
+        try:
+            expected_machine_plan = build_expected_static_machine_command_plan(
+                invocation_id,
+                python_executable=python_executable,
+                current_platform=self.platform,
+            )
+        except (OSError, ValueError) as exc:
+            plan_errors.append(f"static machine authority could not be frozen: {type(exc).__name__}")
+        static_plan = self.command_plan_by_id["static-suite"]
+        capture, protected_bundle = execute_planned_static_suite(
+            static_plan,
+            repo_root=REPO_ROOT,
+            env=self.child_environment,
+            timeout=1200,
+            phase_hook=(
+                (
+                    lambda phase, bundle: self.target_phase_hook(
+                        "static-suite", phase, bundle
+                    )
+                )
+                if self.target_phase_hook is not None
+                else None
+            ),
+        )
+        report: dict[str, Any] | None = None
+        report_errors: list[str] = list(plan_errors)
+        if not capture.output_limited:
+            try:
+                report, parse_errors = parse_static_machine_report(
+                    capture.authoritative_stdout_bytes(),
+                    expected_invocation_id=invocation_id,
+                )
+                report_errors.extend(parse_errors)
+            except (UnicodeEncodeError, ValueError) as exc:
+                report_errors.append(
+                    f"static machine stdout could not be recovered exactly: {type(exc).__name__}"
+                )
+        if report is not None and expected_machine_plan is not None:
+            authority_keys = set(expected_machine_plan[0])
+            reported_plan = [
+                {key: value for key, value in record.items() if key in authority_keys}
+                for record in report["commandResults"]
+            ]
+            if reported_plan != expected_machine_plan:
+                report_errors.append("static machine command plan does not match parent authority")
+            if report["commandPlanDigest"] != static_machine_command_plan_digest(
+                expected_machine_plan
+            ):
+                report_errors.append("static machine commandPlanDigest does not match parent authority")
+        invocation_exact = capture.argv == argv
+        if not invocation_exact:
+            report_errors.append("static machine invocation argv identity is not exact")
+        if report is not None and not report_errors:
+            _canonicalize_static_machine_capture(capture, report)
+        static_command_record = self.add_command(capture)
+        static_command_record["executionInputs"] = copy.deepcopy(
+            protected_bundle["executionInputs"]
+        )
+        static_command_record["executionInputBundleDigest"] = protected_bundle[
+            "executionInputBundleDigest"
+        ]
+        static_command_record["protectedTargetBundle"] = protected_bundle
+        execution_passed = capture.execution_passed() and invocation_exact and report is not None and not report_errors
+        self.add_hard_gate(
+            "STATIC-SUITE-EXECUTION",
+            execution_passed,
+            f"static suite exit={capture.exit_code} processTree={capture.process_tree_status} "
+            f"machineSchema={'valid' if report is not None and not report_errors else 'invalid'}",
+        )
+        if not execution_passed:
+            detail_parts = ["static suite execution failed; semantic output was not parsed"]
+            if capture.stderr:
+                detail_parts.append(
+                    "sanitized stderr tail: "
+                    + bounded_preview(capture.stderr, max_lines=12, max_bytes=1600)
+                )
+            elif capture.error:
+                detail_parts.append(f"runner error: {sanitize_text(capture.error)}")
+            detail_parts.extend(report_errors)
+            self.add_hard_gate("STATIC-SUITE-RESULT", False, "; ".join(detail_parts))
+        else:
+            assert report is not None
+            release_scopes = {
+                entry["testOrPathScope"] for entry in self.baseline.get("releaseOnlySkips", [])
+            }
+            for observation_ordinal, result in enumerate(report["observations"]):
+                scope = f"result:{result['name']}"
+                status = result.get("status")
+                detail = result.get("detail")
+                if scope in release_scopes and status == "pass" and nested_skip(detail):
+                    outcome = "skip"
+                else:
+                    outcome = "pass" if status == "pass" else "fail"
+                if outcome == "pass":
+                    signature = "pass"
+                    identity: Mapping[str, Any] = {"scope": scope, "normalizedSignature": "pass"}
+                else:
+                    identity = structured_failure_identity(scope, detail)
+                    signature = static_failure_signature(scope, detail, identity)
+                raw = make_raw_observation(
+                    "static-suite",
+                    int(static_command_record["ordinal"]),
+                    observation_ordinal,
+                    "static-producer-v1",
+                    str(result["name"]),
+                    STATIC_SUITE_RELATIVE_PATH,
+                    result,
+                    command_output_digest(static_command_record),
+                )
+                self.add_observation(
+                    observation(
+                        "static-suite",
+                        scope,
+                        outcome,
+                        signature,
+                        "static-suite",
+                        failure_identity=identity,
+                        raw_observation=raw,
+                        command_record=static_command_record,
+                    )
+                )
+            self.completed_classes.add("static-suite")
+            self.static_machine_report = report
+        self.run_direct_syntax()
+
+    def run_direct_syntax(self) -> None:
+        paths = [
+            path
+            for path in self.ensure_candidate_paths()
+            if Path(path).suffix.lower() in {".js", ".mjs"}
+        ]
+        node = self.tools.get("node")
+        if node is None:
+            self.add_hard_gate("DIRECT-JAVASCRIPT-SYNTAX", False, "required Node executable is unavailable")
+        else:
+            execution_failure = False
+            def check_one(
+                relative: str,
+            ) -> tuple[str, CommandCapture, TargetExecutionLease | None]:
+                plan_record = self.command_plan_by_id[f"node-check:{relative}"]
+                capture, lease = execute_planned_node_check(
+                    plan_record,
+                    repo_root=REPO_ROOT,
+                    env=self.child_environment,
+                    timeout=30,
+                )
+                return relative, capture, lease
+
+            worker_count = (
+                1
+                if sys.platform.startswith("linux")
+                else min(16, max(2, os.cpu_count() or 2))
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                syntax_results = list(executor.map(check_one, paths))
+            for relative, capture, lease in syntax_results:
+                command_record = self.add_command(capture)
+                if lease is not None:
+                    self.target_execution_leases.append((lease, command_record))
+                scope = relative
+                if not _command_execution_completed(command_record):
+                    execution_failure = True
+                    outcome = "unavailable"
+                    signature = "required-executable-unavailable:node"
+                elif capture.exit_code == 0:
+                    outcome = "pass"
+                    signature = "pass"
+                else:
+                    outcome = "syntax-error"
+                    signature = syntax_failure_signature(scope, capture.stderr, capture.stdout)
+                identity = (
+                    {"scope": scope, "normalizedSignature": "pass"}
+                    if outcome == "pass"
+                    else extract_failure_identity(scope, stdout=capture.stdout, stderr=capture.stderr)
+                )
+                raw = make_raw_observation(
+                    capture.command_id,
+                    int(command_record["ordinal"]),
+                    0,
+                    "process-output-v1",
+                    scope,
+                    relative,
+                    {
+                        "executed": capture.executed,
+                        "exitCode": capture.exit_code,
+                        "stdout": capture.stdout,
+                        "stderr": capture.stderr,
+                        "error": capture.error,
+                    },
+                    command_output_digest(command_record),
+                )
+                self.add_observation(
+                    observation(
+                        "direct-syntax",
+                        scope,
+                        outcome,
+                        signature,
+                        capture.command_id,
+                        failure_identity=identity,
+                        raw_observation=raw,
+                        command_record=command_record,
+                    )
+                )
+            self.completed_classes.add("direct-syntax")
+            self.add_hard_gate(
+                "DIRECT-JAVASCRIPT-SYNTAX-EXECUTION",
+                not execution_failure,
+                f"checked JavaScript files={len(paths)}",
+            )
+
+        python_paths = [path for path in self.ensure_candidate_paths() if Path(path).suffix.lower() == ".py"]
+
+        def evaluate_python(bundle: ProtectedTargetBundle) -> tuple[bool, str, Any]:
+            python_failures: list[str] = []
+            for relative in python_paths:
+                try:
+                    data = bundle.bytes_for(relative)
+                    encoding, _lines = tokenize.detect_encoding(io.BytesIO(data).readline)
+                    source = data.decode(encoding, errors="strict")
+                    compile(source, relative, "exec", dont_inherit=True)
+                except (LookupError, SyntaxError, UnicodeError, ValueError) as exc:
+                    python_failures.append(f"{relative}: {type(exc).__name__}")
+            return (
+                not python_failures,
+                f"checked={len(python_paths)} failures={len(python_failures)}",
+                python_failures,
+            )
+
+        python_record, python_failures = self.execute_protected_internal(
+            "python-source-syntax", evaluate_python
+        )
+        if not isinstance(python_failures, list):
+            python_failures = ["protected Python syntax command did not return results"]
+        python_passed = python_record.get("exitCode") == 0 and not python_failures
+        self.add_hard_gate(
+            "DIRECT-PYTHON-SYNTAX",
+            python_passed,
+            "Python sources compile" if python_passed else "; ".join(python_failures[:10]),
+        )
+
+    def run_frontend_profile(self) -> None:
+        node = self.tools.get("node")
+        if node is None:
+            self.add_hard_gate("FRONTEND-NODE-REQUIRED", False, "required Node executable is unavailable")
+            return
+        bundle, _bundle_record = self.execute_protected_external(
+            "bundle-normalization",
+            timeout=300,
+        )
+        self.add_hard_gate(
+            "BUNDLE-MANIFEST-GENERATED-BYTE-PARITY",
+            bundle.execution_passed(),
+            f"bundle-normalization exit={bundle.exit_code} processTree={bundle.process_tree_status}",
+        )
+
+        learner, learner_record = self.execute_protected_external(
+            "learner-focused",
+            timeout=300,
+        )
+        learner_scope = "command:learner-focused-runtime"
+        if not learner.executed:
+            learner_outcome = "unavailable"
+            learner_signature = "required-executable-unavailable:node"
+            self.add_hard_gate("FOCUSED-LEARNER-RUNTIME-EXECUTION", False, "learner command did not execute")
+        elif learner.exit_code == 0:
+            learner_outcome = "pass"
+            learner_signature = "pass"
+            self.add_hard_gate("FOCUSED-LEARNER-RUNTIME-EXECUTION", True, "learner command executed")
+        else:
+            learner_outcome = "unavailable" if "unavailable" in learner_failure_signature(learner.stdout + learner.stderr) else "fail"
+            learner_signature = learner_failure_signature(learner.stdout + learner.stderr)
+            self.add_hard_gate("FOCUSED-LEARNER-RUNTIME-EXECUTION", True, "learner command executed with a non-pass result")
+        self.add_process_observation(
+            learner_record,
+            learner,
+            source_result_id=learner_scope,
+            source_path="developer/tests/js/learnerPalette.test.js",
+        )
+        self.completed_classes.add("learner-focused")
+
+        for relative in SECURITY_GUARD_FILES:
+            command_id = f"frontend-security:{Path(relative).name}"
+            capture, command_record = self.execute_protected_external(
+                command_id,
+                timeout=180,
+            )
+            scope = f"file:{relative}"
+            if not capture.executed:
+                outcome = "unavailable"
+                signature = "required-executable-unavailable:node"
+                self.add_hard_gate("FRONTEND-SECURITY-GUARD-EXECUTION", False, f"did not execute: {relative}")
+            elif capture.exit_code == 0:
+                outcome = "pass"
+                signature = "pass"
+            else:
+                outcome = "fail"
+                signature = node_failure_signature(scope, capture.stdout + capture.stderr)
+            self.add_process_observation(
+                command_record,
+                capture,
+                source_result_id=scope,
+                source_path=relative,
+            )
+
+        vitest_command_id = "frontend-security:messageOriginGuard.test.js"
+        vitest_capture, vitest_record = self.execute_protected_external(
+            vitest_command_id,
+            timeout=180,
+        )
+        vitest_scope = f"file:{VITEST_SECURITY_GUARD}"
+        if not vitest_capture.executed:
+            vitest_outcome = "unavailable"
+            vitest_signature = "required-command-unavailable:vitest"
+            self.add_hard_gate(
+                "FRONTEND-SECURITY-GUARD-EXECUTION",
+                False,
+                "canonical message-origin Vitest command did not execute",
+            )
+        elif vitest_capture.exit_code == 0:
+            vitest_outcome = "pass"
+            vitest_signature = "pass"
+        else:
+            vitest_outcome = "fail"
+            vitest_identity = extract_failure_identity(
+                vitest_scope,
+                stdout=vitest_capture.stdout,
+                stderr=vitest_capture.stderr,
+            )
+            vitest_signature = failure_identity_hash(vitest_identity)
+        if vitest_outcome == "pass":
+            vitest_identity = {"scope": vitest_scope, "normalizedSignature": "pass"}
+        elif not isinstance(locals().get("vitest_identity"), dict):
+            vitest_identity = extract_failure_identity(
+                vitest_scope,
+                stdout=vitest_capture.stdout,
+                stderr=vitest_capture.stderr,
+            )
+        self.add_process_observation(
+            vitest_record,
+            vitest_capture,
+            source_result_id=vitest_scope,
+            source_path=VITEST_SECURITY_GUARD,
+        )
+        self.completed_classes.add("frontend-security")
+        self.add_hard_gate(
+            "FRONTEND-SECURITY-GUARD-EXECUTION",
+            all(
+                capture.executed and not capture.output_limited and not capture.timed_out
+                for capture in self.captures
+                if capture.command_class == "frontend-security"
+            ),
+            f"focused security guard files={len(SECURITY_GUARD_FILES) + 1}",
+        )
+
+    def run_backend_profile(self) -> None:
+        scope = "command:npm --prefix backend test"
+        capture, command_record = self.execute_protected_external(
+            "backend-canonical",
+            timeout=900,
+        )
+        if not capture.executed:
+            outcome = "unavailable"
+            signature = "required-executable-unavailable:npm"
+            self.add_hard_gate("BACKEND-CANONICAL-EXECUTION", False, "backend canonical suite did not execute")
+        elif capture.exit_code == 0:
+            outcome = "pass"
+            signature = "pass"
+            self.add_hard_gate("BACKEND-CANONICAL-EXECUTION", True, "backend canonical suite executed")
+        else:
+            outcome = "fail"
+            backend_identity = extract_failure_identity(scope, stdout=capture.stdout, stderr=capture.stderr)
+            signature = failure_identity_hash(backend_identity)
+            self.add_hard_gate("BACKEND-CANONICAL-EXECUTION", True, "backend canonical suite executed with a non-pass result")
+        if outcome == "pass":
+            backend_identity = {"scope": scope, "normalizedSignature": "pass"}
+        elif outcome == "unavailable":
+            backend_identity = {"scope": scope, "normalizedSignature": signature}
+        self.add_process_observation(
+            command_record,
+            capture,
+            source_result_id=scope,
+            source_path="backend/package.json",
+        )
+        self.completed_classes.add("backend-canonical")
+
+    def run_standalone_profile(self) -> None:
+        environment = self.child_environment
+        plan_record = self.command_plan_by_id["standalone-packaging"]
+        capture, protected_bundle = execute_planned_static_suite(
+            plan_record,
+            repo_root=REPO_ROOT,
+            env=environment,
+            timeout=900,
+            phase_hook=(
+                (
+                    lambda phase, bundle: self.target_phase_hook(
+                        "standalone-packaging", phase, bundle
+                    )
+                )
+                if self.target_phase_hook is not None
+                else None
+            ),
+        )
+        self.require_command_success(capture, "STANDALONE-PACKAGE-INTEGRITY")
+        standalone_record = self.command_results[-1]
+        standalone_record["executionInputs"] = copy.deepcopy(
+            protected_bundle["executionInputs"]
+        )
+        standalone_record["executionInputBundleDigest"] = protected_bundle[
+            "executionInputBundleDigest"
+        ]
+        standalone_record["protectedTargetBundle"] = protected_bundle
+
+        scope = "membership:index.html::js/siteContent.js"
+        def evaluate_membership(bundle: ProtectedTargetBundle) -> tuple[bool, str, Any]:
+            manifest = strict_json_loads(
+                bundle.text_for("developer/standalone-release-manifest.json"),
+                label="developer/standalone-release-manifest.json",
+            )
+            manifest_files = set(manifest["files"])
+            index_source = bundle.text_for("index.html")
+            script_sources = [
+                match.group(1).strip().lstrip("./")
+                for match in re.finditer(
+                    r"<script\b[^>]*\bsrc\s*=\s*['\"]([^'\"]+)['\"][^>]*>",
+                    index_source,
+                    re.IGNORECASE,
+                )
+                if not re.match(r"(?i)^(?:https?:)?//", match.group(1).strip())
+            ]
+            missing = sorted(path for path in script_sources if path not in manifest_files)
+            return (
+                not missing,
+                f"indexScripts={len(script_sources)} missing={len(missing)}",
+                (script_sources, missing),
+            )
+
+        membership_record, membership_payload = self.execute_protected_internal(
+            "standalone-membership-audit", evaluate_membership
+        )
+        if isinstance(membership_payload, tuple) and len(membership_payload) == 2:
+            script_sources, missing = membership_payload
+            observation_ordinal = 0
+            for relative in missing:
+                raw = make_raw_observation(
+                    "standalone-membership-audit",
+                    int(membership_record["ordinal"]),
+                    observation_ordinal,
+                    "standalone-membership-v1",
+                    f"membership:index.html::{relative}",
+                    relative,
+                    {"relative": relative, "missing": True},
+                    command_output_digest(membership_record),
+                )
+                self.add_observation(
+                    {
+                        "commandId": "standalone-membership-audit",
+                        "rawObservation": raw,
+                    }
+                )
+                observation_ordinal += 1
+            if "js/siteContent.js" not in missing:
+                raw = make_raw_observation(
+                    "standalone-membership-audit",
+                    int(membership_record["ordinal"]),
+                    observation_ordinal,
+                    "standalone-membership-v1",
+                    scope,
+                    "js/siteContent.js",
+                    {"relative": "js/siteContent.js", "missing": False},
+                    command_output_digest(membership_record),
+                )
+                self.add_observation(
+                    {
+                        "commandId": "standalone-membership-audit",
+                        "rawObservation": raw,
+                    }
+                )
+            self.add_hard_gate(
+                "STANDALONE-MEMBERSHIP-AUDIT-EXECUTION",
+                membership_record.get("exitCode") in (0, 1),
+                f"index scripts checked={len(script_sources)}",
+            )
+        else:
+            self.add_hard_gate(
+                "STANDALONE-MEMBERSHIP-AUDIT-EXECUTION",
+                False,
+                "protected standalone membership audit did not execute",
+            )
+
+    def run_lockfile_integrity(self) -> None:
+        def evaluate(bundle: ProtectedTargetBundle) -> tuple[bool, str, Any]:
+            failures = [
+                relative
+                for relative, expected in LOCKED_FILE_SHA256.items()
+                if hashlib.sha256(bundle.bytes_for(relative)).hexdigest() != expected
+            ]
+            return (
+                not failures,
+                f"checked={len(LOCKED_FILE_SHA256)} failures={len(failures)}",
+                failures,
+            )
+
+        record, failures = self.execute_protected_internal("lockfile-integrity", evaluate)
+        if not isinstance(failures, list):
+            failures = ["protected lockfile check did not return authoritative results"]
+        passed = record.get("exitCode") == 0 and not failures
+        self.add_hard_gate(
+            "LOCKFILE-BYTE-INTEGRITY",
+            passed,
+            "locked package manifests match frozen byte identities"
+            if passed
+            else "; ".join(failures),
+        )
+
+    def verify_trusted_integrity(self, phase: str) -> None:
+        current, errors = snapshot_trusted_files()
+        errors.extend(compare_trusted_snapshots(self.initial_trusted_snapshot, current))
+        self.add_hard_gate(
+            f"TRUSTED-FILE-INTEGRITY-{phase.upper()}",
+            not errors,
+            f"trusted files unchanged after {phase}" if not errors else "; ".join(errors),
+        )
+        if self.runtime_dependency_guard is not None:
+            closure_errors = self.runtime_dependency_guard.verify(phase)
+            self.add_hard_gate(
+                f"RUNTIME-DEPENDENCY-CLOSURE-{phase.upper()}",
+                not closure_errors,
+                (
+                    f"runtime/dependency closure unchanged after {phase}"
+                    if not closure_errors
+                    else "; ".join(closure_errors)
+                ),
+            )
+
+    def close_execution_leases(self) -> None:
+        for lease, record in self.target_execution_leases:
+            okay, error = lease.verify()
+            if not okay:
+                record["exitCode"] = PROCESS_TREE_FAILURE_EXIT
+                record["processTreeStatus"] = "cleanup-failed"
+                record["processTreeError"] = error or "target execution source identity drifted"
+                record["error"] = "TARGET-LEASE-ERROR: " + (
+                    error or "target execution source identity drifted"
+                )
+                self.add_hard_gate(
+                    "TARGET-EXECUTION-SOURCE-INTEGRITY",
+                    False,
+                    f"{record.get('commandId')}: {error or 'source identity drifted'}",
+                )
+            lease.close()
+            closed_evidence = lease.evidence()
+            record["targetExecutionLease"] = closed_evidence
+            record["executionInputs"] = [
+                {
+                    "logicalPath": closed_evidence.get("logicalTargetPath"),
+                    "canonicalSourcePath": closed_evidence.get("canonicalSourcePath"),
+                    "plannedByteLength": closed_evidence.get("plannedByteLength"),
+                    "plannedSha256": closed_evidence.get("plannedSha256"),
+                    "plannedStableIdentity": closed_evidence.get("plannedStableFileIdentity"),
+                    "actualByteLength": closed_evidence.get("executedInputByteLength"),
+                    "actualSha256": closed_evidence.get("executedInputSha256"),
+                    "inputMode": closed_evidence.get("executionAdapter"),
+                }
+            ]
+            record["executionInputBundleDigest"] = execution_input_bundle_digest(
+                record["executionInputs"]
+            )
+        self.target_execution_leases.clear()
+        if self.bash_lease is not None:
+            self.bash_lease.close()
+            self.bash_lease = None
+        if self.runtime_dependency_guard is not None:
+            closure_errors = self.runtime_dependency_guard.close()
+            guard_evidence = self.runtime_dependency_guard.evidence()
+            self.runtime_closure_guard_evidence = copy.deepcopy(guard_evidence)
+            for record in self.command_results:
+                if not record.get("dependencyBacked"):
+                    continue
+                record["closureWatcherActive"] = guard_evidence["activeDuringReplay"]
+                record["closureMutationState"] = guard_evidence["mutationState"]
+                record["runtimeClosureGuard"] = copy.deepcopy(guard_evidence)
+                if closure_errors:
+                    record["exitCode"] = PROCESS_TREE_FAILURE_EXIT
+                    record["processTreeStatus"] = "cleanup-failed"
+                    record["processTreeError"] = "; ".join(closure_errors)
+                    record["error"] = "RUNTIME-CLOSURE-ERROR: " + record["processTreeError"]
+            self.add_hard_gate(
+                "RUNTIME-DEPENDENCY-CLOSURE-FINAL",
+                not closure_errors,
+                (
+                    "runtime/dependency closure watcher closed cleanly"
+                    if not closure_errors
+                    else "; ".join(closure_errors)
+                ),
+            )
+            self.runtime_dependency_guard = None
+        if self.runtime_dependency_closure is not None:
+            self.runtime_dependency_closure.close()
+            self.runtime_dependency_closure = None
+        # The verifier is the terminal workflow step, so every task-owned
+        # temporary resource must be released inside this process.  Keeping
+        # this cleanup here also makes legacy callers that explicitly close
+        # leases satisfy the same lifecycle contract.
+        handle = getattr(self, "private_temp_handle", None)
+        if handle is not None:
+            handle.cleanup()
+            self.private_temp_handle = None
+
+    def cleanup_task_resources(self) -> None:
+        self.close_execution_leases()
+
+    def run(self) -> dict[str, Any]:
+        self.run_baseline_policy()
+        self.run_runtime_policy(require_npm=self.profile in {"backend", "all"})
+        self.verify_trusted_integrity("runtime")
+        if self.profile in {"policy", "all"}:
+            self.run_policy_profile()
+            self.verify_trusted_integrity("policy")
+        if self.profile in {"static", "all"}:
+            self.run_static_profile()
+            self.verify_trusted_integrity("static")
+        if self.profile in {"frontend", "all"}:
+            self.run_frontend_profile()
+            self.verify_trusted_integrity("frontend")
+        if self.profile in {"backend", "all"}:
+            self.run_backend_profile()
+            self.verify_trusted_integrity("backend")
+        if self.profile in {"standalone", "all"}:
+            self.run_standalone_profile()
+            self.verify_trusted_integrity("standalone")
+        self.run_lockfile_integrity()
+        self.verify_trusted_integrity("lockfile-check")
+        self.close_execution_leases()
+        finalize_evidence_transcript(self)
+        comparison = derive_authoritative_evidence(
+            self.profile,
+            self.observations,
+            self.completed_classes,
+            self.command_results,
+            self.baseline,
+            self.platform,
+            self.command_plan,
+            getattr(self, "authorization_context_binding_digest", None),
+        )
+        self.violations.extend(comparison["violations"])
+        if self.profile in {"static", "all"}:
+            prior_hard_failures = [
+                item for item in self.hard_gate_results if item["status"] != "pass"
+            ]
+            static_result_passed = not comparison["violations"] and not prior_hard_failures
+            self.add_hard_gate(
+                "STATIC-SUITE-RESULT",
+                static_result_passed,
+                (
+                    "all static observations were classified by frozen authority"
+                    if static_result_passed
+                    else "static observations include an unknown, expanded, hard, or policy failure"
+                ),
+            )
+        return comparison
+
+
+def validate_evidence_root_absent(
+    output_dir: Path = OUTPUT_DIR,
+    *,
+    repo_root: Path = REPO_ROOT,
+) -> list[str]:
+    errors: list[str] = []
+    try:
+        repo_metadata = repo_root.lstat()
+        repo_resolved = repo_root.resolve(strict=True)
+    except OSError as exc:
+        return [f"repository root cannot be resolved: {type(exc).__name__}"]
+    if not stat.S_ISDIR(repo_metadata.st_mode) or stat.S_ISLNK(repo_metadata.st_mode) or _is_reparse_point(repo_metadata):
+        errors.append("repository root must be a non-reparse directory")
+    try:
+        parent_resolved = output_dir.parent.resolve(strict=True)
+    except OSError as exc:
+        errors.append(f"evidence parent cannot be resolved: {type(exc).__name__}")
+    else:
+        if parent_resolved != repo_resolved:
+            errors.append("evidence root parent resolves outside the repository workspace")
+    try:
+        output_dir.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        errors.append(f"evidence root cannot be inspected: {type(exc).__name__}")
+    else:
+        errors.append(".ci-results must be absent before every runner invocation")
+    return errors
+
+
+def validate_evidence_root(
+    output_dir: Path = OUTPUT_DIR,
+    *,
+    repo_root: Path = REPO_ROOT,
+) -> list[str]:
+    errors: list[str] = []
+    try:
+        metadata = output_dir.lstat()
+    except OSError as exc:
+        return [f"evidence root cannot be inspected: {type(exc).__name__}"]
+    if not stat.S_ISDIR(metadata.st_mode):
+        errors.append("evidence root is not a directory")
+    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
+        errors.append("evidence root is a symbolic link, junction, or reparse point")
+    try:
+        parent_resolved = output_dir.parent.resolve(strict=True)
+        root_resolved = output_dir.resolve(strict=True)
+        repo_resolved = repo_root.resolve(strict=True)
+    except OSError as exc:
+        errors.append(f"evidence root cannot be resolved: {type(exc).__name__}")
+    else:
+        if parent_resolved != repo_resolved:
+            errors.append("evidence root parent resolves outside the repository workspace")
+        if root_resolved.parent != repo_resolved or root_resolved.name != output_dir.name:
+            errors.append("evidence root resolves outside its exact workspace path")
+    return errors
+
+
+def create_fresh_evidence_root(
+    output_dir: Path = OUTPUT_DIR,
+    *,
+    repo_root: Path = REPO_ROOT,
+) -> None:
+    errors = validate_evidence_root_absent(output_dir, repo_root=repo_root)
+    if errors:
+        raise RuntimeError("; ".join(errors))
+    os.mkdir(output_dir, 0o700)
+    errors = validate_evidence_root(output_dir, repo_root=repo_root)
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+
+def _exclusive_write(path: Path, data: bytes, *, repo_root: Path = REPO_ROOT) -> None:
+    root_errors = validate_evidence_root(path.parent, repo_root=repo_root)
+    if root_errors:
+        raise RuntimeError("; ".join(root_errors))
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise RuntimeError(f"evidence file is not an exclusive single-link regular file: {path.name}")
+        with os.fdopen(descriptor, "wb", closefd=False) as destination:
+            destination.write(data)
+            destination.flush()
+            os.fsync(destination.fileno())
+    finally:
+        os.close(descriptor)
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata) or not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError(f"evidence path changed type after write: {path.name}")
+    if path.resolve(strict=True).parent != path.parent.resolve(strict=True):
+        raise RuntimeError(f"evidence file parent escaped after write: {path.name}")
+
+
+def _json_bytes(value: Any) -> bytes:
+    return (
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
+
+
+def write_json(path: Path, value: Any, *, repo_root: Path = REPO_ROOT) -> None:
+    _exclusive_write(path, _json_bytes(value), repo_root=repo_root)
+
+
+def verify_evidence_file_set(
+    output_dir: Path = OUTPUT_DIR,
+    *,
+    repo_root: Path = REPO_ROOT,
+    expected_command_plan: Sequence[Mapping[str, Any]] | None = None,
+    expected_context: ExternallyExpectedVerificationContext | None = None,
+) -> list[str]:
+    errors = validate_evidence_root(output_dir, repo_root=repo_root)
+    if errors:
+        return errors
+    try:
+        entries = list(os.scandir(output_dir))
+    except OSError as exc:
+        return [f"evidence directory cannot be enumerated: {type(exc).__name__}"]
+    names = {entry.name for entry in entries}
+    expected = set(EVIDENCE_FILE_NAMES)
+    if names != expected:
+        errors.append(
+            f"evidence file set is not exact; missing={sorted(expected - names)} additional={sorted(names - expected)}"
+        )
+        return sorted(set(errors))
+
+    snapshots: dict[str, _FileSnapshot] = {}
+    for name in EVIDENCE_FILE_NAMES:
+        snapshot, snapshot_errors = _read_evidence_file_snapshot(
+            output_dir / name,
+            output_dir=output_dir,
+            byte_limit=EVIDENCE_FILE_BYTE_LIMITS[name],
+        )
+        errors.extend(f"{name}: {error}" for error in snapshot_errors)
+        if snapshot is not None:
+            snapshots[name] = snapshot
+    if errors:
+        return sorted(set(errors))
+
+    documents: dict[str, dict[str, Any]] = {}
+    for name in ("summary.json", "observed-debt.json", "resolved-candidates.json", "command-results.json"):
+        document, document_errors = _decode_evidence_json(name, snapshots[name].data)
+        errors.extend(document_errors)
+        if document is not None:
+            documents[name] = document
+    if errors:
+        return sorted(set(errors))
+    errors.extend(
+        _validate_evidence_semantics(
+            documents,
+            snapshots,
+            expected_command_plan=expected_command_plan,
+            expected_context=expected_context,
+        )
+    )
+
+    try:
+        final_entries = list(os.scandir(output_dir))
+    except OSError as exc:
+        errors.append(f"evidence directory cannot be re-enumerated: {type(exc).__name__}")
+    else:
+        final_names = {entry.name for entry in final_entries}
+        if final_names != expected:
+            errors.append("evidence file membership changed during verification")
+        for name, snapshot in snapshots.items():
+            try:
+                metadata = (output_dir / name).lstat()
+            except OSError as exc:
+                errors.append(f"{name}: changed after validation ({type(exc).__name__})")
+                continue
+            if _stat_identity(metadata) != snapshot.identity:
+                errors.append(f"{name}: changed after validation")
+    return sorted(set(errors))
+
+
+def _read_evidence_file_snapshot(
+    path: Path,
+    *,
+    output_dir: Path,
+    byte_limit: int,
+) -> tuple[_FileSnapshot | None, list[str]]:
+    errors: list[str] = []
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        return None, [f"cannot inspect ({type(exc).__name__})"]
+    if stat.S_ISLNK(before.st_mode) or _is_reparse_point(before) or not stat.S_ISREG(before.st_mode):
+        return None, ["evidence entry is not a non-reparse regular file"]
+    acceptable_link_counts = {0, 1} if os.name == "nt" else {1}
+    if before.st_nlink not in acceptable_link_counts:
+        errors.append("evidence link count is not acceptable")
+    if before.st_size <= 0 or before.st_size > byte_limit:
+        errors.append("evidence byte length is outside the fixed bound")
+    try:
+        if path.resolve(strict=True).parent != output_dir.resolve(strict=True):
+            errors.append("evidence parent resolution escaped")
+    except OSError as exc:
+        errors.append(f"cannot resolve ({type(exc).__name__})")
+    if errors:
+        return None, errors
+
+    descriptor = -1
+    data = b""
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0),
+        )
+        opened = os.fstat(descriptor)
+        if _stat_identity(opened) != _stat_identity(before):
+            errors.append("changed between lstat and open")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(65_536, byte_limit + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > byte_limit:
+                errors.append("exceeded the fixed read bound")
+                break
+            chunks.append(chunk)
+        data = b"".join(chunks)
+    except OSError as exc:
+        errors.append(f"cannot read safely ({type(exc).__name__})")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    try:
+        after = path.lstat()
+    except OSError as exc:
+        errors.append(f"changed during read ({type(exc).__name__})")
+    else:
+        if _stat_identity(after) != _stat_identity(before):
+            errors.append("changed during read")
+    if len(data) != before.st_size:
+        errors.append("read length does not match the inspected byte length")
+    if errors:
+        return None, errors
+    return _FileSnapshot(data=data, identity=_stat_identity(before)), []
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant is forbidden: {value}")
+
+
+def _decode_evidence_json(name: str, data: bytes) -> tuple[dict[str, Any] | None, list[str]]:
+    if data.startswith(b"\xef\xbb\xbf"):
+        return None, [f"{name}: JSON must be UTF-8 without BOM"]
+    try:
+        text = data.decode("utf-8", errors="strict")
+        value = strict_json_loads(text, label=name)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        return None, [f"{name}: invalid UTF-8 JSON ({type(exc).__name__})"]
+    if not isinstance(value, dict):
+        return None, [f"{name}: top-level JSON value must be an object"]
+    errors = _bounded_evidence_json(value, label=name)
+    return value, errors
+
+
+def _bounded_evidence_json(value: Any, *, label: str, depth: int = 0) -> list[str]:
+    if depth > MAX_EVIDENCE_JSON_DEPTH:
+        return [f"{label}: JSON nesting exceeds the fixed bound"]
+    errors: list[str] = []
+    if isinstance(value, dict):
+        if len(value) > MAX_EVIDENCE_COLLECTION_ITEMS:
+            errors.append(f"{label}: object exceeds the fixed item bound")
+        for key, child in value.items():
+            if not isinstance(key, str):
+                errors.append(f"{label}: object key is not a string")
+                continue
+            if len(key.encode("utf-8")) > MAX_EVIDENCE_STRING_BYTES:
+                errors.append(f"{label}: object key exceeds the fixed byte bound")
+            errors.extend(_bounded_evidence_json(child, label=f"{label}.{key}", depth=depth + 1))
+    elif isinstance(value, list):
+        if len(value) > MAX_EVIDENCE_COLLECTION_ITEMS:
+            errors.append(f"{label}: array exceeds the fixed item bound")
+        for index, child in enumerate(value):
+            errors.extend(_bounded_evidence_json(child, label=f"{label}[{index}]", depth=depth + 1))
+    elif isinstance(value, str) and len(value.encode("utf-8")) > MAX_EVIDENCE_STRING_BYTES:
+        errors.append(f"{label}: string exceeds the fixed byte bound")
+    elif isinstance(value, float) and not math.isfinite(value):
+        errors.append(f"{label}: non-finite number is forbidden")
+    elif value is not None and not isinstance(value, (str, int, float, bool)):
+        errors.append(f"{label}: unsupported JSON value type")
+    return errors
+
+
+def _exact_document_keys(
+    document: Mapping[str, Any],
+    expected: set[str],
+    label: str,
+    errors: list[str],
+) -> None:
+    if set(document) != expected:
+        errors.append(
+            f"{label}: keys are not exact; missing={sorted(expected - set(document))} "
+            f"unknown={sorted(set(document) - expected)}"
+        )
+
+
+def _invocation_identity(invocation_without_id: Mapping[str, Any], runtime: Mapping[str, Any]) -> str:
+    canonical = json.dumps(
+        {"invocation": invocation_without_id, "runtime": runtime},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return sha256_text(canonical)
+
+
+def _validate_invocation_and_runtime(
+    invocation: Any,
+    runtime: Any,
+    *,
+    label: str,
+    errors: list[str],
+) -> None:
+    invocation_keys = {
+        "invocationId",
+        "startedAt",
+        "profile",
+        "platform",
+        "baselineCommit",
+        "baselineTree",
+        "checkpointTag",
+        "policyVersion",
+    }
+    runtime_keys = {
+        "platform",
+        "os",
+        "python",
+        "pythonImplementation",
+        "node",
+        "npm",
+        "runtimeClosureDigest",
+        "dependencyClosureDigest",
+        "dependencyMemberCount",
+    }
+    if not isinstance(invocation, dict):
+        errors.append(f"{label}: invocation must be an object")
+        return
+    if not isinstance(runtime, dict):
+        errors.append(f"{label}: runtime must be an object")
+        return
+    _exact_document_keys(invocation, invocation_keys, f"{label}.invocation", errors)
+    _exact_document_keys(runtime, runtime_keys, f"{label}.runtime", errors)
+    if any(not isinstance(invocation.get(key), str) for key in invocation_keys):
+        errors.append(f"{label}: every invocation value must be a string")
+        return
+    if any(not isinstance(runtime.get(key), str) for key in runtime_keys):
+        errors.append(f"{label}: every runtime value must be a string")
+        return
+    without_id = {key: invocation[key] for key in invocation_keys - {"invocationId"}}
+    expected_id = _invocation_identity(without_id, runtime)
+    if invocation.get("invocationId") != expected_id:
+        errors.append(f"{label}: invocation identity hash is invalid")
+    try:
+        started = datetime.fromisoformat(invocation["startedAt"].replace("Z", "+00:00"))
+        timestamp_value = started.timestamp()
+    except (ValueError, OverflowError, OSError):
+        errors.append(f"{label}: startedAt is not a valid finite timestamp")
+    else:
+        if started.tzinfo is None or not math.isfinite(timestamp_value):
+            errors.append(f"{label}: startedAt must include a finite timezone-aware timestamp")
+
+
+def _validate_runtime_dependency_closure(
+    closure: Any,
+    guard: Any,
+    runtime: Any,
+    *,
+    profile: Any,
+    status: Any,
+    errors: list[str],
+) -> None:
+    """Validate producer closure claims without treating them as verifier authority."""
+
+    label = "command-results.json.runtimeDependencyClosure"
+    if not isinstance(closure, dict):
+        errors.append(f"{label}: closure must be an object")
+        return
+    measurement = closure.get("measurementStatus")
+    if measurement == "unmeasured-local-producer":
+        expected = {
+            "closureSchemaVersion",
+            "measurementStatus",
+            "profile",
+            "runnerOS",
+            "dependencyClosureDigest",
+            "dependencyMemberCount",
+            "closureDigest",
+        }
+        _exact_document_keys(closure, expected, label, errors)
+        if closure.get("dependencyMemberCount") != 0:
+            errors.append(f"{label}: unmeasured closure must have zero members")
+    elif measurement in {
+        "measured-complete",
+        "local-nondependency-npm-unavailable",
+    }:
+        expected = {
+            "closureSchemaVersion",
+            "measurementStatus",
+            "profile",
+            "runnerOS",
+            "pythonExecutable",
+            "nodeExecutable",
+            "npmEntrypoint",
+            "gitExecutable",
+            "lockfiles",
+            "dependencyRoots",
+            "vitest",
+            "nodePath",
+            "dependencyClosureDigest",
+            "dependencyMemberCount",
+            "closureDigest",
+        }
+        _exact_document_keys(closure, expected, label, errors)
+        lockfiles = closure.get("lockfiles")
+        roots = closure.get("dependencyRoots")
+        node_path = closure.get("nodePath")
+        vitest = closure.get("vitest")
+        if not isinstance(lockfiles, list) or not isinstance(roots, list):
+            errors.append(f"{label}: lockfiles and dependencyRoots must be arrays")
+            lockfiles, roots = [], []
+        if node_path != []:
+            errors.append(f"{label}: NODE_PATH authority must be the exact empty list")
+        expected_lockfiles = ["developer/package-lock.json", "backend/package-lock.json"]
+        if [item.get("relativePath") for item in lockfiles if isinstance(item, dict)] != expected_lockfiles:
+            errors.append(f"{label}: lockfile set/order is not exact")
+        for index, item in enumerate(lockfiles):
+            if not isinstance(item, dict) or set(item) != {"relativePath", "mode", "size", "sha256"}:
+                errors.append(f"{label}.lockfiles[{index}]: schema is not exact")
+                continue
+            if not re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256", ""))):
+                errors.append(f"{label}.lockfiles[{index}]: SHA-256 is invalid")
+        total_members = 0
+        root_names: list[str] = []
+        for root_index, root in enumerate(roots):
+            root_label = f"{label}.dependencyRoots[{root_index}]"
+            if not isinstance(root, dict) or set(root) != {
+                "logicalRoot",
+                "memberCount",
+                "members",
+                "memberManifestDigest",
+            }:
+                errors.append(f"{root_label}: schema is not exact")
+                continue
+            logical_root = root.get("logicalRoot")
+            root_names.append(str(logical_root))
+            members = root.get("members")
+            if not isinstance(members, list):
+                errors.append(f"{root_label}: members must be an array")
+                continue
+            if root.get("memberCount") != len(members):
+                errors.append(f"{root_label}: memberCount is invalid")
+            total_members += len(members)
+            if root.get("memberManifestDigest") != hashlib.sha256(
+                _canonical_frame(members)
+            ).hexdigest():
+                errors.append(f"{root_label}: member manifest digest is invalid")
+            paths: list[str] = []
+            for member_index, member in enumerate(members):
+                member_label = f"{root_label}.members[{member_index}]"
+                if not isinstance(member, dict) or set(member) != {
+                    "relativePath",
+                    "fileType",
+                    "mode",
+                    "size",
+                    "sha256",
+                    "symlinkTarget",
+                }:
+                    errors.append(f"{member_label}: schema is not exact")
+                    continue
+                relative = member.get("relativePath")
+                if not isinstance(relative, str) or not relative or "\\" in relative or any(
+                    part in {"", ".", ".."} for part in relative.split("/")
+                ):
+                    errors.append(f"{member_label}: relative path is invalid")
+                else:
+                    paths.append(relative)
+                file_type = member.get("fileType")
+                if file_type not in {"regular-file", "directory", "symlink"}:
+                    errors.append(f"{member_label}: file type is invalid")
+                if file_type == "regular-file" and not re.fullmatch(
+                    r"[0-9a-f]{64}", str(member.get("sha256", ""))
+                ):
+                    errors.append(f"{member_label}: regular-file SHA-256 is invalid")
+                if file_type == "symlink" and not isinstance(member.get("symlinkTarget"), str):
+                    errors.append(f"{member_label}: symlink target is invalid")
+            if paths != sorted(paths) or len(paths) != len(set(paths)):
+                errors.append(f"{root_label}: member ordering/membership is invalid")
+        expected_roots = []
+        if profile in {"frontend", "all"}:
+            expected_roots.append("developer/node_modules")
+        if profile in {"backend", "all"}:
+            expected_roots.append("backend/node_modules")
+        if root_names != expected_roots:
+            errors.append(f"{label}: dependency root set/order is not exact for profile")
+        if closure.get("dependencyMemberCount") != total_members:
+            errors.append(f"{label}: dependencyMemberCount is invalid")
+        if profile in {"frontend", "all"}:
+            if not isinstance(vitest, dict) or set(vitest) != {
+                "resolvedEntrypoint",
+                "packageVersion",
+                "entrypointSha256",
+            }:
+                errors.append(f"{label}: Vitest identity is missing or invalid")
+        elif vitest is not None:
+            errors.append(f"{label}: Vitest identity is unexpected for profile")
+        semantic = {
+            "lockfiles": lockfiles,
+            "dependencyRoots": roots,
+            "vitest": vitest,
+            "nodePath": node_path,
+        }
+        if closure.get("dependencyClosureDigest") != hashlib.sha256(
+            _canonical_frame(semantic)
+        ).hexdigest():
+            errors.append(f"{label}: dependency closure digest is invalid")
+        without_digest = {
+            key: value for key, value in closure.items() if key != "closureDigest"
+        }
+        if closure.get("closureDigest") != hashlib.sha256(
+            _canonical_frame(without_digest)
+        ).hexdigest():
+            errors.append(f"{label}: runtime closure digest is invalid")
+        for executable_name in (
+            "pythonExecutable",
+            "nodeExecutable",
+            "npmEntrypoint",
+            "gitExecutable",
+        ):
+            executable = closure.get(executable_name)
+            if executable_name == "gitExecutable" and executable is None:
+                continue
+            if not isinstance(executable, dict):
+                errors.append(f"{label}.{executable_name}: identity is unavailable")
+                continue
+            if executable_name == "npmEntrypoint" and executable.get("available") is False:
+                if measurement != "local-nondependency-npm-unavailable":
+                    errors.append(f"{label}: npm may be unavailable only in local nondependency mode")
+                continue
+            if not Path(str(executable.get("canonicalPath", ""))).is_absolute():
+                errors.append(f"{label}.{executable_name}: canonical path is not absolute")
+            if not re.fullmatch(r"[0-9a-f]{64}", str(executable.get("sha256", ""))):
+                errors.append(f"{label}.{executable_name}: SHA-256 is invalid")
+    else:
+        errors.append(f"{label}: measurement status is invalid")
+
+    if closure.get("closureSchemaVersion") != RUNTIME_DEPENDENCY_CLOSURE_SCHEMA_VERSION:
+        errors.append(f"{label}: schema version is invalid")
+    if closure.get("profile") != profile:
+        errors.append(f"{label}: profile differs from evidence profile")
+    if isinstance(runtime, dict):
+        if closure.get("closureDigest") != runtime.get("runtimeClosureDigest"):
+            errors.append(f"{label}: digest differs from runtime identity")
+        if closure.get("dependencyClosureDigest") != runtime.get("dependencyClosureDigest"):
+            errors.append(f"{label}: dependency digest differs from runtime identity")
+        if str(closure.get("dependencyMemberCount")) != runtime.get("dependencyMemberCount"):
+            errors.append(f"{label}: member count differs from runtime identity")
+
+    guard_label = "command-results.json.runtimeDependencyGuard"
+    guard_keys = {
+        "guardSchemaVersion",
+        "watcherBackend",
+        "active",
+        "activeDuringReplay",
+        "mutationState",
+        "queueOverflow",
+        "mutationEventCount",
+    }
+    if not isinstance(guard, dict) or set(guard) != guard_keys:
+        errors.append(f"{guard_label}: schema is not exact")
+    else:
+        if guard.get("guardSchemaVersion") != RUNTIME_DEPENDENCY_GUARD_SCHEMA_VERSION:
+            errors.append(f"{guard_label}: schema version is invalid")
+        if type(guard.get("active")) is not bool or type(guard.get("activeDuringReplay")) is not bool:
+            errors.append(f"{guard_label}: active state is invalid")
+        if type(guard.get("queueOverflow")) is not bool or type(guard.get("mutationEventCount")) is not int:
+            errors.append(f"{guard_label}: mutation state is invalid")
+        if status == "PASS" and measurement != "unmeasured-local-producer" and (
+            guard.get("activeDuringReplay") is not True
+            or guard.get("mutationState") != "clean"
+            or guard.get("queueOverflow") is not False
+            or guard.get("mutationEventCount") != 0
+        ):
+            errors.append(f"{guard_label}: PASS requires a clean watcher active throughout replay")
+
+
+def _validate_execution_binding(
+    binding: Any,
+    digest: Any,
+    *,
+    label: str,
+    errors: list[str],
+) -> None:
+    keys = {
+        "bindingSchemaVersion",
+        "bindingKind",
+        "bindingMode",
+        "producerJobId",
+        "producerRunnerOS",
+        "producerProfile",
+        "runId",
+        "runAttempt",
+        "eventName",
+        "repository",
+        "checkoutCommit",
+        "checkoutTree",
+        "baselineCommit",
+        "baselineTree",
+        "trustFileDigest",
+        "commandPlanDigest",
+        "producerInvocationId",
+    }
+    if not isinstance(binding, dict):
+        errors.append(f"{label}: executionBinding must be an object")
+        return
+    _exact_document_keys(binding, keys, f"{label}.executionBinding", errors)
+    if binding.get("bindingSchemaVersion") != EVIDENCE_EXECUTION_BINDING_SCHEMA_VERSION:
+        errors.append(f"{label}: execution-binding schema version is invalid")
+    if binding.get("bindingKind") != "ProducerExecutionBinding":
+        errors.append(f"{label}: evidence may contain only a ProducerExecutionBinding")
+    if binding.get("bindingMode") not in {"github-actions", "local"}:
+        errors.append(f"{label}: execution-binding mode is invalid")
+    if binding.get("producerProfile") not in PROFILES:
+        errors.append(f"{label}: producer profile is invalid")
+    if binding.get("producerRunnerOS") not in {"Linux", "Windows"}:
+        errors.append(f"{label}: execution-binding runner OS is invalid")
+    for key in (
+        "producerJobId",
+        "runId",
+        "runAttempt",
+        "eventName",
+        "repository",
+    ):
+        value = binding.get(key)
+        if not isinstance(value, str) or not value or value != value.strip() or len(value.encode("utf-8")) > 512:
+            errors.append(f"{label}: execution-binding {key} is invalid")
+    for key in ("checkoutCommit", "checkoutTree", "baselineCommit", "baselineTree"):
+        if not re.fullmatch(r"[0-9a-f]{40}", str(binding.get(key, ""))):
+            errors.append(f"{label}: execution-binding {key} is invalid")
+    for key in ("trustFileDigest", "commandPlanDigest", "producerInvocationId"):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(binding.get(key, ""))):
+            errors.append(f"{label}: execution-binding {key} is invalid")
+    if binding.get("baselineCommit") != BASELINE_COMMIT or binding.get("baselineTree") != BASELINE_TREE:
+        errors.append(f"{label}: execution-binding baseline identity is invalid")
+    if binding.get("bindingMode") == "github-actions":
+        authority = _workflow_authority_for_producer(str(binding.get("producerJobId", "")))
+        if authority is None:
+            errors.append(f"{label}: producer job is outside fixed workflow authority")
+        elif (
+            authority["runnerOS"] != binding.get("producerRunnerOS")
+            or authority["profile"] != binding.get("producerProfile")
+        ):
+            errors.append(f"{label}: producer job/profile/OS authority mismatch")
+        if not re.fullmatch(r"[1-9][0-9]*", str(binding.get("runId", ""))):
+            errors.append(f"{label}: execution-binding run ID is invalid")
+        if not re.fullmatch(r"[1-9][0-9]*", str(binding.get("runAttempt", ""))):
+            errors.append(f"{label}: execution-binding run attempt is invalid")
+        if not re.fullmatch(r"[^/\s]+/[^/\s]+", str(binding.get("repository", ""))):
+            errors.append(f"{label}: execution-binding repository is invalid")
+        partial = {
+            key: value
+            for key, value in binding.items()
+            if key != "producerInvocationId"
+        }
+        if binding.get("producerInvocationId") != _github_binding_invocation_id(partial):
+            errors.append(f"{label}: GitHub producer invocation identity is invalid")
+    elif binding.get("bindingMode") == "local":
+        if (
+            binding.get("producerJobId") != "local-producer"
+            or binding.get("runId") != "local"
+            or binding.get("runAttempt") != "1"
+            or binding.get("eventName") != "local"
+            or not re.fullmatch(
+                r"local-root-sha256:[0-9a-f]{64}", str(binding.get("repository", ""))
+            )
+        ):
+            errors.append(f"{label}: local execution-binding sentinel authority is invalid")
+    expected_digest = execution_binding_digest(binding)
+    if digest != expected_digest:
+        errors.append(f"{label}: executionBindingDigest is invalid")
+
+
+def execution_binding_external_context_errors(
+    binding: Any,
+    digest: Any,
+    expected_context: ExternallyExpectedVerificationContext,
+) -> list[str]:
+    errors: list[str] = []
+    _validate_execution_binding(
+        binding,
+        digest,
+        label="external-verification",
+        errors=errors,
+    )
+    expected_binding = expected_context.evidence_binding()
+    if binding != expected_binding:
+        errors.append("execution binding differs from externally expected verification context")
+    if digest != execution_binding_digest(expected_binding):
+        errors.append("execution-binding digest differs from external authority")
+    return sorted(set(errors))
+
+
+def _validate_command_record(record: Any, index: int, errors: list[str]) -> bool:
+    label = f"command-results.json.records[{index}]"
+    required = {
+        "commandId",
+        "ordinal",
+        "commandClass",
+        "commandRole",
+        "executable",
+        "required",
+        "profile",
+        "platform",
+        "argv",
+        "logicalArgv",
+        "executionArgv",
+        "executionInputMode",
+        "executionInputSize",
+        "executionInputSha256",
+        "cwd",
+        "toolRole",
+        "resolvedExecutablePath",
+        "resolvedExecutableSize",
+        "resolvedExecutableSha256",
+        "resolvedExecutableFileIdentity",
+        "executionLease",
+        "targets",
+        "resultSemantics",
+        "allowedExecutionExits",
+        "executed",
+        "started",
+        "setupFailure",
+        "exitCode",
+        "durationSeconds",
+        "executionDurationClass",
+        "timeoutStatus",
+        "outputLimitStatus",
+        "stdoutBytesObserved",
+        "stderrBytesObserved",
+        "stdoutByteLimit",
+        "stderrByteLimit",
+        "containment",
+        "processTreeStatus",
+        "descendantsTerminated",
+        "actualExecutionArgv",
+        "actualExecutionInputMode",
+        "actualExecutionInputSize",
+        "actualExecutionInputSha256",
+        "stdoutSha256",
+        "stderrSha256",
+        "producerObservations",
+        "producerObservationSetDigest",
+        "completedCommandClass",
+        "executionInputs",
+        "executionInputBundleDigest",
+        "targetExecutionLease",
+        "protectedTargetBundle",
+    }
+    optional = {
+        "error",
+        "limitReason",
+        "processTreeError",
+        "diagnosticPreview",
+        "parsedFailureSummary",
+        "fileScans",
+        "dependencyBacked",
+        "runtimeClosureDigest",
+        "dependencyClosureDigest",
+        "nodePath",
+        "resolvedTestRunnerEntrypoint",
+        "resolvedTestRunnerSha256",
+        "closureWatcherActive",
+        "closureMutationState",
+        "runtimeClosureGuard",
+    }
+    if not isinstance(record, dict):
+        errors.append(f"{label}: record must be an object")
+        return True
+    if not required.issubset(record) or set(record) - required - optional:
+        errors.append(f"{label}: command record keys are not valid")
+    if (
+        not isinstance(record.get("commandId"), str)
+        or not isinstance(record.get("commandClass"), str)
+        or not isinstance(record.get("executable"), str)
+    ):
+        errors.append(f"{label}: command identity values must be strings")
+    if type(record.get("ordinal")) is not int or not 0 <= record.get("ordinal", -1) < MAX_PROFILE_COMMANDS:
+        errors.append(f"{label}: ordinal must be a bounded non-negative integer")
+    if record.get("commandRole") not in {"required-execution", "observation-producing"}:
+        errors.append(f"{label}: commandRole is invalid")
+    if record.get("profile") not in PROFILES or not isinstance(record.get("platform"), str):
+        errors.append(f"{label}: profile/platform authority is invalid")
+    if record.get("dependencyBacked") is True:
+        for field_name in (
+            "runtimeClosureDigest",
+            "dependencyClosureDigest",
+            "resolvedTestRunnerSha256",
+        ):
+            if not re.fullmatch(r"[0-9a-f]{64}", str(record.get(field_name, ""))):
+                errors.append(f"{label}: {field_name} is invalid")
+        if record.get("nodePath") != []:
+            errors.append(f"{label}: dependency-backed command has an unauthorized NODE_PATH")
+        if record.get("closureWatcherActive") is not True:
+            errors.append(f"{label}: dependency closure watcher was not active")
+        if record.get("closureMutationState") != "clean":
+            errors.append(f"{label}: dependency closure mutation state is not clean")
+        entrypoint = record.get("resolvedTestRunnerEntrypoint")
+        if not isinstance(entrypoint, str) or not entrypoint:
+            errors.append(f"{label}: resolved test-runner entrypoint is invalid")
+        elif record.get("toolRole") != "node-vitest-security-test" and not Path(entrypoint).is_absolute():
+            errors.append(f"{label}: resolved test-runner entrypoint is not absolute")
+        guard = record.get("runtimeClosureGuard")
+        guard_keys = {
+            "guardSchemaVersion",
+            "watcherBackend",
+            "active",
+            "activeDuringReplay",
+            "mutationState",
+            "queueOverflow",
+            "mutationEventCount",
+        }
+        if not isinstance(guard, dict) or set(guard) != guard_keys:
+            errors.append(f"{label}: runtime closure guard schema is not exact")
+        elif (
+            guard.get("guardSchemaVersion") != RUNTIME_DEPENDENCY_GUARD_SCHEMA_VERSION
+            or guard.get("activeDuringReplay") is not True
+            or guard.get("mutationState") != "clean"
+            or guard.get("queueOverflow") is not False
+            or guard.get("mutationEventCount") != 0
+        ):
+            errors.append(f"{label}: runtime closure guard does not authorize clean replay")
+    argv = record.get("argv")
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or len(argv) > 256
+        or any(not isinstance(value, str) or not value for value in argv)
+    ):
+        errors.append(f"{label}: argv must be a bounded non-empty string array")
+    logical_argv = record.get("logicalArgv")
+    execution_argv = record.get("executionArgv")
+    actual_execution_argv = record.get("actualExecutionArgv")
+    for key, value in (
+        ("logicalArgv", logical_argv),
+        ("executionArgv", execution_argv),
+        ("actualExecutionArgv", actual_execution_argv),
+    ):
+        if (
+            not isinstance(value, list)
+            or not value
+            or len(value) > 256
+            or any(not isinstance(item, str) or not item for item in value)
+        ):
+            errors.append(f"{label}: {key} must be a bounded non-empty string array")
+    if argv != logical_argv:
+        errors.append(f"{label}: argv legacy alias must equal logicalArgv")
+    if actual_execution_argv != execution_argv:
+        errors.append(f"{label}: actualExecutionArgv does not equal the authorized executionArgv")
+    execution_input_mode = record.get("executionInputMode")
+    actual_input_mode = record.get("actualExecutionInputMode")
+    if execution_input_mode not in {
+        "NONE",
+        "TARGET-BYTES-STDIN",
+        "PROTECTED-TARGET-BUNDLE",
+    }:
+        errors.append(f"{label}: executionInputMode is invalid")
+    if actual_input_mode != execution_input_mode:
+        errors.append(f"{label}: actualExecutionInputMode does not equal command authority")
+    for key in ("executionInputSize", "actualExecutionInputSize"):
+        value = record.get(key)
+        if value is not None and (type(value) is not int or not 0 <= value <= MAX_SCANNED_FILE_BYTES):
+            errors.append(f"{label}: {key} is invalid")
+    for key in ("executionInputSha256", "actualExecutionInputSha256"):
+        value = record.get(key)
+        if value is not None and (
+            not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+        ):
+            errors.append(f"{label}: {key} is invalid")
+    for key in ("stdoutSha256", "stderrSha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(record.get(key, ""))):
+            errors.append(f"{label}: {key} is invalid")
+    cwd = record.get("cwd")
+    if not isinstance(cwd, str) or not cwd or Path(cwd).is_absolute() or ".." in Path(cwd).parts:
+        errors.append(f"{label}: cwd must be repository-relative")
+    if not isinstance(record.get("toolRole"), str) or not record.get("toolRole"):
+        errors.append(f"{label}: toolRole must be a non-empty string")
+    resolved_executable = record.get("resolvedExecutablePath")
+    if not isinstance(resolved_executable, str) or not resolved_executable:
+        errors.append(f"{label}: resolvedExecutablePath must be a non-empty string")
+    executable_size = record.get("resolvedExecutableSize")
+    executable_hash = record.get("resolvedExecutableSha256")
+    executable_identity = record.get("resolvedExecutableFileIdentity")
+    execution_lease = record.get("executionLease")
+    if record.get("executed") is True and record.get("containment") != "internal":
+        if type(executable_size) is not int or executable_size < 0:
+            errors.append(f"{label}: executed command lacks executable size authority")
+        if not isinstance(executable_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", executable_hash):
+            errors.append(f"{label}: executed command lacks executable hash authority")
+        identity_keys = {
+            "deviceOrVolume",
+            "inodeOrFileIndex",
+            "creationOrChangeTimeNs",
+            "writeTimeNs",
+            "reparsePoint",
+        }
+        if not isinstance(executable_identity, dict) or set(executable_identity) != identity_keys:
+            errors.append(f"{label}: executable stable identity is invalid")
+    if execution_lease is not None:
+        lease_keys = {
+            "canonicalPath",
+            "trustedGitRoot",
+            "size",
+            "volumeSerial",
+            "fileIndex",
+            "creationTime",
+            "writeTime",
+            "reparsePoint",
+            "sha256",
+        }
+        if (
+            record.get("commandId") != "git-bash-version"
+            or not isinstance(execution_lease, dict)
+            or set(execution_lease) != lease_keys
+            or execution_lease.get("reparsePoint") is not False
+            or execution_lease.get("canonicalPath") != resolved_executable
+            or execution_lease.get("size") != executable_size
+            or execution_lease.get("sha256") != executable_hash
+            or not re.fullmatch(r"[0-9a-f]{64}", str(execution_lease.get("sha256", "")))
+        ):
+            errors.append(f"{label}: trusted Bash execution lease is invalid")
+    targets = record.get("targets")
+    if not isinstance(targets, list) or len(targets) > MAX_EVIDENCE_COLLECTION_ITEMS:
+        errors.append(f"{label}: targets must be a bounded array")
+        targets = []
+    else:
+        target_keys = {
+            "path",
+            "canonicalSourcePath",
+            "size",
+            "sha256",
+            "fileIdentity",
+            "modeType",
+            "reparsePoint",
+        }
+        for target_index, target in enumerate(targets):
+            target_label = f"{label}.targets[{target_index}]"
+            if not isinstance(target, dict) or set(target) != target_keys:
+                errors.append(f"{target_label}: schema is not exact")
+                continue
+            if not isinstance(target.get("path"), str) or not target.get("path"):
+                errors.append(f"{target_label}: path is invalid")
+            if target.get("canonicalSourcePath") is not None and (
+                not isinstance(target.get("canonicalSourcePath"), str)
+                or not Path(target.get("canonicalSourcePath", "")).is_absolute()
+            ):
+                errors.append(f"{target_label}: canonicalSourcePath is invalid")
+            if target.get("size") is not None and (
+                type(target.get("size")) is not int or target.get("size", -1) < 0
+            ):
+                errors.append(f"{target_label}: size is invalid")
+            if target.get("sha256") is not None and (
+                not isinstance(target.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", target.get("sha256", ""))
+            ):
+                errors.append(f"{target_label}: sha256 is invalid")
+            if target.get("modeType") not in {None, "regular-file", "other"}:
+                errors.append(f"{target_label}: modeType is invalid")
+            if target.get("reparsePoint") not in {None, True, False}:
+                errors.append(f"{target_label}: reparsePoint is invalid")
+    execution_inputs = record.get("executionInputs")
+    execution_input_digest = record.get("executionInputBundleDigest")
+    input_keys = {
+        "logicalPath",
+        "canonicalSourcePath",
+        "plannedByteLength",
+        "plannedSha256",
+        "plannedStableIdentity",
+        "actualByteLength",
+        "actualSha256",
+        "inputMode",
+    }
+    if not isinstance(execution_inputs, list) or len(execution_inputs) > MAX_EVIDENCE_COLLECTION_ITEMS:
+        errors.append(f"{label}: executionInputs must be a bounded array")
+        execution_inputs = []
+    else:
+        for input_index, execution_input in enumerate(execution_inputs):
+            input_label = f"{label}.executionInputs[{input_index}]"
+            if not isinstance(execution_input, dict) or set(execution_input) != input_keys:
+                errors.append(f"{input_label}: schema is not exact")
+                continue
+            if execution_input.get("inputMode") != execution_input_mode:
+                errors.append(f"{input_label}: inputMode does not equal command authority")
+            if input_index >= len(targets or []):
+                errors.append(f"{input_label}: has no planned target")
+                continue
+            target = targets[input_index]
+            if (
+                execution_input.get("logicalPath") != target.get("path")
+                or execution_input.get("canonicalSourcePath")
+                != target.get("canonicalSourcePath")
+                or execution_input.get("plannedByteLength") != target.get("size")
+                or execution_input.get("plannedSha256") != target.get("sha256")
+                or execution_input.get("plannedStableIdentity")
+                != target.get("fileIdentity")
+            ):
+                errors.append(f"{input_label}: planned identity does not match target authority")
+            if record.get("executed") is True and (
+                execution_input.get("actualByteLength") != execution_input.get("plannedByteLength")
+                or execution_input.get("actualSha256") != execution_input.get("plannedSha256")
+            ):
+                errors.append(f"{input_label}: actual input identity differs from planned bytes")
+    expected_input_digest = (
+        execution_input_bundle_digest(execution_inputs) if execution_inputs else None
+    )
+    if execution_input_digest != expected_input_digest:
+        errors.append(f"{label}: executionInputBundleDigest is invalid")
+    target_execution = record.get("targetExecutionLease")
+    protected_bundle = record.get("protectedTargetBundle")
+    if execution_input_mode == "TARGET-BYTES-STDIN":
+        if not isinstance(targets, list) or len(targets) != 1:
+            errors.append(f"{label}: TARGET-BYTES-STDIN requires exactly one target")
+        else:
+            target = targets[0]
+            if record.get("executionInputSize") != target.get("size"):
+                errors.append(f"{label}: planned execution-input size does not equal target size")
+            if record.get("executionInputSha256") != target.get("sha256"):
+                errors.append(f"{label}: planned execution-input hash does not equal target hash")
+        lease_keys = {
+            "leaseVersion",
+            "logicalTargetPath",
+            "canonicalSourcePath",
+            "plannedByteLength",
+            "plannedSha256",
+            "plannedStableFileIdentity",
+            "modeType",
+            "reparsePoint",
+            "executionAdapter",
+            "executedInputByteLength",
+            "executedInputSha256",
+            "preExecutionSourceIdentity",
+            "postExecutionSourceIdentity",
+            "mutationDetected",
+            "cleanupState",
+        }
+        if not isinstance(target_execution, dict) or set(target_execution) != lease_keys:
+            errors.append(f"{label}: targetExecutionLease schema is not exact")
+        elif isinstance(targets, list) and len(targets) == 1:
+            target = targets[0]
+            if (
+                target_execution.get("leaseVersion") != TARGET_EXECUTION_LEASE_VERSION
+                or target_execution.get("logicalTargetPath") != target.get("path")
+                or target_execution.get("canonicalSourcePath") != target.get("canonicalSourcePath")
+                or target_execution.get("plannedByteLength") != target.get("size")
+                or target_execution.get("plannedSha256") != target.get("sha256")
+                or target_execution.get("plannedStableFileIdentity") != target.get("fileIdentity")
+                or target_execution.get("modeType") != target.get("modeType")
+                or target_execution.get("reparsePoint") != target.get("reparsePoint")
+                or target_execution.get("executionAdapter") != execution_input_mode
+            ):
+                errors.append(f"{label}: targetExecutionLease does not bind the command plan")
+            if record.get("executed") is True and (
+                target_execution.get("executedInputByteLength") != record.get("actualExecutionInputSize")
+                or target_execution.get("executedInputSha256") != record.get("actualExecutionInputSha256")
+                or record.get("actualExecutionInputSize") != record.get("executionInputSize")
+                or record.get("actualExecutionInputSha256") != record.get("executionInputSha256")
+                or target_execution.get("mutationDetected") is not False
+                or target_execution.get("cleanupState") != "closed"
+                or target_execution.get("preExecutionSourceIdentity") is None
+                or target_execution.get("postExecutionSourceIdentity") is None
+            ):
+                errors.append(f"{label}: executed target input identity is invalid or source drifted")
+        if protected_bundle is not None:
+            errors.append(f"{label}: single-target stdin command claims a protectedTargetBundle")
+        if record.get("executed") is True and len(execution_inputs) != 1:
+            errors.append(f"{label}: executed TARGET-BYTES-STDIN command lacks one execution input")
+    elif execution_input_mode == "PROTECTED-TARGET-BUNDLE":
+        bundle_keys = {
+            "bundleVersion",
+            "executionAdapter",
+            "orderedLogicalTargetPaths",
+            "canonicalSourcePaths",
+            "plannedByteLengths",
+            "plannedSha256Values",
+            "plannedStableIdentities",
+            "executionInputs",
+            "executionInputBundleDigest",
+            "preExecutionIdentities",
+            "postExecutionIdentities",
+            "mutationDetected",
+            "cleanupState",
+        }
+        if target_execution is not None:
+            errors.append(f"{label}: protected bundle command claims a single target lease")
+        if (
+            record.get("executionInputSize") is not None
+            or record.get("executionInputSha256") is not None
+            or record.get("actualExecutionInputSize") is not None
+            or record.get("actualExecutionInputSha256") is not None
+        ):
+            errors.append(f"{label}: protected multi-target command claims a singular input")
+        if not isinstance(protected_bundle, dict) or set(protected_bundle) != bundle_keys:
+            errors.append(f"{label}: protectedTargetBundle schema is not exact")
+        else:
+            pre_identities = protected_bundle.get("preExecutionIdentities")
+            post_identities = protected_bundle.get("postExecutionIdentities")
+            if not isinstance(pre_identities, list) or not isinstance(post_identities, list):
+                errors.append(f"{label}: protectedTargetBundle identity arrays are invalid")
+                pre_identities = []
+                post_identities = []
+            if (
+                protected_bundle.get("bundleVersion") != PROTECTED_TARGET_BUNDLE_VERSION
+                or protected_bundle.get("executionAdapter") != execution_input_mode
+                or protected_bundle.get("orderedLogicalTargetPaths")
+                != [target.get("path") for target in targets]
+                or protected_bundle.get("canonicalSourcePaths")
+                != [target.get("canonicalSourcePath") for target in targets]
+                or protected_bundle.get("plannedByteLengths")
+                != [target.get("size") for target in targets]
+                or protected_bundle.get("plannedSha256Values")
+                != [target.get("sha256") for target in targets]
+                or protected_bundle.get("plannedStableIdentities")
+                != [target.get("fileIdentity") for target in targets]
+                or protected_bundle.get("executionInputs") != execution_inputs
+                or protected_bundle.get("executionInputBundleDigest")
+                != execution_input_digest
+                or protected_bundle.get("cleanupState") != "closed"
+            ):
+                errors.append(f"{label}: protectedTargetBundle does not bind the command plan")
+            if record.get("executed") is True and (
+                len(execution_inputs) != len(targets)
+                or protected_bundle.get("mutationDetected") is not False
+                or len(pre_identities) != len(targets)
+                or len(post_identities) != len(targets)
+                or any(identity is None for identity in pre_identities + post_identities)
+            ):
+                errors.append(f"{label}: protected target execution drifted or is incomplete")
+    elif (
+        record.get("executionInputSize") is not None
+        or record.get("executionInputSha256") is not None
+        or record.get("actualExecutionInputSize") is not None
+        or record.get("actualExecutionInputSha256") is not None
+        or target_execution is not None
+        or protected_bundle is not None
+        or execution_inputs
+        or execution_input_digest is not None
+    ):
+        errors.append(f"{label}: non-target command claims target execution input")
+    producer = record.get("producerObservations")
+    if not isinstance(producer, list) or len(producer) > MAX_EVIDENCE_COLLECTION_ITEMS:
+        errors.append(f"{label}: producerObservations must be a bounded array")
+    elif record.get("producerObservationSetDigest") != producer_observation_set_digest(producer):
+        errors.append(f"{label}: producerObservationSetDigest is invalid")
+    if not isinstance(record.get("resultSemantics"), str) or not record.get("resultSemantics"):
+        errors.append(f"{label}: resultSemantics is invalid")
+    allowed_exits = record.get("allowedExecutionExits")
+    if (
+        not isinstance(allowed_exits, list)
+        or not allowed_exits
+        or allowed_exits != sorted(set(allowed_exits))
+        or any(type(value) is not int or not 0 <= value <= 255 for value in allowed_exits)
+    ):
+        errors.append(f"{label}: allowedExecutionExits is invalid")
+    if record.get("executionDurationClass") not in {"bounded", "not-started"}:
+        errors.append(f"{label}: executionDurationClass is invalid")
+    elif record.get("executionDurationClass") != (
+        "bounded" if record.get("executed") is True else "not-started"
+    ):
+        errors.append(f"{label}: executionDurationClass contradicts execution state")
+    expected_completed_class = (
+        record.get("commandClass") if _command_completed_for_class(record) else None
+    )
+    if record.get("completedCommandClass") != expected_completed_class:
+        errors.append(f"{label}: completedCommandClass is not independently derived")
+    for key in ("required", "executed", "started", "setupFailure"):
+        if type(record.get(key)) is not bool:
+            errors.append(f"{label}: {key} must be boolean")
+    exit_code = record.get("exitCode")
+    if exit_code is not None and (
+        type(exit_code) is not int or not 0 <= exit_code <= 255
+    ):
+        errors.append(f"{label}: exitCode must be null or an integer in [0, 255]")
+    duration = record.get("durationSeconds")
+    if (
+        type(duration) not in {int, float}
+        or not math.isfinite(duration)
+        or not 0 <= duration <= MAX_JOB_TIMEOUT_SECONDS
+    ):
+        errors.append(f"{label}: durationSeconds must be finite and within the job timeout")
+    for key in (
+        "stdoutBytesObserved",
+        "stderrBytesObserved",
+        "stdoutByteLimit",
+        "stderrByteLimit",
+    ):
+        if (
+            type(record.get(key)) is not int
+            or not 0 <= record.get(key, -1) <= MAX_RECORDED_STREAM_BYTES
+        ):
+            errors.append(f"{label}: {key} must be an explicitly bounded non-negative integer")
+    if (
+        type(record.get("descendantsTerminated")) is not int
+        or not 0 <= record.get("descendantsTerminated", -1) <= 4096
+    ):
+        errors.append(f"{label}: descendantsTerminated must be a bounded non-negative integer")
+    for observed_key, limit_key, status_key in (
+        ("stdoutBytesObserved", "stdoutByteLimit", "outputLimitStatus"),
+        ("stderrBytesObserved", "stderrByteLimit", "outputLimitStatus"),
+    ):
+        observed_value = record.get(observed_key)
+        limit_value = record.get(limit_key)
+        if type(observed_value) is int and type(limit_value) is int:
+            permitted = limit_value + (OUTPUT_READ_CHUNK_BYTES if record.get(status_key) == "OUTPUT-LIMIT-EXCEEDED" else 0)
+            if observed_value > permitted:
+                errors.append(f"{label}: {observed_key} exceeds its explicit command cap")
+    if record.get("timeoutStatus") not in {"within-limit", "TIMED-OUT"}:
+        errors.append(f"{label}: timeoutStatus is invalid")
+    if record.get("outputLimitStatus") not in {"within-limit", "OUTPUT-LIMIT-EXCEEDED"}:
+        errors.append(f"{label}: outputLimitStatus is invalid")
+    if record.get("containment") not in {
+        "internal",
+        "not-started",
+        "linux-subreaper-pidfd-proc-supervisor",
+        "windows-job-object",
+    }:
+        errors.append(f"{label}: containment value is invalid")
+    if record.get("processTreeStatus") not in {
+        "not-applicable",
+        "not-started",
+        "setup-failed",
+        "contained-clean",
+        "cleanup-failed",
+    }:
+        errors.append(f"{label}: processTreeStatus is invalid")
+    expected_setup_failure = record.get("executed") is not True or record.get("processTreeStatus") == "setup-failed"
+    if record.get("setupFailure") != expected_setup_failure:
+        errors.append(f"{label}: setupFailure contradicts execution/containment state")
+    if record.get("started") is not record.get("executed"):
+        errors.append(f"{label}: started contradicts executed")
+    hard_execution_failure = bool(record.get("required")) and not _command_execution_completed(record)
+    if _command_execution_completed(record):
+        if exit_code not in (allowed_exits if isinstance(allowed_exits, list) else []):
+            hard_execution_failure = True
+        elif record.get("commandRole") == "required-execution" and exit_code != 0:
+            hard_execution_failure = True
+    if record.get("timeoutStatus") == "TIMED-OUT" and exit_code != 124:
+        errors.append(f"{label}: timeout status and exit code contradict")
+    if record.get("outputLimitStatus") == "OUTPUT-LIMIT-EXCEEDED" and exit_code != 125:
+        errors.append(f"{label}: output-limit status and exit code contradict")
+    file_scans = record.get("fileScans")
+    if file_scans is not None:
+        if not isinstance(file_scans, list) or len(file_scans) > MAX_EVIDENCE_COLLECTION_ITEMS:
+            errors.append(f"{label}: fileScans must be a bounded array")
+            hard_execution_failure = True
+        else:
+            scan_keys = {
+                "path",
+                "fileSize",
+                "classification",
+                "scannedBytes",
+                "rawBytesScanned",
+                "encodingViewsApplied",
+                "utf16LeDecodedUnits",
+                "utf16BeDecodedUnits",
+                "patternFamiliesApplied",
+                "hitCount",
+            }
+            for scan_index, scan in enumerate(file_scans):
+                scan_label = f"{label}.fileScans[{scan_index}]"
+                if not isinstance(scan, dict) or set(scan) != scan_keys:
+                    errors.append(f"{scan_label}: file-scan record keys are not exact")
+                    hard_execution_failure = True
+                    continue
+                classification = scan.get("classification")
+                if classification not in {
+                    "text-scanned",
+                    "binary-scanned",
+                    "rejected-special-file",
+                    "read-error",
+                }:
+                    errors.append(f"{scan_label}: classification is invalid")
+                file_size = scan.get("fileSize")
+                scanned_bytes = scan.get("scannedBytes")
+                raw_bytes = scan.get("rawBytesScanned")
+                hit_count = scan.get("hitCount")
+                if file_size is not None and (
+                    type(file_size) is not int or not 0 <= file_size <= MAX_SCANNED_FILE_BYTES
+                ):
+                    errors.append(f"{scan_label}: fileSize is invalid")
+                if type(scanned_bytes) is not int or not 0 <= scanned_bytes <= MAX_SCANNED_FILE_BYTES:
+                    errors.append(f"{scan_label}: scannedBytes is invalid")
+                if type(raw_bytes) is not int or not 0 <= raw_bytes <= MAX_SCANNED_FILE_BYTES:
+                    errors.append(f"{scan_label}: rawBytesScanned is invalid")
+                if type(hit_count) is not int or not 0 <= hit_count <= len(SECRET_SCAN_PATTERN_FAMILIES) + 8:
+                    errors.append(f"{scan_label}: hitCount is invalid")
+                views = scan.get("encodingViewsApplied")
+                full_views = ["raw-bytes", *UTF16_ASCII_CREDENTIAL_VIEWS]
+                allowed_views = (
+                    (full_views,)
+                    if classification in {"text-scanned", "binary-scanned"}
+                    else (["raw-bytes"], full_views)
+                )
+                if not isinstance(views, list) or views not in allowed_views:
+                    errors.append(f"{scan_label}: encodingViewsApplied is invalid")
+                    views = []
+                for key, view_prefix in (
+                    ("utf16LeDecodedUnits", "utf-16le-"),
+                    ("utf16BeDecodedUnits", "utf-16be-"),
+                ):
+                    units = scan.get(key)
+                    if type(units) is not int or units < 0 or (
+                        type(file_size) is int and units > file_size + 1
+                    ):
+                        errors.append(f"{scan_label}: {key} is invalid")
+                    if not any(
+                        isinstance(view, str) and view.startswith(view_prefix) for view in views
+                    ) and units != 0:
+                        errors.append(f"{scan_label}: {key} claims a decoded view that was not applied")
+                if scan.get("patternFamiliesApplied") != list(SECRET_SCAN_PATTERN_FAMILIES):
+                    errors.append(f"{scan_label}: byte-pattern family set is not exact")
+                if classification in {"text-scanned", "binary-scanned"} and (
+                    scanned_bytes != file_size or raw_bytes != file_size or scanned_bytes != raw_bytes
+                ):
+                    errors.append(f"{scan_label}: regular-file rawBytesScanned does not equal fileSize")
+                if classification in {"rejected-special-file", "read-error"} or (type(hit_count) is int and hit_count > 0):
+                    hard_execution_failure = True
+    return hard_execution_failure
+
+
+def _validate_evidence_semantics(
+    documents: Mapping[str, dict[str, Any]],
+    snapshots: Mapping[str, _FileSnapshot],
+    *,
+    expected_command_plan: Sequence[Mapping[str, Any]] | None = None,
+    expected_context: ExternallyExpectedVerificationContext | None = None,
+) -> list[str]:
+    errors: list[str] = []
+    summary = documents["summary.json"]
+    observed = documents["observed-debt.json"]
+    resolved = documents["resolved-candidates.json"]
+    commands = documents["command-results.json"]
+    summary_keys = {
+        "documentKind",
+        "schemaVersion",
+        "generatedAt",
+        "status",
+        "profile",
+        "platform",
+        "baselineCommit",
+        "baselineTree",
+        "checkpointTag",
+        "policyVersion",
+        "invocation",
+        "runtime",
+        "executionBinding",
+        "executionBindingDigest",
+        "authorizationContextBinding",
+        "authorizationContextBindingDigest",
+        "trustBoundary",
+        "counts",
+        "hardGateResults",
+        "policyViolations",
+        "knownDebtsObserved",
+        "resolvedCandidates",
+        "expectedOmissions",
+        "releaseOnlySkips",
+        "observationalChecks",
+        "evidenceManifest",
+    }
+    observed_keys = {
+        "documentKind",
+        "schemaVersion",
+        "invocation",
+        "runtime",
+        "executionBinding",
+        "executionBindingDigest",
+        "authorizationContextBinding",
+        "authorizationContextBindingDigest",
+        "profile",
+        "platform",
+        "baselineCommit",
+        "records",
+        "expectedOmissions",
+        "releaseOnlySkips",
+    }
+    resolved_keys = {
+        "documentKind",
+        "schemaVersion",
+        "invocation",
+        "runtime",
+        "executionBinding",
+        "executionBindingDigest",
+        "authorizationContextBinding",
+        "authorizationContextBindingDigest",
+        "profile",
+        "platform",
+        "baselineCommit",
+        "records",
+    }
+    command_keys = {
+        "documentKind",
+        "schemaVersion",
+        "invocation",
+        "runtime",
+        "executionBinding",
+        "executionBindingDigest",
+        "authorizationContextBinding",
+        "authorizationContextBindingDigest",
+        "profile",
+        "platform",
+        "records",
+        "observations",
+        "completedCommandClasses",
+        "expectedCompletedCommandClasses",
+        "actualCompletedCommandClasses",
+        "expectedCompletedCommandClassSetDigest",
+        "completedCommandClassSetDigest",
+        "producerObservationCount",
+        "producerObservationUniverseDigest",
+        "producerTranscriptDigest",
+        "missingCommandIds",
+        "extraCommandIds",
+        "duplicateCommandIds",
+        "commandPlanDigest",
+        "commandAuthority",
+        "runtimeDependencyClosure",
+        "runtimeDependencyGuard",
+    }
+    _exact_document_keys(summary, summary_keys, "summary.json", errors)
+    _exact_document_keys(observed, observed_keys, "observed-debt.json", errors)
+    _exact_document_keys(resolved, resolved_keys, "resolved-candidates.json", errors)
+    _exact_document_keys(commands, command_keys, "command-results.json", errors)
+    for name, document in documents.items():
+        if document.get("documentKind") != EVIDENCE_DOCUMENT_KINDS[name]:
+            errors.append(f"{name}: document kind is invalid")
+        if document.get("schemaVersion") != 2:
+            errors.append(f"{name}: schema version is invalid")
+        _validate_invocation_and_runtime(
+            document.get("invocation"),
+            document.get("runtime"),
+            label=name,
+            errors=errors,
+        )
+        _validate_execution_binding(
+            document.get("executionBinding"),
+            document.get("executionBindingDigest"),
+            label=name,
+            errors=errors,
+        )
+        errors.extend(
+            f"{name}: {error}"
+            for error in authorization_context_binding_errors(
+                document.get("authorizationContextBinding"),
+                document.get("authorizationContextBindingDigest"),
+                execution_binding=document.get("executionBinding"),
+                expected_context=expected_context,
+            )
+        )
+
+    _validate_runtime_dependency_closure(
+        commands.get("runtimeDependencyClosure"),
+        commands.get("runtimeDependencyGuard"),
+        summary.get("runtime"),
+        profile=summary.get("profile"),
+        status=summary.get("status"),
+        errors=errors,
+    )
+
+    invocation = summary.get("invocation")
+    runtime = summary.get("runtime")
+    execution_binding = summary.get("executionBinding")
+    execution_binding_digest_value = summary.get("executionBindingDigest")
+    authorization_context_binding = summary.get("authorizationContextBinding")
+    authorization_context_binding_digest_value = summary.get(
+        "authorizationContextBindingDigest"
+    )
+    for name, document in documents.items():
+        if document.get("invocation") != invocation:
+            errors.append(f"{name}: invocation identity is inconsistent")
+        if document.get("runtime") != runtime:
+            errors.append(f"{name}: runtime identity is inconsistent")
+        if document.get("executionBinding") != execution_binding:
+            errors.append(f"{name}: execution binding is inconsistent")
+        if document.get("executionBindingDigest") != execution_binding_digest_value:
+            errors.append(f"{name}: execution-binding digest is inconsistent")
+        if document.get("authorizationContextBinding") != authorization_context_binding:
+            errors.append(f"{name}: authorization context binding is inconsistent")
+        if (
+            document.get("authorizationContextBindingDigest")
+            != authorization_context_binding_digest_value
+        ):
+            errors.append(
+                f"{name}: authorization-context digest is inconsistent"
+            )
+        if document.get("profile") != summary.get("profile"):
+            errors.append(f"{name}: profile identity is inconsistent")
+        if document.get("platform") != summary.get("platform"):
+            errors.append(f"{name}: platform identity is inconsistent")
+
+    if isinstance(execution_binding, dict):
+        if execution_binding.get("producerProfile") != summary.get("profile"):
+            errors.append("summary.json: profile differs from producer execution binding")
+        if execution_binding.get("baselineCommit") != summary.get("baselineCommit"):
+            errors.append("summary.json: baseline commit differs from execution binding")
+        if execution_binding.get("baselineTree") != summary.get("baselineTree"):
+            errors.append("summary.json: baseline tree differs from execution binding")
+        expected_platform = (
+            "windows"
+            if execution_binding.get("producerRunnerOS") == "Windows"
+            else "ubuntu"
+        )
+        if summary.get("platform") != expected_platform:
+            errors.append("summary.json: platform differs from execution-binding runner OS")
+    if expected_context is not None:
+        errors.extend(
+            execution_binding_external_context_errors(
+                execution_binding,
+                execution_binding_digest_value,
+                expected_context,
+            )
+        )
+        for name, document in documents.items():
+            if document.get("profile") != expected_context.expected_profile:
+                errors.append(f"{name}: expected-profile mismatch")
+
+    if summary.get("status") not in {"PASS", "FAIL"}:
+        errors.append("summary.json: status is invalid")
+    if summary.get("profile") not in PROFILES or not isinstance(summary.get("platform"), str):
+        errors.append("summary.json: profile/platform identity is invalid")
+    if not isinstance(invocation, dict):
+        invocation = {}
+    for field_name in ("profile", "platform", "baselineCommit", "baselineTree", "checkpointTag", "policyVersion"):
+        if summary.get(field_name) != invocation.get(field_name):
+            errors.append(f"summary.json: {field_name} contradicts invocation identity")
+    if summary.get("generatedAt") != invocation.get("startedAt"):
+        errors.append("summary.json: generatedAt contradicts invocation start identity")
+    if summary.get("trustBoundary") != dict(TRUST_BOUNDARY):
+        errors.append("summary.json: candidate-controlled trust warning is not exact")
+
+    list_fields = (
+        "hardGateResults",
+        "policyViolations",
+        "knownDebtsObserved",
+        "resolvedCandidates",
+        "expectedOmissions",
+        "releaseOnlySkips",
+        "observationalChecks",
+    )
+    for field_name in list_fields:
+        if not isinstance(summary.get(field_name), list):
+            errors.append(f"summary.json: {field_name} must be an array")
+    if not isinstance(observed.get("records"), list) or not isinstance(resolved.get("records"), list):
+        errors.append("debt/candidate evidence records must be arrays")
+    if not isinstance(commands.get("records"), list):
+        errors.append("command-results.json: records must be an array")
+        command_records: list[Any] = []
+    else:
+        command_records = commands["records"]
+    command_observations = commands.get("observations")
+    if not isinstance(command_observations, list) or len(command_observations) > MAX_EVIDENCE_COLLECTION_ITEMS:
+        errors.append("command-results.json: observations must be a bounded array")
+        command_observations = []
+    completed_command_classes = commands.get("completedCommandClasses")
+    if (
+        not isinstance(completed_command_classes, list)
+        or any(not isinstance(value, str) or not value for value in completed_command_classes)
+        or completed_command_classes != sorted(set(completed_command_classes))
+    ):
+        errors.append("command-results.json: completedCommandClasses must be a sorted unique string array")
+        completed_command_classes = []
+    command_authority = commands.get("commandAuthority")
+    authority_profile = (
+        expected_context.expected_profile
+        if expected_context is not None
+        else str(summary.get("profile", ""))
+    )
+    expected_authority = list(expected_command_plan) if expected_command_plan is not None else expected_command_authority(
+        authority_profile,
+    )
+    if command_authority != expected_authority:
+        errors.append("command-results.json: command authority does not match the immutable profile plan")
+    expected_plan_digest = command_plan_digest(expected_authority)
+    if commands.get("commandPlanDigest") != expected_plan_digest:
+        errors.append("command-results.json: commandPlanDigest does not match the immutable profile plan")
+    if isinstance(execution_binding, dict) and execution_binding.get("commandPlanDigest") != expected_plan_digest:
+        errors.append("execution binding command-plan digest differs from external profile authority")
+    valid_command_records = [
+        record for record in command_records if isinstance(record, Mapping)
+    ]
+    independently_expected_classes = expected_completed_command_classes(expected_authority)
+    independently_actual_classes = actual_completed_command_classes(
+        expected_authority,
+        valid_command_records,
+    )
+    if commands.get("expectedCompletedCommandClasses") != independently_expected_classes:
+        errors.append(
+            "command-results.json: expectedCompletedCommandClasses does not match the profile plan"
+        )
+    if commands.get("actualCompletedCommandClasses") != independently_actual_classes:
+        errors.append(
+            "command-results.json: actualCompletedCommandClasses does not match command execution"
+        )
+    if completed_command_classes != independently_actual_classes:
+        errors.append(
+            "command-results.json: completedCommandClasses does not equal independently derived execution"
+        )
+    if summary.get("profile") in {"policy", "static"} and not independently_expected_classes:
+        errors.append(
+            "command-results.json: policy/static completed-command-class authority cannot be empty"
+        )
+    if summary.get("status") == "PASS" and independently_actual_classes != independently_expected_classes:
+        errors.append(
+            "command-results.json: PASS requires the exact nonempty completed-command-class set"
+        )
+    expected_class_digest = completed_command_class_set_digest(
+        independently_expected_classes
+    )
+    actual_class_digest = completed_command_class_set_digest(
+        independently_actual_classes
+    )
+    if commands.get("expectedCompletedCommandClassSetDigest") != expected_class_digest:
+        errors.append(
+            "command-results.json: expected completed-command-class set digest is invalid"
+        )
+    if commands.get("completedCommandClassSetDigest") != actual_class_digest:
+        errors.append(
+            "command-results.json: completed-command-class set digest is invalid"
+        )
+    universe_digest = producer_observation_universe_digest(valid_command_records)
+    if commands.get("producerObservationUniverseDigest") != universe_digest:
+        errors.append(
+            "command-results.json: producerObservationUniverseDigest is invalid"
+        )
+    producer_count = sum(
+        len(record.get("producerObservations", []))
+        for record in valid_command_records
+        if isinstance(record.get("producerObservations", []), list)
+    )
+    if commands.get("producerObservationCount") != producer_count:
+        errors.append("command-results.json: producerObservationCount is invalid")
+    transcript_digest = producer_transcript_digest(
+        expected_plan_digest,
+        valid_command_records,
+        independently_actual_classes,
+    )
+    if commands.get("producerTranscriptDigest") != transcript_digest:
+        errors.append("command-results.json: producerTranscriptDigest is invalid")
+    missing_ids, extra_ids, duplicate_ids = command_id_set_differences(
+        expected_authority,
+        valid_command_records,
+    )
+    for key, expected_value in (
+        ("missingCommandIds", missing_ids),
+        ("extraCommandIds", extra_ids),
+        ("duplicateCommandIds", duplicate_ids),
+    ):
+        if commands.get(key) != expected_value:
+            errors.append(f"command-results.json: {key} is invalid")
+    if summary.get("status") == "PASS" and (missing_ids or extra_ids or duplicate_ids):
+        errors.append(
+            "command-results.json: PASS transcript has missing, extra, or duplicate command IDs"
+        )
+    for index, item in enumerate(command_observations):
+        if not isinstance(item, Mapping):
+            continue
+        if (
+            item.get("producerObservationUniverseDigest") != universe_digest
+            or item.get("producerTranscriptDigest") != transcript_digest
+            or item.get("profileCompletedCommandClassSetDigest") != actual_class_digest
+        ):
+            errors.append(
+                f"command-results.json.observations[{index}]: profile producer context is invalid"
+            )
+
+    if observed.get("baselineCommit") != summary.get("baselineCommit"):
+        errors.append("observed-debt.json: baseline identity is inconsistent")
+    if resolved.get("baselineCommit") != summary.get("baselineCommit"):
+        errors.append("resolved-candidates.json: baseline identity is inconsistent")
+    if observed.get("records") != summary.get("knownDebtsObserved"):
+        errors.append("observed-debt.json: known-debt set contradicts summary")
+    if observed.get("expectedOmissions") != summary.get("expectedOmissions"):
+        errors.append("observed-debt.json: omission set contradicts summary")
+    if observed.get("releaseOnlySkips") != summary.get("releaseOnlySkips"):
+        errors.append("observed-debt.json: release-skip set contradicts summary")
+    if resolved.get("records") != summary.get("resolvedCandidates"):
+        errors.append("resolved-candidates.json: resolved-candidate set contradicts summary")
+
+    counts = summary.get("counts")
+    count_keys = {
+        "hardGateFailures",
+        "policyViolations",
+        "knownDebtsObserved",
+        "resolvedCandidates",
+        "expectedOmissions",
+        "releaseOnlySkips",
+        "commands",
+    }
+    if not isinstance(counts, dict) or set(counts) != count_keys or any(
+        type(counts.get(key)) is not int
+        or not 0 <= counts.get(key, -1) <= (
+            MAX_PROFILE_COMMANDS if key == "commands" else MAX_EVIDENCE_COLLECTION_ITEMS
+        )
+        for key in count_keys
+    ):
+        errors.append("summary.json: counts schema is invalid")
+        counts = {}
+    hard_results = summary.get("hardGateResults") if isinstance(summary.get("hardGateResults"), list) else []
+    hard_failures = 0
+    for index, result in enumerate(hard_results):
+        if not isinstance(result, dict) or set(result) != {"id", "status", "detail"}:
+            errors.append(f"summary.json.hardGateResults[{index}]: schema is not exact")
+            continue
+        if not isinstance(result.get("id"), str) or not isinstance(result.get("detail"), str) or result.get("status") not in {"pass", "fail"}:
+            errors.append(f"summary.json.hardGateResults[{index}]: values are invalid")
+        if result.get("status") != "pass":
+            hard_failures += 1
+    policy_violations = summary.get("policyViolations") if isinstance(summary.get("policyViolations"), list) else []
+    expected_counts = {
+        "hardGateFailures": hard_failures,
+        "policyViolations": len(policy_violations),
+        "knownDebtsObserved": len(summary.get("knownDebtsObserved", [])) if isinstance(summary.get("knownDebtsObserved"), list) else 0,
+        "resolvedCandidates": len(summary.get("resolvedCandidates", [])) if isinstance(summary.get("resolvedCandidates"), list) else 0,
+        "expectedOmissions": len(summary.get("expectedOmissions", [])) if isinstance(summary.get("expectedOmissions"), list) else 0,
+        "releaseOnlySkips": len(summary.get("releaseOnlySkips", [])) if isinstance(summary.get("releaseOnlySkips"), list) else 0,
+        "commands": len(command_records),
+    }
+    if counts != expected_counts:
+        errors.append("summary.json: counts contradict structured evidence")
+    expected_status = "PASS" if hard_failures == 0 and not policy_violations else "FAIL"
+    if summary.get("status") != expected_status:
+        errors.append("summary.json: status contradicts hard-failure/policy counts")
+
+    command_hard_failure = False
+    for index, record in enumerate(command_records):
+        command_hard_failure |= _validate_command_record(record, index, errors)
+        if isinstance(record, dict) and record.get("ordinal") != index:
+            errors.append(f"command-results.json.records[{index}]: ordinal does not match order")
+    if command_hard_failure and summary.get("status") == "PASS":
+        errors.append("summary.json reports PASS while command-results records an execution failure")
+
+    try:
+        baseline = read_json(BASELINE_PATH)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        errors.append(f"immutable baseline authority could not be loaded: {type(exc).__name__}")
+    else:
+        baseline_errors = validate_baseline_document(baseline)
+        errors.extend(f"immutable baseline authority: {error}" for error in baseline_errors)
+        if not baseline_errors:
+            derived = derive_authoritative_evidence(
+                authority_profile,
+                command_observations,
+                completed_command_classes,
+                command_records,
+                baseline,
+                str(summary.get("platform", "")),
+                expected_authority,
+                authorization_context_binding_digest_value,
+            )
+            derived_sets = {
+                "knownDebtsObserved": derived["observedDebts"],
+                "resolvedCandidates": derived["resolvedCandidates"],
+                "expectedOmissions": derived["expectedOmissions"],
+                "releaseOnlySkips": derived["releaseOnlySkips"],
+            }
+            for field_name, expected_value in derived_sets.items():
+                if summary.get(field_name) != expected_value:
+                    errors.append(
+                        f"summary.json: {field_name} contradicts baseline-bound command observations"
+                    )
+            policy_keys = {
+                json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                for item in policy_violations
+                if isinstance(item, dict)
+            }
+            for violation in derived["violations"]:
+                key = json.dumps(violation, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                if key not in policy_keys:
+                    errors.append("summary.json: derived command/baseline violation is missing")
+
+    manifest = summary.get("evidenceManifest")
+    if not isinstance(manifest, list) or len(manifest) != len(EVIDENCE_MANIFEST_FILE_NAMES):
+        errors.append("summary.json: evidence manifest cardinality is invalid")
+        manifest = []
+    manifest_names: list[str] = []
+    for index, record in enumerate(manifest):
+        label = f"summary.json.evidenceManifest[{index}]"
+        if not isinstance(record, dict) or set(record) != {
+            "relativeFilename",
+            "byteLength",
+            "sha256",
+            "documentKind",
+        }:
+            errors.append(f"{label}: manifest record schema is not exact")
+            continue
+        name = record.get("relativeFilename")
+        manifest_names.append(name if isinstance(name, str) else "")
+        if name not in EVIDENCE_MANIFEST_FILE_NAMES:
+            errors.append(f"{label}: relative filename is invalid")
+            continue
+        data = snapshots[name].data
+        if type(record.get("byteLength")) is not int or record.get("byteLength") != len(data):
+            errors.append(f"{label}: byte length does not match")
+        expected_hash = hashlib.sha256(data).hexdigest()
+        if record.get("sha256") != expected_hash:
+            errors.append(f"{label}: SHA-256 does not match")
+        if record.get("documentKind") != EVIDENCE_DOCUMENT_KINDS[name]:
+            errors.append(f"{label}: document kind does not match")
+    if manifest_names != list(EVIDENCE_MANIFEST_FILE_NAMES):
+        errors.append("summary.json: evidence manifest order/membership is not exact")
+
+    canonical_markdown = render_summary_markdown(summary).encode("utf-8")
+    if snapshots["summary.md"].data != canonical_markdown:
+        errors.append("summary.md is not the exact canonical rendering of summary.json")
+    return errors
+
+
+def verification_replay_transcript(runner: FoundationRunner) -> dict[str, Any]:
+    finalize_evidence_transcript(runner)
+    binding = copy.deepcopy(getattr(runner, "execution_binding", None))
+    if not isinstance(binding, Mapping):
+        raise ValueError("verification replay lacks external execution-binding authority")
+    verifier_binding = copy.deepcopy(
+        getattr(runner, "verifier_execution_binding", None)
+    )
+    if not isinstance(verifier_binding, Mapping):
+        verifier_binding = {}
+    authorization_binding = copy.deepcopy(
+        getattr(runner, "authorization_context_binding", None)
+    )
+    authorization_digest = getattr(
+        runner, "authorization_context_binding_digest", None
+    )
+    return {
+        "documentKind": "VerificationReplayTranscript",
+        "schemaVersion": VERIFICATION_REPLAY_TRANSCRIPT_VERSION,
+        "profile": runner.profile,
+        "executionBinding": binding,
+        "executionBindingDigest": execution_binding_digest(binding),
+        "authorizationContextBinding": authorization_binding,
+        "authorizationContextBindingDigest": authorization_digest,
+        "verifierExecutionBinding": verifier_binding,
+        "verifierExecutionBindingDigest": (
+            execution_binding_digest(verifier_binding) if verifier_binding else None
+        ),
+        "freshRuntimeClosureDigest": runner.runtime_closure_digest,
+        "dependencyClosureDigest": runner.dependency_closure_digest,
+        "dependencyMemberCount": runner.dependency_member_count,
+        "freshRuntimeDependencyClosure": copy.deepcopy(
+            getattr(runner, "runtime_closure_document", {})
+        ),
+        "freshRuntimeDependencyGuard": copy.deepcopy(
+            getattr(runner, "runtime_closure_guard_evidence", {})
+        ),
+        "linuxContainmentSelfTest": copy.deepcopy(
+            getattr(
+                runner,
+                "linux_containment_self_test",
+                {"status": "REMOTE-LIVE-VALIDATION-PENDING", "results": []},
+            )
+        ),
+        "commandPlanDigest": runner.command_plan_digest,
+        "commandCount": len(runner.command_results),
+        "records": [
+            _canonical_transcript_record(record) for record in runner.command_results
+        ],
+        "expectedCompletedCommandClasses": list(
+            runner.expected_completed_command_classes
+        ),
+        "actualCompletedCommandClasses": list(
+            runner.actual_completed_command_classes
+        ),
+        "expectedCompletedCommandClassSetDigest": (
+            runner.expected_completed_command_class_set_digest
+        ),
+        "completedCommandClassSetDigest": runner.completed_command_class_set_digest,
+        "producerObservationCount": runner.producer_observation_count,
+        "producerObservationUniverseDigest": (
+            runner.producer_observation_universe_digest
+        ),
+        "producerTranscriptDigest": runner.producer_transcript_digest,
+        "missingCommandIds": list(runner.missing_command_ids),
+        "extraCommandIds": list(runner.extra_command_ids),
+        "duplicateCommandIds": list(runner.duplicate_command_ids),
+    }
+
+
+def _read_evidence_documents_for_replay(
+    output_dir: Path,
+) -> tuple[dict[str, dict[str, Any]], dict[str, _FileSnapshot], list[str]]:
+    documents: dict[str, dict[str, Any]] = {}
+    snapshots: dict[str, _FileSnapshot] = {}
+    errors: list[str] = []
+    for name in EVIDENCE_FILE_NAMES:
+        snapshot, snapshot_errors = _read_evidence_file_snapshot(
+            output_dir / name,
+            output_dir=output_dir,
+            byte_limit=EVIDENCE_FILE_BYTE_LIMITS[name],
+        )
+        errors.extend(f"{name}: {error}" for error in snapshot_errors)
+        if snapshot is not None:
+            snapshots[name] = snapshot
+    for name in (
+        "summary.json",
+        "observed-debt.json",
+        "resolved-candidates.json",
+        "command-results.json",
+    ):
+        snapshot = snapshots.get(name)
+        if snapshot is None:
+            continue
+        document, document_errors = _decode_evidence_json(name, snapshot.data)
+        errors.extend(document_errors)
+        if document is not None:
+            documents[name] = document
+    return documents, snapshots, sorted(set(errors))
+
+
+def compare_verification_replay_claims(
+    documents: Mapping[str, dict[str, Any]],
+    runner: FoundationRunner,
+    comparison: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Compare mutable evidence claims with independently replayed facts."""
+
+    errors: list[str] = []
+    summary = documents.get("summary.json", {})
+    commands = documents.get("command-results.json", {})
+    transcript = verification_replay_transcript(runner)
+    for claimed_field in (
+        "verificationReplayTranscript",
+        "replayTranscript",
+        "replayStatus",
+        "verifierReplayContextBinding",
+        "verifierReplayContextDigest",
+        "replayAuthorizationEnvelopeDigest",
+    ):
+        if claimed_field in summary or claimed_field in commands:
+            errors.append(
+                "evidence-provided replay fields cannot authorize command execution"
+            )
+    hard_failures = [
+        result
+        for result in runner.hard_gate_results
+        if result.get("status") != "pass"
+    ]
+    if hard_failures or runner.violations or comparison is None:
+        errors.append(
+            "verification replay profile is non-PASS: "
+            f"hardFailures={len(hard_failures)} violations={len(runner.violations)}"
+        )
+
+    if summary.get("profile") != runner.profile or transcript.get("profile") != runner.profile:
+        errors.append("verification replay profile selector mismatch")
+    if summary.get("executionBinding") != transcript.get("executionBinding"):
+        errors.append("verification replay execution binding mismatch")
+    if commands.get("executionBinding") != transcript.get("executionBinding"):
+        errors.append("verification replay command execution binding mismatch")
+    if summary.get("executionBindingDigest") != transcript.get("executionBindingDigest"):
+        errors.append("verification replay execution-binding digest mismatch")
+    if commands.get("executionBindingDigest") != transcript.get("executionBindingDigest"):
+        errors.append("verification replay command execution-binding digest mismatch")
+    if summary.get("authorizationContextBinding") != transcript.get(
+        "authorizationContextBinding"
+    ):
+        errors.append("verification replay authorization context mismatch")
+    if commands.get("authorizationContextBinding") != transcript.get(
+        "authorizationContextBinding"
+    ):
+        errors.append("verification replay command authorization context mismatch")
+    if summary.get("authorizationContextBindingDigest") != transcript.get(
+        "authorizationContextBindingDigest"
+    ):
+        errors.append("verification replay authorization-context digest mismatch")
+    if commands.get("authorizationContextBindingDigest") != transcript.get(
+        "authorizationContextBindingDigest"
+    ):
+        errors.append(
+            "verification replay command authorization-context digest mismatch"
+        )
+
+    if _portable_command_plan_value(commands.get("commandAuthority", [])) != _portable_command_plan_value(runner.command_plan):
+        errors.append("verification replay command plan differs from evidence authority")
+    if commands.get("commandPlanDigest") != transcript["commandPlanDigest"]:
+        errors.append("verification replay commandPlanDigest mismatch")
+    evidence_records = commands.get("records")
+    replay_records = transcript["records"]
+    if not isinstance(evidence_records, list):
+        errors.append("verification replay evidence command records are unavailable")
+    else:
+        comparable_evidence_records = [
+            _canonical_transcript_record(record)
+            for record in evidence_records
+            if isinstance(record, Mapping)
+        ]
+        if comparable_evidence_records != replay_records:
+            errors.append("verification replay command execution transcript mismatch")
+    if isinstance(evidence_records, list) and len(evidence_records) != transcript["commandCount"]:
+        errors.append("verification replay commandCount mismatch")
+    top_level_fields = (
+        "expectedCompletedCommandClasses",
+        "actualCompletedCommandClasses",
+        "expectedCompletedCommandClassSetDigest",
+        "completedCommandClassSetDigest",
+        "producerObservationCount",
+        "producerObservationUniverseDigest",
+        "producerTranscriptDigest",
+        "missingCommandIds",
+        "extraCommandIds",
+        "duplicateCommandIds",
+    )
+    for field_name in top_level_fields:
+        if commands.get(field_name) != transcript.get(field_name):
+            errors.append(f"verification replay {field_name} mismatch")
+    if commands.get("completedCommandClasses") != transcript.get(
+        "actualCompletedCommandClasses"
+    ):
+        errors.append("verification replay completedCommandClasses mismatch")
+    if commands.get("observations") != runner.observations:
+        errors.append("verification replay producer observations mismatch")
+    if comparison is not None:
+        replay_sets = {
+            "knownDebtsObserved": comparison.get("observedDebts", []),
+            "resolvedCandidates": comparison.get("resolvedCandidates", []),
+            "expectedOmissions": comparison.get("expectedOmissions", []),
+            "releaseOnlySkips": comparison.get("releaseOnlySkips", []),
+        }
+        for field_name, replay_value in replay_sets.items():
+            if summary.get(field_name) != replay_value:
+                errors.append(
+                    f"verification replay {field_name} differs from replay-backed facts"
+                )
+    return transcript, sorted(set(errors))
+
+
+def build_verifier_replay_context_binding(
+    expected_context: ExternallyExpectedVerificationContext,
+    runner: Any,
+    replay_transcript: Mapping[str, Any],
+) -> dict[str, Any]:
+    linux_result = copy.deepcopy(
+        getattr(
+            runner,
+            "linux_containment_self_test",
+            {"status": "REMOTE-LIVE-VALIDATION-PENDING", "results": []},
+        )
+    )
+    cleanup_incomplete = any(
+        (
+            bool(getattr(runner, "target_execution_leases", [])),
+            getattr(runner, "bash_lease", None) is not None,
+            getattr(runner, "runtime_dependency_guard", None) is not None,
+            getattr(runner, "runtime_dependency_closure", None) is not None,
+            getattr(runner, "private_temp_handle", None) is not None,
+            active_containment_count() != 0,
+        )
+    )
+    binding = {
+        "bindingSchemaVersion": VERIFIER_REPLAY_CONTEXT_BINDING_SCHEMA_VERSION,
+        "bindingKind": "VerifierReplayContextBinding",
+        "actualVerifierJobId": expected_context.verifier_job_id,
+        "actualVerifierRunnerOS": expected_context.runner_os,
+        "verifierInvocationId": expected_context.verifier_invocation_id,
+        "freshRuntimeClosureDigest": str(runner.runtime_closure_digest),
+        "freshDependencyClosureDigest": str(runner.dependency_closure_digest),
+        "linuxContainmentLiveTestResultDigest": canonical_failure_digest(
+            linux_result
+        ),
+        "replayTranscriptDigest": canonical_failure_digest(
+            dict(replay_transcript)
+        ),
+        "cleanupResult": (
+            "cleanup-incomplete" if cleanup_incomplete else "closed-clean"
+        ),
+    }
+    return _require_verifier_replay_context_binding(binding)
+
+
+def run_verification_replay(
+    documents: Mapping[str, dict[str, Any]],
+    *,
+    expected_context: ExternallyExpectedVerificationContext,
+    verification_runner: FoundationRunner,
+    repo_root: Path = REPO_ROOT,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Re-execute only the externally selected profile and command plan."""
+
+    errors: list[str] = []
+    if repo_root.resolve(strict=True) != REPO_ROOT.resolve(strict=True):
+        return None, ["verification replay repository root is not the active runner root"]
+    runner = verification_runner
+    if runner.profile != expected_context.expected_profile:
+        return None, ["verification replay runner profile differs from external authority"]
+    if runner.command_plan_digest != expected_context.command_plan_digest:
+        return None, ["verification replay command plan differs from external authority"]
+    if getattr(runner, "execution_binding", None) != expected_context.evidence_binding():
+        return None, ["verification replay execution binding differs from external authority"]
+    if getattr(runner, "verifier_execution_binding", None) != expected_context.verifier_binding():
+        return None, ["verification replay verifier binding differs from external authority"]
+    expected_authorization_binding = expected_context.authorization_context_binding()
+    expected_authorization_digest = authorization_context_binding_digest(
+        expected_authorization_binding
+    )
+    if (
+        getattr(runner, "authorization_context_binding", None)
+        != expected_authorization_binding
+    ):
+        return None, [
+            "verification replay authorization context differs from external authority"
+        ]
+    if (
+        getattr(runner, "authorization_context_binding_digest", None)
+        != expected_authorization_digest
+    ):
+        return None, [
+            "verification replay authorization-context digest differs from external authority"
+        ]
+    if runner.runtime_closure_digest != expected_context.fresh_runtime_closure_digest:
+        return None, ["verification replay runtime closure differs from external authority"]
+    comparison: dict[str, Any] | None = None
+    try:
+        comparison = runner.run()
+    except Exception as exc:
+        errors.append(
+            f"verification replay execution is unavailable: {type(exc).__name__}: {sanitize_text(str(exc))}"
+        )
+    finally:
+        runner.close_execution_leases()
+    if comparison is None:
+        return None, errors or ["verification replay did not produce a comparison"]
+    transcript, comparison_errors = compare_verification_replay_claims(
+        documents,
+        runner,
+        comparison,
+    )
+    errors.extend(comparison_errors)
+    try:
+        replay_binding = build_verifier_replay_context_binding(
+            expected_context,
+            runner,
+            transcript,
+        )
+        replay_digest = verifier_replay_context_digest(replay_binding)
+        full_context_set_digest = current_full_context_digest_set_digest(
+            runner.observations
+        )
+        envelope_digest = replay_authorization_envelope_digest(
+            current_full_context_set_digest=full_context_set_digest,
+            authorization_context_binding_digest_value=(
+                expected_authorization_digest
+            ),
+            verifier_replay_context_digest_value=replay_digest,
+        )
+        if replay_binding["cleanupResult"] != "closed-clean":
+            errors.append("verification replay cleanup did not close cleanly")
+    except (TypeError, ValueError) as exc:
+        errors.append(
+            "verification replay authorization envelope could not be derived: "
+            f"{type(exc).__name__}: {sanitize_text(str(exc))}"
+        )
+    else:
+        transcript = {
+            **transcript,
+            "currentFullContextDigestSetDigest": full_context_set_digest,
+            "verifierReplayContextBinding": replay_binding,
+            "verifierReplayContextDigest": replay_digest,
+            "replayAuthorizationEnvelopeDigest": envelope_digest,
+            "finalAcceptance": "PASS" if not errors else "REJECT",
+        }
+    return transcript, sorted(set(errors))
+
+
+def verify_evidence_with_replay(
+    output_dir: Path = OUTPUT_DIR,
+    *,
+    expected_context: ExternallyExpectedVerificationContext,
+    verification_runner: FoundationRunner,
+    repo_root: Path = REPO_ROOT,
+) -> tuple[list[str], dict[str, Any] | None]:
+    if verification_runner.profile != expected_context.expected_profile:
+        return ["verification runner profile differs from external expected profile"], None
+    if verification_runner.command_plan_digest != expected_context.command_plan_digest:
+        return ["verification runner command plan differs from external expected context"], None
+    errors = verify_evidence_file_set(
+        output_dir,
+        repo_root=repo_root,
+        expected_command_plan=verification_runner.command_plan,
+        expected_context=expected_context,
+    )
+    if errors:
+        return errors, None
+    documents, snapshots, snapshot_errors = _read_evidence_documents_for_replay(output_dir)
+    if snapshot_errors:
+        return snapshot_errors, None
+    if documents.get("summary.json", {}).get("status") != "PASS":
+        return [], None
+    transcript, replay_errors = run_verification_replay(
+        documents,
+        expected_context=expected_context,
+        verification_runner=verification_runner,
+        repo_root=repo_root,
+    )
+    errors.extend(replay_errors)
+    if transcript is not None and transcript.get("finalAcceptance") != "PASS":
+        errors.append(
+            "verification replay lacks a PASS ReplayAuthorizationEnvelope"
+        )
+    try:
+        rebuilt_context = rebuild_external_verification_context(
+            expected_context,
+            verification_runner,
+            repo_root=repo_root,
+        )
+    except (OSError, ValueError) as exc:
+        errors.append(
+            f"verification replay external context could not be revalidated: {type(exc).__name__}: {sanitize_text(str(exc))}"
+        )
+    else:
+        if rebuilt_context != expected_context:
+            errors.append("verification replay external context changed during replay")
+    for name, original in snapshots.items():
+        current, current_errors = _read_evidence_file_snapshot(
+            output_dir / name,
+            output_dir=output_dir,
+            byte_limit=EVIDENCE_FILE_BYTE_LIMITS[name],
+        )
+        errors.extend(f"{name}: {error}" for error in current_errors)
+        if current is not None and (
+            current.identity != original.identity or current.data != original.data
+        ):
+            errors.append(f"{name}: evidence changed during verification replay")
+    return sorted(set(errors)), transcript
+
+
+def render_markdown_text(value: Any) -> str:
+    """Render dynamic evidence text without permitting Markdown or HTML structure."""
+
+    text = sanitize_text(str(value)).replace("\\", "\\\\")
+    for character in "`*_{}[]()#+-.!|>~":
+        text = text.replace(character, "\\" + character)
+    text = text.replace("\n", "\\n").replace("\r", "\\r")
+    return html.escape(text, quote=True)
+
+
+def render_summary_markdown(summary: Mapping[str, Any]) -> str:
+    status = render_markdown_text(summary["status"])
+    binding = summary["executionBinding"]
+    authorization_binding = summary["authorizationContextBinding"]
+    lines = [
+        "# Baseline-aware CI summary",
+        "",
+        f"- Status: **{status}**",
+        f"- Profile: {render_markdown_text(summary['profile'])}",
+        f"- Platform: {render_markdown_text(summary['platform'])}",
+        f"- Baseline commit: {render_markdown_text(summary['baselineCommit'])}",
+        f"- Python: {render_markdown_text(summary['runtime']['python'])}",
+        f"- Node: {render_markdown_text(summary['runtime']['node'])}",
+        f"- npm: {render_markdown_text(summary['runtime']['npm'])}",
+        f"- Runtime closure: {render_markdown_text(summary['runtime']['runtimeClosureDigest'])}",
+        f"- Dependency closure: {render_markdown_text(summary['runtime']['dependencyClosureDigest'])}",
+        f"- Dependency members: {render_markdown_text(summary['runtime']['dependencyMemberCount'])}",
+        "",
+        "## Evidence execution binding",
+        "",
+        f"- Binding mode: {render_markdown_text(binding['bindingMode'])}",
+        f"- Binding kind: {render_markdown_text(binding['bindingKind'])}",
+        f"- Producer profile: {render_markdown_text(binding['producerProfile'])}",
+        f"- Producer job: {render_markdown_text(binding['producerJobId'])}",
+        f"- Producer runner OS: {render_markdown_text(binding['producerRunnerOS'])}",
+        f"- Run ID: {render_markdown_text(binding['runId'])}",
+        f"- Run attempt: {render_markdown_text(binding['runAttempt'])}",
+        f"- Event: {render_markdown_text(binding['eventName'])}",
+        f"- Repository: {render_markdown_text(binding['repository'])}",
+        f"- Checkout commit: {render_markdown_text(binding['checkoutCommit'])}",
+        f"- Checkout tree: {render_markdown_text(binding['checkoutTree'])}",
+        f"- CI trust-file digest: {render_markdown_text(binding['trustFileDigest'])}",
+        f"- Command-plan digest: {render_markdown_text(binding['commandPlanDigest'])}",
+        f"- Producer invocation ID: {render_markdown_text(binding['producerInvocationId'])}",
+        f"- Binding digest: {render_markdown_text(summary['executionBindingDigest'])}",
+        "",
+        "## Stable authorization context",
+        "",
+        f"- Binding kind: {render_markdown_text(authorization_binding['bindingKind'])}",
+        f"- Expected profile: {render_markdown_text(authorization_binding['expectedProfile'])}",
+        f"- Producer job: {render_markdown_text(authorization_binding['producerJobId'])}",
+        f"- Expected verifier job: {render_markdown_text(authorization_binding['expectedVerifierJobId'])}",
+        f"- Runner OS: {render_markdown_text(authorization_binding['runnerOS'])}",
+        f"- Authorization-context digest: {render_markdown_text(summary['authorizationContextBindingDigest'])}",
+        "",
+        "## Bootstrap trust boundary",
+        "",
+        *TRUST_WARNING_LINES,
+        "",
+        "## Counts",
+        "",
+        f"- Hard-gate failures: {summary['counts']['hardGateFailures']}",
+        f"- Policy violations: {summary['counts']['policyViolations']}",
+        f"- Known debts observed: {summary['counts']['knownDebtsObserved']}",
+        f"- Resolved candidates: {summary['counts']['resolvedCandidates']}",
+        f"- Expected private-resource omissions: {summary['counts']['expectedOmissions']}",
+        f"- Release-only skips: {summary['counts']['releaseOnlySkips']}",
+        "",
+        "## RESOLVED-CANDIDATE",
+        "",
+    ]
+    candidates = summary["resolvedCandidates"]
+    if candidates:
+        lines.extend(
+            f"- **RESOLVED-CANDIDATE** {render_markdown_text(item['id'])}"
+            for item in candidates
+        )
+    else:
+        lines.append("- None")
+    lines.extend(["", "## Known Phase 1 debt observed", ""])
+    debts = summary["knownDebtsObserved"]
+    if debts:
+        lines.extend(
+            f"- {render_markdown_text(item['id'])} "
+            f"({render_markdown_text(item['observedOutcome'])})"
+            for item in debts
+        )
+    else:
+        lines.append("- None")
+    lines.extend(["", "## Intentional public-clone omissions", ""])
+    omissions = summary["expectedOmissions"]
+    if omissions:
+        lines.extend(
+            f"- {render_markdown_text(item['id'])} — intentional public-clone omission"
+            for item in omissions
+        )
+    else:
+        lines.append("- None")
+    lines.extend(["", "## Release-only skips", ""])
+    release_skips = summary["releaseOnlySkips"]
+    if release_skips:
+        lines.extend(
+            f"- {render_markdown_text(item['id'])} — release input not authorized for this CI run"
+            for item in release_skips
+        )
+    else:
+        lines.append("- None")
+    lines.extend(["", "## Policy violations", ""])
+    violations = summary["policyViolations"]
+    if violations:
+        lines.extend(
+            f"- {render_markdown_text(item.get('id', 'VIOLATION'))}: "
+            + render_markdown_text(
+                json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            )
+            for item in violations
+        )
+    else:
+        lines.append("- None")
+    return "\n".join(lines) + "\n"
+
+
+def write_evidence(
+    runner: FoundationRunner,
+    comparison: Mapping[str, Any],
+    *,
+    runner_error: str | None = None,
+) -> dict[str, Any]:
+    root_errors = validate_evidence_root(OUTPUT_DIR, repo_root=REPO_ROOT)
+    if root_errors:
+        raise RuntimeError("; ".join(root_errors))
+    if active_containment_count() != 0:
+        raise RuntimeError("repository-controlled process containment remains active before evidence generation")
+    if runner_error:
+        runner.violations.append({"id": "CI-RUNNER-ERROR", "detail": sanitize_text(runner_error)})
+    finalize_evidence_transcript(runner)
+    execution_binding = copy.deepcopy(getattr(runner, "execution_binding", None))
+    execution_binding_digest_value = (
+        execution_binding_digest(execution_binding)
+        if isinstance(execution_binding, Mapping)
+        else None
+    )
+    authorization_context_binding = copy.deepcopy(
+        getattr(runner, "authorization_context_binding", None)
+    )
+    authorization_context_binding_digest_value = getattr(
+        runner, "authorization_context_binding_digest", None
+    )
+    binding_errors: list[str] = []
+    _validate_execution_binding(
+        execution_binding,
+        execution_binding_digest_value,
+        label="evidence-generation",
+        errors=binding_errors,
+    )
+    binding_errors.extend(
+        authorization_context_binding_errors(
+            authorization_context_binding,
+            authorization_context_binding_digest_value,
+            execution_binding=execution_binding,
+        )
+    )
+    if isinstance(execution_binding, Mapping):
+        if execution_binding.get("producerProfile") != runner.profile:
+            binding_errors.append("generation execution binding profile differs from runner profile")
+        if execution_binding.get("commandPlanDigest") != runner.command_plan_digest:
+            binding_errors.append("generation execution binding command plan differs from runner plan")
+        if execution_binding.get("baselineCommit") != runner.baseline.get("baselineCommit"):
+            binding_errors.append("generation execution binding baseline commit differs from runner baseline")
+        if execution_binding.get("baselineTree") != runner.baseline.get("baselineTree"):
+            binding_errors.append("generation execution binding baseline tree differs from runner baseline")
+    if binding_errors:
+        raise RuntimeError("; ".join(sorted(set(binding_errors))))
+    observations = list(getattr(runner, "observations", []))
+    completed_command_classes = sorted(set(getattr(runner, "completed_classes", set())))
+    comparison = derive_authoritative_evidence(
+        runner.profile,
+        observations,
+        completed_command_classes,
+        runner.command_results,
+        runner.baseline,
+        runner.platform,
+        runner.command_plan,
+        getattr(runner, "authorization_context_binding_digest", None),
+    )
+    existing_violation_keys = {
+        json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        for item in runner.violations
+    }
+    for violation in comparison["violations"]:
+        key = json.dumps(violation, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if key not in existing_violation_keys:
+            runner.violations.append(violation)
+            existing_violation_keys.add(key)
+    runtime = {key: str(value) for key, value in runner.runtime.items()}
+    runtime.setdefault("runtimeClosureDigest", hashlib.sha256(
+        _canonical_frame({"mode": "synthetic-unmeasured", "profile": runner.profile})
+    ).hexdigest())
+    runtime.setdefault("dependencyClosureDigest", hashlib.sha256(
+        _canonical_frame({"dependencyRoots": [], "profile": runner.profile})
+    ).hexdigest())
+    runtime.setdefault("dependencyMemberCount", "0")
+    started_at = utc_now()
+    invocation_without_id = {
+        "startedAt": started_at,
+        "profile": runner.profile,
+        "platform": runner.platform,
+        "baselineCommit": str(runner.baseline.get("baselineCommit", "")),
+        "baselineTree": str(runner.baseline.get("baselineTree", "")),
+        "checkpointTag": str(runner.baseline.get("checkpointTag", "")),
+        "policyVersion": str(runner.baseline.get("policyVersion", "")),
+    }
+    invocation = {
+        "invocationId": _invocation_identity(invocation_without_id, runtime),
+        **invocation_without_id,
+    }
+    runtime_closure_document = copy.deepcopy(
+        getattr(runner, "runtime_closure_document", None)
+    )
+    if not isinstance(runtime_closure_document, dict):
+        runtime_closure_document = {
+            "closureSchemaVersion": RUNTIME_DEPENDENCY_CLOSURE_SCHEMA_VERSION,
+            "measurementStatus": "unmeasured-local-producer",
+            "profile": runner.profile,
+            "runnerOS": _canonical_runner_os(),
+            "dependencyClosureDigest": runtime["dependencyClosureDigest"],
+            "dependencyMemberCount": int(runtime["dependencyMemberCount"]),
+            "closureDigest": runtime["runtimeClosureDigest"],
+        }
+    runtime_guard_document = copy.deepcopy(
+        getattr(runner, "runtime_closure_guard_evidence", None)
+    )
+    if not isinstance(runtime_guard_document, dict):
+        runtime_guard_document = {
+            "guardSchemaVersion": RUNTIME_DEPENDENCY_GUARD_SCHEMA_VERSION,
+            "watcherBackend": "not-active",
+            "active": False,
+            "activeDuringReplay": False,
+            "mutationState": "unmeasured",
+            "queueOverflow": False,
+            "mutationEventCount": 0,
+        }
+    command_document: dict[str, Any] = {
+        "documentKind": EVIDENCE_DOCUMENT_KINDS["command-results.json"],
+        "schemaVersion": 2,
+        "invocation": invocation,
+        "runtime": runtime,
+        "executionBinding": execution_binding,
+        "executionBindingDigest": execution_binding_digest_value,
+        "authorizationContextBinding": authorization_context_binding,
+        "authorizationContextBindingDigest": (
+            authorization_context_binding_digest_value
+        ),
+        "profile": runner.profile,
+        "platform": runner.platform,
+        "records": runner.command_results,
+        "observations": observations,
+        "completedCommandClasses": completed_command_classes,
+        "expectedCompletedCommandClasses": list(
+            runner.expected_completed_command_classes
+        ),
+        "actualCompletedCommandClasses": list(
+            runner.actual_completed_command_classes
+        ),
+        "expectedCompletedCommandClassSetDigest": (
+            runner.expected_completed_command_class_set_digest
+        ),
+        "completedCommandClassSetDigest": runner.completed_command_class_set_digest,
+        "producerObservationCount": runner.producer_observation_count,
+        "producerObservationUniverseDigest": (
+            runner.producer_observation_universe_digest
+        ),
+        "producerTranscriptDigest": runner.producer_transcript_digest,
+        "missingCommandIds": list(runner.missing_command_ids),
+        "extraCommandIds": list(runner.extra_command_ids),
+        "duplicateCommandIds": list(runner.duplicate_command_ids),
+        "commandPlanDigest": runner.command_plan_digest,
+        "commandAuthority": runner.command_plan,
+        "runtimeDependencyClosure": runtime_closure_document,
+        "runtimeDependencyGuard": runtime_guard_document,
+    }
+    command_bytes = _json_bytes(command_document)
+    if len(command_bytes) > MAX_COMMAND_RESULTS_JSON_BYTES:
+        runner.violations.append(
+            {
+                "id": "COMMAND-RESULT-JSON-LIMIT",
+                "detail": "OUTPUT-LIMIT-EXCEEDED for command-results.json",
+            }
+        )
+        executable_size, executable_hash, executable_identity = _measured_file_authority(
+            Path(sys.executable)
+        )
+        limited_record = {
+            "ordinal": 0,
+            "commandRole": "required-execution",
+            "profile": runner.profile,
+            "platform": runner.platform,
+            "argv": [sys.executable, "<internal>", "command-results-size-limit"],
+            "logicalArgv": [sys.executable, "<internal>", "command-results-size-limit"],
+            "executionArgv": [sys.executable, "<internal>", "command-results-size-limit"],
+            "executionInputMode": "NONE",
+            "executionInputSize": None,
+            "executionInputSha256": None,
+            "cwd": ".",
+            "toolRole": "python-in-process",
+            "resolvedExecutablePath": str(Path(sys.executable).resolve()),
+            "resolvedExecutableSize": executable_size,
+            "resolvedExecutableSha256": executable_hash,
+            "resolvedExecutableFileIdentity": executable_identity,
+            "executionLease": None,
+            "targets": [],
+            "resultSemantics": "bounded-evidence-failure-record",
+            "allowedExecutionExits": [0],
+            **make_internal_result(
+                "command-results-size-limit",
+                "evidence-size-limit",
+                False,
+                "command result evidence exceeded its fixed JSON limit",
+            ),
+        }
+        limited_record["exitCode"] = 125
+        limited_record["outputLimitStatus"] = "OUTPUT-LIMIT-EXCEEDED"
+        command_document["records"] = [limited_record]
+        command_document["observations"] = []
+        command_document["completedCommandClasses"] = []
+        command_document["actualCompletedCommandClasses"] = []
+        command_document["completedCommandClassSetDigest"] = (
+            completed_command_class_set_digest([])
+        )
+        command_document["commandPlanDigest"] = runner.command_plan_digest
+        command_document["commandAuthority"] = runner.command_plan
+        command_document["producerObservationCount"] = 0
+        command_document["producerObservationUniverseDigest"] = (
+            producer_observation_universe_digest(command_document["records"])
+        )
+        command_document["producerTranscriptDigest"] = producer_transcript_digest(
+            runner.command_plan_digest,
+            command_document["records"],
+            [],
+        )
+        missing_ids, extra_ids, duplicate_ids = command_id_set_differences(
+            runner.command_plan,
+            command_document["records"],
+        )
+        command_document["missingCommandIds"] = missing_ids
+        command_document["extraCommandIds"] = extra_ids
+        command_document["duplicateCommandIds"] = duplicate_ids
+        command_bytes = _json_bytes(command_document)
+        comparison = {
+            "observedDebts": [],
+            "resolvedCandidates": [],
+            "expectedOmissions": [],
+            "releaseOnlySkips": [],
+            "violations": [{"id": "COMMAND-RESULT-JSON-LIMIT"}],
+        }
+    hard_failures = [item for item in runner.hard_gate_results if item["status"] != "pass"]
+    status = "PASS" if not runner.violations and not hard_failures else "FAIL"
+    summary = {
+        "documentKind": EVIDENCE_DOCUMENT_KINDS["summary.json"],
+        "schemaVersion": 2,
+        "generatedAt": started_at,
+        "status": status,
+        "profile": runner.profile,
+        "platform": runner.platform,
+        "baselineCommit": runner.baseline.get("baselineCommit"),
+        "baselineTree": runner.baseline.get("baselineTree"),
+        "checkpointTag": runner.baseline.get("checkpointTag"),
+        "policyVersion": runner.baseline.get("policyVersion"),
+        "invocation": invocation,
+        "runtime": runtime,
+        "executionBinding": execution_binding,
+        "executionBindingDigest": execution_binding_digest_value,
+        "authorizationContextBinding": authorization_context_binding,
+        "authorizationContextBindingDigest": (
+            authorization_context_binding_digest_value
+        ),
+        "trustBoundary": dict(TRUST_BOUNDARY),
+        "counts": {
+            "hardGateFailures": len(hard_failures),
+            "policyViolations": len(runner.violations),
+            "knownDebtsObserved": len(comparison.get("observedDebts", [])),
+            "resolvedCandidates": len(comparison.get("resolvedCandidates", [])),
+            "expectedOmissions": len(comparison.get("expectedOmissions", [])),
+            "releaseOnlySkips": len(comparison.get("releaseOnlySkips", [])),
+            "commands": len(command_document["records"]),
+        },
+        "hardGateResults": sorted(runner.hard_gate_results, key=lambda item: item["id"]),
+        "policyViolations": runner.violations,
+        "knownDebtsObserved": comparison.get("observedDebts", []),
+        "resolvedCandidates": comparison.get("resolvedCandidates", []),
+        "expectedOmissions": comparison.get("expectedOmissions", []),
+        "releaseOnlySkips": comparison.get("releaseOnlySkips", []),
+        "observationalChecks": runner.baseline.get("observationalChecks", []),
+        "evidenceManifest": [],
+    }
+    observed_document = {
+        "documentKind": EVIDENCE_DOCUMENT_KINDS["observed-debt.json"],
+        "schemaVersion": 2,
+        "invocation": invocation,
+        "runtime": runtime,
+        "executionBinding": execution_binding,
+        "executionBindingDigest": execution_binding_digest_value,
+        "authorizationContextBinding": authorization_context_binding,
+        "authorizationContextBindingDigest": (
+            authorization_context_binding_digest_value
+        ),
+        "profile": runner.profile,
+        "platform": runner.platform,
+        "baselineCommit": runner.baseline.get("baselineCommit"),
+        "records": comparison.get("observedDebts", []),
+        "expectedOmissions": comparison.get("expectedOmissions", []),
+        "releaseOnlySkips": comparison.get("releaseOnlySkips", []),
+    }
+    resolved_document = {
+        "documentKind": EVIDENCE_DOCUMENT_KINDS["resolved-candidates.json"],
+        "schemaVersion": 2,
+        "invocation": invocation,
+        "runtime": runtime,
+        "executionBinding": execution_binding,
+        "executionBindingDigest": execution_binding_digest_value,
+        "authorizationContextBinding": authorization_context_binding,
+        "authorizationContextBindingDigest": (
+            authorization_context_binding_digest_value
+        ),
+        "profile": runner.profile,
+        "platform": runner.platform,
+        "baselineCommit": runner.baseline.get("baselineCommit"),
+        "records": comparison.get("resolvedCandidates", []),
+    }
+    payloads = {
+        "summary.md": render_summary_markdown(summary).encode("utf-8"),
+        "observed-debt.json": _json_bytes(observed_document),
+        "resolved-candidates.json": _json_bytes(resolved_document),
+        "command-results.json": _json_bytes(command_document),
+    }
+    summary["evidenceManifest"] = [
+        {
+            "relativeFilename": name,
+            "byteLength": len(payloads[name]),
+            "sha256": hashlib.sha256(payloads[name]).hexdigest(),
+            "documentKind": EVIDENCE_DOCUMENT_KINDS[name],
+        }
+        for name in EVIDENCE_MANIFEST_FILE_NAMES
+    ]
+    payloads["summary.json"] = _json_bytes(summary)
+    for name, payload in payloads.items():
+        if len(payload) > EVIDENCE_FILE_BYTE_LIMITS[name]:
+            raise RuntimeError(f"{name} exceeds its fixed evidence byte limit")
+    for name in EVIDENCE_FILE_NAMES:
+        _exclusive_write(OUTPUT_DIR / name, payloads[name], repo_root=REPO_ROOT)
+    if active_containment_count() != 0:
+        raise RuntimeError("repository-controlled process containment became active before evidence verification")
+    verification_errors = verify_evidence_file_set(
+        OUTPUT_DIR,
+        repo_root=REPO_ROOT,
+        expected_command_plan=runner.command_plan,
+    )
+    if verification_errors:
+        raise RuntimeError("; ".join(verification_errors))
+    return summary
+
+
+def _validate_directory_chain(path: Path, *, stop: Path) -> list[str]:
+    errors: list[str] = []
+    try:
+        stop_resolved = stop.resolve(strict=True)
+        path_resolved = path.resolve(strict=True)
+    except OSError as exc:
+        return [f"installed package path cannot be resolved: {type(exc).__name__}"]
+    if not _path_is_within(path_resolved, stop_resolved):
+        return ["installed package path escapes the exact node_modules root"]
+    current = path
+    while True:
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            errors.append(f"{current}: cannot inspect ({type(exc).__name__})")
+            break
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
+            errors.append(f"{current}: package path component is not a non-reparse directory")
+        if current.resolve(strict=True) == stop_resolved:
+            break
+        if current.parent == current:
+            errors.append("installed package path did not reach node_modules root")
+            break
+        current = current.parent
+    return errors
+
+
+def prepare_developer_esbuild() -> list[str]:
+    """Run only the locked esbuild postinstall after ignore-scripts npm ci."""
+
+    errors: list[str] = []
+    tools, tool_errors = resolve_trusted_tools({"python", "node", "git"})
+    errors.extend(tool_errors)
+    if errors:
+        return errors
+    environment = child_process_environment(tools)
+    before, snapshot_errors = snapshot_trusted_files()
+    errors.extend(snapshot_errors)
+    lock_path = REPO_ROOT / "developer" / "package-lock.json"
+    try:
+        lock_document = read_json(lock_path)
+        lock_record = lock_document["packages"]["node_modules/esbuild"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError, ValueError) as exc:
+        errors.append(f"developer lockfile cannot authorize esbuild: {type(exc).__name__}")
+        return errors
+    if lock_record.get("version") != ESBUILD_VERSION:
+        errors.append("developer lockfile esbuild version is not exact")
+    if lock_record.get("integrity") != ESBUILD_LOCK_INTEGRITY or lock_record.get("hasInstallScript") is not True:
+        errors.append("developer lockfile esbuild integrity/install-script authority is not exact")
+
+    node_modules = REPO_ROOT / "developer" / "node_modules"
+    package_root = node_modules / "esbuild"
+    errors.extend(_validate_directory_chain(package_root, stop=node_modules))
+    package_json_path = package_root / "package.json"
+    installer_path = package_root / "install.js"
+    for path in (package_json_path, installer_path):
+        okay, reason = _secure_regular_file(path)
+        if not okay:
+            errors.append(f"{path.name}: {reason}")
+    try:
+        installed_package = read_json(package_json_path)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        errors.append(f"installed esbuild package metadata cannot be read: {type(exc).__name__}")
+    else:
+        if installed_package.get("name") != "esbuild" or installed_package.get("version") != ESBUILD_VERSION:
+            errors.append("installed esbuild package name/version is not exact")
+        if installed_package.get("scripts", {}).get("postinstall") != "node install.js":
+            errors.append("installed esbuild postinstall command is not exactly node install.js")
+
+    machine = platform.machine().casefold()
+    architecture = "x64" if machine in {"amd64", "x86_64"} else "arm64" if machine in {"arm64", "aarch64"} else ""
+    operating_system = "win32" if sys.platform.startswith("win") else "linux" if sys.platform.startswith("linux") else ""
+    if not architecture or not operating_system:
+        errors.append("esbuild preparation supports only the canonical Windows/Linux x64/arm64 runners")
+    else:
+        platform_package = node_modules / "@esbuild" / f"{operating_system}-{architecture}"
+        errors.extend(_validate_directory_chain(platform_package, stop=node_modules))
+        platform_package_json = platform_package / "package.json"
+        okay, reason = _secure_regular_file(platform_package_json)
+        if not okay:
+            errors.append(f"installed platform esbuild package: {reason}")
+        else:
+            try:
+                platform_metadata = read_json(platform_package_json)
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                errors.append(f"platform esbuild metadata cannot be read: {type(exc).__name__}")
+            else:
+                if platform_metadata.get("version") != ESBUILD_VERSION:
+                    errors.append("installed platform esbuild version is not exact")
+        binary = platform_package / ("esbuild.exe" if operating_system == "win32" else "bin/esbuild")
+        okay, reason = _secure_regular_file(binary)
+        if not okay:
+            errors.append(f"installed platform esbuild binary: {reason}")
+
+    if errors:
+        return sorted(set(errors))
+    trusted_arguments = trusted_git_arguments(
+        tools["git"], "diff", "--exit-code", "--", *TRUSTED_FILE_PATHS
+    )
+    before_diff = execute_command(
+        "trusted-files-before-esbuild",
+        "trusted-file-integrity",
+        trusted_arguments,
+        timeout=60,
+        env=environment,
+        include_preview=False,
+    )
+    if not before_diff.executed or before_diff.exit_code != 0:
+        errors.append("tracked trusted bytes changed before the esbuild installer")
+        return errors
+    capture = execute_command(
+        "locked-esbuild-installer",
+        "dependency-lifecycle",
+        [tools["node"], str(installer_path.resolve(strict=True))],
+        timeout=180,
+        env=environment,
+        cwd=package_root,
+    )
+    if not capture.executed or capture.exit_code != 0 or capture.output_limited or capture.timed_out:
+        errors.append(
+            "exact locked esbuild installer failed: "
+            + bounded_preview("\n".join(part for part in (capture.error or "", capture.stdout, capture.stderr) if part), max_lines=8)
+        )
+    after, after_errors = snapshot_trusted_files()
+    errors.extend(after_errors)
+    errors.extend(compare_trusted_snapshots(before, after))
+    after_diff = execute_command(
+        "trusted-files-after-esbuild",
+        "trusted-file-integrity",
+        trusted_arguments,
+        timeout=60,
+        env=environment,
+        include_preview=False,
+    )
+    if not after_diff.executed or after_diff.exit_code != 0:
+        errors.append("tracked trusted bytes changed after the esbuild installer")
+    return sorted(set(errors))
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    selected_argv = list(sys.argv[1:] if argv is None else argv)
+    for option in (
+        "--expected-profile",
+        "--expected-producer-job",
+        "--expected-verifier-job",
+        "--expected-runner-os",
+        "--expected-invocation-id",
+        "--untrusted-evidence-root",
+    ):
+        occurrences = sum(
+            token == option or token.startswith(option + "=")
+            for token in selected_argv
+        )
+        if occurrences > 1:
+            raise ValueError(f"{option} may be supplied at most once")
+    parser = argparse.ArgumentParser(
+        description="Run the baseline-aware Phase 1 CI foundation policy.",
+        exit_on_error=False,
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--profile", choices=PROFILES)
+    group.add_argument("--list-profiles", action="store_true")
+    group.add_argument("--prepare-developer-esbuild", action="store_true")
+    group.add_argument("--verify-evidence", action="store_true")
+    parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--require-install-tools", action="store_true")
+    parser.add_argument("--expected-profile", choices=PROFILES)
+    parser.add_argument(
+        "--expected-producer-job",
+        choices=tuple(
+            authority["producerJobId"]
+            for authority in WORKFLOW_JOB_PROFILE_AUTHORITY.values()
+        ),
+    )
+    parser.add_argument(
+        "--expected-verifier-job",
+        choices=tuple(WORKFLOW_JOB_PROFILE_AUTHORITY),
+    )
+    parser.add_argument("--expected-runner-os", choices=("Linux", "Windows"))
+    parser.add_argument("--expected-invocation-id")
+    parser.add_argument("--untrusted-evidence-root")
+    parser.add_argument("--require-linux-containment-self-test", action="store_true")
+    parser.add_argument("--require-fresh-runtime-closure", action="store_true")
+    try:
+        args = parser.parse_args(selected_argv)
+    except argparse.ArgumentError as exc:
+        raise ValueError(str(exc)) from exc
+    if args.verify_only and args.profile != "policy":
+        raise ValueError("--verify-only is supported only with --profile policy")
+    if args.require_install_tools and not (args.verify_only and args.profile == "policy"):
+        raise ValueError("--require-install-tools requires the policy verify-only pre-install profile")
+    expected_options = (
+        args.expected_profile,
+        args.expected_producer_job,
+        args.expected_verifier_job,
+        args.expected_runner_os,
+        args.expected_invocation_id,
+        args.untrusted_evidence_root,
+    )
+    if args.verify_evidence:
+        if args.expected_profile is None:
+            raise ValueError("--verify-evidence requires --expected-profile from external authority")
+    elif any(value is not None for value in expected_options) or (
+        args.require_linux_containment_self_test
+        or args.require_fresh_runtime_closure
+    ):
+        raise ValueError("expected verification context options require --verify-evidence")
+    return args
+
+
+def prepare_verification_authority(
+    args: argparse.Namespace,
+    *,
+    repo_root: Path = REPO_ROOT,
+    source_environment: Mapping[str, str] | None = None,
+) -> tuple[ExternallyExpectedVerificationContext, FoundationRunner]:
+    """Build the expected runner and binding before opening the evidence root."""
+
+    baseline_path = repo_root / "developer" / "tests" / "ci" / "phase1-ci-baseline.json"
+    try:
+        baseline = strict_json_load_file(baseline_path)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"verification baseline is unavailable: {type(exc).__name__}") from exc
+    schema_errors = validate_baseline_document(baseline)
+    if schema_errors:
+        raise ValueError("verification baseline schema is invalid: " + "; ".join(schema_errors))
+    source = dict(os.environ if source_environment is None else source_environment)
+    github_actions = source.get("GITHUB_ACTIONS") == "true"
+    if github_actions:
+        if not args.untrusted_evidence_root:
+            raise ValueError("GitHub verifier requires an explicit untrusted evidence root")
+        if args.expected_runner_os == "Linux" and not args.require_linux_containment_self_test:
+            raise ValueError("every Linux verifier requires the live containment self-test")
+        if args.expected_runner_os == "Windows" and args.require_linux_containment_self_test:
+            raise ValueError("Windows verifier cannot claim the Linux live containment self-test")
+        if args.expected_profile == "all" and not args.require_fresh_runtime_closure:
+            raise ValueError("all-profile verifier requires a fresh runtime/dependency closure")
+        captured_python = source.get("CI_TRUSTED_PYTHON", "")
+        if (
+            not captured_python
+            or not Path(captured_python).is_absolute()
+            or Path(captured_python).resolve(strict=True)
+            != Path(sys.executable).resolve(strict=True)
+        ):
+            raise ValueError("verifier was not invoked through the captured absolute trusted Python")
+        for name in ("CI_TRUSTED_NODE", "CI_TRUSTED_NPM_ENTRY"):
+            value = source.get(name, "")
+            if not value or not Path(value).is_absolute():
+                raise ValueError(f"GitHub verifier is missing absolute {name}")
+    if sys.platform.startswith("linux"):
+        ensure_main_linux_subreaper()
+    runner = FoundationRunner(
+        str(args.expected_profile),
+        baseline,
+        source_environment=source_environment,
+        enable_runtime_closure=True,
+        require_fresh_runtime_closure=bool(args.require_fresh_runtime_closure),
+    )
+    runner.linux_containment_self_test = {
+        "status": "REMOTE-LIVE-VALIDATION-PENDING",
+        "results": [],
+    }
+    if args.require_linux_containment_self_test:
+        results, live_errors = run_linux_containment_live_self_test(
+            python_executable=runner.tools["python"],
+            environment=runner.child_environment,
+            temp_root=runner.private_temp_root,
+        )
+        runner.linux_containment_self_test = {
+            "status": "PASS" if not live_errors else "FAIL",
+            "results": results,
+        }
+        if live_errors:
+            runner.cleanup_task_resources()
+            raise ValueError("Linux containment live self-test failed: " + "; ".join(live_errors))
+    try:
+        context = build_externally_expected_verification_context(
+            expected_profile=str(args.expected_profile),
+            expected_producer_job=args.expected_producer_job,
+            expected_verifier_job=args.expected_verifier_job,
+            expected_runner_os=args.expected_runner_os,
+            expected_invocation_id=args.expected_invocation_id,
+            command_plan_digest_value=runner.command_plan_digest,
+            fresh_runtime_closure_digest=runner.runtime_closure_digest,
+            baseline=baseline,
+            git=runner.tools["git"],
+            child_environment=runner.child_environment,
+            source_environment=source_environment,
+            repo_root=repo_root,
+        )
+    except Exception:
+        runner.close_execution_leases()
+        raise
+    runner.execution_binding = context.evidence_binding()
+    runner.verifier_execution_binding = context.verifier_binding()
+    runner.external_verification_context = context
+    runner.authorization_context_binding = context.authorization_context_binding()
+    runner.authorization_context_binding_digest = authorization_context_binding_digest(
+        runner.authorization_context_binding
+    )
+    return context, runner
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        args = parse_args(argv)
+    except (ValueError, SystemExit) as exc:
+        if isinstance(exc, SystemExit) and exc.code == 0:
+            return EXIT_SUCCESS
+        print(f"CI foundation argument error: {sanitize_text(str(exc))}", file=sys.stderr)
+        return EXIT_CONFIGURATION_ERROR
+    if args.list_profiles:
+        print("\n".join(PROFILES))
+        return EXIT_SUCCESS
+    if args.verify_evidence:
+        evidence_root = (
+            REPO_ROOT / args.untrusted_evidence_root
+            if args.untrusted_evidence_root
+            and not Path(args.untrusted_evidence_root).is_absolute()
+            else Path(args.untrusted_evidence_root)
+            if args.untrusted_evidence_root
+            else OUTPUT_DIR
+        )
+        try:
+            evidence_root = evidence_root.resolve(strict=True)
+        except OSError as exc:
+            print(
+                f"CI foundation untrusted evidence root error: {type(exc).__name__}",
+                file=sys.stderr,
+            )
+            return EXIT_CONFIGURATION_ERROR
+        try:
+            expected_context, verification_runner = prepare_verification_authority(
+                args,
+                repo_root=REPO_ROOT,
+            )
+        except (OSError, KeyError, ValueError) as exc:
+            print(
+                f"CI foundation verification configuration error: {type(exc).__name__}: {sanitize_text(str(exc))}",
+                file=sys.stderr,
+            )
+            return EXIT_CONFIGURATION_ERROR
+        try:
+            verification_errors, replay_transcript = verify_evidence_with_replay(
+                evidence_root,
+                expected_context=expected_context,
+                verification_runner=verification_runner,
+                repo_root=REPO_ROOT,
+            )
+        finally:
+            verification_runner.cleanup_task_resources()
+        if verification_errors:
+            print("CI foundation evidence verification failed:", file=sys.stderr)
+            for error in verification_errors:
+                print(f"- {sanitize_text(error)}", file=sys.stderr)
+            return EXIT_POLICY_VIOLATION
+        replay_status = "PASS" if replay_transcript is not None else "NOT-REQUIRED"
+        print(
+            "CI foundation evidence verification status=PASS "
+            f"replay={replay_status}"
+        )
+        return EXIT_SUCCESS
+    evidence_errors = validate_evidence_root_absent(OUTPUT_DIR, repo_root=REPO_ROOT)
+    if evidence_errors:
+        print(
+            "CI foundation evidence-root guard violation: " + sanitize_text("; ".join(evidence_errors)),
+            file=sys.stderr,
+        )
+        return EXIT_RUNNER_ERROR
+    try:
+        baseline = read_json(BASELINE_PATH)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        print(f"CI foundation baseline error: {type(exc).__name__}", file=sys.stderr)
+        return EXIT_CONFIGURATION_ERROR
+    schema_errors = validate_baseline_document(baseline)
+    if schema_errors:
+        print("CI foundation baseline schema violation:", file=sys.stderr)
+        for error in schema_errors:
+            print(f"- {sanitize_text(error)}", file=sys.stderr)
+        return EXIT_CONFIGURATION_ERROR
+
+    if args.prepare_developer_esbuild:
+        preparation_errors = prepare_developer_esbuild()
+        if preparation_errors:
+            print("CI foundation esbuild preparation violation:", file=sys.stderr)
+            for error in preparation_errors:
+                print(f"- {sanitize_text(error)}", file=sys.stderr)
+            return EXIT_POLICY_VIOLATION
+        print("CI foundation locked esbuild preparation status=PASS")
+        return EXIT_SUCCESS
+
+    runner = FoundationRunner(
+        args.profile,
+        baseline,
+        require_install_tools=args.require_install_tools,
+        enable_runtime_closure=os.environ.get("GITHUB_ACTIONS") == "true",
+    )
+    if not args.verify_only:
+        try:
+            runner.execution_binding = build_generation_execution_binding(
+                runner,
+                repo_root=REPO_ROOT,
+            )
+        except (OSError, KeyError, ValueError) as exc:
+            runner.close_execution_leases()
+            print(
+                f"CI foundation execution-binding configuration error: {type(exc).__name__}: {sanitize_text(str(exc))}",
+                file=sys.stderr,
+            )
+            return EXIT_CONFIGURATION_ERROR
+        try:
+            create_fresh_evidence_root(OUTPUT_DIR, repo_root=REPO_ROOT)
+        except Exception as exc:
+            runner.close_execution_leases()
+            print(
+                f"CI foundation evidence-root creation error: {type(exc).__name__}: {sanitize_text(str(exc))}",
+                file=sys.stderr,
+            )
+            return EXIT_RUNNER_ERROR
+    comparison: dict[str, Any] = {
+        "observedDebts": [],
+        "resolvedCandidates": [],
+        "expectedOmissions": [],
+        "releaseOnlySkips": [],
+        "violations": [],
+    }
+    runner_error: str | None = None
+    try:
+        comparison = runner.run()
+    except Exception as exc:  # pragma: no cover - last-resort evidence path
+        runner_error = f"{type(exc).__name__}: {exc}"
+    finally:
+        runner.close_execution_leases()
+    if args.verify_only:
+        if runner_error:
+            print(
+                f"CI foundation verify-only error: {sanitize_text(runner_error)}",
+                file=sys.stderr,
+            )
+            return EXIT_POLICY_VIOLATION
+        hard_failures = [item for item in runner.hard_gate_results if item["status"] != "pass"]
+        status = "PASS" if not runner.violations and not hard_failures else "FAIL"
+        print(f"CI foundation profile={args.profile} verify-only status={status}")
+        return EXIT_SUCCESS if status == "PASS" else EXIT_POLICY_VIOLATION
+    try:
+        summary = write_evidence(runner, comparison, runner_error=runner_error)
+    except Exception as exc:  # pragma: no cover - evidence failure must be loud
+        print(f"CI foundation evidence error: {type(exc).__name__}: {sanitize_text(str(exc))}", file=sys.stderr)
+        return EXIT_RUNNER_ERROR
+    finally:
+        runner.cleanup_task_resources()
+    print(f"CI foundation profile={args.profile} status={summary['status']}")
+    if summary["executionBinding"]["bindingMode"] == "local":
+        print(
+            "Local verification invocation authority: "
+            + summary["executionBinding"]["producerInvocationId"]
+        )
+    print("Sanitized summary: .ci-results/summary.md")
+    return EXIT_SUCCESS if summary["status"] == "PASS" else EXIT_POLICY_VIOLATION
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--internal-linux-containment-supervisor":
+        raise SystemExit(_linux_containment_supervisor_entrypoint(sys.argv[2:]))
+    raise SystemExit(main())

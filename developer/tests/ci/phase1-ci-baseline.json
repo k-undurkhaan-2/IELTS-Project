@@ -1,0 +1,599 @@
+{
+  "documentKind": "ieltmps-phase1-ci-baseline-v1",
+  "schemaVersion": 1,
+  "baselineCommit": "db743cc625daded38442834731cbf35db024e10f",
+  "baselineTree": "c3f3825ecc4523a6e39da1164df41d6d59e3527a",
+  "checkpointTag": "checkpoint-phase1-20260730",
+  "policyVersion": "1.0.0",
+  "ratifiedCounts": {
+    "productOrPackagingObligations": 4,
+    "validationInfrastructureObligations": 14,
+    "acceptedCheckpointNonblockingDebts": 3,
+    "expectedPrivateResourceOmissions": 2,
+    "releaseOnlySkips": 3,
+    "confirmedSecurityProductDefects": 0,
+    "unresolvedClassifications": 0
+  },
+  "approvedActions": {
+    "actions/checkout": {
+      "tag": "v7.0.1",
+      "sha": "3d3c42e5aac5ba805825da76410c181273ba90b1"
+    },
+    "actions/setup-node": {
+      "tag": "v7.0.0",
+      "sha": "820762786026740c76f36085b0efc47a31fe5020"
+    },
+    "actions/setup-python": {
+      "tag": "v7.0.0",
+      "sha": "5fda3b95a4ea91299a34e894583c3862153e4b97"
+    },
+    "actions/upload-artifact": {
+      "tag": "v7.0.1",
+      "sha": "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+    }
+  },
+  "hardGates": [
+    {
+      "id": "BASELINE-POLICY-ENFORCEMENT",
+      "description": "The baseline schema, exact scopes, signatures, occurrence ceilings, and unknown-failure policy must remain valid."
+    },
+    {
+      "id": "REPOSITORY-GIT-BOUNDARY",
+      "description": "Git state, tracked paths, untracked implementation scope, symlink exclusion, and whitespace boundaries must pass."
+    },
+    {
+      "id": "TRACKED-PRIVATE-RESOURCE-EXCLUSION",
+      "description": "Private Listening or Reading resources and local runtime state must not be tracked."
+    },
+    {
+      "id": "SECRET-OPERATIONAL-ARTIFACT-EXCLUSION",
+      "description": "High-confidence secrets, private keys, database dumps, client authorization, and operational artifacts must not be tracked."
+    },
+    {
+      "id": "LICENSE-GOVERNANCE-CONSISTENCY",
+      "description": "Mixed-license documents, server package metadata, and authorized server SPDX headers must remain consistent."
+    },
+    {
+      "id": "WORKFLOW-SELF-POLICY",
+      "description": "The workflow must use read-only permissions, safe triggers, immutable official actions, bounded jobs, and sanitized evidence."
+    },
+    {
+      "id": "DIRECT-SYNTAX-EXECUTION",
+      "description": "Every tracked JavaScript, MJS, and Python source must be examined; only exact frozen syntax debt may remain."
+    },
+    {
+      "id": "BUNDLE-MANIFEST-GENERATED-BYTE-PARITY",
+      "description": "The canonical bundle manifest and generated bundle bytes must match exactly."
+    },
+    {
+      "id": "FOCUSED-LEARNER-RUNTIME-EXECUTION",
+      "description": "The focused learner palette and runtime stabilization command must execute."
+    },
+    {
+      "id": "FRONTEND-SECURITY-GUARD-EXECUTION",
+      "description": "Export, protected-resource, server-authority, privacy, origin, and identifier guard files must execute."
+    },
+    {
+      "id": "BACKEND-CANONICAL-EXECUTION",
+      "description": "The complete canonical backend authorization, session, TOTP, step-up, and protected-resource suite must execute."
+    },
+    {
+      "id": "STANDALONE-PACKAGE-INTEGRITY",
+      "description": "The canonical standalone packaging security and integrity suite must pass."
+    },
+    {
+      "id": "STANDALONE-MEMBERSHIP-AUDIT-EXECUTION",
+      "description": "Every local index script must be compared with the positive standalone manifest."
+    },
+    {
+      "id": "LOCKFILE-BYTE-INTEGRITY",
+      "description": "The existing backend and developer lockfiles must remain byte-identical after installation and validation."
+    },
+    {
+      "id": "UNKNOWN-NONPASS-FAIL-CLOSED",
+      "description": "Every non-pass outside an exact baseline scope, outcome, signature, and occurrence ceiling fails CI."
+    }
+  ],
+  "knownDebts": [
+    {
+      "id": "B-STATIC-NAVIGATION-VIEW-COVERAGE",
+      "category": "product-or-packaging",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "static-suite",
+      "testOrPathScope": "result:导航视图覆盖",
+      "expectedOutcome": "fail",
+      "allowedNormalizedSignature": [
+        "sha256:228af861e8a15481fcf5dee0e1ec28380c99f44e54170b471c57c465d863c3f9"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "open-product-obligation",
+      "targetStage": "phase2-navigation-contract",
+      "securityImpact": "No direct authorization bypass was confirmed; local/static Practice and Settings reachability remains inconsistent.",
+      "notes": "The exact configured-versus-DOM view mismatch is frozen; any changed detail is unknown debt."
+    },
+    {
+      "id": "G-STANDALONE-SITE-CONTENT-MEMBERSHIP",
+      "category": "product-or-packaging",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "standalone-membership",
+      "testOrPathScope": "membership:index.html::js/siteContent.js",
+      "expectedOutcome": "fail",
+      "allowedNormalizedSignature": [
+        "missing:index-script:js/siteContent.js"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "open-packaging-obligation",
+      "targetStage": "phase2-standalone-membership",
+      "securityImpact": "The positive standalone manifest remains fail-closed for all other membership drift.",
+      "notes": "Only the exact js/siteContent.js omission is frozen; no other index script omission may match."
+    },
+    {
+      "id": "B-SYNTAX-READING-EXPLANATION-P1-HIGH-194",
+      "category": "product-or-packaging",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "direct-syntax",
+      "testOrPathScope": "assets/generated/reading-explanations/p1-high-194.js",
+      "expectedOutcome": "syntax-error",
+      "allowedNormalizedSignature": [
+        "SyntaxError: Unexpected identifier '行会'"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "open-generated-source-obligation",
+      "targetStage": "phase2-reading-source-correction",
+      "securityImpact": "No security defect was identified; the generated asset cannot execute.",
+      "notes": "The exact file and parser diagnostic are frozen; other syntax failures fail closed."
+    },
+    {
+      "id": "B-SYNTAX-READING-EXPLANATION-P3-LOW-151",
+      "category": "product-or-packaging",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "direct-syntax",
+      "testOrPathScope": "assets/generated/reading-explanations/p3-low-151.js",
+      "expectedOutcome": "syntax-error",
+      "allowedNormalizedSignature": [
+        "SyntaxError: Unexpected identifier 'Ice'"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "open-generated-source-obligation",
+      "targetStage": "phase2-reading-source-correction",
+      "securityImpact": "No security defect was identified; the generated asset cannot execute.",
+      "notes": "The exact file and parser diagnostic are frozen; other syntax failures fail closed."
+    },
+    {
+      "id": "B-STATIC-E2E-SNAPSHOT-SCRIPT-DRIFT",
+      "category": "validation-infrastructure",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "static-suite",
+      "testOrPathScope": "result:E2E 快照脚本清单与 index 同步",
+      "expectedOutcome": "fail",
+      "allowedNormalizedSignature": [
+        "sha256:151a7faca5ae580f7198bea35d94758ed36856d5d26cfafc20828cb6044a19a7"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "open-validation-obligation",
+      "targetStage": "phase2-e2e-inventory",
+      "securityImpact": "The affected snapshot omits site-content bootstrap coverage.",
+      "notes": "The exact 6-versus-5 script inventory and single missing script are frozen."
+    },
+    {
+      "id": "B-STATIC-SETTINGS-BUTTON-COVERAGE",
+      "category": "validation-infrastructure",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "static-suite",
+      "testOrPathScope": "result:设置按钮覆盖",
+      "expectedOutcome": "fail",
+      "allowedNormalizedSignature": [
+        "sha256:6d87d832ea50373c72f99071926bf55307a6dab67034ba727a9d55b3950ad386"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "open-validation-obligation",
+      "targetStage": "phase2-settings-coverage",
+      "securityImpact": "Password, session, and TOTP controls lack the expected interaction discovery coverage.",
+      "notes": "Only the exact six DOM-only Settings controls may match."
+    },
+    {
+      "id": "B-STATIC-PRACTICE-RECORDER-SYNTHETIC-GUARD",
+      "category": "validation-infrastructure",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "static-suite",
+      "testOrPathScope": "result:PracticeRecorder 生产 synthetic 保护",
+      "expectedOutcome": "fail",
+      "allowedNormalizedSignature": [
+        "sha256:7021ce6adf0558deec21090b13da8592141407d6a850ab14f9a7f78e161a9723"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "open-validation-expectation-drift",
+      "targetStage": "phase2-practice-recorder-contract",
+      "securityImpact": "The canonical backend suite remains the hard server-authority gate.",
+      "notes": "Ratified as expectation drift; the exact missing guard assertion is frozen, not waived."
+    },
+    {
+      "id": "B-STATIC-SUITE-SESSION-ROUTING",
+      "category": "validation-infrastructure",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "static-suite",
+      "testOrPathScope": "result:套题模式状态机回归测试",
+      "expectedOutcome": "fail",
+      "allowedNormalizedSignature": [
+        "sha256:238122c8a9d7f99eb1767d2656038644234a3d0f8d2492a573740eadbb635817"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "open-validation-expectation-drift",
+      "targetStage": "phase2-suite-session-contract",
+      "securityImpact": "No authorization failure was confirmed; suite session/token expectations require reconciliation.",
+      "notes": "Only the exact session-ID routing assertion may match."
+    },
+    {
+      "id": "B-STATIC-PY-PLAYWRIGHT-NB-DRAG",
+      "category": "validation-infrastructure",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "static-suite",
+      "testOrPathScope": "result:模拟模式 NB 拖拽回灌回归测试",
+      "expectedOutcome": "fail",
+      "allowedNormalizedSignature": [
+        "sha256:ad01918ee43866b2aa9e965584f471cf135cb83e449bca94bb6bdcc16eae6817"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "open-validation-runner-obligation",
+      "targetStage": "phase2-python-playwright-runner",
+      "securityImpact": "No direct security defect was established by the unavailable validation responsibility.",
+      "notes": "The exact playwright_python_missing outcome is frozen."
+    },
+    {
+      "id": "B-STATIC-PY-PLAYWRIGHT-ROUNDTRIP",
+      "category": "validation-infrastructure",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "static-suite",
+      "testOrPathScope": "result:模拟模式切题回灌回归测试",
+      "expectedOutcome": "fail",
+      "allowedNormalizedSignature": [
+        "sha256:ad01918ee43866b2aa9e965584f471cf135cb83e449bca94bb6bdcc16eae6817"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "open-validation-runner-obligation",
+      "targetStage": "phase2-python-playwright-runner",
+      "securityImpact": "No direct security defect was established by the unavailable validation responsibility.",
+      "notes": "The exact playwright_python_missing outcome is frozen."
+    },
+    {
+      "id": "B-STATIC-PY-PLAYWRIGHT-UNIFIED-SUBMIT",
+      "category": "validation-infrastructure",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "static-suite",
+      "testOrPathScope": "result:统一阅读提交只读高亮回归测试",
+      "expectedOutcome": "fail",
+      "allowedNormalizedSignature": [
+        "sha256:ad01918ee43866b2aa9e965584f471cf135cb83e449bca94bb6bdcc16eae6817"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "open-validation-runner-obligation",
+      "targetStage": "phase2-python-playwright-runner",
+      "securityImpact": "No direct security defect was established by the unavailable validation responsibility.",
+      "notes": "The exact playwright_python_missing outcome is frozen."
+    },
+    {
+      "id": "B-STATIC-PY-PLAYWRIGHT-READING-QUICK-AUDIT",
+      "category": "validation-infrastructure",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "static-suite",
+      "testOrPathScope": "result:Reading 逐题自动排查（quick）",
+      "expectedOutcome": "fail",
+      "allowedNormalizedSignature": [
+        "sha256:77323b9d35e9ec70ea98c3918b955dc5246205a862589d4df4862ff1d42e3a4d"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "open-validation-runner-obligation",
+      "targetStage": "phase2-python-playwright-runner",
+      "securityImpact": "No direct security defect was established by the unavailable audit.",
+      "notes": "The exact missing Python Playwright audit outcome is frozen."
+    },
+    {
+      "id": "B-STATIC-PRACTICE-CUSTOM-CARD-LAYOUT",
+      "category": "validation-infrastructure",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "static-suite",
+      "testOrPathScope": "result:Practice 自定义卡片守卫",
+      "expectedOutcome": "fail",
+      "allowedNormalizedSignature": [
+        "sha256:ba4db767e8e8a7071a3761324324bcf0866e82b4df2687a2c5359e94d159569c"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "open-validation-assertion-drift",
+      "targetStage": "phase2-responsive-assertion",
+      "securityImpact": "None identified.",
+      "notes": "Only the exact single-column-grid assertion detail may match."
+    },
+    {
+      "id": "B-STATIC-ON-DEMAND-HARNESS-DOM-STUB",
+      "category": "validation-infrastructure",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "static-suite",
+      "testOrPathScope": "result:按需入口回归测试",
+      "expectedOutcome": "fail",
+      "allowedNormalizedSignature": [
+        "sha256:62024688ae5db841aabe291e19fd552f82e4d537dddf7d76684cf0f88642fc04"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "open-validation-harness-obligation",
+      "targetStage": "phase2-dom-stub-repair",
+      "securityImpact": "No direct security defect was established.",
+      "notes": "Only the exact querySelectorAll DOM-stub failure may match."
+    },
+    {
+      "id": "B-SYNTAX-PERFORMANCE-BASELINE",
+      "category": "validation-infrastructure",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "direct-syntax",
+      "testOrPathScope": "developer/tests/js/performanceBaseline.js",
+      "expectedOutcome": "syntax-error",
+      "allowedNormalizedSignature": [
+        "SyntaxError: Unexpected identifier 'testDataProcessingPerformance'"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "open-validation-syntax-obligation",
+      "targetStage": "phase2-validation-maintenance",
+      "securityImpact": "The validation responsibility cannot execute; no direct product defect was established.",
+      "notes": "Only the exact file and parser diagnostic may match."
+    },
+    {
+      "id": "B-SYNTAX-STATE-SERIALIZER-TEST",
+      "category": "validation-infrastructure",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "direct-syntax",
+      "testOrPathScope": "developer/tests/js/stateSerializerTest.js",
+      "expectedOutcome": "syntax-error",
+      "allowedNormalizedSignature": [
+        "SyntaxError: Unexpected token 'class'"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "open-validation-syntax-obligation",
+      "targetStage": "phase2-validation-maintenance",
+      "securityImpact": "The validation responsibility cannot execute; no direct product defect was established.",
+      "notes": "Only the exact file and parser diagnostic may match."
+    },
+    {
+      "id": "E-ADMIN-FRONTEND-DOM-STUB",
+      "category": "validation-infrastructure",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "frontend-security",
+      "testOrPathScope": "file:developer/tests/js/adminFrontendGuard.test.js",
+      "expectedOutcome": "fail",
+      "allowedNormalizedSignature": [
+        "TypeError:document.querySelectorAll-is-not-a-function"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "open-validation-harness-obligation",
+      "targetStage": "phase2-admin-dom-stub-repair",
+      "securityImpact": "Admin export and authorization UI coverage is incomplete; backend authorization remains hard-gated.",
+      "notes": "A second failure in the same file changes the fail count and cannot match."
+    },
+    {
+      "id": "E-REMOTE-PRACTICE-DISABLE-TOTP-TEST-DRIFT",
+      "category": "validation-infrastructure",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "frontend-security",
+      "testOrPathScope": "file:developer/tests/js/remotePracticeDataSource.test.js",
+      "expectedOutcome": "fail",
+      "allowedNormalizedSignature": [
+        "TypeError:apiClient.disableTotp-is-not-a-function"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "open-retired-test-contract-drift",
+      "targetStage": "phase2-security-test-reconciliation",
+      "securityImpact": "The canonical backend suite must continue to prove scoped managed TOTP-disable behavior.",
+      "notes": "Only the retired direct API call failure may match."
+    },
+    {
+      "id": "E-WINDOWS-LOCAL-DATA-CRLF-ASSERTION",
+      "category": "accepted-checkpoint-nonblocking",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "frontend-security",
+      "testOrPathScope": "file:developer/tests/js/localDataRenderingGuard.test.js",
+      "expectedOutcome": "fail",
+      "allowedNormalizedSignature": [
+        "AssertionError:vocab-store-source-CRLF-assertion"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "windows"
+      ],
+      "checkpointDisposition": "accepted-checkpoint-nonblocking",
+      "targetStage": "phase2-cross-platform-test-normalization",
+      "securityImpact": "The asserted size limits and defensive clone code remain present; the matcher is EOL-sensitive.",
+      "notes": "A passing Windows result is RESOLVED-CANDIDATE; any other file failure is unknown."
+    },
+    {
+      "id": "F-WINDOWS-BACKEND-COMPATIBILITY-RUNNER",
+      "category": "accepted-checkpoint-nonblocking",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "backend-canonical",
+      "testOrPathScope": "command:npm --prefix backend test",
+      "expectedOutcome": "unavailable",
+      "allowedNormalizedSignature": [
+        "required-executable-unavailable:npm"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "windows"
+      ],
+      "checkpointDisposition": "accepted-checkpoint-nonblocking",
+      "targetStage": "ci-foundation-windows-runner",
+      "securityImpact": "Canonical Ubuntu authorization evidence passed at the checkpoint, but the new CI runner must now execute Windows coverage.",
+      "notes": "Historical record only: current CI disposition requires execution and fails if npm remains unavailable.",
+      "currentCiDisposition": "must-execute"
+    },
+    {
+      "id": "D-WSL-PLAYWRIGHT-BROWSER-UNAVAILABLE",
+      "category": "accepted-checkpoint-nonblocking",
+      "gate": "frozen-baseline-debt",
+      "commandClass": "learner-focused",
+      "testOrPathScope": "command:learner-focused-runtime",
+      "expectedOutcome": "unavailable",
+      "allowedNormalizedSignature": [
+        "learner-browser-executable-unavailable"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "ubuntu"
+      ],
+      "checkpointDisposition": "accepted-checkpoint-nonblocking",
+      "targetStage": "ci-foundation-ubuntu-browser-runner",
+      "securityImpact": "None identified; Windows browser coverage passed at the checkpoint.",
+      "notes": "The stable V1 ID is retained. A successful Ubuntu browser run is RESOLVED-CANDIDATE."
+    }
+  ],
+  "expectedOmissions": [
+    {
+      "id": "B-STATIC-PRIVATE-LISTENING-INDEX-OMISSION",
+      "category": "expected-private-resource-omission",
+      "gate": "public-private-boundary",
+      "commandClass": "static-suite",
+      "testOrPathScope": "result:Listening generated 索引结构",
+      "expectedOutcome": "fail",
+      "allowedNormalizedSignature": [
+        "sha256:1a578b664e36295ffb91231057905272c7c92ab3c7e66f5cda87844d7813ef1e"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "intentional-public-clone-omission",
+      "targetStage": "authorized-private-runtime-validation",
+      "securityImpact": "Private-resource exclusion is preserved; no private content is opened by CI.",
+      "notes": "Reported as an intentional public-clone omission, never as a generic failure."
+    },
+    {
+      "id": "B-STATIC-PRIVATE-LISTENING-BRIDGE-OMISSION",
+      "category": "expected-private-resource-omission",
+      "gate": "public-private-boundary",
+      "commandClass": "static-suite",
+      "testOrPathScope": "result:Listening 静态 bridge 覆盖守卫",
+      "expectedOutcome": "fail",
+      "allowedNormalizedSignature": [
+        "sha256:49cb4e511ecd094afd74343a4ff1f9dfa8ceaa6f80239479bce9114ceb2c9449"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "intentional-public-clone-omission",
+      "targetStage": "authorized-private-runtime-validation",
+      "securityImpact": "No private source or operational value is exposed.",
+      "notes": "Reported as an intentional public-clone omission, never as a generic failure."
+    }
+  ],
+  "releaseOnlySkips": [
+    {
+      "id": "B-SKIP-RELEASE-ZIP",
+      "category": "release-only-skip",
+      "gate": "release-input-not-authorized",
+      "commandClass": "static-suite",
+      "testOrPathScope": "result:Release ZIP 运行时内容守卫",
+      "expectedOutcome": "skip",
+      "allowedNormalizedSignature": [
+        "sha256:8ae895e21db520d968113c11eac0e2df73ed14d70521c5ac5957bb3f92f0da7f"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "release-only-not-required",
+      "targetStage": "independent-release-workflow",
+      "securityImpact": "No publication artifact is created or inspected by this CI foundation.",
+      "notes": "The absence of dist is an explicit engineering-checkpoint skip, not a release waiver."
+    },
+    {
+      "id": "B-SKIP-PDF-RECONCILIATION",
+      "category": "release-only-skip",
+      "gate": "release-input-not-authorized",
+      "commandClass": "static-suite",
+      "testOrPathScope": "result:PDF 对账与回归审计",
+      "expectedOutcome": "skip",
+      "allowedNormalizedSignature": [
+        "sha256:33bc9b849164b41e15815b3b0db644c6b5bb44620715cd08b26852dda0a22a2d"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "release-only-not-required",
+      "targetStage": "independent-release-workflow",
+      "securityImpact": "No release checklist or PDF publication input is authorized here.",
+      "notes": "The missing checklist is explicit and does not trigger publication work."
+    },
+    {
+      "id": "B-SKIP-CHECKLIST-CONSISTENCY",
+      "category": "release-only-skip",
+      "gate": "release-input-not-authorized",
+      "commandClass": "static-suite",
+      "testOrPathScope": "result:Checklist 对账一致性校验",
+      "expectedOutcome": "skip",
+      "allowedNormalizedSignature": [
+        "sha256:6817f608de514acb77d92038f93328ef15d0c8da44cf377126984efb1d2cee07"
+      ],
+      "maximumOccurrences": 1,
+      "platforms": [
+        "all"
+      ],
+      "checkpointDisposition": "release-only-not-required",
+      "targetStage": "independent-release-workflow",
+      "securityImpact": "No release checklist input is authorized here.",
+      "notes": "The missing checklist is explicit and does not trigger publication work."
+    }
+  ],
+  "observationalChecks": []
+}

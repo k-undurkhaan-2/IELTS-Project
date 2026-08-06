@@ -7,11 +7,14 @@ invoked locally or inside CI before changes are merged.
 """
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import uuid
 import zipfile
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
@@ -19,8 +22,85 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from run_ci_foundation import strict_json_load_file, strict_json_loads
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+MACHINE_DOCUMENT_KIND = "ieltmps-static-suite-machine-report-v2"
+MACHINE_SCHEMA_VERSION = 2
+STATIC_SUITE_RELATIVE_PATH = "developer/tests/ci/run_static_suite.py"
+
+
+def _machine_platform() -> str:
+    if sys.platform.startswith("win"):
+        return "windows"
+    if sys.platform.startswith("linux"):
+        return "ubuntu"
+    return "macos"
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(65_536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_ci_machine_command_plan(
+    invocation_id: str,
+    *,
+    python_executable: str | Path = sys.executable,
+    repo_root: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Freeze the producer invocation identity before repository checks run."""
+
+    executable = Path(python_executable).resolve(strict=True)
+    root = REPO_ROOT if repo_root is None else repo_root
+    target = (root / STATIC_SUITE_RELATIVE_PATH).resolve(strict=True)
+    return [
+        {
+            "commandId": "static-check-registry",
+            "ordinal": 0,
+            "commandClass": "static-machine-producer",
+            "required": True,
+            "profile": "static",
+            "platform": _machine_platform(),
+            "argv": [
+                str(executable),
+                "-B",
+                STATIC_SUITE_RELATIVE_PATH,
+                "--ci-machine-json-stdout",
+                "--ci-invocation-id",
+                invocation_id,
+            ],
+            "cwd": ".",
+            "toolRole": "python-static-producer",
+            "resolvedExecutablePath": str(executable),
+            "resolvedExecutableSize": executable.stat().st_size,
+            "resolvedExecutableSha256": _file_sha256(executable),
+            "targets": [
+                {
+                    "path": STATIC_SUITE_RELATIVE_PATH,
+                    "size": target.stat().st_size,
+                    "sha256": _file_sha256(target),
+                }
+            ],
+            "resultSemantics": "complete-registry-execution-with-native-observations",
+            "allowedExecutionExits": [0],
+        }
+    ]
+
+
+def _command_plan_digest(plan: List[dict[str, Any]]) -> str:
+    canonical = json.dumps(
+        plan,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 class _HTMLDoctypeParser(HTMLParser):
@@ -102,7 +182,7 @@ def _load_interaction_targets(path: Path) -> Tuple[Optional[Dict[str, List[str]]
         return None, "未找到交互目标对象"
 
     try:
-        data = json.loads(match.group(1))
+        data = strict_json_loads(match.group(1), label=str(path))
     except json.JSONDecodeError as exc:
         return None, f"解析失败：{exc}"
 
@@ -583,7 +663,7 @@ def _extract_js_json_assignment(source: str, marker: str, end_marker: str) -> An
     end = source.find(end_marker, start)
     if end < 0:
         raise ValueError(f"missing end marker after: {marker}")
-    return json.loads(source[start:end].strip())
+    return strict_json_loads(source[start:end].strip(), label="embedded JavaScript JSON")
 
 
 def _check_listening_generated_assets(index_path: Path, manifest_path: Path) -> Tuple[bool, dict]:
@@ -1078,7 +1158,7 @@ def _check_json_path_map(path: Path) -> Tuple[bool, str]:
     if not path.exists():
         return False, "路径映射文件缺失"
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = strict_json_load_file(path)
     except Exception as exc:  # pragma: no cover - defensive guard
         return False, f"读取失败：{exc}"
 
@@ -1104,7 +1184,7 @@ def _extract_registered_payload(path: Path) -> Optional[dict]:
         return None
 
     try:
-        payload = json.loads(match.group(2))
+        payload = strict_json_loads(match.group(2), label="registered payload")
     except json.JSONDecodeError:
         payload = _extract_registered_payload_from_js_object(match.group(2))
     return payload if isinstance(payload, dict) else None
@@ -1352,7 +1432,7 @@ def _run_json_subprocess(
         parse_target = (completed.stdout or "").strip() or (completed.stderr or "").strip()
 
     try:
-        payload = json.loads(parse_target or "{}")
+        payload = strict_json_loads(parse_target or "{}", label="subprocess JSON stdout")
     except json.JSONDecodeError as parse_error:
         return False, f"输出解析失败: {parse_error}"
     return True, payload
@@ -1761,7 +1841,7 @@ def run_checks() -> Tuple[List[dict], bool]:
     if contract_exists:
         try:
             raw_contract = contract_path.read_text(encoding="utf-8")
-            expected_methods = json.loads(raw_contract)
+            expected_methods = strict_json_loads(raw_contract, label=str(contract_path))
             if not isinstance(expected_methods, list):
                 raise ValueError("契约数据不是列表")
             expected_set = set(expected_methods)
@@ -1821,7 +1901,7 @@ def run_checks() -> Tuple[List[dict], bool]:
         else:
             raw_output = (completed.stdout or "").strip() or (completed.stderr or "").strip()
             try:
-                payload = json.loads(raw_output or "{}")
+                payload = strict_json_loads(raw_output or "{}", label="suite bridge stdout")
             except json.JSONDecodeError as parse_error:
                 suite_passed = False
                 result_detail = f"输出解析失败: {parse_error}"
@@ -1851,7 +1931,9 @@ def run_checks() -> Tuple[List[dict], bool]:
         else:
             raw_suite_regression = (completed_suite_regression.stdout or "").strip() or (completed_suite_regression.stderr or "").strip()
             try:
-                suite_regression_payload = json.loads(raw_suite_regression or "{}")
+                suite_regression_payload = strict_json_loads(
+                    raw_suite_regression or "{}", label="suite regression stdout"
+                )
             except json.JSONDecodeError as parse_error:
                 suite_regression_passed = False
                 suite_regression_detail = f"输出解析失败: {parse_error}"
@@ -1885,7 +1967,9 @@ def run_checks() -> Tuple[List[dict], bool]:
         else:
             raw_sim_nb_drag = (completed_sim_nb_drag.stdout or "").strip() or (completed_sim_nb_drag.stderr or "").strip()
             try:
-                sim_nb_drag_payload = json.loads(raw_sim_nb_drag or "{}")
+                sim_nb_drag_payload = strict_json_loads(
+                    raw_sim_nb_drag or "{}", label="NB drag stdout"
+                )
             except json.JSONDecodeError as parse_error:
                 sim_nb_drag_passed = False
                 sim_nb_drag_detail = f"输出解析失败: {parse_error}"
@@ -1919,7 +2003,9 @@ def run_checks() -> Tuple[List[dict], bool]:
         else:
             raw_sim_roundtrip_restore = (completed_sim_roundtrip_restore.stdout or "").strip() or (completed_sim_roundtrip_restore.stderr or "").strip()
             try:
-                sim_roundtrip_restore_payload = json.loads(raw_sim_roundtrip_restore or "{}")
+                sim_roundtrip_restore_payload = strict_json_loads(
+                    raw_sim_roundtrip_restore or "{}", label="roundtrip stdout"
+                )
             except json.JSONDecodeError as parse_error:
                 sim_roundtrip_restore_passed = False
                 sim_roundtrip_restore_detail = f"输出解析失败: {parse_error}"
@@ -1953,7 +2039,9 @@ def run_checks() -> Tuple[List[dict], bool]:
         else:
             raw_unified_submit = (completed_unified_submit.stdout or "").strip() or (completed_unified_submit.stderr or "").strip()
             try:
-                unified_submit_payload = json.loads(raw_unified_submit or "{}")
+                unified_submit_payload = strict_json_loads(
+                    raw_unified_submit or "{}", label="unified submit stdout"
+                )
             except json.JSONDecodeError as parse_error:
                 unified_submit_passed = False
                 unified_submit_detail = f"输出解析失败: {parse_error}"
@@ -1983,7 +2071,9 @@ def run_checks() -> Tuple[List[dict], bool]:
         else:
             raw_unified_lock = (completed_unified_lock.stdout or "").strip() or (completed_unified_lock.stderr or "").strip()
             try:
-                unified_lock_payload = json.loads(raw_unified_lock or "{}")
+                unified_lock_payload = strict_json_loads(
+                    raw_unified_lock or "{}", label="unified lock stdout"
+                )
             except json.JSONDecodeError as parse_error:
                 unified_lock_passed = False
                 unified_lock_detail = f"输出解析失败: {parse_error}"
@@ -2013,7 +2103,9 @@ def run_checks() -> Tuple[List[dict], bool]:
         else:
             raw_inline_output = (completed_inline.stdout or "").strip() or (completed_inline.stderr or "").strip()
             try:
-                inline_payload = json.loads(raw_inline_output or "{}")
+                inline_payload = strict_json_loads(
+                    raw_inline_output or "{}", label="inline injection stdout"
+                )
             except json.JSONDecodeError as parse_error:
                 inline_passed = False
                 inline_detail = f"输出解析失败: {parse_error}"
@@ -2044,7 +2136,9 @@ def run_checks() -> Tuple[List[dict], bool]:
         else:
             raw_full_lib_output = (completed_full_lib.stdout or "").strip() or (completed_full_lib.stderr or "").strip()
             try:
-                full_lib_payload = json.loads(raw_full_lib_output or "{}")
+                full_lib_payload = strict_json_loads(
+                    raw_full_lib_output or "{}", label="full library stdout"
+                )
             except json.JSONDecodeError as parse_error:
                 full_lib_passed = False
                 full_lib_detail = f"输出解析失败: {parse_error}"
@@ -2074,7 +2168,9 @@ def run_checks() -> Tuple[List[dict], bool]:
         else:
             raw_practice_core_output = (completed_practice_core.stdout or "").strip() or (completed_practice_core.stderr or "").strip()
             try:
-                practice_core_payload = json.loads(raw_practice_core_output or "{}")
+                practice_core_payload = strict_json_loads(
+                    raw_practice_core_output or "{}", label="practice core stdout"
+                )
             except json.JSONDecodeError as parse_error:
                 practice_core_passed = False
                 practice_core_detail = f"输出解析失败: {parse_error}"
@@ -2104,7 +2200,9 @@ def run_checks() -> Tuple[List[dict], bool]:
         else:
             raw_practice_recorder_output = (completed_practice_recorder.stdout or "").strip() or (completed_practice_recorder.stderr or "").strip()
             try:
-                practice_recorder_payload = json.loads(raw_practice_recorder_output or "{}")
+                practice_recorder_payload = strict_json_loads(
+                    raw_practice_recorder_output or "{}", label="practice recorder stdout"
+                )
             except json.JSONDecodeError as parse_error:
                 practice_recorder_passed = False
                 practice_recorder_detail = f"输出解析失败: {parse_error}"
@@ -2134,7 +2232,9 @@ def run_checks() -> Tuple[List[dict], bool]:
         else:
             raw_practice_custom_card_output = (completed_practice_custom_card.stdout or "").strip() or (completed_practice_custom_card.stderr or "").strip()
             try:
-                practice_custom_card_payload = json.loads(raw_practice_custom_card_output or "{}")
+                practice_custom_card_payload = strict_json_loads(
+                    raw_practice_custom_card_output or "{}", label="practice card stdout"
+                )
             except json.JSONDecodeError as parse_error:
                 practice_custom_card_passed = False
                 practice_custom_card_detail = f"输出解析失败: {parse_error}"
@@ -2164,7 +2264,9 @@ def run_checks() -> Tuple[List[dict], bool]:
         else:
             raw_vocab_store_output = (completed_vocab_store.stdout or "").strip() or (completed_vocab_store.stderr or "").strip()
             try:
-                vocab_store_payload = json.loads(raw_vocab_store_output or "{}")
+                vocab_store_payload = strict_json_loads(
+                    raw_vocab_store_output or "{}", label="vocab store stdout"
+                )
             except json.JSONDecodeError as parse_error:
                 vocab_store_passed = False
                 vocab_store_detail = f"输出解析失败: {parse_error}"
@@ -2194,7 +2296,9 @@ def run_checks() -> Tuple[List[dict], bool]:
         else:
             raw_resource_core_output = (completed_resource_core.stdout or "").strip() or (completed_resource_core.stderr or "").strip()
             try:
-                resource_core_payload = json.loads(raw_resource_core_output or "{}")
+                resource_core_payload = strict_json_loads(
+                    raw_resource_core_output or "{}", label="resource core stdout"
+                )
             except json.JSONDecodeError as parse_error:
                 resource_core_passed = False
                 resource_core_detail = f"输出解析失败: {parse_error}"
@@ -2307,7 +2411,9 @@ def run_checks() -> Tuple[List[dict], bool]:
         else:
             raw_on_demand_output = (completed_on_demand.stdout or "").strip() or (completed_on_demand.stderr or "").strip()
             try:
-                on_demand_payload = json.loads(raw_on_demand_output or "{}")
+                on_demand_payload = strict_json_loads(
+                    raw_on_demand_output or "{}", label="on-demand stdout"
+                )
             except json.JSONDecodeError as parse_error:
                 on_demand_passed = False
                 on_demand_detail = f"输出解析失败: {parse_error}"
@@ -2337,7 +2443,9 @@ def run_checks() -> Tuple[List[dict], bool]:
         else:
             raw_service_facade_output = (completed_service_facade.stdout or "").strip() or (completed_service_facade.stderr or "").strip()
             try:
-                service_facade_payload = json.loads(raw_service_facade_output or "{}")
+                service_facade_payload = strict_json_loads(
+                    raw_service_facade_output or "{}", label="service facade stdout"
+                )
             except json.JSONDecodeError as parse_error:
                 service_facade_passed = False
                 service_facade_detail = f"输出解析失败: {parse_error}"
@@ -2367,7 +2475,9 @@ def run_checks() -> Tuple[List[dict], bool]:
         else:
             raw_exam_filter_service_output = (completed_exam_filter_service.stdout or "").strip() or (completed_exam_filter_service.stderr or "").strip()
             try:
-                exam_filter_service_payload = json.loads(raw_exam_filter_service_output or "{}")
+                exam_filter_service_payload = strict_json_loads(
+                    raw_exam_filter_service_output or "{}", label="exam filter stdout"
+                )
             except json.JSONDecodeError as parse_error:
                 exam_filter_service_passed = False
                 exam_filter_service_detail = f"输出解析失败: {parse_error}"
@@ -2397,7 +2507,9 @@ def run_checks() -> Tuple[List[dict], bool]:
         else:
             raw_guard_output = (completed_practice_core_guard.stdout or "").strip() or (completed_practice_core_guard.stderr or "").strip()
             try:
-                practice_core_guard_payload = json.loads(raw_guard_output or "{}")
+                practice_core_guard_payload = strict_json_loads(
+                    raw_guard_output or "{}", label="practice core guard stdout"
+                )
             except json.JSONDecodeError as parse_error:
                 practice_core_guard_passed = False
                 practice_core_guard_detail = f"输出解析失败: {parse_error}"
@@ -2427,7 +2539,9 @@ def run_checks() -> Tuple[List[dict], bool]:
         else:
             raw_persistence_output = (completed_practice_record_persistence.stdout or "").strip() or (completed_practice_record_persistence.stderr or "").strip()
             try:
-                practice_record_persistence_payload = json.loads(raw_persistence_output or "{}")
+                practice_record_persistence_payload = strict_json_loads(
+                    raw_persistence_output or "{}", label="practice persistence stdout"
+                )
             except json.JSONDecodeError as parse_error:
                 practice_record_persistence_passed = False
                 practice_record_persistence_detail = f"输出解析失败: {parse_error}"
@@ -2475,7 +2589,9 @@ def run_checks() -> Tuple[List[dict], bool]:
         else:
             raw_app_state_output = (completed_practice_core_app_state_sync.stdout or "").strip() or (completed_practice_core_app_state_sync.stderr or "").strip()
             try:
-                practice_core_app_state_sync_payload = json.loads(raw_app_state_output or "{}")
+                practice_core_app_state_sync_payload = strict_json_loads(
+                    raw_app_state_output or "{}", label="app-state sync stdout"
+                )
             except json.JSONDecodeError as parse_error:
                 practice_core_app_state_sync_passed = False
                 practice_core_app_state_sync_detail = f"输出解析失败: {parse_error}"
@@ -2529,7 +2645,9 @@ def run_checks() -> Tuple[List[dict], bool]:
             else:
                 raw_integration_output = (completed_integration.stdout or "").strip() or (completed_integration.stderr or "").strip()
                 try:
-                    integration_payload = json.loads(raw_integration_output or "{}")
+                    integration_payload = strict_json_loads(
+                        raw_integration_output or "{}", label="integration stdout"
+                    )
                 except json.JSONDecodeError as parse_error:
                     integration_passed = False
                     integration_detail = f"输出解析失败: {parse_error}"
@@ -2571,7 +2689,7 @@ def run_checks() -> Tuple[List[dict], bool]:
             reading_report_path = REPO_ROOT / "developer" / "tests" / "e2e" / "reports" / "reading-question-audit-quick.json"
             if reading_report_path.exists():
                 try:
-                    payload = json.loads(reading_report_path.read_text(encoding="utf-8"))
+                    payload = strict_json_load_file(reading_report_path)
                 except json.JSONDecodeError as parse_error:
                     reading_audit_passed = False
                     reading_audit_detail = f"报告解析失败: {parse_error}"
@@ -2652,12 +2770,112 @@ def run_checks() -> Tuple[List[dict], bool]:
     return results, all_passed
 
 
-def main() -> int:
-    if sys.platform.startswith('win'):
+def _parse_cli(argv: List[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the static validation suite.")
+    parser.add_argument("--ci-machine-json-stdout", action="store_true")
+    parser.add_argument("--ci-invocation-id")
+    machine_count = sum(value == "--ci-machine-json-stdout" for value in argv)
+    invocation_count = sum(
+        value == "--ci-invocation-id" or value.startswith("--ci-invocation-id=")
+        for value in argv
+    )
+    if machine_count > 1 or invocation_count > 1:
+        parser.error("machine protocol flags may be supplied only once")
+    args = parser.parse_args(argv)
+    if args.ci_machine_json_stdout != bool(args.ci_invocation_id):
+        parser.error("--ci-machine-json-stdout and --ci-invocation-id must be used together")
+    if args.ci_invocation_id:
+        try:
+            parsed = uuid.UUID(args.ci_invocation_id)
+        except (ValueError, AttributeError) as exc:
+            parser.error(f"--ci-invocation-id must be a canonical UUID: {type(exc).__name__}")
+        if str(parsed) != args.ci_invocation_id or parsed.version != 4:
+            parser.error("--ci-invocation-id must be a canonical lowercase UUIDv4")
+    return args
+
+
+def _write_machine_document(document: dict) -> None:
+    data = (
+        json.dumps(
+            document,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8", errors="strict")
+    output = getattr(sys.stdout, "buffer", None)
+    if output is None:
+        sys.stdout.write(data.decode("utf-8"))
+        sys.stdout.flush()
+    else:
+        output.write(data)
+        output.flush()
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    try:
+        args = _parse_cli(arguments)
+    except SystemExit as exc:
+        return int(exc.code or 2)
+
+    machine_mode = bool(args.ci_machine_json_stdout)
+    if (
+        sys.platform.startswith('win')
+        and not machine_mode
+        and getattr(sys.stdout, "buffer", None) is not None
+    ):
         import io
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
-    results, all_passed = run_checks()
+    machine_plan: List[dict[str, Any]] = []
+    if machine_mode:
+        try:
+            machine_plan = build_ci_machine_command_plan(args.ci_invocation_id)
+        except (OSError, ValueError) as exc:
+            diagnostic = f"static machine plan error: {type(exc).__name__}"
+            print(diagnostic[:16_384], file=sys.stderr)
+            return 2
+
+    try:
+        results, all_passed = run_checks()
+    except Exception as exc:
+        if machine_mode:
+            diagnostic = f"static machine execution error: {type(exc).__name__}"
+            print(diagnostic[:16_384], file=sys.stderr)
+            return 2
+        raise
+
+    native_non_pass_count = sum(result.get("status") != "pass" for result in results)
+    if machine_mode:
+        command_results = [
+            {
+                **machine_plan[0],
+                "started": True,
+                "executed": True,
+                "exitCode": 0,
+                "timeoutStatus": "within-limit",
+                "outputLimitStatus": "within-limit",
+                "containmentStatus": "parent-contained",
+            }
+        ]
+        machine_report = {
+            "documentKind": MACHINE_DOCUMENT_KIND,
+            "schemaVersion": MACHINE_SCHEMA_VERSION,
+            "invocationId": args.ci_invocation_id,
+            "executionStatus": "COMPLETE",
+            "commandPlanDigest": _command_plan_digest(machine_plan),
+            "commandResults": command_results,
+            "observations": results,
+            "nativeNonPassCount": native_non_pass_count,
+            "internalRunnerFailures": [],
+        }
+        _write_machine_document(machine_report)
+        # Machine mode communicates only producer/plan completion. The parent
+        # classifies every native observation against frozen authority.
+        return 0
 
     report = {
         "generatedAt": datetime.now(timezone.utc).isoformat(),

@@ -1,0 +1,352 @@
+name: Baseline-aware CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+      - ci/phase2-foundation
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository-policy-producer:
+    name: Repository policy producer (untrusted evidence)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          ref: ${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.x"
+
+      - name: Run CI foundation self-tests
+        run: python -B developer/tests/ci/test_ci_foundation.py
+
+      - name: Generate untrusted policy evidence
+        run: python -B developer/tests/ci/run_ci_foundation.py --profile policy
+
+      - name: Upload untrusted policy evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: untrusted-repository-policy-${{ runner.os }}-${{ github.run_attempt }}
+          path: |
+            .ci-results/summary.json
+            .ci-results/summary.md
+            .ci-results/observed-debt.json
+            .ci-results/resolved-candidates.json
+            .ci-results/command-results.json
+          if-no-files-found: error
+          retention-days: 7
+
+  ubuntu-canonical-producer:
+    name: Ubuntu canonical producer (untrusted evidence)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          ref: ${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.x"
+
+      - name: Install locked developer dependencies for untrusted production
+        run: npm --prefix developer ci --ignore-scripts --no-audit --no-fund
+
+      - name: Install locked backend dependencies for untrusted production
+        run: npm --prefix backend ci --ignore-scripts --no-audit --no-fund
+
+      - name: Generate untrusted Ubuntu evidence
+        run: python -B developer/tests/ci/run_ci_foundation.py --profile all
+
+      - name: Upload untrusted Ubuntu evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: untrusted-ubuntu-canonical-${{ runner.os }}-${{ github.run_attempt }}
+          path: |
+            .ci-results/summary.json
+            .ci-results/summary.md
+            .ci-results/observed-debt.json
+            .ci-results/resolved-candidates.json
+            .ci-results/command-results.json
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-compatibility-producer:
+    name: Windows compatibility producer (untrusted evidence)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          ref: ${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.x"
+
+      - name: Install locked developer dependencies for untrusted production
+        run: npm --prefix developer ci --ignore-scripts --no-audit --no-fund
+
+      - name: Install locked backend dependencies for untrusted production
+        run: npm --prefix backend ci --ignore-scripts --no-audit --no-fund
+
+      - name: Generate untrusted Windows evidence
+        run: python -B developer/tests/ci/run_ci_foundation.py --profile all
+
+      - name: Upload untrusted Windows evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: untrusted-windows-compatibility-${{ runner.os }}-${{ github.run_attempt }}
+          path: |
+            .ci-results/summary.json
+            .ci-results/summary.md
+            .ci-results/observed-debt.json
+            .ci-results/resolved-candidates.json
+            .ci-results/command-results.json
+          if-no-files-found: error
+          retention-days: 7
+
+  repository-policy:
+    name: Repository policy
+    needs:
+      - repository-policy-producer
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          ref: ${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.x"
+
+      - name: Capture trusted runtime paths
+        shell: bash
+        run: |
+          python_path="$pythonLocation/bin/python"
+          node_path="$(command -v node)"
+          npm_path="$(command -v npm)"
+          test -x "$python_path"
+          test -x "$node_path"
+          test -e "$npm_path"
+          printf 'CI_TRUSTED_PYTHON=%s\n' "$(realpath "$python_path")" >> "$GITHUB_ENV"
+          printf 'CI_TRUSTED_NODE=%s\n' "$(realpath "$node_path")" >> "$GITHUB_ENV"
+          printf 'CI_TRUSTED_NPM_ENTRY=%s\n' "$(realpath "$npm_path")" >> "$GITHUB_ENV"
+
+      - name: Download untrusted policy evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: untrusted-repository-policy-${{ runner.os }}-${{ github.run_attempt }}
+          path: .ci-untrusted/repository-policy
+
+      - name: Verify untrusted policy evidence by fresh replay
+        shell: bash
+        run: '"$CI_TRUSTED_PYTHON" -B developer/tests/ci/run_ci_foundation.py --verify-evidence --expected-profile policy --expected-producer-job repository-policy-producer --expected-verifier-job repository-policy --expected-runner-os Linux --untrusted-evidence-root .ci-untrusted/repository-policy --require-linux-containment-self-test'
+
+  ubuntu-canonical:
+    name: Ubuntu canonical validation
+    needs:
+      - ubuntu-canonical-producer
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          ref: ${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.x"
+
+      - name: Capture trusted runtime paths
+        shell: bash
+        run: |
+          python_path="$pythonLocation/bin/python"
+          node_path="$(command -v node)"
+          npm_path="$(command -v npm)"
+          test -x "$python_path"
+          test -x "$node_path"
+          test -e "$npm_path"
+          printf 'CI_TRUSTED_PYTHON=%s\n' "$(realpath "$python_path")" >> "$GITHUB_ENV"
+          printf 'CI_TRUSTED_NODE=%s\n' "$(realpath "$node_path")" >> "$GITHUB_ENV"
+          printf 'CI_TRUSTED_NPM_ENTRY=%s\n' "$(realpath "$npm_path")" >> "$GITHUB_ENV"
+          printf 'CI_FRESH_DEPENDENCY_INSTALL=1\n' >> "$GITHUB_ENV"
+
+      - name: Require initially absent dependency roots
+        shell: bash
+        run: |
+          test ! -e developer/node_modules
+          test ! -e backend/node_modules
+
+      - name: Install fresh locked developer dependencies
+        shell: bash
+        run: '"$CI_TRUSTED_NODE" "$CI_TRUSTED_NPM_ENTRY" --prefix developer ci --ignore-scripts --no-audit --no-fund'
+
+      - name: Install fresh locked backend dependencies
+        shell: bash
+        run: '"$CI_TRUSTED_NODE" "$CI_TRUSTED_NPM_ENTRY" --prefix backend ci --ignore-scripts --no-audit --no-fund'
+
+      - name: Download untrusted Ubuntu evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: untrusted-ubuntu-canonical-${{ runner.os }}-${{ github.run_attempt }}
+          path: .ci-untrusted/ubuntu-canonical
+
+      - name: Verify untrusted Ubuntu evidence by fresh replay
+        shell: bash
+        run: '"$CI_TRUSTED_PYTHON" -B developer/tests/ci/run_ci_foundation.py --verify-evidence --expected-profile all --expected-producer-job ubuntu-canonical-producer --expected-verifier-job ubuntu-canonical --expected-runner-os Linux --untrusted-evidence-root .ci-untrusted/ubuntu-canonical --require-linux-containment-self-test --require-fresh-runtime-closure'
+
+  windows-compatibility:
+    name: Windows compatibility validation
+    needs:
+      - windows-compatibility-producer
+    runs-on: windows-latest
+    timeout-minutes: 55
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          ref: ${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.x"
+
+      - name: Capture trusted runtime paths
+        shell: pwsh
+        run: |
+          $pythonPath = (Resolve-Path -LiteralPath (Join-Path $env:pythonLocation 'python.exe')).Path
+          $nodePath = (Get-Command node.exe -CommandType Application).Source
+          $npmEntry = (Resolve-Path -LiteralPath (Join-Path (Split-Path $nodePath -Parent) 'node_modules\npm\bin\npm-cli.js')).Path
+          if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) { throw 'trusted Python is unavailable' }
+          if (-not (Test-Path -LiteralPath $nodePath -PathType Leaf)) { throw 'trusted Node is unavailable' }
+          if (-not (Test-Path -LiteralPath $npmEntry -PathType Leaf)) { throw 'trusted npm entry is unavailable' }
+          "CI_TRUSTED_PYTHON=$pythonPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CI_TRUSTED_NODE=$nodePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CI_TRUSTED_NPM_ENTRY=$npmEntry" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CI_FRESH_DEPENDENCY_INSTALL=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Require initially absent dependency roots
+        shell: pwsh
+        run: |
+          if (Test-Path -LiteralPath 'developer/node_modules') { throw 'developer/node_modules was not fresh' }
+          if (Test-Path -LiteralPath 'backend/node_modules') { throw 'backend/node_modules was not fresh' }
+
+      - name: Install fresh locked developer dependencies
+        shell: pwsh
+        run: '& $env:CI_TRUSTED_NODE $env:CI_TRUSTED_NPM_ENTRY --prefix developer ci --ignore-scripts --no-audit --no-fund'
+
+      - name: Install fresh locked backend dependencies
+        shell: pwsh
+        run: '& $env:CI_TRUSTED_NODE $env:CI_TRUSTED_NPM_ENTRY --prefix backend ci --ignore-scripts --no-audit --no-fund'
+
+      - name: Download untrusted Windows evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: untrusted-windows-compatibility-${{ runner.os }}-${{ github.run_attempt }}
+          path: .ci-untrusted/windows-compatibility
+
+      - name: Verify untrusted Windows evidence by fresh replay
+        shell: pwsh
+        run: '& $env:CI_TRUSTED_PYTHON -B developer/tests/ci/run_ci_foundation.py --verify-evidence --expected-profile all --expected-producer-job windows-compatibility-producer --expected-verifier-job windows-compatibility --expected-runner-os Windows --untrusted-evidence-root .ci-untrusted/windows-compatibility --require-fresh-runtime-closure'
+
+  final-result:
+    name: Final result
+    if: ${{ always() }}
+    needs:
+      - repository-policy
+      - ubuntu-canonical
+      - windows-compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require every fresh verifier to succeed
+        shell: bash
+        run: |
+          echo "SELF-VALIDATOR TRUST: candidate-controlled" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "MERGE AUTHORIZATION: not provided by this workflow" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "INDEPENDENT REVIEW: required for CI trust-file changes" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ needs.repository-policy.result }}" != "success" ]]; then
+            echo "Repository policy verifier did not succeed."
+            exit 1
+          fi
+          if [[ "${{ needs.ubuntu-canonical.result }}" != "success" ]]; then
+            echo "Ubuntu canonical verifier did not succeed."
+            exit 1
+          fi
+          if [[ "${{ needs.windows-compatibility.result }}" != "success" ]]; then
+            echo "Windows compatibility verifier did not succeed."
+            exit 1
+          fi
+          echo "Fresh candidate-local verifier jobs succeeded; merge authorization is not provided." >> "$GITHUB_STEP_SUMMARY"
