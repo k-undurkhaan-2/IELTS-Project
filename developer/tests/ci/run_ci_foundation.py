@@ -454,13 +454,22 @@ def expected_command_authority(
             candidate_paths = []
     if baseline is None:
         baseline = read_json(BASELINE_PATH)
+    resolution_errors: list[str] = []
+    required_tools = required_tool_names(profile)
     if tools is None:
-        required_tools = required_tool_names(profile)
-        tools, _errors = resolve_trusted_tools(required_tools, repo_root=root)
+        tools, resolution_errors = resolve_trusted_tools(required_tools, repo_root=root)
+    tools = require_tool_set(
+        tools,
+        required_tools,
+        phase="COMMAND_PLAN",
+        resolution_errors=resolution_errors,
+    )
     bash_lease: TrustedBashLease | None = None
     try:
-        if os.name == "nt" and tools.get("bash") and tools.get("git"):
-            bash_lease = TrustedBashLease(tools["bash"], tools["git"])
+        bash = tools.get("bash")
+        git = tools.get("git")
+        if os.name == "nt" and bash and git:
+            bash_lease = TrustedBashLease(bash, git)
         return build_profile_command_plan(
             profile,
             tools=tools,
@@ -764,6 +773,99 @@ def platform_key() -> str:
     if sys.platform.startswith("linux"):
         return "ubuntu"
     return "other"
+
+
+RUN_WIDE_COVERAGE_PLATFORMS = frozenset({"ubuntu", "windows"})
+
+
+def evaluate_run_wide_os_coverage(
+    requirements: Sequence[Mapping[str, Any]],
+    job_facts: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Separate truthful job-local skips from required live run-wide coverage."""
+
+    errors: list[str] = []
+    requirement_map: dict[str, tuple[str, ...]] = {}
+    for requirement in requirements:
+        family = requirement.get("familyId")
+        platforms = requirement.get("requiredLivePlatforms")
+        if (
+            not isinstance(family, str)
+            or not family
+            or family in requirement_map
+            or not isinstance(platforms, list)
+            or not platforms
+            or any(platform not in RUN_WIDE_COVERAGE_PLATFORMS for platform in platforms)
+            or len(set(platforms)) != len(platforms)
+        ):
+            errors.append("run-wide coverage requirement schema is invalid")
+            continue
+        requirement_map[family] = tuple(platforms)
+
+    normalized_facts: list[dict[str, Any]] = []
+    for fact in job_facts:
+        family = fact.get("familyId")
+        job_id = fact.get("jobId")
+        platform_name = fact.get("platform")
+        mode = fact.get("executionMode")
+        counts = {
+            key: fact.get(key)
+            for key in ("discovered", "passed", "failed", "skippedByPlatform")
+        }
+        if (
+            not isinstance(family, str)
+            or family not in requirement_map
+            or not isinstance(job_id, str)
+            or not job_id
+            or platform_name not in RUN_WIDE_COVERAGE_PLATFORMS
+            or mode not in {"live", "model"}
+            or any(type(value) is not int or value < 0 for value in counts.values())
+            or counts["discovered"]
+            != counts["passed"] + counts["failed"] + counts["skippedByPlatform"]
+        ):
+            errors.append("job-local coverage fact schema or totals are invalid")
+            continue
+        normalized_facts.append(
+            {
+                "familyId": family,
+                "jobId": job_id,
+                "platform": platform_name,
+                "executionMode": mode,
+                **counts,
+            }
+        )
+
+    records: list[dict[str, Any]] = []
+    for family, platforms in sorted(requirement_map.items()):
+        for required_platform in platforms:
+            matching = [
+                fact
+                for fact in normalized_facts
+                if fact["familyId"] == family
+                and fact["platform"] == required_platform
+                and fact["executionMode"] == "live"
+            ]
+            discovered = sum(fact["discovered"] for fact in matching)
+            passed = sum(fact["passed"] for fact in matching)
+            failed = sum(fact["failed"] for fact in matching)
+            skipped = sum(fact["skippedByPlatform"] for fact in matching)
+            covered = discovered > 0 and passed > 0 and failed == 0
+            records.append(
+                {
+                    "familyId": family,
+                    "requiredLivePlatform": required_platform,
+                    "jobLocalDiscovered": discovered,
+                    "jobLocalPassed": passed,
+                    "jobLocalFailed": failed,
+                    "jobLocalSkippedByPlatform": skipped,
+                    "runWideCovered": covered,
+                }
+            )
+            if not covered:
+                errors.append(
+                    f"required live coverage missing: family={family} platform={required_platform}"
+                )
+    return records, sorted(set(errors))
 
 
 def strip_terminal_controls(value: str) -> str:
@@ -1887,7 +1989,239 @@ def _secure_regular_file(path: Path) -> tuple[bool, str]:
     return True, ""
 
 
-def _unsafe_tool_path_reason(path: Path, repo_root: Path) -> str | None:
+TOOL_AUTHORITY_UNAVAILABLE_CODE = "CI_TOOL_AUTHORITY_UNAVAILABLE"
+TOOL_AUTHORITY_PHASES = frozenset(
+    {
+        "DISCOVERY",
+        "CAPTURE",
+        "COMMAND_PLAN",
+        "EXECUTION_BINDING",
+        "EXECUTION",
+        "POST_EXECUTION",
+        "RUNTIME_CLOSURE",
+        "VERIFICATION_PREPARATION",
+    }
+)
+
+
+class ToolAuthorityUnavailable(ValueError):
+    """Stable, path-free required-tool failure used at every authority boundary."""
+
+    def __init__(self, tool: str, phase: str) -> None:
+        normalized_tool = str(tool).strip().casefold()
+        normalized_phase = str(phase).strip().upper()
+        if not normalized_tool or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", normalized_tool):
+            normalized_tool = "authority-set"
+        if normalized_phase not in TOOL_AUTHORITY_PHASES:
+            normalized_phase = "EXECUTION"
+        self.tool = normalized_tool
+        self.phase = normalized_phase
+        super().__init__(
+            f"{TOOL_AUTHORITY_UNAVAILABLE_CODE} tool={normalized_tool} phase={normalized_phase}"
+        )
+
+
+def require_tool(
+    tools: Mapping[str, str],
+    name: str,
+    *,
+    phase: str,
+    resolution_errors: Sequence[str] = (),
+) -> str:
+    """Return one canonical absolute tool or fail with a stable typed result."""
+
+    value = tools.get(name)
+    if resolution_errors or not isinstance(value, str) or not value:
+        raise ToolAuthorityUnavailable(name, phase)
+    candidate = Path(value)
+    try:
+        canonical = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ToolAuthorityUnavailable(name, phase) from exc
+    okay, _reason = _secure_regular_file(canonical)
+    if not candidate.is_absolute() or not okay:
+        raise ToolAuthorityUnavailable(name, phase)
+    return str(canonical)
+
+
+def require_tool_set(
+    tools: Mapping[str, str],
+    required: Iterable[str],
+    *,
+    phase: str,
+    resolution_errors: Sequence[str] = (),
+) -> dict[str, str]:
+    """Narrow a complete required-tool map before planning or binding."""
+
+    names = sorted(set(required))
+    missing = [name for name in names if not isinstance(tools.get(name), str) or not tools.get(name)]
+    if resolution_errors or missing:
+        raise ToolAuthorityUnavailable(missing[0] if missing else "authority-set", phase)
+    return {name: require_tool(tools, name, phase=phase) for name in names}
+
+
+@dataclass(frozen=True)
+class ToolAuthorityPolicy:
+    """Role-specific trusted roots plus a test-only hosted-runner filesystem model."""
+
+    platform_name: str
+    path_separator: str
+    role_roots: Mapping[str, tuple[tuple[str, Path], ...]]
+    minimal_system_directories: tuple[Path, ...]
+    running_python: Path
+    synthetic: bool = False
+
+    def roots_for(self, role: str) -> tuple[tuple[str, Path], ...]:
+        return self.role_roots.get(role, ())
+
+
+def _resolved_non_reparse_directory(path: Path) -> Path | None:
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError:
+        return None
+    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        return None
+    return resolved
+
+
+def _deduplicated_roots(values: Iterable[tuple[str, Path]]) -> tuple[tuple[str, Path], ...]:
+    result: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for label, value in values:
+        resolved = _resolved_non_reparse_directory(value)
+        if resolved is None:
+            continue
+        key = str(resolved).casefold() if os.name == "nt" else str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append((label, resolved))
+    return tuple(result)
+
+
+def default_tool_authority_policy(
+    source_environment: Mapping[str, str],
+    *,
+    repo_root: Path = REPO_ROOT,
+) -> ToolAuthorityPolicy:
+    """Construct production authority without accepting caller-selected role roots."""
+
+    running_python = Path(sys.executable).resolve(strict=True)
+    runtime_roots: list[tuple[str, Path]] = []
+    if len(running_python.parents) >= 2:
+        runtime_roots.append(("approved-local-runtime", running_python.parents[1]))
+    toolcache_roots: list[tuple[str, Path]] = []
+    if source_environment.get("RUNNER_TOOL_CACHE"):
+        toolcache_roots.append(
+            ("github-hosted-toolcache", Path(source_environment["RUNNER_TOOL_CACHE"]))
+        )
+
+    windows = os.name == "nt"
+    system_directories: list[Path] = []
+    git_roots: list[tuple[str, Path]] = []
+    bash_roots: list[tuple[str, Path]] = []
+    powershell_roots: list[tuple[str, Path]] = []
+    if windows:
+        for key in ("SystemRoot", "WINDIR"):
+            if value := source_environment.get(key):
+                root = Path(value)
+                system_directories.extend((root / "System32", root))
+                powershell_roots.append(
+                    ("windows-system-powershell", root / "System32" / "WindowsPowerShell")
+                )
+        for key in ("ProgramFiles", "ProgramFiles(x86)"):
+            if value := source_environment.get(key):
+                root = Path(value)
+                git_roots.append(("program-files-git", root / "Git"))
+                powershell_roots.append(("program-files-powershell", root / "PowerShell"))
+        approved_local_git = Path("D:/Git")
+        if approved_local_git.is_dir():
+            git_roots.append(("approved-local-git", approved_local_git))
+        bash_roots.extend(
+            (label.replace("git", "git-bash"), root)
+            for label, root in git_roots
+        )
+    else:
+        system_directories.extend((Path("/usr/bin"), Path("/bin")))
+        git_roots.extend(
+            (("posix-system-git", Path("/usr/bin")), ("posix-system-git", Path("/bin")))
+        )
+        bash_roots.extend(
+            (("posix-system-bash", Path("/usr/bin")), ("posix-system-bash", Path("/bin")))
+        )
+        powershell_roots.extend(
+            (
+                ("posix-system-pwsh", Path("/usr/bin")),
+                ("microsoft-pwsh", Path("/opt/microsoft/powershell")),
+            )
+        )
+
+    role_roots = {
+        "python": _deduplicated_roots(toolcache_roots),
+        "node": _deduplicated_roots([*toolcache_roots, *runtime_roots]),
+        "npm": _deduplicated_roots([*toolcache_roots, *runtime_roots]),
+        "git": _deduplicated_roots(git_roots),
+        "bash": _deduplicated_roots(bash_roots),
+        "powershell": _deduplicated_roots(powershell_roots),
+        "pwsh": _deduplicated_roots(powershell_roots),
+    }
+    minimal = tuple(
+        value
+        for _label, value in _deduplicated_roots(
+            ("minimal-system", path) for path in system_directories
+        )
+    )
+    return ToolAuthorityPolicy(
+        platform_name="Windows" if windows else "Linux",
+        path_separator=os.pathsep,
+        role_roots=MappingProxyType(role_roots),
+        minimal_system_directories=minimal,
+        running_python=running_python,
+    )
+
+
+def synthetic_tool_authority_policy(
+    platform_name: str,
+    *,
+    running_python: Path,
+    role_roots: Mapping[str, Sequence[tuple[str, Path]]],
+    minimal_system_directories: Sequence[Path],
+    path_separator: str = os.pathsep,
+) -> ToolAuthorityPolicy:
+    """Build a non-executable test model backed by inspected task-owned files."""
+
+    normalized_platform = "Windows" if platform_name.casefold().startswith("win") else "Linux"
+    normalized_roots = {
+        role: _deduplicated_roots(values)
+        for role, values in role_roots.items()
+    }
+    minimal = tuple(
+        value
+        for _label, value in _deduplicated_roots(
+            ("synthetic-minimal-system", path) for path in minimal_system_directories
+        )
+    )
+    running = running_python.resolve(strict=True)
+    okay, reason = _secure_regular_file(running)
+    if not okay:
+        raise ValueError(f"synthetic Python identity is invalid: {reason}")
+    return ToolAuthorityPolicy(
+        platform_name=normalized_platform,
+        path_separator=path_separator,
+        role_roots=MappingProxyType(normalized_roots),
+        minimal_system_directories=minimal,
+        running_python=running,
+        synthetic=True,
+    )
+
+
+def _unsafe_tool_path_reason(
+    path: Path,
+    repo_root: Path,
+    source_environment: Mapping[str, str] | None = None,
+) -> str | None:
     try:
         resolved = path.resolve(strict=True)
     except OSError:
@@ -1909,36 +2243,65 @@ def _unsafe_tool_path_reason(path: Path, repo_root: Path) -> str | None:
         temp_root = Path(tempfile.gettempdir()).resolve()
     if _path_is_within(resolved, temp_root):
         return "path is beneath the task temporary directory"
+    source = {} if source_environment is None else source_environment
+    for variable, description in (
+        ("GITHUB_WORKSPACE", "GitHub workspace"),
+        ("RUNNER_TEMP", "runner temporary directory"),
+    ):
+        value = source.get(variable)
+        if not value:
+            continue
+        try:
+            forbidden_root = Path(value).resolve(strict=True)
+        except OSError:
+            continue
+        if _path_is_within(resolved, forbidden_root):
+            return f"path is beneath the {description}"
     return None
 
 
-def _trusted_tool_roots(source_environment: Mapping[str, str]) -> tuple[Path, ...]:
-    roots: list[Path] = []
-    python_path = Path(sys.executable).resolve()
-    if len(python_path.parents) >= 2:
-        roots.append(python_path.parents[1])
-    for key in ("SystemRoot", "WINDIR", "ProgramFiles", "ProgramFiles(x86)", "RUNNER_TOOL_CACHE"):
-        value = source_environment.get(key)
-        if value:
-            roots.append(Path(value))
-    roots.extend(Path(value) for value in ("/bin", "/usr", "/usr/local", "/opt", "/nix/store"))
-    normalized: list[Path] = []
-    for root in roots:
+def _same_file_identity(left: Path, right: Path) -> bool:
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return False
+
+
+def _tool_root_classification(
+    path: Path,
+    role: str,
+    policy: ToolAuthorityPolicy,
+) -> str | None:
+    resolved = path.resolve(strict=True)
+    if role == "python" and _same_file_identity(resolved, policy.running_python):
+        return "running-python-file-identity"
+    for label, root in policy.roots_for(role):
+        if not _path_is_within(resolved, root):
+            continue
         try:
-            resolved = root.resolve(strict=True)
+            if not _non_reparse_directory_chain(resolved.parent, root):
+                continue
         except OSError:
             continue
-        if resolved not in normalized:
-            normalized.append(resolved)
-    return tuple(normalized)
+        return label
+    return None
 
 
-def _tool_location_is_allowlisted(path: Path, source_environment: Mapping[str, str]) -> bool:
-    resolved = path.resolve(strict=True)
-    if any(_path_is_within(resolved, root) for root in _trusted_tool_roots(source_environment)):
-        return True
-    normalized = str(resolved).replace("\\", "/")
-    return bool(re.match(r"(?i)^[A-Z]:/Git(?:/|$)", normalized))
+def _tool_location_is_allowlisted(
+    path: Path,
+    source_environment: Mapping[str, str],
+    *,
+    role: str | None = None,
+    policy: ToolAuthorityPolicy | None = None,
+    repo_root: Path = REPO_ROOT,
+) -> bool:
+    selected = policy or default_tool_authority_policy(source_environment, repo_root=repo_root)
+    if role is not None:
+        return _tool_root_classification(path, role, selected) is not None
+    return any(
+        _tool_root_classification(path, candidate_role, selected) is not None
+        for candidate_role in selected.role_roots
+    ) or _same_file_identity(path, selected.running_python)
 
 
 def _windows_system_launcher_path(path: Path, source_environment: Mapping[str, str]) -> bool:
@@ -1997,10 +2360,12 @@ def resolve_trusted_git_bash(
     *,
     source_environment: Mapping[str, str] | None = None,
     repo_root: Path = REPO_ROOT,
+    policy: ToolAuthorityPolicy | None = None,
 ) -> tuple[str | None, list[str]]:
     """Derive Git Bash from the already trusted Git for Windows installation."""
 
     source = dict(os.environ if source_environment is None else source_environment)
+    selected_policy = policy or default_tool_authority_policy(source, repo_root=repo_root)
     git_path = Path(git)
     okay, reason = _secure_regular_file(git_path)
     if not okay:
@@ -2030,14 +2395,21 @@ def resolve_trusted_git_bash(
         if not chain_ok:
             errors.append(f"Git Bash candidate has a link or reparse point in its installation chain: {candidate}")
             continue
-        unsafe_reason = _unsafe_tool_path_reason(candidate, repo_root)
-        if unsafe_reason:
+        unsafe_reason = _unsafe_tool_path_reason(candidate, repo_root, source)
+        classification = _tool_root_classification(candidate, "bash", selected_policy)
+        if unsafe_reason and not (selected_policy.synthetic and classification):
             errors.append(f"untrusted Git Bash candidate {candidate}: {unsafe_reason}")
             continue
         if _windows_system_launcher_path(candidate, source):
             errors.append(f"Windows System32/Sysnative Bash launcher is forbidden: {candidate}")
             continue
-        if not _tool_location_is_allowlisted(candidate, source):
+        if classification is None and not _tool_location_is_allowlisted(
+            candidate,
+            source,
+            role="bash",
+            policy=selected_policy,
+            repo_root=repo_root,
+        ):
             errors.append(f"Git Bash is outside the sanitized system/toolcache roots: {candidate}")
             continue
         return str(resolved), []
@@ -2046,15 +2418,189 @@ def resolve_trusted_git_bash(
     return None, sorted(set(errors))
 
 
+@dataclass(frozen=True)
+class _TrustedPathEntry:
+    index: int
+    resolved: Path
+    unsafe_reason: str | None
+
+
+def _tool_alias_names(role: str, policy: ToolAuthorityPolicy) -> tuple[str, ...]:
+    stems: list[str]
+    if role == "python":
+        running_name = policy.running_python.name.casefold()
+        if running_name.endswith(".exe"):
+            running_name = running_name[:-4]
+        stems = ["python", "python3", running_name]
+        stems.extend(f"python3.{minor}" for minor in range(0, 21))
+    elif role in {"powershell", "pwsh"}:
+        stems = ["powershell", "pwsh"]
+    else:
+        stems = [role]
+    stems = list(dict.fromkeys(stem for stem in stems if stem))
+    if policy.platform_name == "Windows":
+        suffixes = (".exe", ".cmd", ".bat", ".ps1", "")
+        return tuple(dict.fromkeys(stem + suffix for stem in stems for suffix in suffixes))
+    return tuple(stems)
+
+
+def _first_tool_alias(
+    directory: Path,
+    role: str,
+    policy: ToolAuthorityPolicy,
+) -> tuple[Path | None, str | None]:
+    for alias in _tool_alias_names(role, policy):
+        candidate = directory / alias
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None, f"PATH alias inspection failed closed for {role}"
+        if stat.S_ISDIR(metadata.st_mode):
+            continue
+        if not (
+            stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or _is_reparse_point(metadata)
+        ):
+            return None, f"PATH alias type is invalid for {role}"
+        if (
+            policy.platform_name != "Windows"
+            and not policy.synthetic
+            and stat.S_ISREG(metadata.st_mode)
+            and not (stat.S_IMODE(metadata.st_mode) & 0o111)
+        ):
+            continue
+        return candidate, None
+    return None, None
+
+
+def _path_entries(
+    source: Mapping[str, str],
+    *,
+    repo_root: Path,
+    policy: ToolAuthorityPolicy,
+) -> tuple[list[_TrustedPathEntry], list[str]]:
+    raw_path = source.get("PATH", source.get("Path", ""))
+    raw_entries = raw_path.split(policy.path_separator) if raw_path else []
+    entries: list[_TrustedPathEntry] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    for index, raw_entry in enumerate(raw_entries):
+        if not raw_entry or not Path(raw_entry).is_absolute():
+            # Empty/current/relative entries are removed and never inherited.
+            continue
+        entry = Path(raw_entry)
+        try:
+            metadata = entry.lstat()
+            resolved = entry.resolve(strict=True)
+        except OSError:
+            errors.append("PATH directory cannot be inspected")
+            continue
+        if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
+            errors.append("PATH entry is a link, reparse point, or non-directory")
+            continue
+        key = str(resolved).casefold() if policy.platform_name == "Windows" else str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        unsafe_reason = _unsafe_tool_path_reason(resolved, repo_root, source)
+        if policy.synthetic and any(
+            _path_is_within(resolved, root)
+            for role_roots in policy.role_roots.values()
+            for _label, root in role_roots
+        ):
+            unsafe_reason = None
+        entries.append(_TrustedPathEntry(index=index, resolved=resolved, unsafe_reason=unsafe_reason))
+    return entries, sorted(set(errors))
+
+
+def _npm_entry_from_launcher(candidate: Path) -> Path:
+    if candidate.suffix.casefold() not in {".cmd", ".ps1", ".bat"}:
+        return candidate
+    npm_entry = candidate.parent / "node_modules" / "npm" / "bin" / "npm-cli.js"
+    return npm_entry if npm_entry.is_file() else candidate
+
+
+def _fallback_tool_candidate(role: str, policy: ToolAuthorityPolicy) -> Path | None:
+    runtime_root = policy.running_python.parent.parent
+    names = {
+        "node": (
+            runtime_root / "node" / "bin" / ("node.exe" if os.name == "nt" else "node"),
+            runtime_root / "node" / ("node.exe" if os.name == "nt" else "bin/node"),
+        ),
+        "npm": (
+            runtime_root / "node" / "node_modules" / "npm" / "bin" / "npm-cli.js",
+            runtime_root / "node" / "bin" / "node_modules" / "npm" / "bin" / "npm-cli.js",
+        ),
+        "git": (Path("D:/Git/cmd/git.exe"), Path("D:/Git/bin/git.exe")),
+    }
+    candidates = list(names.get(role, ()))
+    if role in {"powershell", "pwsh"}:
+        for _label, root in policy.roots_for(role):
+            candidates.extend(
+                (
+                    root / "powershell.exe",
+                    root / "pwsh.exe",
+                    root / "v1.0" / "powershell.exe",
+                    root / "7" / "pwsh.exe",
+                    root / "pwsh",
+                    root / "7" / "pwsh",
+                )
+            )
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def _preceding_shadow_error(
+    entries: Sequence[_TrustedPathEntry],
+    candidate: Path,
+    role: str,
+    policy: ToolAuthorityPolicy,
+    *,
+    scan_all_if_absent: bool = True,
+) -> str | None:
+    canonical = candidate.resolve(strict=True)
+    candidate_parent = canonical.parent
+    candidate_position = next(
+        (offset for offset, entry in enumerate(entries) if entry.resolved == candidate_parent),
+        len(entries) if scan_all_if_absent else 0,
+    )
+    for entry in entries[:candidate_position]:
+        if (
+            role == "bash"
+            and policy.platform_name == "Windows"
+            and any(
+                _path_is_within(entry.resolved, system_root)
+                for system_root in policy.minimal_system_directories
+            )
+        ):
+            # System32/Sysnative WSL launchers are never Bash candidates;
+            # execution is bound to Git Bash derived from trusted Git.
+            continue
+        alias, inspection_error = _first_tool_alias(entry.resolved, role, policy)
+        if inspection_error:
+            return inspection_error
+        if alias is None:
+            continue
+        comparable_alias = _npm_entry_from_launcher(alias) if role == "npm" else alias
+        if _same_file_identity(comparable_alias, canonical):
+            continue
+        return f"untrusted executable shadow blocks required {role}"
+    return None
+
+
 def resolve_trusted_tools(
     required: Iterable[str],
     *,
     source_environment: Mapping[str, str] | None = None,
     repo_root: Path = REPO_ROOT,
+    policy: ToolAuthorityPolicy | None = None,
 ) -> tuple[dict[str, str], list[str]]:
-    """Resolve tools once from a filtered PATH and reject caller/workspace shadowing."""
+    """Resolve role-specific tools and reject only real preceding executable shadows."""
 
     source = dict(os.environ if source_environment is None else source_environment)
+    selected_policy = policy or default_tool_authority_policy(source, repo_root=repo_root)
     errors: list[str] = []
     for override in (
         "NODE_EXE",
@@ -2067,34 +2613,10 @@ def resolve_trusted_tools(
         if source.get(override):
             errors.append(f"caller-controlled executable override is forbidden: {override}")
 
-    raw_path = source.get("PATH", source.get("Path", ""))
-    raw_entries = raw_path.split(os.pathsep) if raw_path else []
-    safe_entries: list[str] = []
-    unsafe_indices: list[int] = []
-    resolved_entries: list[Path | None] = []
-    for index, raw_entry in enumerate(raw_entries):
-        if not raw_entry or not Path(raw_entry).is_absolute():
-            unsafe_indices.append(index)
-            resolved_entries.append(None)
-            continue
-        entry = Path(raw_entry)
-        reason = _unsafe_tool_path_reason(entry, repo_root)
-        if reason:
-            unsafe_indices.append(index)
-            resolved_entries.append(None)
-            continue
-        try:
-            resolved_entry = entry.resolve(strict=True)
-        except OSError:
-            unsafe_indices.append(index)
-            resolved_entries.append(None)
-            continue
-        resolved_entries.append(resolved_entry)
-        safe_entries.append(str(resolved_entry))
-
-    sanitized_path = os.pathsep.join(safe_entries)
+    entries, path_errors = _path_entries(source, repo_root=repo_root, policy=selected_policy)
+    errors.extend(path_errors)
     requested = set(required)
-    windows_git_bash = os.name == "nt" and "bash" in requested
+    windows_git_bash = selected_policy.platform_name == "Windows" and "bash" in requested
     path_resolved_names = requested - ({"bash"} if windows_git_bash else set())
     captured_runtime_variables = {
         "python": "CI_TRUSTED_PYTHON",
@@ -2105,35 +2627,32 @@ def resolve_trusted_tools(
     for name in sorted(path_resolved_names):
         captured_name = captured_runtime_variables.get(name)
         captured_value = source.get(captured_name, "") if captured_name else ""
-        candidate = (
-            captured_value
-            if captured_value
-            else sys.executable
-            if name == "python"
-            else shutil.which(name, path=sanitized_path)
-        )
-        if candidate and name == "npm" and not captured_value:
-            candidate_path = Path(candidate)
-            if candidate_path.suffix.casefold() in {".cmd", ".ps1"}:
-                npm_entry = (
-                    candidate_path.parent
-                    / "node_modules"
-                    / "npm"
-                    / "bin"
-                    / "npm-cli.js"
-                )
-                if npm_entry.is_file():
-                    candidate = str(npm_entry)
-        if not candidate and name == "node":
-            python_runtime_root = Path(sys.executable).resolve(strict=True).parent.parent
-            bundled_candidates = (
-                python_runtime_root / "node" / "bin" / ("node.exe" if os.name == "nt" else "node"),
-                python_runtime_root / "node" / ("node.exe" if os.name == "nt" else "bin/node"),
-            )
-            candidate = next(
-                (str(value) for value in bundled_candidates if value.is_file()),
-                None,
-            )
+        candidate: str | None = captured_value or None
+        if candidate is None and name == "python":
+            candidate = str(selected_policy.running_python)
+        if candidate is None:
+            for entry in entries:
+                alias, inspection_error = _first_tool_alias(entry.resolved, name, selected_policy)
+                if inspection_error:
+                    errors.append(inspection_error)
+                    break
+                if alias is None:
+                    continue
+                alias = _npm_entry_from_launcher(alias) if name == "npm" else alias
+                try:
+                    alias_canonical = alias.resolve(strict=True)
+                except OSError:
+                    errors.append(f"resolved executable does not exist: {name}")
+                    break
+                if _tool_root_classification(alias_canonical, name, selected_policy) is None:
+                    errors.append(f"untrusted executable shadow blocks required {name}")
+                    break
+                candidate = str(alias_canonical)
+                break
+        if candidate is None:
+            fallback = _fallback_tool_candidate(name, selected_policy)
+            if fallback is not None:
+                candidate = str(fallback)
         if not candidate:
             errors.append(f"required trusted executable is unavailable: {name}")
             continue
@@ -2150,29 +2669,35 @@ def resolve_trusted_tools(
         if not okay:
             errors.append(f"untrusted executable {name}: {reason}")
             continue
-        unsafe_reason = _unsafe_tool_path_reason(canonical_candidate, repo_root)
+        classification = _tool_root_classification(canonical_candidate, name, selected_policy)
+        unsafe_reason = _unsafe_tool_path_reason(canonical_candidate, repo_root, source)
         if (
             name == "npm"
             and unsafe_reason == "path is beneath node_modules"
             and not _path_is_within(canonical_candidate, repo_root.resolve(strict=True))
+            and classification is not None
         ):
             unsafe_reason = None
-        if unsafe_reason:
+        if unsafe_reason and not (selected_policy.synthetic and classification is not None):
             errors.append(f"untrusted executable {name}: {unsafe_reason}")
             continue
-        if not _tool_location_is_allowlisted(canonical_candidate, source):
+        if classification is None:
             errors.append(f"executable is outside the sanitized system/toolcache roots: {name}")
             continue
-        candidate_parent = canonical_candidate.parent
-        candidate_index = next(
-            (index for index, entry in enumerate(resolved_entries) if entry == candidate_parent),
-            -1,
+        shadow_error = _preceding_shadow_error(
+            entries,
+            canonical_candidate,
+            name,
+            selected_policy,
+            scan_all_if_absent=bool(captured_value),
         )
-        if candidate_index >= 0 and any(index < candidate_index for index in unsafe_indices):
-            errors.append(f"workspace-controlled or unsafe PATH entry precedes trusted {name}")
+        if shadow_error:
+            errors.append(shadow_error)
             continue
-        if name == "python" and captured_value and canonical_candidate != Path(sys.executable).resolve(strict=True):
-            errors.append("captured trusted Python path does not equal the running verifier executable")
+        if name == "python" and captured_value and not _same_file_identity(
+            candidate_path, selected_policy.running_python
+        ):
+            errors.append("captured trusted Python file identity does not equal the running verifier")
             continue
         resolved_tools[name] = str(canonical_candidate)
     if windows_git_bash:
@@ -2184,10 +2709,20 @@ def resolve_trusted_tools(
                 git,
                 source_environment=source,
                 repo_root=repo_root,
+                policy=selected_policy,
             )
             errors.extend(bash_errors)
             if bash is not None:
-                resolved_tools["bash"] = bash
+                shadow_error = _preceding_shadow_error(
+                    entries,
+                    Path(bash),
+                    "bash",
+                    selected_policy,
+                )
+                if shadow_error:
+                    errors.append(shadow_error)
+                else:
+                    resolved_tools["bash"] = bash
     return resolved_tools, sorted(set(errors))
 
 
@@ -2217,19 +2752,43 @@ def child_process_environment(
     *,
     source_environment: Mapping[str, str] | None = None,
     private_temp_root: Path | None = None,
+    repo_root: Path = REPO_ROOT,
+    policy: ToolAuthorityPolicy | None = None,
 ) -> dict[str, str]:
     source = os.environ if source_environment is None else source_environment
+    selected_policy = policy or default_tool_authority_policy(source, repo_root=repo_root)
     environment = {
         key: value
         for key, value in source.items()
         if key.upper() in CHILD_ENVIRONMENT_ALLOWLIST
     }
     tool_directories: list[str] = []
-    for executable in tools.values():
-        parent = str(Path(executable).resolve(strict=True).parent)
-        if parent not in tool_directories:
-            tool_directories.append(parent)
-    environment["PATH"] = os.pathsep.join(tool_directories)
+    seen_directories: set[str] = set()
+
+    def add_directory(directory: Path, *, synthetic_authority: bool = False) -> None:
+        resolved = directory.resolve(strict=True)
+        reason = _unsafe_tool_path_reason(resolved, repo_root, source)
+        if reason and not (selected_policy.synthetic and synthetic_authority):
+            return
+        key = str(resolved).casefold() if selected_policy.platform_name == "Windows" else str(resolved)
+        if key in seen_directories:
+            return
+        seen_directories.add(key)
+        tool_directories.append(str(resolved))
+
+    for role, executable in tools.items():
+        # npm is an entrypoint executed by captured Node, never a PATH authority.
+        if role == "npm":
+            continue
+        resolved_executable = Path(executable).resolve(strict=True)
+        classification = _tool_root_classification(resolved_executable, role, selected_policy)
+        add_directory(
+            resolved_executable.parent,
+            synthetic_authority=classification is not None,
+        )
+    for directory in selected_policy.minimal_system_directories:
+        add_directory(directory, synthetic_authority=selected_policy.synthetic)
+    environment["PATH"] = selected_policy.path_separator.join(tool_directories)
     environment["PYTHONIOENCODING"] = "utf-8"
     environment["PYTHONUTF8"] = "1"
     if private_temp_root is not None:
@@ -2239,12 +2798,13 @@ def child_process_environment(
     powershell = tools.get("powershell") or tools.get("pwsh")
     if powershell:
         environment["POWERSHELL_EXE"] = str(Path(powershell).resolve(strict=True))
-    if tools.get("bash"):
-        environment["BASH_EXE"] = str(Path(tools["bash"]).resolve(strict=True))
+    bash = tools.get("bash")
+    if bash:
+        environment["BASH_EXE"] = str(Path(bash).resolve(strict=True))
     if tools.get("git"):
         environment["GIT_CONFIG_COUNT"] = "1"
         environment["GIT_CONFIG_KEY_0"] = "safe.directory"
-        environment["GIT_CONFIG_VALUE_0"] = str(REPO_ROOT.resolve())
+        environment["GIT_CONFIG_VALUE_0"] = str(repo_root.resolve())
     return environment
 
 
@@ -2323,6 +2883,10 @@ class CommandCapture:
     containment: str = "not-started"
     process_tree_status: str = "not-started"
     descendants_terminated: int = 0
+    descendants_observed: int = 0
+    descendants_reaped: int = 0
+    descendants_surviving: int = 0
+    containment_disposition: str = "not-applicable"
     process_tree_error: str | None = None
     logical_argv: list[str] | None = None
     execution_input_mode: str = "NONE"
@@ -2391,6 +2955,10 @@ class CommandCapture:
             "containment": self.containment,
             "processTreeStatus": self.process_tree_status,
             "descendantsTerminated": self.descendants_terminated,
+            "descendantsObserved": self.descendants_observed,
+            "descendantsReaped": self.descendants_reaped,
+            "descendantsSurviving": self.descendants_surviving,
+            "containmentDisposition": self.containment_disposition,
             "actualExecutionArgv": list(self.argv),
             "actualExecutionInputMode": self.execution_input_mode,
             "actualExecutionInputSize": self.execution_input_size,
@@ -2544,6 +3112,38 @@ class PosixContainmentStateMachine:
     def clean(self) -> bool:
         return not self.failures and not self.active_keys
 
+    def outcome(
+        self,
+        *,
+        root_key: tuple[int, int] | None = None,
+        cleanup_signal_sent: bool = False,
+        forced_terminated: int = 0,
+    ) -> dict[str, Any]:
+        """Report the security truth condition independently of cleanup counters."""
+
+        excluded = {root_key} if root_key is not None else set()
+        observed = set(self.registry) - excluded
+        reaped = self.reaped_keys & observed
+        surviving = self.active_keys & observed
+        cleanup_complete = not self.failures and not self.active_keys
+        if self.failures:
+            disposition = "unknown-ancestry"
+        elif surviving:
+            disposition = "survivor"
+        elif cleanup_signal_sent or forced_terminated:
+            disposition = "forced-terminated"
+        elif observed:
+            disposition = "natural-exit-reaped"
+        else:
+            disposition = "no-descendants"
+        return {
+            "cleanupComplete": cleanup_complete,
+            "descendantsObserved": len(observed),
+            "descendantsReaped": len(reaped),
+            "descendantsSurviving": len(surviving),
+            "containmentDisposition": disposition,
+        }
+
 
 _MAIN_SUBREAPER_CONFIGURED = False
 _MAIN_SUBREAPER_LOCK = threading.Lock()
@@ -2668,6 +3268,7 @@ def _linux_containment_supervisor_entrypoint(arguments: Sequence[str]) -> int:
         return PROCESS_TREE_FAILURE_EXIT
     stdin_fd, stdout_fd, stderr_fd, result_fd, control_fd = map(int, arguments)
     root_pid: int | None = None
+    root_key: tuple[int, int] | None = None
     pidfds: dict[tuple[int, int], int] = {}
     state = PosixContainmentStateMachine(os.getpid())
     root_exit_code: int | None = None
@@ -2735,6 +3336,7 @@ def _linux_containment_supervisor_entrypoint(arguments: Sequence[str]) -> int:
             if fd >= 0:
                 os.close(fd)
         root_identity = _read_linux_process_identity(root_pid, 1)
+        root_key = root_identity.key()
         root_pidfd = os.pidfd_open(root_pid, 0)
         pidfds[root_identity.key()] = root_pidfd
         state.registry[root_identity.key()] = root_identity
@@ -2843,6 +3445,11 @@ def _linux_containment_supervisor_entrypoint(arguments: Sequence[str]) -> int:
             state.fail("root process was not reaped")
         if state.failures:
             error_text = "; ".join(state.failures)
+        containment_outcome = state.outcome(
+            root_key=root_key,
+            cleanup_signal_sent=term_sent or kill_sent,
+            forced_terminated=terminated_count,
+        )
         _linux_supervisor_write(
             result_fd,
             {
@@ -2850,6 +3457,7 @@ def _linux_containment_supervisor_entrypoint(arguments: Sequence[str]) -> int:
                 "commandStarted": command_started,
                 "rootExitCode": root_exit_code,
                 "cleanupOk": not state.failures and state.clean(),
+                **containment_outcome,
                 "descendantsTerminated": terminated_count,
                 "registrySize": len(state.registry),
                 "discoveryGenerations": state.generation,
@@ -2861,6 +3469,10 @@ def _linux_containment_supervisor_entrypoint(arguments: Sequence[str]) -> int:
         return EXIT_SUCCESS if not state.failures else PROCESS_TREE_FAILURE_EXIT
     except BaseException as exc:
         error_text = f"Linux containment supervisor failure: {type(exc).__name__}: {exc}"
+        containment_outcome = state.outcome(
+            root_key=root_key,
+            forced_terminated=terminated_count,
+        )
         try:
             _linux_supervisor_write(
                 result_fd,
@@ -2869,6 +3481,7 @@ def _linux_containment_supervisor_entrypoint(arguments: Sequence[str]) -> int:
                     "commandStarted": command_started,
                     "rootExitCode": root_exit_code,
                     "cleanupOk": False,
+                    **containment_outcome,
                     "descendantsTerminated": terminated_count,
                     "registrySize": len(state.registry),
                     "discoveryGenerations": state.generation,
@@ -2979,6 +3592,7 @@ class _WindowsJob:
         self.ntdll.NtResumeProcess.restype = ctypes.c_long
 
         self.handle = self.kernel32.CreateJobObjectW(None, None)
+        self.root_pid: int | None = None
         if not self.handle:
             raise ctypes.WinError(ctypes.get_last_error())
         information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
@@ -2998,6 +3612,7 @@ class _WindowsJob:
         process_handle = self.wintypes.HANDLE(int(process._handle))  # type: ignore[attr-defined]
         if not self.kernel32.AssignProcessToJobObject(self.handle, process_handle):
             raise self.ctypes.WinError(self.ctypes.get_last_error())
+        self.root_pid = int(process.pid)
         status = int(self.ntdll.NtResumeProcess(process_handle))
         if status != 0:
             raise OSError(f"NtResumeProcess failed with NTSTATUS 0x{status & 0xFFFFFFFF:08x}")
@@ -3058,16 +3673,19 @@ class _WindowsJob:
             query_error = f"Windows Job Object membership query failed: {type(exc).__name__}"
         else:
             query_error = None
+        descendant_count = len(
+            [process_id for process_id in process_ids if process_id != self.root_pid]
+        )
         handle = self.handle
         self.handle = None
         if not self.kernel32.CloseHandle(handle):
-            return False, len(process_ids), "Windows Job Object close failed"
+            return False, descendant_count, "Windows Job Object close failed"
         wait_ok, wait_error = self._wait_for_pids(process_ids)
         if query_error:
-            return False, len(process_ids), query_error
+            return False, descendant_count, query_error
         if not wait_ok:
-            return False, len(process_ids), wait_error
-        return True, len(process_ids), None
+            return False, descendant_count, wait_error
+        return True, descendant_count, None
 
     def close_without_members(self) -> None:
         if self.handle:
@@ -3498,7 +4116,31 @@ def _execute_linux_supervised(
     if final is None:
         result_error.append("Linux containment supervisor omitted its final record")
         final = {}
-    cleanup_ok = bool(final.get("cleanupOk")) and not result_error and not stdin_error and hook_error is None
+    for key in (
+        "descendantsObserved",
+        "descendantsReaped",
+        "descendantsSurviving",
+    ):
+        if type(final.get(key)) is not int or not 0 <= int(final.get(key, -1)) <= 4096:
+            result_error.append(f"Linux containment supervisor returned invalid {key}")
+    disposition = final.get("containmentDisposition")
+    if disposition not in {
+        "no-descendants",
+        "natural-exit-reaped",
+        "forced-terminated",
+        "survivor",
+        "unknown-ancestry",
+    }:
+        result_error.append("Linux containment supervisor returned invalid containmentDisposition")
+    cleanup_ok = (
+        bool(final.get("cleanupOk"))
+        and final.get("cleanupComplete") is True
+        and final.get("descendantsSurviving") == 0
+        and disposition not in {"survivor", "unknown-ancestry"}
+        and not result_error
+        and not stdin_error
+        and hook_error is None
+    )
     process_tree_error = str(final.get("error") or "") or None
     if result_error or stdin_error or hook_error:
         extra = "; ".join([*result_error, *stdin_error, *([hook_error] if hook_error else [])])
@@ -3554,6 +4196,12 @@ def _execute_linux_supervised(
         containment=containment,
         process_tree_status="contained-clean" if cleanup_ok else "cleanup-failed",
         descendants_terminated=int(final.get("descendantsTerminated", 0) or 0),
+        descendants_observed=int(final.get("descendantsObserved", 0) or 0),
+        descendants_reaped=int(final.get("descendantsReaped", 0) or 0),
+        descendants_surviving=int(final.get("descendantsSurviving", 0) or 0),
+        containment_disposition=(
+            str(disposition) if isinstance(disposition, str) else "unknown-ancestry"
+        ),
         process_tree_error=process_tree_error,
         logical_argv=list(logical_argv) if logical_argv is not None else list(argv),
         execution_input_mode=execution_input_mode,
@@ -3626,6 +4274,10 @@ def run_linux_containment_live_self_test(
                 "exitCode": capture.exit_code,
                 "processTreeStatus": capture.process_tree_status,
                 "descendantsTerminated": capture.descendants_terminated,
+                "descendantsObserved": capture.descendants_observed,
+                "descendantsReaped": capture.descendants_reaped,
+                "descendantsSurviving": capture.descendants_surviving,
+                "containmentDisposition": capture.containment_disposition,
             }
         )
         if not passed:
@@ -3659,7 +4311,7 @@ def execute_command(
     max_stdout_bytes: int = MAX_STDOUT_BYTES,
     max_stderr_bytes: int = MAX_STDERR_BYTES,
     max_line_bytes: int = MAX_OUTPUT_LINE_BYTES,
-    executable_lease: TrustedBashLease | None = None,
+    executable_lease: Any | None = None,
     stdin_data: bytes | None = None,
     logical_argv: Sequence[str] | None = None,
     execution_input_mode: str = "NONE",
@@ -4006,6 +4658,16 @@ def execute_command(
         containment=containment,
         process_tree_status="contained-clean" if cleanup_ok else "cleanup-failed",
         descendants_terminated=descendants_terminated,
+        descendants_observed=descendants_terminated,
+        descendants_reaped=descendants_terminated if cleanup_ok else 0,
+        descendants_surviving=0 if cleanup_ok else descendants_terminated,
+        containment_disposition=(
+            "forced-terminated"
+            if cleanup_ok and descendants_terminated
+            else "no-descendants"
+            if cleanup_ok
+            else "unknown-ancestry"
+        ),
         process_tree_error=process_tree_error,
         logical_argv=list(logical_argv) if logical_argv is not None else list(argv),
         execution_input_mode=execution_input_mode,
@@ -4046,6 +4708,10 @@ def make_internal_result(
         "containment": "internal",
         "processTreeStatus": "not-applicable",
         "descendantsTerminated": 0,
+        "descendantsObserved": 0,
+        "descendantsReaped": 0,
+        "descendantsSurviving": 0,
+        "containmentDisposition": "not-applicable",
         "actualExecutionArgv": [sys.executable, "<internal>", command_id],
         "actualExecutionInputMode": "NONE",
         "actualExecutionInputSize": None,
@@ -5115,6 +5781,7 @@ def git_candidate_paths(
     *,
     git: str,
     env: Mapping[str, str],
+    executable_lease: Any | None = None,
 ) -> tuple[list[str], list[str], CommandCapture]:
     capture = execute_command(
         "git-candidate-paths",
@@ -5123,6 +5790,7 @@ def git_candidate_paths(
         timeout=60,
         env=env,
         include_preview=False,
+        executable_lease=executable_lease,
     )
     if not capture.executed or capture.exit_code != 0:
         return [], ["git ls-files did not execute successfully"], capture
@@ -6276,6 +6944,17 @@ def build_externally_expected_verification_context(
     )
 
 
+def _runner_required_tool(runner: Any, name: str, *, phase: str) -> str:
+    narrowed = getattr(runner, "require_tool", None)
+    if callable(narrowed):
+        return str(narrowed(name, phase=phase))
+    tools = getattr(runner, "tools", {})
+    errors = getattr(runner, "tool_resolution_errors", ())
+    if not isinstance(tools, Mapping):
+        raise ToolAuthorityUnavailable(name, phase)
+    return require_tool(tools, name, phase=phase, resolution_errors=errors)
+
+
 def build_generation_execution_binding(
     runner: Any,
     *,
@@ -6283,13 +6962,14 @@ def build_generation_execution_binding(
     repo_root: Path = REPO_ROOT,
 ) -> dict[str, Any]:
     source = os.environ if source_environment is None else source_environment
+    git = _runner_required_tool(runner, "git", phase="EXECUTION_BINDING")
     checkout_commit, checkout_tree = current_checkout_identity(
-        git=str(runner.tools["git"]),
+        git=git,
         environment=runner.child_environment,
         repo_root=repo_root,
     )
     _manifest, trust_digest = ci_trust_file_set_authority(
-        git=str(runner.tools["git"]),
+        git=git,
         environment=runner.child_environment,
         repo_root=repo_root,
     )
@@ -6372,7 +7052,7 @@ def rebuild_external_verification_context(
         command_plan_digest_value=str(runner.command_plan_digest),
         fresh_runtime_closure_digest=str(runner.runtime_closure_digest),
         baseline=runner.baseline,
-        git=str(runner.tools["git"]),
+        git=_runner_required_tool(runner, "git", phase="EXECUTION_BINDING"),
         child_environment=runner.child_environment,
         source_environment=source_environment,
         repo_root=repo_root,
@@ -8675,16 +9355,13 @@ class ExecutableIdentityLease:
         if self._fd is None:
             return _sha256_file(Path(self.path))
         digest = hashlib.sha256()
-        offset = os.lseek(self._fd, 0, os.SEEK_CUR)
-        try:
-            os.lseek(self._fd, 0, os.SEEK_SET)
-            while True:
-                chunk = os.read(self._fd, 65_536)
-                if not chunk:
-                    break
-                digest.update(chunk)
-        finally:
-            os.lseek(self._fd, offset, os.SEEK_SET)
+        position = 0
+        while True:
+            chunk = os.pread(self._fd, 65_536, position)
+            if not chunk:
+                break
+            digest.update(chunk)
+            position += len(chunk)
         return digest.hexdigest()
 
     def verify(self) -> tuple[bool, str | None]:
@@ -8737,6 +9414,70 @@ class ExecutableIdentityLease:
             self.close()
         except Exception:
             pass
+
+
+_TRUSTED_TOOL_VERSION_CACHE: dict[tuple[str, str, str], str] = {}
+_TRUSTED_TOOL_VERSION_CACHE_LOCK = threading.Lock()
+
+
+def _captured_tool_version(
+    role: str,
+    tools: Mapping[str, str],
+    environment: Mapping[str, str],
+    lease: ExecutableIdentityLease,
+) -> str:
+    key = (role, lease.path, lease.expected_sha256)
+    with _TRUSTED_TOOL_VERSION_CACHE_LOCK:
+        cached = _TRUSTED_TOOL_VERSION_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if role == "python":
+        value = f"Python {platform.python_version()}"
+    else:
+        if role == "npm":
+            argv = [
+                require_tool(tools, "node", phase="CAPTURE"),
+                lease.path,
+                "--version",
+            ]
+        elif role in {"powershell", "pwsh"}:
+            argv = [
+                lease.path,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$PSVersionTable.PSVersion.ToString()",
+            ]
+        else:
+            argv = [lease.path, "--version"]
+        completed = subprocess.run(
+            argv,
+            cwd=tempfile.gettempdir(),
+            env=dict(environment),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            timeout=30,
+            check=False,
+        )
+        output = completed.stdout + completed.stderr
+        if completed.returncode != 0 or not output or len(output) > 16_384:
+            raise OSError(f"trusted {role} version capture failed")
+        text = output.decode("utf-8", errors="strict")
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            raise OSError(f"trusted {role} version output is empty")
+        value = lines[0]
+    if not value or len(value.encode("utf-8")) > 512:
+        raise OSError(f"trusted {role} version output is invalid")
+    okay, error = lease.verify()
+    if not okay:
+        raise OSError(error or f"trusted {role} identity drifted during version capture")
+    with _TRUSTED_TOOL_VERSION_CACHE_LOCK:
+        _TRUSTED_TOOL_VERSION_CACHE[key] = value
+    return value
 
 
 def _portable_file_mode(metadata: os.stat_result) -> str:
@@ -8850,19 +9591,22 @@ class RuntimeDependencyClosure:
         source = os.environ if source_environment is None else source_environment
         if source.get("NODE_PATH"):
             raise ValueError("unplanned NODE_PATH is forbidden")
-        python_path = Path(tools.get("python", sys.executable)).resolve(strict=True)
-        node_value = tools.get("node")
-        npm_value = tools.get("npm")
-        if node_value is None:
-            raise ValueError("runtime closure requires a trusted Node entrypoint")
+        if source.get("NODE_OPTIONS"):
+            raise ValueError("unplanned NODE_OPTIONS is forbidden")
+        python_path = Path(require_tool(tools, "python", phase="RUNTIME_CLOSURE"))
+        node_value = require_tool(tools, "node", phase="RUNTIME_CLOSURE")
+        npm_candidate = tools.get("npm")
         local_npm_omission = (
-            npm_value is None
+            npm_candidate is None
             and source.get("GITHUB_ACTIONS") != "true"
             and not require_fresh_dependencies
             and profile in {"policy", "static", "standalone"}
         )
-        if npm_value is None and not local_npm_omission:
-            raise ValueError("runtime closure requires a trusted npm entrypoint")
+        npm_value = (
+            None
+            if local_npm_omission
+            else require_tool(tools, "npm", phase="RUNTIME_CLOSURE")
+        )
         node_path = Path(node_value).resolve(strict=True)
         npm_path = Path(npm_value).resolve(strict=True) if npm_value is not None else None
         dependency_logical_roots: list[str] = []
@@ -9412,8 +10156,7 @@ def required_tool_names(profile: str, *, require_install_tools: bool = False) ->
     if profile in {"backend", "all"} or require_install_tools:
         required.add("npm")
     if profile in {"static", "standalone", "all"}:
-        required.add("bash")
-        required.add("powershell" if os.name == "nt" else "pwsh")
+        required.update({"bash", "powershell"})
     return required
 
 
@@ -9644,11 +10387,21 @@ def build_profile_command_plan(
     """Build the complete ordered plan before profile execution begins."""
 
     plan: list[dict[str, Any]] = []
-    python = tools.get("python", sys.executable)
-    git = tools.get("git", "<unavailable-git>")
-    node = tools.get("node", "node")
-    npm = tools.get("npm", "npm")
-    bash = tools.get("bash", "bash")
+    python = require_tool(tools, "python", phase="COMMAND_PLAN")
+    git = require_tool(tools, "git", phase="COMMAND_PLAN")
+    node = require_tool(tools, "node", phase="COMMAND_PLAN")
+    npm = (
+        require_tool(tools, "npm", phase="COMMAND_PLAN")
+        if tools.get("npm")
+        else None
+    )
+    bash = (
+        require_tool(tools, "bash", phase="COMMAND_PLAN")
+        if profile in {"static", "standalone", "all"}
+        else None
+    )
+    if profile in {"static", "standalone", "all"}:
+        require_tool(tools, "powershell", phase="COMMAND_PLAN")
     baseline_nonpass_commands = {
         command_id
         for collection in ("knownDebts", "expectedOmissions", "releaseOnlySkips")
@@ -9672,7 +10425,10 @@ def build_profile_command_plan(
         execution_argv: Sequence[str] | None = None,
         execution_input_mode: str = "NONE",
     ) -> None:
-        executable_value = str(argv[0]) if argv else str(python)
+        actual_execution_argv = [
+            str(value) for value in (argv if execution_argv is None else execution_argv)
+        ]
+        executable_value = actual_execution_argv[0] if actual_execution_argv else str(python)
         executable_path = Path(executable_value)
         try:
             resolved_executable = str(executable_path.resolve(strict=True))
@@ -9686,9 +10442,6 @@ def build_profile_command_plan(
             if relative not in target_authority_cache:
                 target_authority_cache[relative] = _target_authority(repo_root, relative)
             target_authorities.append(copy.deepcopy(target_authority_cache[relative]))
-        actual_execution_argv = [
-            str(value) for value in (argv if execution_argv is None else execution_argv)
-        ]
         if execution_input_mode == "TARGET-BYTES-STDIN":
             if len(target_authorities) != 1:
                 raise ValueError("TARGET-BYTES-STDIN commands require exactly one target")
@@ -9760,11 +10513,17 @@ def build_profile_command_plan(
     add(
         "npm-version",
         "runtime-identity",
-        [npm, "--version"],
+        [npm or "<unavailable-npm>", "--version"],
         required=profile in {"backend", "all"},
         tool_role="npm-runtime",
+        execution_argv=(
+            [node, npm, "--version"]
+            if npm is not None
+            else [node, "<unavailable-npm>"]
+        ),
     )
     if profile in {"static", "standalone", "all"}:
+        assert bash is not None
         add("git-bash-version", "runtime-identity", [bash, "--version"], tool_role="git-bash-runtime")
     if profile in {"policy", "all"}:
         add(
@@ -9892,11 +10651,13 @@ def build_profile_command_plan(
             execution_input_mode="PROTECTED-TARGET-BUNDLE",
         )
     if profile in {"backend", "all"}:
+        assert npm is not None
         add(
             "backend-canonical",
             "backend-canonical",
             [npm, "--prefix", "backend", "test"],
             tool_role="npm-backend-test",
+            execution_argv=[node, npm, "--prefix", "backend", "test"],
             targets=candidate_paths,
             command_role="observation-producing" if "backend-canonical" in baseline_nonpass_commands else "required-execution",
             allowed_exits=(0, 1) if "backend-canonical" in baseline_nonpass_commands else (0,),
@@ -10590,6 +11351,7 @@ def execute_planned_static_suite(
     env: Mapping[str, str],
     timeout: int = 1200,
     phase_hook: Any | None = None,
+    executable_lease: Any | None = None,
 ) -> tuple[CommandCapture, dict[str, Any]]:
     """Run one external command from a task-owned snapshot of held planned bytes."""
 
@@ -10663,6 +11425,7 @@ def execute_planned_static_suite(
             max_line_bytes=MAX_OUTPUT_LINE_BYTES,
             logical_argv=logical_argv,
             execution_input_mode=adapter,
+            executable_lease=executable_lease,
         )
         if capture.stdout_raw is not None:
             capture.stdout_raw = _translate_snapshot_output_bytes(
@@ -10780,6 +11543,7 @@ def execute_planned_node_check(
     env: Mapping[str, str],
     timeout: int = 30,
     phase_hook: Any | None = None,
+    executable_lease: Any | None = None,
 ) -> tuple[CommandCapture, TargetExecutionLease | None]:
     """Execute one Node syntax plan from held target bytes through stdin."""
 
@@ -10843,6 +11607,7 @@ def execute_planned_node_check(
         logical_argv=logical_argv,
         execution_input_mode=adapter,
         process_started_hook=started_hook,
+        executable_lease=executable_lease,
     )
     if phase_hook is not None:
         phase_hook("after-process-exit-before-evidence", lease)
@@ -10866,6 +11631,7 @@ class FoundationRunner:
         *,
         require_install_tools: bool = False,
         tools: Mapping[str, str] | None = None,
+        tool_policy: ToolAuthorityPolicy | None = None,
         source_environment: Mapping[str, str] | None = None,
         static_invocation_id: str | None = None,
         target_phase_hook: Any | None = None,
@@ -10900,31 +11666,118 @@ class FoundationRunner:
             or profile in {"frontend", "backend", "all"}
         ):
             required_tools.add("npm")
+        self.required_tools = frozenset(required_tools)
+        self.tool_policy = tool_policy or default_tool_authority_policy(
+            self.source_environment,
+            repo_root=REPO_ROOT,
+        )
+        if self.tool_policy.synthetic:
+            self.platform = (
+                "windows" if self.tool_policy.platform_name == "Windows" else "ubuntu"
+            )
+            self.runtime["platform"] = self.platform
+        self.tools_injected = tools is not None or self.tool_policy.synthetic
         if tools is None:
             self.tools, self.tool_resolution_errors = resolve_trusted_tools(
                 required_tools,
-                source_environment=source_environment,
+                source_environment=self.source_environment,
                 repo_root=REPO_ROOT,
+                policy=self.tool_policy,
             )
         else:
             self.tools = dict(tools)
             self.tool_resolution_errors = []
+        self.tool_authority_failure: ToolAuthorityUnavailable | None = None
+        self.tool_authority_frozen = False
+        try:
+            self.tools = require_tool_set(
+                self.tools,
+                self.required_tools,
+                phase="CAPTURE",
+                resolution_errors=self.tool_resolution_errors,
+            )
+        except ToolAuthorityUnavailable as exc:
+            self.tool_authority_failure = exc
+            if str(exc) not in self.tool_resolution_errors:
+                self.tool_resolution_errors.append(str(exc))
+        else:
+            self.tool_authority_frozen = True
         self.bash_lease: TrustedBashLease | None = None
-        if os.name == "nt" and profile in {"static", "standalone", "all"}:
-            bash = self.tools.get("bash")
-            git = self.tools.get("git")
-            if bash is not None and git is not None:
-                try:
-                    self.bash_lease = TrustedBashLease(bash, git)
-                except OSError as exc:
-                    self.tool_resolution_errors.append(
-                        f"trusted Git Bash lease could not be established: {type(exc).__name__}: {exc}"
-                    )
+        if (
+            self.tool_authority_frozen
+            and self.tool_policy.platform_name == "Windows"
+            and not self.tool_policy.synthetic
+            and profile in {"static", "standalone", "all"}
+        ):
+            bash = self.require_tool("bash", phase="CAPTURE")
+            git = self.require_tool("git", phase="CAPTURE")
+            try:
+                self.bash_lease = TrustedBashLease(bash, git)
+            except OSError as exc:
+                self.tool_resolution_errors.append(
+                    f"trusted Git Bash lease could not be established: {type(exc).__name__}: {exc}"
+                )
+                self.tool_authority_failure = ToolAuthorityUnavailable("bash", "CAPTURE")
+                self.tool_authority_frozen = False
         self.child_environment = child_process_environment(
-            self.tools,
-            source_environment=source_environment,
+            self.tools if self.tool_authority_frozen else {},
+            source_environment=self.source_environment,
             private_temp_root=self.private_temp_root,
+            repo_root=REPO_ROOT,
+            policy=self.tool_policy,
         )
+        self.tool_leases: dict[str, ExecutableIdentityLease] = {}
+        self.tool_authority_evidence: dict[str, dict[str, Any]] = {}
+        if self.tool_authority_frozen:
+            try:
+                for name in sorted(self.required_tools):
+                    path = self.require_tool(name, phase="CAPTURE")
+                    lease = ExecutableIdentityLease(
+                        path,
+                        f"trusted-{name}",
+                        allow_dependency_root=name == "npm",
+                    )
+                    self.tool_leases[name] = lease
+                for name, lease in self.tool_leases.items():
+                    classification = _tool_root_classification(
+                        Path(lease.path), name, self.tool_policy
+                    )
+                    version_output = (
+                        "test-injected-not-executed"
+                        if self.tools_injected
+                        else _captured_tool_version(
+                            name,
+                            self.tools,
+                            self.child_environment,
+                            lease,
+                        )
+                    )
+                    self.tool_authority_evidence[name] = {
+                        **lease.evidence(),
+                        "trustedRootClassification": classification
+                        or "test-injected-authority",
+                        "versionOutput": version_output,
+                    }
+            except (OSError, ToolAuthorityUnavailable) as exc:
+                for lease in self.tool_leases.values():
+                    lease.close()
+                self.tool_leases.clear()
+                if self.bash_lease is not None:
+                    self.bash_lease.close()
+                    self.bash_lease = None
+                failed_role = getattr(exc, "tool", "authority-set")
+                self.tool_authority_failure = ToolAuthorityUnavailable(
+                    failed_role, "CAPTURE"
+                )
+                self.tool_resolution_errors.append(str(self.tool_authority_failure))
+                self.tool_authority_frozen = False
+                self.child_environment = child_process_environment(
+                    {},
+                    source_environment=self.source_environment,
+                    private_temp_root=self.private_temp_root,
+                    repo_root=REPO_ROOT,
+                    policy=self.tool_policy,
+                )
         self.runtime_dependency_closure: RuntimeDependencyClosure | None = None
         self.runtime_dependency_guard: RuntimeDependencyClosureGuard | None = None
         self.runtime_closure_errors: list[str] = []
@@ -10959,7 +11812,7 @@ class FoundationRunner:
             "queueOverflow": False,
             "mutationEventCount": 0,
         }
-        if enable_runtime_closure:
+        if enable_runtime_closure and self.tool_authority_frozen:
             try:
                 closure = RuntimeDependencyClosure.build(
                     profile,
@@ -10995,6 +11848,10 @@ class FoundationRunner:
             REPO_ROOT
         )
         try:
+            if not self.tool_authority_frozen:
+                raise self.tool_authority_failure or ToolAuthorityUnavailable(
+                    "authority-set", "COMMAND_PLAN"
+                )
             self.command_plan = build_profile_command_plan(
                 profile,
                 tools=self.tools,
@@ -11042,6 +11899,44 @@ class FoundationRunner:
             "dependencyClosureDigest": "unavailable",
             "dependencyMemberCount": "0",
         }
+
+    def require_tool(self, name: str, *, phase: str) -> str:
+        if not self.tool_authority_frozen:
+            raise ToolAuthorityUnavailable(name, phase)
+        path = require_tool(self.tools, name, phase=phase)
+        lease = getattr(self, "tool_leases", {}).get(name)
+        if lease is not None:
+            okay, _error = lease.verify()
+            if not okay:
+                self.tool_authority_frozen = False
+                self.tool_authority_failure = ToolAuthorityUnavailable(name, phase)
+                if str(self.tool_authority_failure) not in self.tool_resolution_errors:
+                    self.tool_resolution_errors.append(str(self.tool_authority_failure))
+                raise self.tool_authority_failure
+        return path
+
+    def require_all_tools(self, *, phase: str) -> dict[str, str]:
+        if not self.tool_authority_frozen:
+            missing = sorted(name for name in self.required_tools if name not in self.tools)
+            raise ToolAuthorityUnavailable(missing[0] if missing else "authority-set", phase)
+        return {
+            name: self.require_tool(name, phase=phase)
+            for name in sorted(self.required_tools)
+        }
+
+    def require_tool_lease(self, name: str, *, phase: str) -> ExecutableIdentityLease:
+        """Revalidate and return the held executable identity for one required role."""
+
+        self.require_tool(name, phase=phase)
+        lease = self.tool_leases.get(name)
+        if lease is None:
+            raise ToolAuthorityUnavailable(name, phase)
+        okay, _error = lease.verify()
+        if not okay:
+            self.tool_authority_frozen = False
+            self.tool_authority_failure = ToolAuthorityUnavailable(name, phase)
+            raise self.tool_authority_failure
+        return lease
 
     def add_hard_gate(self, gate_id: str, passed: bool, detail: str) -> None:
         record = {"id": gate_id, "status": "pass" if passed else "fail", "detail": sanitize_text(detail)}
@@ -11260,6 +12155,19 @@ class FoundationRunner:
         timeout: int,
     ) -> tuple[CommandCapture, dict[str, Any]]:
         plan_record = self.command_plan_by_id[command_id]
+        execution_argv = list(plan_record.get("executionArgv", []))
+        if not execution_argv:
+            raise ToolAuthorityUnavailable("authority-set", "EXECUTION")
+        executable_lease = None
+        for name in sorted(self.required_tools):
+            if name == "npm":
+                continue
+            path = self.require_tool(name, phase="EXECUTION")
+            if _same_file_identity(Path(execution_argv[0]), Path(path)):
+                executable_lease = self.require_tool_lease(name, phase="EXECUTION")
+                break
+        if executable_lease is None:
+            raise ToolAuthorityUnavailable("authority-set", "EXECUTION")
         capture, protected_bundle = execute_planned_static_suite(
             plan_record,
             repo_root=REPO_ROOT,
@@ -11276,6 +12184,7 @@ class FoundationRunner:
                 if self.target_phase_hook is not None
                 else None
             ),
+            executable_lease=executable_lease,
         )
         command_record = self.add_command(capture)
         command_record["executionInputs"] = copy.deepcopy(
@@ -11363,15 +12272,13 @@ class FoundationRunner:
 
     def ensure_candidate_paths(self) -> list[str]:
         if self.candidate_paths is None:
-            git = self.tools.get("git")
-            if git is None:
-                paths, errors = [], ["trusted Git executable is unavailable"]
-            else:
-                paths, errors, capture = git_candidate_paths(
-                    git=git,
-                    env=self.child_environment,
-                )
-                self.add_command(capture)
+            git = self.require_tool("git", phase="EXECUTION")
+            paths, errors, capture = git_candidate_paths(
+                git=git,
+                env=self.child_environment,
+                executable_lease=self.require_tool_lease("git", phase="EXECUTION"),
+            )
+            self.add_command(capture)
             if paths != self.planned_candidate_paths:
                 errors.append(
                     "Git command inventory does not match the precomputed index authority"
@@ -11442,57 +12349,51 @@ class FoundationRunner:
             python_ok,
             f"Python {platform.python_version()} (required family 3.12)",
         )
-        node = self.tools.get("node")
-        if node is None:
-            self.add_command(
-                CommandCapture(
-                    command_id="node-version",
-                    command_class="runtime-identity",
-                    argv=["node", "--version"],
-                    executed=False,
-                    exit_code=None,
-                    duration_seconds=0.0,
-                    stdout="",
-                    stderr="",
-                    error="required trusted Node executable is unavailable",
-                )
-            )
-            self.add_hard_gate("NODE-CI-FAMILY", False, "required Node executable is unavailable")
-        else:
-            capture = execute_command(
-                "node-version",
-                "runtime-identity",
-                [node, "--version"],
-                timeout=30,
-                env=self.child_environment,
-            )
-            self.add_command(capture)
-            version = sanitize_text(capture.stdout).strip()
-            self.runtime["node"] = version or "unavailable"
-            self.add_hard_gate(
-                "NODE-CI-FAMILY",
-                capture.executed and capture.exit_code == 0 and bool(re.fullmatch(r"v24\.\d+\.\d+", version)),
-                f"Node {version or 'unavailable'} (required family 24.x)",
-            )
-        npm = self.tools.get("npm")
+        node = self.require_tool("node", phase="EXECUTION")
+        node_lease = self.require_tool_lease("node", phase="EXECUTION")
+        capture = execute_command(
+            "node-version",
+            "runtime-identity",
+            [node, "--version"],
+            timeout=30,
+            env=self.child_environment,
+            executable_lease=node_lease,
+        )
+        self.add_command(capture)
+        version = sanitize_text(capture.stdout).strip()
+        self.runtime["node"] = version or "unavailable"
+        self.add_hard_gate(
+            "NODE-CI-FAMILY",
+            capture.executed and capture.exit_code == 0 and bool(re.fullmatch(r"v24\.\d+\.\d+", version)),
+            f"Node {version or 'unavailable'} (required family 24.x)",
+        )
+        npm = (
+            self.require_tool("npm", phase="EXECUTION")
+            if require_npm
+            else self.tools.get("npm")
+        )
         if npm is not None:
             capture = execute_command(
                 "npm-version",
                 "runtime-identity",
-                [npm, "--version"],
+                [node, npm, "--version"],
                 timeout=30,
                 env=self.child_environment,
                 required=require_npm,
+                logical_argv=[npm, "--version"],
+                executable_lease=node_lease,
             )
             self.add_command(capture)
             if capture.executed and capture.exit_code == 0:
                 self.runtime["npm"] = sanitize_text(capture.stdout).strip()
         else:
+            npm_plan = self.command_plan_by_id["npm-version"]
             self.add_command(
                 CommandCapture(
                     command_id="npm-version",
                     command_class="runtime-identity",
-                    argv=["npm", "--version"],
+                    argv=list(npm_plan["executionArgv"]),
+                    logical_argv=list(npm_plan["logicalArgv"]),
                     executed=False,
                     exit_code=None,
                     duration_seconds=0.0,
@@ -11506,28 +12407,23 @@ class FoundationRunner:
                 self.add_hard_gate("NPM-REQUIRED", False, "required npm executable is unavailable")
 
         if self.profile in {"static", "standalone", "all"}:
-            bash = self.tools.get("bash")
-            if bash is None or (os.name == "nt" and self.bash_lease is None):
-                bash_capture = CommandCapture(
-                    command_id="git-bash-version",
-                    command_class="runtime-identity",
-                    argv=["bash", "--version"],
-                    executed=False,
-                    exit_code=None,
-                    duration_seconds=0.0,
-                    stdout="",
-                    stderr="",
-                    error="trusted Git Bash executable or identity lease is unavailable",
-                )
-            else:
-                bash_capture = execute_command(
-                    "git-bash-version",
-                    "runtime-identity",
-                    [bash, "--version"],
-                    timeout=30,
-                    env=self.child_environment,
-                    executable_lease=self.bash_lease,
-                )
+            bash = self.require_tool("bash", phase="EXECUTION")
+            bash_lease = (
+                self.bash_lease
+                if self.tool_policy.platform_name == "Windows"
+                and not self.tool_policy.synthetic
+                else self.require_tool_lease("bash", phase="EXECUTION")
+            )
+            if bash_lease is None:
+                raise ToolAuthorityUnavailable("bash", "EXECUTION")
+            bash_capture = execute_command(
+                "git-bash-version",
+                "runtime-identity",
+                [bash, "--version"],
+                timeout=30,
+                env=self.child_environment,
+                executable_lease=bash_lease,
+            )
             self.add_command(bash_capture)
             version_text = sanitize_text(bash_capture.stdout + "\n" + bash_capture.stderr)
             bash_ok = bash_capture.execution_passed() and bool(
@@ -11543,7 +12439,8 @@ class FoundationRunner:
 
     def run_repository_boundary(self) -> None:
         paths = self.ensure_candidate_paths()
-        git = self.tools.get("git", "<unavailable-git>")
+        git = self.require_tool("git", phase="EXECUTION")
+        git_lease = self.require_tool_lease("git", phase="EXECUTION")
         unexpected_untracked: list[str] = []
         tracked_capture = execute_command(
             "git-tracked-paths",
@@ -11552,6 +12449,7 @@ class FoundationRunner:
             timeout=60,
             env=self.child_environment,
             include_preview=False,
+            executable_lease=git_lease,
         )
         self.add_command(tracked_capture)
         tracked = set(tracked_capture.stdout.split("\0")) if tracked_capture.exit_code == 0 else set()
@@ -11576,6 +12474,7 @@ class FoundationRunner:
                 argv,
                 timeout=60,
                 env=self.child_environment,
+                executable_lease=git_lease,
             )
             self.add_command(capture)
             if not capture.executed or capture.exit_code != 0:
@@ -11588,6 +12487,7 @@ class FoundationRunner:
             timeout=60,
             env=self.child_environment,
             include_preview=False,
+            executable_lease=git_lease,
         )
         self.add_command(stage_capture)
         if not stage_capture.executed or stage_capture.exit_code != 0:
@@ -11602,6 +12502,7 @@ class FoundationRunner:
             timeout=30,
             env=self.child_environment,
             include_preview=False,
+            executable_lease=git_lease,
         )
         self.add_command(git_dir_capture)
         if git_dir_capture.executed and git_dir_capture.exit_code == 0:
@@ -11825,7 +12726,7 @@ class FoundationRunner:
 
     def run_static_profile(self) -> None:
         invocation_id = self.static_invocation_id
-        python_executable = self.tools.get("python", sys.executable)
+        python_executable = self.require_tool("python", phase="EXECUTION")
         argv = [
             python_executable,
             "-B",
@@ -11859,6 +12760,7 @@ class FoundationRunner:
                 if self.target_phase_hook is not None
                 else None
             ),
+            executable_lease=self.require_tool_lease("python", phase="EXECUTION"),
         )
         report: dict[str, Any] | None = None
         report_errors: list[str] = list(plan_errors)
@@ -11967,10 +12869,9 @@ class FoundationRunner:
             for path in self.ensure_candidate_paths()
             if Path(path).suffix.lower() in {".js", ".mjs"}
         ]
-        node = self.tools.get("node")
-        if node is None:
-            self.add_hard_gate("DIRECT-JAVASCRIPT-SYNTAX", False, "required Node executable is unavailable")
-        else:
+        self.require_tool("node", phase="EXECUTION")
+        node_lease = self.require_tool_lease("node", phase="EXECUTION")
+        if node_lease is not None:
             execution_failure = False
             def check_one(
                 relative: str,
@@ -11981,6 +12882,7 @@ class FoundationRunner:
                     repo_root=REPO_ROOT,
                     env=self.child_environment,
                     timeout=30,
+                    executable_lease=node_lease,
                 )
                 return relative, capture, lease
 
@@ -12077,10 +12979,7 @@ class FoundationRunner:
         )
 
     def run_frontend_profile(self) -> None:
-        node = self.tools.get("node")
-        if node is None:
-            self.add_hard_gate("FRONTEND-NODE-REQUIRED", False, "required Node executable is unavailable")
-            return
+        self.require_tool("node", phase="EXECUTION")
         bundle, _bundle_record = self.execute_protected_external(
             "bundle-normalization",
             timeout=300,
@@ -12351,6 +13250,27 @@ class FoundationRunner:
             else "; ".join(failures),
         )
 
+    def verify_tool_authority(self, phase: str) -> list[str]:
+        errors: list[str] = []
+        for name, lease in getattr(self, "tool_leases", {}).items():
+            okay, error = lease.verify()
+            if not okay:
+                errors.append(f"{name}: {error or 'trusted executable identity drifted'}")
+                self.tool_authority_frozen = False
+                self.tool_authority_failure = ToolAuthorityUnavailable(
+                    name, "POST_EXECUTION"
+                )
+        self.add_hard_gate(
+            f"TRUSTED-TOOL-AUTHORITY-{phase.upper()}",
+            not errors,
+            (
+                f"captured tool identities unchanged after {phase}"
+                if not errors
+                else "; ".join(errors)
+            ),
+        )
+        return errors
+
     def verify_trusted_integrity(self, phase: str) -> None:
         current, errors = snapshot_trusted_files()
         errors.extend(compare_trusted_snapshots(self.initial_trusted_snapshot, current))
@@ -12359,6 +13279,7 @@ class FoundationRunner:
             not errors,
             f"trusted files unchanged after {phase}" if not errors else "; ".join(errors),
         )
+        self.verify_tool_authority(phase)
         if self.runtime_dependency_guard is not None:
             closure_errors = self.runtime_dependency_guard.verify(phase)
             self.add_hard_gate(
@@ -12405,6 +13326,13 @@ class FoundationRunner:
                 record["executionInputs"]
             )
         self.target_execution_leases.clear()
+        if getattr(self, "tool_leases", None):
+            self.verify_tool_authority("post-execution")
+            for name, lease in self.tool_leases.items():
+                lease.close()
+                if name in self.tool_authority_evidence:
+                    self.tool_authority_evidence[name]["leaseHeld"] = False
+            self.tool_leases.clear()
         if self.bash_lease is not None:
             self.bash_lease.close()
             self.bash_lease = None
@@ -13251,6 +14179,10 @@ def _validate_command_record(record: Any, index: int, errors: list[str]) -> bool
         "containment",
         "processTreeStatus",
         "descendantsTerminated",
+        "descendantsObserved",
+        "descendantsReaped",
+        "descendantsSurviving",
+        "containmentDisposition",
         "actualExecutionArgv",
         "actualExecutionInputMode",
         "actualExecutionInputSize",
@@ -13706,11 +14638,33 @@ def _validate_command_record(record: Any, index: int, errors: list[str]) -> bool
             or not 0 <= record.get(key, -1) <= MAX_RECORDED_STREAM_BYTES
         ):
             errors.append(f"{label}: {key} must be an explicitly bounded non-negative integer")
-    if (
-        type(record.get("descendantsTerminated")) is not int
-        or not 0 <= record.get("descendantsTerminated", -1) <= 4096
+    for containment_count in (
+        "descendantsTerminated",
+        "descendantsObserved",
+        "descendantsReaped",
+        "descendantsSurviving",
     ):
-        errors.append(f"{label}: descendantsTerminated must be a bounded non-negative integer")
+        if (
+            type(record.get(containment_count)) is not int
+            or not 0 <= record.get(containment_count, -1) <= 4096
+        ):
+            errors.append(
+                f"{label}: {containment_count} must be a bounded non-negative integer"
+            )
+    if record.get("containmentDisposition") not in {
+        "not-applicable",
+        "no-descendants",
+        "natural-exit-reaped",
+        "forced-terminated",
+        "survivor",
+        "unknown-ancestry",
+    }:
+        errors.append(f"{label}: containmentDisposition is invalid")
+    if record.get("processTreeStatus") == "contained-clean" and (
+        record.get("descendantsSurviving") != 0
+        or record.get("containmentDisposition") in {"survivor", "unknown-ancestry"}
+    ):
+        errors.append(f"{label}: contained-clean contradicts descendant truth state")
     for observed_key, limit_key, status_key in (
         ("stdoutBytesObserved", "stdoutByteLimit", "outputLimitStatus"),
         ("stderrBytesObserved", "stderrByteLimit", "outputLimitStatus"),
@@ -15233,9 +16187,17 @@ def prepare_developer_esbuild() -> list[str]:
 
     errors: list[str] = []
     tools, tool_errors = resolve_trusted_tools({"python", "node", "git"})
-    errors.extend(tool_errors)
-    if errors:
-        return errors
+    try:
+        tools = require_tool_set(
+            tools,
+            {"python", "node", "git"},
+            phase="EXECUTION_BINDING",
+            resolution_errors=tool_errors,
+        )
+    except ToolAuthorityUnavailable as exc:
+        return [str(exc)]
+    git = require_tool(tools, "git", phase="EXECUTION_BINDING")
+    node = require_tool(tools, "node", phase="EXECUTION_BINDING")
     environment = child_process_environment(tools)
     before, snapshot_errors = snapshot_trusted_files()
     errors.extend(snapshot_errors)
@@ -15298,7 +16260,7 @@ def prepare_developer_esbuild() -> list[str]:
     if errors:
         return sorted(set(errors))
     trusted_arguments = trusted_git_arguments(
-        tools["git"], "diff", "--exit-code", "--", *TRUSTED_FILE_PATHS
+        git, "diff", "--exit-code", "--", *TRUSTED_FILE_PATHS
     )
     before_diff = execute_command(
         "trusted-files-before-esbuild",
@@ -15314,7 +16276,7 @@ def prepare_developer_esbuild() -> list[str]:
     capture = execute_command(
         "locked-esbuild-installer",
         "dependency-lifecycle",
-        [tools["node"], str(installer_path.resolve(strict=True))],
+        [node, str(installer_path.resolve(strict=True))],
         timeout=180,
         env=environment,
         cwd=package_root,
@@ -15442,8 +16404,9 @@ def prepare_verification_authority(
         if (
             not captured_python
             or not Path(captured_python).is_absolute()
-            or Path(captured_python).resolve(strict=True)
-            != Path(sys.executable).resolve(strict=True)
+            or not _same_file_identity(
+                Path(captured_python), Path(sys.executable)
+            )
         ):
             raise ValueError("verifier was not invoked through the captured absolute trusted Python")
         for name in ("CI_TRUSTED_NODE", "CI_TRUSTED_NPM_ENTRY"):
@@ -15459,13 +16422,16 @@ def prepare_verification_authority(
         enable_runtime_closure=True,
         require_fresh_runtime_closure=bool(args.require_fresh_runtime_closure),
     )
+    runner.require_all_tools(phase="VERIFICATION_PREPARATION")
     runner.linux_containment_self_test = {
         "status": "REMOTE-LIVE-VALIDATION-PENDING",
         "results": [],
     }
     if args.require_linux_containment_self_test:
         results, live_errors = run_linux_containment_live_self_test(
-            python_executable=runner.tools["python"],
+            python_executable=runner.require_tool(
+                "python", phase="VERIFICATION_PREPARATION"
+            ),
             environment=runner.child_environment,
             temp_root=runner.private_temp_root,
         )
@@ -15486,7 +16452,7 @@ def prepare_verification_authority(
             command_plan_digest_value=runner.command_plan_digest,
             fresh_runtime_closure_digest=runner.runtime_closure_digest,
             baseline=baseline,
-            git=runner.tools["git"],
+            git=runner.require_tool("git", phase="EXECUTION_BINDING"),
             child_environment=runner.child_environment,
             source_environment=source_environment,
             repo_root=repo_root,
@@ -15598,18 +16564,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_install_tools=args.require_install_tools,
         enable_runtime_closure=os.environ.get("GITHUB_ACTIONS") == "true",
     )
+    try:
+        runner.require_all_tools(
+            phase="EXECUTION_BINDING" if not args.verify_only else "EXECUTION"
+        )
+    except ToolAuthorityUnavailable as exc:
+        runner.cleanup_task_resources()
+        print(str(exc), file=sys.stderr)
+        return EXIT_CONFIGURATION_ERROR
     if not args.verify_only:
         try:
             runner.execution_binding = build_generation_execution_binding(
                 runner,
                 repo_root=REPO_ROOT,
             )
-        except (OSError, KeyError, ValueError) as exc:
+        except (OSError, ValueError) as exc:
             runner.close_execution_leases()
-            print(
-                f"CI foundation execution-binding configuration error: {type(exc).__name__}: {sanitize_text(str(exc))}",
-                file=sys.stderr,
-            )
+            if isinstance(exc, ToolAuthorityUnavailable):
+                print(str(exc), file=sys.stderr)
+            else:
+                print(
+                    f"CI foundation execution-binding configuration error: {type(exc).__name__}: {sanitize_text(str(exc))}",
+                    file=sys.stderr,
+                )
             return EXIT_CONFIGURATION_ERROR
         try:
             create_fresh_evidence_root(OUTPUT_DIR, repo_root=REPO_ROOT)

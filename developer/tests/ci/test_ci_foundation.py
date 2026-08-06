@@ -53,6 +53,31 @@ def _is_reparse_point(path: Path) -> bool:
     )
 
 
+def _process_is_alive(pid: int) -> bool:
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel32.OpenProcess(0x00100000, False, pid)
+        if not handle:
+            return False
+        try:
+            return int(kernel32.WaitForSingleObject(handle, 0)) == 258
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except (OSError, ProcessLookupError):
+        return False
+    return True
+
+
 def _candidate_worktree_roots() -> tuple[Path, ...]:
     git_candidates = []
     configured = os.environ.get("GIT_EXE")
@@ -3252,10 +3277,15 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
                 mock.patch.object(ci, "execute_planned_static_suite", side_effect=fake_snapshot),
                 mock.patch.object(ci.FoundationRunner, "run_direct_syntax", autospec=True),
             ):
+                trusted_tools, tool_errors = ci.resolve_trusted_tools(
+                    ci.required_tool_names("static"),
+                    source_environment=os.environ,
+                )
+                self.assertEqual(tool_errors, [])
                 runner = ci.FoundationRunner(
                     "static",
                     copy.deepcopy(self.baseline),
-                    tools={"python": sys.executable},
+                    tools=trusted_tools,
                     source_environment=os.environ,
                 )
                 runner.run_static_profile()
@@ -3411,6 +3441,150 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
         )
         self.assertEqual(self.gate(runner, "STATIC-SUITE-EXECUTION")["status"], "pass")
         self.assertTrue(report_exists)
+
+
+class _HostedToolFixture:
+    """Inspected, non-executed hosted-runner filesystem model under task temp."""
+
+    def __init__(self, platform_name: str) -> None:
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix=f"ci-hosted-{platform_name.casefold()}-"
+        )
+        self.root = Path(self.temporary.name).resolve(strict=True)
+        self.platform_name = platform_name
+        self.runner_temp = self.root / "runner-temp"
+        self.workspace = self.root / "workspace" / "IELTS-Project"
+        self.runner_temp.mkdir(parents=True)
+        self.workspace.mkdir(parents=True)
+        toolcache = self.root / "hostedtoolcache"
+
+        if platform_name == "Windows":
+            python_dir = toolcache / "windows" / "Python" / "3.12.13" / "x64"
+            node_dir = toolcache / "windows" / "node" / "24.18.1" / "x64"
+            git_root = self.root / "Program Files" / "Git"
+            system_root = self.root / "Windows"
+            system_bin = system_root / "System32"
+            powershell_dir = system_bin / "WindowsPowerShell" / "v1.0"
+            python = self._write(python_dir / "python.exe", b"synthetic-python")
+            node = self._write(node_dir / "node.exe", b"synthetic-node")
+            git = self._write(git_root / "cmd" / "git.exe", b"synthetic-git")
+            bash = self._write(git_root / "bin" / "bash.exe", b"synthetic-bash")
+            powershell = self._write(
+                powershell_dir / "powershell.exe", b"synthetic-powershell"
+            )
+            system_bin.mkdir(parents=True, exist_ok=True)
+            path_entries = [
+                self.runner_temp,
+                self.workspace,
+                python_dir,
+                node_dir,
+                git_root / "cmd",
+                git_root / "bin",
+                powershell_dir,
+                system_bin,
+            ]
+            role_roots = {
+                "python": (("github-hosted-python-toolcache", python_dir),),
+                "node": (("github-hosted-node-toolcache", node_dir),),
+                "git": (("program-files-git", git_root),),
+                "bash": (("program-files-git-bash", git_root),),
+                "powershell": (("windows-system-powershell", system_bin / "WindowsPowerShell"),),
+            }
+            extra_source = {
+                "SystemRoot": str(system_root),
+                "WINDIR": str(system_root),
+                "ProgramFiles": str(self.root / "Program Files"),
+            }
+        else:
+            python_dir = toolcache / "Python" / "3.12.13" / "x64" / "bin"
+            node_dir = toolcache / "node" / "24.18.1" / "x64" / "bin"
+            system_bin = self.root / "usr" / "bin"
+            usr_local = self.root / "usr" / "local" / "bin"
+            usr_local.mkdir(parents=True)
+            python = self._write(python_dir / "python3.12", b"synthetic-python")
+            os.link(python, python_dir / "python")
+            os.link(python, python_dir / "python3")
+            node = self._write(node_dir / "node", b"synthetic-node")
+            git = self._write(system_bin / "git", b"synthetic-git")
+            bash = self._write(system_bin / "bash", b"synthetic-bash")
+            powershell = self._write(system_bin / "pwsh", b"synthetic-powershell")
+            path_entries = [
+                self.runner_temp,
+                self.workspace,
+                usr_local,
+                python_dir,
+                node_dir,
+                system_bin,
+            ]
+            role_roots = {
+                "python": (("github-hosted-python-toolcache", python_dir),),
+                "node": (("github-hosted-node-toolcache", node_dir),),
+                "git": (("posix-system-git", system_bin),),
+                "bash": (("posix-system-bash", system_bin),),
+                "powershell": (("posix-system-pwsh", system_bin),),
+            }
+            extra_source = {}
+
+        self.paths = {
+            "python": python.resolve(strict=True),
+            "node": node.resolve(strict=True),
+            "git": git.resolve(strict=True),
+            "bash": bash.resolve(strict=True),
+            "powershell": powershell.resolve(strict=True),
+            "system": system_bin.resolve(strict=True),
+        }
+        self.policy = ci.synthetic_tool_authority_policy(
+            platform_name,
+            running_python=python,
+            role_roots=role_roots,
+            minimal_system_directories=(system_bin,),
+            path_separator=os.pathsep,
+        )
+        self.source = {
+            "PATH": os.pathsep.join(str(path) for path in path_entries),
+            "RUNNER_TOOL_CACHE": str(toolcache),
+            "RUNNER_TEMP": str(self.runner_temp),
+            "GITHUB_WORKSPACE": str(self.workspace),
+            **extra_source,
+        }
+
+    @staticmethod
+    def _write(path: Path, content: bytes) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        return path
+
+    def shadow(self, role: str, *, directory: Path | None = None) -> Path:
+        names = {
+            "Windows": {
+                "python": "python.exe",
+                "node": "node.exe",
+                "git": "git.exe",
+                "bash": "bash.exe",
+                "powershell": "powershell.exe",
+            },
+            "Ubuntu": {
+                "python": "python",
+                "node": "node",
+                "git": "git",
+                "bash": "bash",
+                "powershell": "pwsh",
+            },
+        }
+        target = (directory or self.runner_temp) / names[self.platform_name][role]
+        return self._write(target, b"untrusted-shadow")
+
+    def resolve(
+        self, required: set[str] | frozenset[str] = frozenset({"python", "node", "git", "bash"})
+    ) -> tuple[dict[str, str], list[str]]:
+        return ci.resolve_trusted_tools(
+            required,
+            source_environment=self.source,
+            policy=self.policy,
+        )
+
+    def cleanup(self) -> None:
+        self.temporary.cleanup()
 
 
 class TrustedExecutionTest(unittest.TestCase):
@@ -3572,6 +3746,413 @@ class TrustedExecutionTest(unittest.TestCase):
         self.assertRegex(evidence["stdoutSha256"], r"^[0-9a-f]{64}$")
 
 
+class HostedRunnerToolResolutionTest(unittest.TestCase):
+    REQUIRED = frozenset({"python", "node", "git", "bash", "powershell"})
+
+    def test_github_ubuntu_hosted_path_resolves_role_specific_tools(self) -> None:
+        fixture = _HostedToolFixture("Ubuntu")
+        try:
+            tools, errors = fixture.resolve(self.REQUIRED)
+            self.assertEqual(errors, [])
+            for role in self.REQUIRED:
+                captured = ci.require_tool(tools, role, phase="CAPTURE")
+                self.assertEqual(Path(captured), fixture.paths[role])
+            self.assertTrue(
+                ci._same_file_identity(
+                    Path(ci.require_tool(tools, "python", phase="CAPTURE")),
+                    fixture.root
+                    / "hostedtoolcache"
+                    / "Python"
+                    / "3.12.13"
+                    / "x64"
+                    / "bin"
+                    / "python3.12",
+                )
+            )
+        finally:
+            fixture.cleanup()
+
+    def test_github_windows_hosted_path_resolves_git_bash_from_captured_git(self) -> None:
+        fixture = _HostedToolFixture("Windows")
+        try:
+            fixture.shadow("bash", directory=fixture.paths["system"])
+            tools, errors = fixture.resolve(self.REQUIRED)
+            self.assertEqual(errors, [])
+            for role in self.REQUIRED:
+                self.assertEqual(
+                    Path(ci.require_tool(tools, role, phase="CAPTURE")),
+                    fixture.paths[role],
+                )
+            bash = Path(ci.require_tool(tools, "bash", phase="CAPTURE"))
+            git = Path(ci.require_tool(tools, "git", phase="CAPTURE"))
+            self.assertEqual(bash.parents[1], git.parents[1])
+            self.assertFalse(ci._windows_system_launcher_path(bash, fixture.source))
+        finally:
+            fixture.cleanup()
+
+    def test_unsafe_empty_prefix_is_accepted_and_actual_shadow_matrix_is_rejected(self) -> None:
+        for platform_name in ("Ubuntu", "Windows"):
+            with self.subTest(platform=platform_name, case="empty-prefix"):
+                fixture = _HostedToolFixture(platform_name)
+                try:
+                    tools, errors = fixture.resolve(self.REQUIRED)
+                    self.assertEqual(errors, [])
+                    self.assertEqual(set(tools), set(self.REQUIRED))
+                finally:
+                    fixture.cleanup()
+            for role in self.REQUIRED:
+                with self.subTest(platform=platform_name, case="shadow", role=role):
+                    fixture = _HostedToolFixture(platform_name)
+                    try:
+                        fixture.shadow(role)
+                        tools, errors = fixture.resolve(self.REQUIRED)
+                        self.assertNotIn(role, tools)
+                        self.assertTrue(
+                            any(f"required {role}" in error for error in errors),
+                            errors,
+                        )
+                    finally:
+                        fixture.cleanup()
+
+    def test_minimal_child_path_and_post_capture_shadow_race_remain_inert(self) -> None:
+        for platform_name in ("Ubuntu", "Windows"):
+            with self.subTest(platform=platform_name):
+                fixture = _HostedToolFixture(platform_name)
+                try:
+                    tools, errors = fixture.resolve(self.REQUIRED)
+                    self.assertEqual(errors, [])
+                    child = ci.child_process_environment(
+                        tools,
+                        source_environment=fixture.source,
+                        private_temp_root=fixture.runner_temp,
+                        policy=fixture.policy,
+                    )
+                    child_entries = {
+                        str(Path(entry).resolve(strict=True)).casefold()
+                        for entry in child["PATH"].split(fixture.policy.path_separator)
+                        if entry
+                    }
+                    for rejected in (fixture.runner_temp, fixture.workspace):
+                        self.assertNotIn(str(rejected.resolve(strict=True)).casefold(), child_entries)
+                    self.assertFalse(
+                        any("node_modules" in entry.casefold() for entry in child_entries)
+                    )
+                    captured_git = ci.require_tool(tools, "git", phase="CAPTURE")
+                    lease = ci.ExecutableIdentityLease(captured_git, "hosted-fixture-git")
+                    try:
+                        fixture.shadow("git")
+                        self.assertEqual(
+                            ci.require_tool(tools, "git", phase="EXECUTION"),
+                            captured_git,
+                        )
+                        self.assertEqual(lease.verify(), (True, None))
+                        self.assertNotIn(
+                            str(fixture.runner_temp.resolve(strict=True)).casefold(),
+                            child_entries,
+                        )
+                    finally:
+                        lease.close()
+                finally:
+                    fixture.cleanup()
+
+    def test_python_alias_file_identity_and_command_path_poisoning_matrix(self) -> None:
+        for platform_name in ("Ubuntu", "Windows"):
+            with self.subTest(platform=platform_name):
+                fixture = _HostedToolFixture(platform_name)
+                try:
+                    approved = fixture.paths["python"]
+                    alias_dir = fixture.root / "command-file-alias"
+                    alias_dir.mkdir()
+                    alias_name = "python.exe" if platform_name == "Windows" else "python"
+                    alias = alias_dir / alias_name
+                    try:
+                        alias.symlink_to(approved)
+                    except OSError:
+                        os.link(approved, alias)
+                    source = dict(fixture.source)
+                    source["PATH"] = fixture.policy.path_separator.join(
+                        [str(alias_dir), source["PATH"]]
+                    )
+                    source["GITHUB_PATH"] = str(fixture.root / "github-path-command")
+                    tools, errors = ci.resolve_trusted_tools(
+                        self.REQUIRED,
+                        source_environment=source,
+                        policy=fixture.policy,
+                    )
+                    self.assertEqual(errors, [])
+                    captured = Path(ci.require_tool(tools, "python", phase="CAPTURE"))
+                    self.assertEqual(captured, approved)
+                    self.assertTrue(ci._same_file_identity(alias, approved))
+                    child = ci.child_process_environment(
+                        tools,
+                        source_environment=source,
+                        policy=fixture.policy,
+                    )
+                    self.assertNotIn(str(alias_dir), child["PATH"])
+                    self.assertNotIn("GITHUB_PATH", child)
+                finally:
+                    fixture.cleanup()
+
+    def test_missing_tool_and_partial_map_failures_are_typed_and_keyerror_free(self) -> None:
+        for role in ("git", "bash", "node", "python"):
+            with self.subTest(role=role):
+                with self.assertRaises(ci.ToolAuthorityUnavailable) as raised:
+                    ci.require_tool({}, role, phase="EXECUTION_BINDING")
+                self.assertEqual(
+                    str(raised.exception),
+                    f"CI_TOOL_AUTHORITY_UNAVAILABLE tool={role} phase=EXECUTION_BINDING",
+                )
+                self.assertNotIsInstance(raised.exception, KeyError)
+
+        fixture = _HostedToolFixture("Ubuntu")
+        try:
+            complete, errors = fixture.resolve(self.REQUIRED)
+            self.assertEqual(errors, [])
+            for profile, missing in (
+                ("policy", "git"),
+                ("policy", "node"),
+                ("policy", "python"),
+                ("static", "bash"),
+            ):
+                with self.subTest(profile=profile, missing=missing):
+                    partial = {key: value for key, value in complete.items() if key != missing}
+                    runner = ci.FoundationRunner(
+                        profile,
+                        ci.strict_json_load_file(ci.BASELINE_PATH),
+                        tools=partial,
+                        tool_policy=fixture.policy,
+                        source_environment=fixture.source,
+                    )
+                    try:
+                        self.assertEqual(runner.command_plan, [])
+                        with self.assertRaises(ci.ToolAuthorityUnavailable) as raised:
+                            runner.require_all_tools(phase="EXECUTION_BINDING")
+                        self.assertNotIsInstance(raised.exception, KeyError)
+                    finally:
+                        runner.cleanup_task_resources()
+        finally:
+            fixture.cleanup()
+
+    def test_resolution_errors_and_post_capture_lease_drift_are_sticky(self) -> None:
+        fixture = _HostedToolFixture("Ubuntu")
+        try:
+            tools, errors = fixture.resolve(self.REQUIRED)
+            self.assertEqual(errors, [])
+            with self.assertRaises(ci.ToolAuthorityUnavailable) as raised:
+                ci.require_tool_set(
+                    {"git": ci.require_tool(tools, "git", phase="CAPTURE")},
+                    {"git", "node"},
+                    phase="EXECUTION_BINDING",
+                    resolution_errors=("captured resolver failure",),
+                )
+            self.assertEqual(raised.exception.tool, "node")
+
+            runner = ci.FoundationRunner(
+                "policy",
+                ci.strict_json_load_file(ci.BASELINE_PATH),
+                tool_policy=fixture.policy,
+                source_environment=fixture.source,
+            )
+            try:
+                with mock.patch.object(
+                    runner.tool_leases["git"],
+                    "verify",
+                    return_value=(False, "fixture identity drifted"),
+                ):
+                    with self.assertRaises(ci.ToolAuthorityUnavailable) as drifted:
+                        runner.require_tool("git", phase="EXECUTION")
+                self.assertEqual(drifted.exception.phase, "EXECUTION")
+                self.assertFalse(runner.tool_authority_frozen)
+                with self.assertRaises(ci.ToolAuthorityUnavailable):
+                    runner.require_tool("node", phase="POST_EXECUTION")
+            finally:
+                runner.cleanup_task_resources()
+        finally:
+            fixture.cleanup()
+
+    def test_missing_authority_cli_is_nonzero_path_free_and_has_no_traceback(self) -> None:
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                ci,
+                "resolve_trusted_tools",
+                return_value=({}, ["fixture resolver failure with a private path"]),
+            ),
+            contextlib.redirect_stderr(stderr),
+            contextlib.redirect_stdout(stdout),
+        ):
+            result = ci.main(["--profile", "policy"])
+        self.assertNotEqual(result, 0)
+        diagnostic = stderr.getvalue()
+        self.assertIn("CI_TOOL_AUTHORITY_UNAVAILABLE", diagnostic)
+        self.assertIn("phase=EXECUTION_BINDING", diagnostic)
+        self.assertNotIn("Traceback", diagnostic)
+        self.assertNotIn("KeyError", diagnostic)
+        self.assertNotIn("private path", diagnostic)
+        self.assertFalse(ci.OUTPUT_DIR.exists())
+
+    def test_synthetic_hosted_profiles_initialize_bind_and_preserve_static_count(self) -> None:
+        baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
+        for platform_name, canonical_os in (("Ubuntu", "Linux"), ("Windows", "Windows")):
+            with self.subTest(platform=platform_name):
+                fixture = _HostedToolFixture(platform_name)
+                runner: ci.FoundationRunner | None = None
+                try:
+                    with mock.patch.object(
+                        ci,
+                        "execute_command",
+                        side_effect=AssertionError("synthetic executable must never run"),
+                    ):
+                        runner = ci.FoundationRunner(
+                            "static",
+                            baseline,
+                            tool_policy=fixture.policy,
+                            source_environment=fixture.source,
+                        )
+                        self.assertEqual(runner.tool_resolution_errors, [])
+                        self.assertEqual(set(runner.require_all_tools(phase="CAPTURE")), set(self.REQUIRED))
+                        self.assertEqual(len(runner.command_plan), 677)
+                        with (
+                            mock.patch.object(
+                                ci,
+                                "current_checkout_identity",
+                                return_value=(
+                                    "e50540eb20a7a1bd6906add22a24198e8da70c7f",
+                                    "3b4935101110851675be04f30db340b37b06129f",
+                                ),
+                            ),
+                            mock.patch.object(
+                                ci,
+                                "ci_trust_file_set_authority",
+                                return_value=([], "a" * 64),
+                            ),
+                            mock.patch.object(ci, "_canonical_runner_os", return_value=canonical_os),
+                        ):
+                            binding = ci.build_generation_execution_binding(runner)
+                        self.assertEqual(binding.get("producerProfile"), "static")
+                        self.assertRegex(
+                            str(binding.get("producerInvocationId", "")),
+                            r"^[0-9a-f]{64}$",
+                        )
+                        child_entries = runner.child_environment["PATH"].split(
+                            fixture.policy.path_separator
+                        )
+                        self.assertNotIn(str(fixture.runner_temp), child_entries)
+                        self.assertNotIn(str(fixture.workspace), child_entries)
+                finally:
+                    if runner is not None:
+                        runner.cleanup_task_resources()
+                    fixture.cleanup()
+
+class RunWideOSCoverageAccountingTest(unittest.TestCase):
+    REQUIREMENTS = (
+        {"familyId": "windows-job-object", "requiredLivePlatforms": ["windows"]},
+        {
+            "familyId": "cross-platform-tool-authority",
+            "requiredLivePlatforms": ["ubuntu", "windows"],
+        },
+        {"familyId": "posix-containment-live", "requiredLivePlatforms": ["ubuntu"]},
+    )
+
+    @staticmethod
+    def fact(
+        family: str,
+        platform_name: str,
+        *,
+        passed: int,
+        skipped: int,
+        mode: str = "live",
+    ) -> dict[str, object]:
+        return {
+            "familyId": family,
+            "jobId": f"{platform_name}-{family}-{mode}",
+            "platform": platform_name,
+            "executionMode": mode,
+            "discovered": passed + skipped,
+            "passed": passed,
+            "failed": 0,
+            "skippedByPlatform": skipped,
+        }
+
+    def passing_facts(self) -> list[dict[str, object]]:
+        return [
+            self.fact("windows-job-object", "ubuntu", passed=0, skipped=10),
+            self.fact("windows-job-object", "windows", passed=10, skipped=0),
+            self.fact("cross-platform-tool-authority", "ubuntu", passed=8, skipped=0),
+            self.fact("cross-platform-tool-authority", "windows", passed=8, skipped=0),
+            self.fact("posix-containment-live", "windows", passed=9, skipped=0, mode="model"),
+            self.fact("posix-containment-live", "ubuntu", passed=4, skipped=0),
+        ]
+
+    def test_windows_only_skips_on_ubuntu_are_covered_by_live_windows_passes(self) -> None:
+        records, errors = ci.evaluate_run_wide_os_coverage(
+            self.REQUIREMENTS,
+            self.passing_facts(),
+        )
+        self.assertEqual(errors, [])
+        self.assertTrue(all(record["runWideCovered"] for record in records))
+        windows = next(
+            record
+            for record in records
+            if record["familyId"] == "windows-job-object"
+        )
+        self.assertEqual(windows["requiredLivePlatform"], "windows")
+        self.assertEqual(windows["jobLocalPassed"], 10)
+
+    def test_windows_only_family_skipped_on_every_job_is_blocking(self) -> None:
+        facts = [
+            fact
+            for fact in self.passing_facts()
+            if not (
+                fact["familyId"] == "windows-job-object"
+                and fact["platform"] == "windows"
+            )
+        ]
+        facts.append(self.fact("windows-job-object", "windows", passed=0, skipped=10))
+        _records, errors = ci.evaluate_run_wide_os_coverage(self.REQUIREMENTS, facts)
+        self.assertTrue(
+            any("family=windows-job-object platform=windows" in error for error in errors),
+            errors,
+        )
+
+    def test_required_cross_platform_family_skipped_on_one_platform_is_blocking(self) -> None:
+        facts = [
+            fact
+            for fact in self.passing_facts()
+            if not (
+                fact["familyId"] == "cross-platform-tool-authority"
+                and fact["platform"] == "ubuntu"
+            )
+        ]
+        facts.append(
+            self.fact("cross-platform-tool-authority", "ubuntu", passed=0, skipped=8)
+        )
+        _records, errors = ci.evaluate_run_wide_os_coverage(self.REQUIREMENTS, facts)
+        self.assertTrue(
+            any(
+                "family=cross-platform-tool-authority platform=ubuntu" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_windows_posix_model_is_supporting_not_a_live_ubuntu_substitute(self) -> None:
+        facts = [
+            fact
+            for fact in self.passing_facts()
+            if not (
+                fact["familyId"] == "posix-containment-live"
+                and fact["platform"] == "ubuntu"
+            )
+        ]
+        _records, errors = ci.evaluate_run_wide_os_coverage(self.REQUIREMENTS, facts)
+        self.assertTrue(
+            any("family=posix-containment-live platform=ubuntu" in error for error in errors),
+            errors,
+        )
+
+
 @unittest.skipUnless(os.name == "nt", "Windows Git Bash policy")
 class WindowsGitBashResolutionTest(unittest.TestCase):
     def make_git_install(self, root: Path, *, bin_bash: bool = True, usr_bash: bool = False) -> Path:
@@ -3688,11 +4269,12 @@ class WindowsGitBashResolutionTest(unittest.TestCase):
                 {"git", "bash"}, source_environment=source
             )
         self.assertEqual(errors, [])
-        self.assertEqual(Path(tools["bash"]).resolve(), git_bash.resolve())
+        bash = ci.require_tool(tools, "bash", phase="CAPTURE")
+        self.assertEqual(Path(bash).resolve(), git_bash.resolve())
         self.assertNotIn("bash", calls)
         self.assertNotIn("wsl", calls)
 
-    def test_system32_only_fails_without_wsl_or_bash_lookup(self) -> None:
+    def test_system32_only_uses_captured_local_git_without_wsl_or_path_bash_lookup(self) -> None:
         source = {
             "PATH": r"C:\Windows\System32",
             "SystemRoot": r"C:\Windows",
@@ -3708,9 +4290,16 @@ class WindowsGitBashResolutionTest(unittest.TestCase):
             tools, errors = ci.resolve_trusted_tools(
                 {"git", "bash"}, source_environment=source
             )
-        self.assertNotIn("bash", tools)
-        self.assertTrue(errors)
-        self.assertEqual(calls, ["git"])
+        if "git" in tools:
+            self.assertEqual(errors, [])
+            git = Path(ci.require_tool(tools, "git", phase="CAPTURE"))
+            bash = Path(ci.require_tool(tools, "bash", phase="CAPTURE"))
+            self.assertEqual(git.parents[1], bash.parents[1])
+            self.assertFalse(ci._windows_system_launcher_path(bash, source))
+        else:
+            self.assertNotIn("bash", tools)
+            self.assertTrue(errors)
+        self.assertEqual(calls, [])
 
     def test_git_bash_product_verification_uses_absolute_candidate(self) -> None:
         bash = Path(r"D:\Git\bin\bash.exe")
@@ -3744,6 +4333,11 @@ class WindowsGitBashResolutionTest(unittest.TestCase):
                 "npm": sys.executable,
                 "git": r"D:\Git\cmd\git.exe",
                 "bash": str(bash.resolve()),
+                "powershell": str(
+                    Path(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe").resolve(
+                        strict=True
+                    )
+                ),
             },
             source_environment=os.environ,
         )
@@ -3975,14 +4569,37 @@ class ProcessTreeContainmentTest(unittest.TestCase):
 
     def test_successful_parent_cannot_leave_daemon_child_alive(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ci-tree-success-") as temp_dir:
-            sentinel = Path(temp_dir) / "daemon-survived.txt"
-            child = f"import time,pathlib; time.sleep(1); pathlib.Path({str(sentinel)!r}).write_text('bad')"
-            parent = f"import subprocess,sys; subprocess.Popen([sys.executable,'-c',{child!r}])"
+            root = Path(temp_dir)
+            pid_file = root / "daemon.pid"
+            ready = root / "daemon.ready"
+            sentinel = root / "daemon-survived.txt"
+            child = (
+                "import os,time,pathlib; "
+                f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
+                f"pathlib.Path({str(ready)!r}).write_text('ready'); "
+                "time.sleep(2.5); "
+                f"pathlib.Path({str(sentinel)!r}).write_text('bad')"
+            )
+            parent = (
+                "import subprocess,sys,time,pathlib; "
+                f"subprocess.Popen([sys.executable,'-c',{child!r}]); "
+                f"p=pathlib.Path({str(ready)!r}); d=time.monotonic()+2; "
+                "\nwhile not p.exists() and time.monotonic()<d: time.sleep(.01)\n"
+                "\nif not p.exists(): raise SystemExit(4)\n"
+            )
             capture = self.execute_python(parent)
-            time.sleep(1.3)
+            self.assertTrue(ready.is_file())
+            daemon_pid = int(pid_file.read_text(encoding="utf-8"))
             self.assertEqual(capture.exit_code, 0)
             self.assertTrue(capture.execution_passed())
-            self.assertGreaterEqual(capture.descendants_terminated, 1)
+            self.assertGreaterEqual(capture.descendants_observed, 1)
+            self.assertEqual(capture.descendants_surviving, 0)
+            self.assertIn(
+                capture.containment_disposition,
+                {"natural-exit-reaped", "forced-terminated"},
+            )
+            self.assertFalse(_process_is_alive(daemon_pid))
+            time.sleep(2.8)
             self.assertFalse(sentinel.exists())
 
     def test_timeout_escalation_kills_child_that_ignores_sigterm(self) -> None:
@@ -5170,7 +5787,7 @@ class CI5TargetExecutionLeaseTest(unittest.TestCase):
         tools, errors = ci.resolve_trusted_tools({"python", "node"})
         if errors or "node" not in tools:
             raise AssertionError(f"trusted Node is required for CI5 target tests: {errors}")
-        cls.node = tools["node"]
+        cls.node = ci.require_tool(tools, "node", phase="CAPTURE")
         cls.environment = ci.child_process_environment(
             {"python": tools.get("python", sys.executable), "node": cls.node}
         )
@@ -6045,6 +6662,7 @@ class CI6ProtectedPolicyInputTest(unittest.TestCase):
         tools = {
             "python": sys.executable,
             "node": sys.executable,
+            "npm": sys.executable,
             "git": sys.executable,
             "bash": sys.executable,
             "powershell": sys.executable,
@@ -6619,7 +7237,7 @@ class CI7ExternalAuthorityBindingTest(unittest.TestCase):
         runner = ci.FoundationRunner("policy", ci.strict_json_load_file(ci.BASELINE_PATH))
         try:
             records, digest = ci.ci_trust_file_set_authority(
-                git=runner.tools["git"],
+                git=runner.require_tool("git", phase="EXECUTION_BINDING"),
                 environment=runner.child_environment,
             )
         finally:
@@ -7012,7 +7630,27 @@ class CI8FreshVerifierTrustDomainTest(unittest.TestCase):
             self.assertNotIn(str(attacker), child["PATH"])
             self.assertNotIn("GITHUB_PATH", child)
             self.assertEqual(Path(child["TEMP"]), verifier_temp.resolve(strict=True))
-            self.assertEqual(Path(sys.executable).resolve(strict=True), Path(child["PATH"].split(os.pathsep)[0]) / Path(sys.executable).name)
+            approved_python = ci.require_tool(
+                {"python": sys.executable},
+                "python",
+                phase="VERIFICATION_PREPARATION",
+            )
+            terminal_verifier_argv = [
+                approved_python,
+                "-B",
+                str(Path(ci.__file__).resolve(strict=True)),
+                "--verify-evidence",
+            ]
+            self.assertTrue(Path(terminal_verifier_argv[0]).is_absolute())
+            self.assertTrue(
+                ci._same_file_identity(
+                    Path(terminal_verifier_argv[0]), Path(sys.executable)
+                )
+            )
+            self.assertIn(
+                str(Path(approved_python).parent.resolve(strict=True)),
+                child["PATH"].split(os.pathsep),
+            )
             self.assertFalse(sentinel.exists())
 
     def test_artifact_source_and_job_substitution_matrix(self) -> None:
@@ -7147,6 +7785,40 @@ class CI8PosixContainmentStateMachineTest(unittest.TestCase):
         self.assertTrue(any("escaped supervisor ancestry" in error for error in state.failures))
         self.assertEqual([item.key() for item in state.active_identities()], [child.key()])
 
+    def test_truth_outcome_distinguishes_natural_exit_and_reap(self) -> None:
+        state = ci.PosixContainmentStateMachine(10)
+        child = self.identity(20, 10)
+        state.observe({20: child})
+        state.mark_reaped(20)
+        outcome = state.outcome()
+        self.assertTrue(outcome["cleanupComplete"])
+        self.assertEqual(outcome["descendantsObserved"], 1)
+        self.assertEqual(outcome["descendantsReaped"], 1)
+        self.assertEqual(outcome["descendantsSurviving"], 0)
+        self.assertEqual(outcome["containmentDisposition"], "natural-exit-reaped")
+
+    def test_truth_outcome_distinguishes_forced_termination(self) -> None:
+        state = ci.PosixContainmentStateMachine(10)
+        child = self.identity(20, 10)
+        state.observe({20: child})
+        state.mark_reaped(20)
+        outcome = state.outcome(cleanup_signal_sent=True, forced_terminated=1)
+        self.assertTrue(outcome["cleanupComplete"])
+        self.assertEqual(outcome["descendantsSurviving"], 0)
+        self.assertEqual(outcome["containmentDisposition"], "forced-terminated")
+
+    def test_truth_outcome_rejects_survivor_and_unknown_ancestry(self) -> None:
+        state = ci.PosixContainmentStateMachine(10)
+        state.observe({20: self.identity(20, 10)})
+        survivor = state.outcome()
+        self.assertFalse(survivor["cleanupComplete"])
+        self.assertEqual(survivor["descendantsSurviving"], 1)
+        self.assertEqual(survivor["containmentDisposition"], "survivor")
+        state.fail("unprovable descendant ancestry")
+        unknown = state.outcome()
+        self.assertFalse(unknown["cleanupComplete"])
+        self.assertEqual(unknown["containmentDisposition"], "unknown-ancestry")
+
 
 class _CI8FixtureLease:
     def __init__(self, path: Path) -> None:
@@ -7246,33 +7918,95 @@ class CI8RuntimeDependencyClosureTest(unittest.TestCase):
     def test_unplanned_node_path_and_workspace_runtime_shadowing_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ci8-node-path-") as temp_dir:
             root = Path(temp_dir)
+            approved_tools, setup_errors = ci.resolve_trusted_tools(
+                {"node"},
+                source_environment=os.environ,
+            )
+            self.assertEqual(setup_errors, [], f"positive Node capture failed: {setup_errors}")
+            approved_node = ci.require_tool(
+                approved_tools,
+                "node",
+                phase="RUNTIME_CLOSURE",
+            )
             with self.assertRaisesRegex(ValueError, "NODE_PATH"):
                 ci.RuntimeDependencyClosure.build(
                     "policy",
-                    {},
+                    {"node": approved_node},
                     {},
                     repo_root=root,
                     source_environment={"NODE_PATH": str(root / "shadow")},
                 )
-            fake_node = root / ("node.exe" if os.name == "nt" else "node")
+            with self.assertRaisesRegex(ValueError, "NODE_OPTIONS"):
+                ci.RuntimeDependencyClosure.build(
+                    "policy",
+                    {"node": approved_node},
+                    {},
+                    repo_root=root,
+                    source_environment={"NODE_OPTIONS": "--require=./untrusted-loader.js"},
+                )
+            workspace = root / "workspace"
+            workspace.mkdir()
+            fake_node = workspace / ("node.exe" if os.name == "nt" else "node")
             fake_node.write_bytes(b"fake-node")
+            shadow_source = dict(os.environ)
+            shadow_source["PATH"] = os.pathsep.join(
+                [str(workspace), str(Path(approved_node).parent)]
+            )
+            shadow_source["GITHUB_WORKSPACE"] = str(workspace)
             tools, errors = ci.resolve_trusted_tools(
                 {"node"},
-                source_environment={"PATH": str(root)},
-                repo_root=root,
+                source_environment=shadow_source,
+                repo_root=workspace,
             )
-            self.assertIn("node", tools)
-            self.assertNotEqual(Path(tools["node"]), fake_node)
-            self.assertFalse(ci._path_is_within(Path(tools["node"]), root))
-            fake_npm = root / ("npm.cmd" if os.name == "nt" else "npm")
+            self.assertNotIn("node", tools)
+            self.assertTrue(any("shadow" in error for error in errors), errors)
+            fake_npm = workspace / ("npm.cmd" if os.name == "nt" else "npm")
             fake_npm.write_bytes(b"fake-npm")
             npm_tools, npm_errors = ci.resolve_trusted_tools(
                 {"npm"},
-                source_environment={"PATH": str(root)},
-                repo_root=root,
+                source_environment=shadow_source,
+                repo_root=workspace,
             )
             self.assertNotIn("npm", npm_tools)
             self.assertTrue(npm_errors)
+
+    def test_runtime_node_shadow_matrix_rejects_workspace_temp_and_node_modules_bin(self) -> None:
+        approved_tools, setup_errors = ci.resolve_trusted_tools(
+            {"node"}, source_environment=os.environ
+        )
+        self.assertEqual(setup_errors, [], f"positive Node capture failed: {setup_errors}")
+        approved_node = ci.require_tool(
+            approved_tools, "node", phase="RUNTIME_CLOSURE"
+        )
+        with tempfile.TemporaryDirectory(prefix="ci8-node-shadow-matrix-") as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            runner_temp = root / "runner-temp"
+            module_bin = workspace / "developer" / "node_modules" / ".bin"
+            for directory in (workspace, runner_temp, module_bin):
+                directory.mkdir(parents=True, exist_ok=True)
+            for label, directory in (
+                ("workspace", workspace),
+                ("runner-temp", runner_temp),
+                ("node-modules-bin", module_bin),
+            ):
+                with self.subTest(label=label):
+                    fake = directory / ("node.exe" if os.name == "nt" else "node")
+                    fake.write_bytes(b"untrusted-node-shadow")
+                    source = dict(os.environ)
+                    source["PATH"] = os.pathsep.join(
+                        [str(directory), str(Path(approved_node).parent)]
+                    )
+                    source["GITHUB_WORKSPACE"] = str(workspace)
+                    source["RUNNER_TEMP"] = str(runner_temp)
+                    tools, errors = ci.resolve_trusted_tools(
+                        {"node"},
+                        source_environment=source,
+                        repo_root=workspace,
+                    )
+                    self.assertNotIn("node", tools)
+                    self.assertTrue(any("shadow" in error for error in errors), errors)
+                    fake.unlink()
 
     def test_vitest_change_and_restore_is_sticky(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ci8-closure-restore-") as temp_dir:

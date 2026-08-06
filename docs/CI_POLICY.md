@@ -373,32 +373,66 @@ digest and every producer record's source-output digest.
 
 ### Trusted tools and environment
 
-Required executables are resolved once from a sanitized system/tool-cache
-`PATH`. Caller overrides for Node, npm, Python, Git, Bash, and PowerShell are
-rejected. Resolved files must be absolute regular files outside the workspace,
-`node_modules`, and task temporary directories, with no symlink or reparse-point
-indirection. A workspace-controlled path preceding a trusted tool is rejected.
-Static and standalone profiles additionally resolve trusted Bash and
-PowerShell/pwsh paths. On Windows, Bash is never discovered through `PATH` or
-`shutil.which`. Its only candidates are `<TrustedGitRoot>\bin\bash.exe` and
-`<TrustedGitRoot>\usr\bin\bash.exe`, in that order, derived from the already
-trusted Git for Windows executable. System32, Sysnative, `wsl.exe`, workspace,
-`node_modules`, temporary, reparse, and mismatched Git-root candidates fail
-closed. The selected absolute executable must pass a contained `--version`
-probe identifying GNU Bash; no Linux or WSL fallback is attempted. On Windows,
-the selected Bash is opened with `CreateFileW` using read access, read sharing
-only, `OPEN_EXISTING`, and `FILE_FLAG_OPEN_REPARSE_POINT`. The guard handle
-remains open from final identity resolution through product verification and
-all authorized launches. Its canonical path, trusted Git root, byte length,
-SHA-256, volume serial, file index, creation/write identity, and reparse status
-must remain exact before and after every launch. Write sharing and delete
-sharing are absent, so overwrite, rename, delete/recreate, and hard-link writes
-cannot replace the executable during the lease. Canonical execution also makes
-a later junction redirection irrelevant.
+Required executables pass five ordered boundaries: discovery, role-specific
+validation, identity capture, absolute-path execution, and post-execution
+revalidation. The runner resolves and verifies the complete tool set for the
+selected profile before it constructs the immutable command plan or any
+authorization binding. A missing or partial map fails with the stable,
+path-free typed diagnostic
+`CI_TOOL_AUTHORITY_UNAVAILABLE tool=<role> phase=<phase>`, a nonzero result, no
+Python traceback, no `KeyError`, no partial binding, and no pass-shaped
+evidence. Policy requires Python, Node, and Git; static and standalone also
+require Bash and PowerShell/pwsh because the unchanged standalone packaging
+producer invokes both shells; dependency-using profiles explicitly require the
+npm entrypoint.
+
+Authority is role-specific rather than a general PATH allowlist. Python is the
+canonical `sys.executable` file identity or that same verified setup-python
+toolcache identity. `python`, `python3`, `python3.12`, and `python.exe` are
+aliases only when `samefile`/stable identity proves that they resolve to that
+approved file; basename equality grants nothing. Node comes only from a
+verified setup-node toolcache or the approved local runtime. Git comes from an
+explicit POSIX system installation, Program Files Git, or the approved local
+Git installation; a setup toolcache, workspace, runner temporary directory, or
+user-writable shim cannot authorize Git. POSIX Bash comes from an explicit
+system installation. PowerShell/pwsh comes only from the inspected Windows
+system/Program Files installation or the explicit POSIX system/Microsoft
+installation root. On Windows, Bash is never selected by `PATH`,
+`shutil.which`, WSL, System32, or Sysnative: it is derived as
+`<TrustedGitRoot>\bin\bash.exe` or
+`<TrustedGitRoot>\usr\bin\bash.exe` from the already captured Git executable.
+
+PATH order and executable shadowing are distinct facts. The resolver inspects
+each absolute, non-link directory and enumerates the platform aliases for the
+role being resolved. An earlier workspace, runner-temp, `node_modules/.bin`, or
+other untrusted directory is harmless when it contains no relevant alias. If
+it contains a different executable, script, shim, or alias that could shadow
+the role, resolution fails closed. An uninspectable directory, invalid entry
+type, or ambiguous identity also fails closed. Empty, current-directory,
+relative, and duplicate entries are removed and never inherited. An alias in
+an earlier directory may match only when file identity proves it is the same
+approved executable; capture still records and executes the canonical approved
+path, never the alias.
+
+Each captured tool record contains its canonical absolute path, stable file
+identity, byte length, SHA-256, version output, and trusted-root
+classification. A held descriptor or handle revalidates the identity before
+command construction, immediately before launch, after execution, and at final
+cleanup. Replacement, rename/delete/recreate, mutation-and-restore, parent
+redirection, or reparse substitution becomes a sticky hard failure and never
+causes PATH re-resolution. npm is an entrypoint, not a PATH executable: it is
+invoked only as `<CAPTURED_NODE> <CAPTURED_NPM_ENTRY> ...`. On Windows, the
+selected Bash additionally uses a `CreateFileW` read-only, read-sharing-only,
+no-delete-sharing identity lease rooted in the same trusted Git installation.
 
 Children receive an allowlisted environment containing only required runtime,
-platform, locale, temporary-directory, and CI values. `PATH` is rebuilt from
-the resolved executable directories. Trusted shell bindings and one computed
+platform, locale, temporary-directory, and CI values. `PATH` is rebuilt solely
+from directories containing captured approved executables plus the minimum
+inspected system directories. It never contains the checkout, workspace,
+runner temp, task fixture root, current directory, empty or relative entries,
+`node_modules/.bin`, or an unapproved user-local directory, even when such a
+parent PATH entry was empty during discovery. Consequently, a shadow created
+after capture cannot redirect execution. Trusted shell bindings and one computed
 Git `safe.directory` entry for the exact repository are added; inherited
 versions of those controls are discarded. Credential-shaped variables,
 GitHub tokens, authorization values, proxy variables, Node injection options,
@@ -427,7 +461,17 @@ The runner never contacts the network or invokes Docker, SSH, GPG, WSL,
 publication, deployment, or production operations.
 
 Every child command runs inside an independently terminable process-tree
-boundary. Linux no longer treats a process group or session as descendant
+boundary. Its security invariant is: after command completion and bounded
+cleanup, no tracked or attributable descendant remains alive. A forced-kill
+counter is diagnostic only; `descendantsTerminated == 0` can be safe when a
+child exited naturally, closed with the session, or was already reaped. Each
+command therefore records descendants observed, explicitly reaped, forced
+termination count, descendants surviving, and a disposition of
+`no-descendants`, `natural-exit-reaped`, `forced-terminated`, `survivor`, or
+`unknown-ancestry`. `contained-clean` requires zero survivors, complete
+cleanup, and neither survivor nor unknown-ancestry disposition.
+
+Linux no longer treats a process group or session as descendant
 authority. The main verifier and a dedicated per-command supervisor both set
 `PR_SET_CHILD_SUBREAPER`; a start gate holds the repository command before
 `execve`. The supervisor continuously rebuilds `/proc` ancestry, records PID,
@@ -453,8 +497,13 @@ covering setsid escape, double fork, sleeping grandchildren, sentinel writers,
 parent-first exit, ignored SIGTERM, rapid fork/exit, ordinary daemons, timeout,
 and stdout/stderr limits. It requires no survivors or sentinels and an active
 containment count of zero before any artifact can be accepted. Windows unit
-tests exercise the pure state machine without a skipped security test; they do
-not claim Linux-kernel execution. Local Windows status is
+tests exercise the pure state machine and distinguish natural exit/reap,
+forced termination, survivor, and unknown ancestry without requiring a
+positive termination counter. A daemon fixture publishes its PID and ready
+marker, schedules a delayed sentinel, and passes only when cleanup is complete,
+the attributable PID is no longer alive, and the sentinel remains absent after
+a bounded settle period. These model and Windows results do not claim
+Linux-kernel execution. Local Windows status is
 `REMOTE-LIVE-VALIDATION-PENDING`.
 
 For required commands, output is eligible for semantic parsing only after the
@@ -622,6 +671,9 @@ stable executable identities; the two lockfiles; the ordered complete manifests
 of required dependency roots; member type, mode, size, hash, and authorized
 relative symlink target; resolved Vitest entrypoint and package version; exact
 empty `NODE_PATH`; member count; dependency digest; and closure digest.
+Inherited `NODE_PATH` or `NODE_OPTIONS` is rejected before tool access, so a
+workspace loader, preload, or unplanned dependency root cannot extend the
+closure.
 The full producer closure claim is stored in `command-results.json`, but it is untrusted
 and never becomes verifier runtime authority. The in-memory verifier transcript
 records its independently measured fresh closure.
@@ -644,6 +696,25 @@ dependency roots and makes no fresh-install claim. It cannot be used by a
 GitHub verifier or a dependency-using profile. Remote fresh npm installation
 and Linux-kernel containment therefore remain accurately labelled
 `REMOTE-LIVE-VALIDATION-PENDING` until the approved GitHub run occurs.
+
+### Job-local skips and run-wide OS coverage
+
+Test reporting distinguishes four facts: job-local discovered tests,
+job-local passes, job-local skips caused by platform applicability, and the
+required live run-wide coverage for each security family. A Windows Job Object
+or Git Bash implementation test may truthfully be discovered and skipped on an
+Ubuntu job when the required Windows job discovers and passes that family.
+Likewise, a Windows execution of a pure POSIX model is supporting evidence, not
+a substitute for the required live Ubuntu containment gate. The policy does
+not claim that every individual job has zero skips.
+
+The run-wide model fails closed when a Windows-only family is skipped on every
+job, when any required cross-platform family has no live pass on one required
+OS, when a required live family has only model execution, or when job-local
+discovered/pass/fail/skipped totals are inconsistent. Platform skips are thus
+neither mislabeled as implementation failures nor allowed to erase mandatory
+coverage. This accounting changes no workflow job, verifier, artifact, or
+final-result authority.
 
 ## Evidence filesystem and artifact boundary
 
