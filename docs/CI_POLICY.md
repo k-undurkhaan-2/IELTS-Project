@@ -397,22 +397,41 @@ Git installation; a setup toolcache, workspace, runner temporary directory, or
 user-writable shim cannot authorize Git. POSIX Bash comes from an explicit
 system installation. PowerShell/pwsh comes only from the inspected Windows
 system/Program Files installation or the explicit POSIX system/Microsoft
-installation root. On Windows, Bash is never selected by `PATH`,
-`shutil.which`, WSL, System32, or Sysnative: it is derived as
-`<TrustedGitRoot>\bin\bash.exe` or
-`<TrustedGitRoot>\usr\bin\bash.exe` from the already captured Git executable.
+installation root. On Windows, an already approved Git for Windows executable
+derives exactly one installation root by complete path components. The
+supported executable suffixes are `bin\git.exe` and `cmd\git.exe`; both remove
+their complete suffix and therefore identify the same installation root.
+Relative, UNC, device, extended-device, reparse-escaped, unknown, and internal
+`mingw*\bin\git.exe` spellings fail closed. Internal layouts are not added on
+the strength of a filename or a hosted-image patch version; each needs separate
+layout evidence and regression authority.
+
+Windows Bash is never selected by `PATH`, `PATHEXT`, `shutil.which`, WSL,
+System32, Sysnative, WindowsApps, the workspace, runner temporary storage,
+`node_modules`, or another Git installation. It is enumerated only from the
+derived Git root, in the fixed priority
+`<TrustedGitRoot>\bin\bash.exe` then
+`<TrustedGitRoot>\usr\bin\bash.exe`. The chosen path must be the exact fixed
+candidate under the same component-equal root, not a near-prefix root or an
+arbitrary descendant. A missing or invalid candidate retains the stable typed
+tool-authority failure and cannot yield a partial authorization binding or a
+pass-shaped artifact.
 
 PATH order and executable shadowing are distinct facts. The resolver inspects
 each absolute, non-link directory and enumerates the platform aliases for the
 role being resolved. An earlier workspace, runner-temp, `node_modules/.bin`, or
 other untrusted directory is harmless when it contains no relevant alias. If
 it contains a different executable, script, shim, or alias that could shadow
-the role, resolution fails closed. An uninspectable directory, invalid entry
-type, or ambiguous identity also fails closed. Empty, current-directory,
-relative, and duplicate entries are removed and never inherited. An alias in
-an earlier directory may match only when file identity proves it is the same
-approved executable; capture still records and executes the canonical approved
-path, never the alias.
+an ordinarily PATH-resolved role, resolution fails closed. An uninspectable
+directory, invalid entry type, or ambiguous identity also fails closed. Empty,
+current-directory, relative, and duplicate entries are removed and never
+inherited. An alias in an earlier directory may match only when file identity
+proves it is the same approved executable; capture still records and executes
+the canonical approved path, never the alias. Windows Git Bash is the narrow
+exception to shadow authority because it is not PATH-resolved: a parent-PATH
+Bash alias is detected for audit, but it cannot replace or veto the fixed
+same-installation absolute candidate and is absent from the rebuilt child
+PATH. The alias itself receives no authority and is never executed.
 
 Each captured tool record contains its canonical absolute path, stable file
 identity, byte length, SHA-256, version output, and trusted-root
@@ -424,6 +443,17 @@ causes PATH re-resolution. npm is an entrypoint, not a PATH executable: it is
 invoked only as `<CAPTURED_NODE> <CAPTURED_NPM_ENTRY> ...`. On Windows, the
 selected Bash additionally uses a `CreateFileW` read-only, read-sharing-only,
 no-delete-sharing identity lease rooted in the same trusted Git installation.
+The Bash candidate must be a non-reparse, single-name regular `.exe` with a
+non-reparse parent chain. Its stable file identity, complete byte length, and
+SHA-256 are captured; version inspection invokes that captured absolute path;
+and the held identity is checked before and after every authorized execution.
+Identity, same-size, hardlink, or change-and-restore drift fails closed before
+an unverified replacement can run.
+
+A new real hosted Windows producer and independent verifier run remains
+required before merge eligibility. Local synthetic layout evidence validates
+the authority algorithm but does not make a hosted image name, image patch
+number, or local installation a substitute for that remote gate.
 
 Children receive an allowlisted environment containing only required runtime,
 platform, locale, temporary-directory, and CI values. `PATH` is rebuilt solely

@@ -9,6 +9,7 @@ import ast
 import hashlib
 import io
 import inspect
+import itertools
 import json
 import math
 import os
@@ -3805,7 +3806,25 @@ class HostedRunnerToolResolutionTest(unittest.TestCase):
                     fixture = _HostedToolFixture(platform_name)
                     try:
                         fixture.shadow(role)
-                        tools, errors = fixture.resolve(self.REQUIRED)
+                        diagnostics: list[dict[str, object]] = []
+                        tools, errors = ci.resolve_trusted_tools(
+                            self.REQUIRED,
+                            source_environment=fixture.source,
+                            policy=fixture.policy,
+                            diagnostics=diagnostics,
+                        )
+                        if platform_name == "Windows" and role == "bash":
+                            self.assertEqual(errors, [])
+                            self.assertEqual(Path(tools["bash"]), fixture.paths["bash"])
+                            self.assertTrue(
+                                any(
+                                    item.get("reasonCode")
+                                    == ci.BASH_PARENT_PATH_SHADOW_INERT
+                                    for item in diagnostics
+                                ),
+                                diagnostics,
+                            )
+                            continue
                         self.assertNotIn(role, tools)
                         self.assertTrue(
                             any(f"required {role}" in error for error in errors),
@@ -4406,48 +4425,26 @@ class WindowsGitBashResolutionTest(unittest.TestCase):
                     with self.assertRaises(OSError):
                         hardlink.write_bytes(replacement_bytes)
 
-                sentinel = Path(temp_dir) / "original-executed.txt"
-                sleeper = Path(temp_dir) / "lease-sleeper.py"
-                sleeper.write_text(
-                    "import pathlib,time\n"
-                    "time.sleep(1)\n"
-                    f"pathlib.Path({str(sentinel)!r}).write_text('original', encoding='utf-8')\n",
-                    encoding="utf-8",
+                sentinel = Path(temp_dir) / "hardlink-executed.txt"
+                command = (
+                    f"{Path(sys.executable).resolve()} -B -c \"from pathlib import Path; "
+                    f"Path({str(sentinel)!r}).write_text('bad')\""
                 )
-                command = f"{Path(sys.executable).resolve()} -B {sleeper}"
-                captures: list[ci.CommandCapture] = []
-                worker = threading.Thread(
-                    target=lambda: captures.append(
-                        ci.execute_command(
-                            "lease-real-execution",
-                            "unit",
-                            [lease.path, "/d", "/c", command],
-                            timeout=10,
-                            executable_lease=lease,
-                        )
-                    )
+                self.assertEqual(
+                    lease.verify(),
+                    (False, "trusted Git Bash stable file identity drifted"),
                 )
-                worker.start()
-                time.sleep(0.2)
-                # Replacement during a contained execution remains denied.
-                with self.assertRaises(OSError):
-                    bash.write_bytes(replacement_bytes)
-                worker.join(timeout=15)
-                self.assertFalse(worker.is_alive())
-                self.assertEqual(len(captures), 1)
-                self.assertTrue(
-                    captures[0].execution_passed(),
-                    (
-                        captures[0].exit_code,
-                        captures[0].error,
-                        captures[0].stdout,
-                        captures[0].stderr,
-                        captures[0].process_tree_status,
-                    ),
+                capture = ci.execute_command(
+                    "hardlink-alias-preexecution",
+                    "unit",
+                    [lease.path, "/d", "/c", command],
+                    timeout=10,
+                    executable_lease=lease,
                 )
-                self.assertEqual(sentinel.read_text(encoding="utf-8").strip(), "original")
+                self.assertFalse(capture.executed)
+                self.assertEqual(capture.process_tree_status, "setup-failed")
+                self.assertFalse(sentinel.exists())
                 self.assertEqual(ci._sha256_file(bash), original_hash)
-                self.assertEqual(lease.verify(), (True, None))
             finally:
                 lease.close()
 
@@ -4483,28 +4480,567 @@ class WindowsGitBashResolutionTest(unittest.TestCase):
                 self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
             create_junction(target)
-            lease = ci.TrustedBashLease(
-                str(alias / "bin" / "bash.exe"),
-                str(alias / "cmd" / "git.exe"),
-            )
-            try:
-                self.assertEqual(Path(lease.path), target_bash.resolve())
-                os.rmdir(alias)
-                create_junction(alternate)
-                self.assertEqual((alias / "bin" / "bash.exe").resolve(), alternate_bash.resolve())
-                self.assertEqual(lease.verify(), (True, None))
-                capture = ci.execute_command(
-                    "junction-substitution",
-                    "unit",
-                    [lease.path, "/d", "/c", "echo GNU bash version 5.2.37"],
-                    timeout=10,
-                    executable_lease=lease,
+            with self.assertRaisesRegex(OSError, "reparse"):
+                ci.TrustedBashLease(
+                    str(alias / "bin" / "bash.exe"),
+                    str(alias / "cmd" / "git.exe"),
                 )
-                self.assertTrue(capture.execution_passed(), capture.error)
-                self.assertEqual(Path(capture.argv[0]), target_bash.resolve())
-                self.assertNotEqual(Path(capture.argv[0]), alternate_bash.resolve())
-            finally:
-                lease.close()
+            os.rmdir(alias)
+            create_junction(alternate)
+            self.assertEqual((alias / "bin" / "bash.exe").resolve(), alternate_bash.resolve())
+            with self.assertRaisesRegex(OSError, "reparse"):
+                ci.TrustedBashLease(
+                    str(alias / "bin" / "bash.exe"),
+                    str(alias / "cmd" / "git.exe"),
+                )
+            os.rmdir(alias)
+
+
+@unittest.skipUnless(os.name == "nt", "Windows Git installation authority")
+class WindowsGitInstallationAuthorityRegressionTest(unittest.TestCase):
+    REQUIRED = frozenset({"python", "node", "git", "bash", "powershell"})
+
+    def hosted_layout(
+        self,
+        *,
+        git_directory: str,
+        bash_position: str,
+        both_bash_candidates: bool = False,
+    ) -> tuple[_HostedToolFixture, Path]:
+        fixture = _HostedToolFixture("Windows")
+        git_root = fixture.root / "Program Files" / "Git"
+        git_target = git_root / git_directory / "git.exe"
+        git_target.parent.mkdir(parents=True, exist_ok=True)
+        if fixture.paths["git"] != git_target.resolve():
+            os.replace(fixture.paths["git"], git_target)
+        fixture.paths["git"] = git_target.resolve(strict=True)
+
+        bash_target = git_root.joinpath(*bash_position.split("/"))
+        bash_target.parent.mkdir(parents=True, exist_ok=True)
+        if fixture.paths["bash"] != bash_target.resolve():
+            os.replace(fixture.paths["bash"], bash_target)
+        fixture.paths["bash"] = bash_target.resolve(strict=True)
+        if both_bash_candidates:
+            for suffix in ci.WINDOWS_GIT_BASH_CANDIDATE_SUFFIXES:
+                candidate = git_root.joinpath(*suffix)
+                if not candidate.exists():
+                    fixture._write(candidate, b"synthetic-bash-secondary")
+        return fixture, git_root
+
+    def assert_layout_binds(self, git_directory: str, bash_position: str) -> None:
+        fixture, git_root = self.hosted_layout(
+            git_directory=git_directory,
+            bash_position=bash_position,
+        )
+        try:
+            diagnostics: list[dict[str, object]] = []
+            tools, errors = ci.resolve_trusted_tools(
+                self.REQUIRED,
+                source_environment=fixture.source,
+                policy=fixture.policy,
+                diagnostics=diagnostics,
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(Path(tools["git"]), fixture.paths["git"])
+            self.assertEqual(Path(tools["bash"]), fixture.paths["bash"])
+            root, root_error = ci._trusted_git_installation_root(fixture.paths["git"])
+            self.assertIsNone(root_error)
+            self.assertTrue(os.path.samefile(root, git_root))
+            self.assertEqual(
+                ci._trusted_git_bash_candidate_position(
+                    Path(tools["bash"]),
+                    root,
+                    windows=True,
+                ),
+                bash_position.replace("/", "\\"),
+            )
+            self.assertTrue(
+                any(item.get("disposition") == "accepted" for item in diagnostics),
+                diagnostics,
+            )
+        finally:
+            fixture.cleanup()
+
+    def test_bin_git_bin_bash_hosted_layout_binds(self) -> None:
+        self.assert_layout_binds("bin", "bin/bash.exe")
+
+    def test_bin_git_usr_bin_bash_hosted_layout_binds(self) -> None:
+        self.assert_layout_binds("bin", "usr/bin/bash.exe")
+
+    def test_cmd_git_bin_bash_hosted_layout_binds(self) -> None:
+        self.assert_layout_binds("cmd", "bin/bash.exe")
+
+    def test_cmd_git_usr_bin_bash_hosted_layout_binds(self) -> None:
+        self.assert_layout_binds("cmd", "usr/bin/bash.exe")
+
+    def test_fixed_candidate_priority_is_path_and_pathex_independent(self) -> None:
+        fixture, git_root = self.hosted_layout(
+            git_directory="bin",
+            bash_position="bin/bash.exe",
+            both_bash_candidates=True,
+        )
+        try:
+            windows_apps = fixture.root / "Users" / "runneradmin" / "AppData" / "Local" / "Microsoft" / "WindowsApps"
+            fixture._write(windows_apps / "bash.exe", b"windows-app-alias")
+            fixture.source["PATH"] = fixture.policy.path_separator.join(
+                (
+                    str(git_root / "usr" / "bin"),
+                    str(windows_apps),
+                    fixture.source["PATH"],
+                )
+            )
+            fixture.source["PATHEXT"] = ".CMD;.UNSAFE;.EXE"
+            diagnostics: list[dict[str, object]] = []
+            tools, errors = ci.resolve_trusted_tools(
+                self.REQUIRED,
+                source_environment=fixture.source,
+                policy=fixture.policy,
+                diagnostics=diagnostics,
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(Path(tools["bash"]), (git_root / "bin" / "bash.exe").resolve())
+            self.assertTrue(
+                any(
+                    item.get("reasonCode") == ci.BASH_PARENT_PATH_SHADOW_INERT
+                    for item in diagnostics
+                ),
+                diagnostics,
+            )
+            self.assertFalse(any(str(fixture.root) in json.dumps(item) for item in diagnostics))
+        finally:
+            fixture.cleanup()
+
+    def test_git_suffix_namespace_case_and_space_matrix(self) -> None:
+        fixture, git_root = self.hosted_layout(
+            git_directory="bin",
+            bash_position="bin/bash.exe",
+        )
+        try:
+            mixed_case_git = Path(str(fixture.paths["git"]).swapcase())
+            root, error = ci._trusted_git_installation_root(mixed_case_git)
+            self.assertIsNone(error)
+            self.assertTrue(os.path.samefile(root, git_root))
+
+            unsupported = (
+                git_root / "portable" / "git.exe",
+                git_root / "mingw64" / "bin" / "git.exe",
+                git_root / "bin" / "git.cmd",
+            )
+            for candidate in unsupported:
+                with self.subTest(candidate=candidate.relative_to(git_root)):
+                    fixture._write(candidate, b"unsupported-git")
+                    derived, reason = ci._trusted_git_installation_root(candidate)
+                    self.assertIsNone(derived)
+                    self.assertIn(ci.GIT_INSTALL_ROOT_UNRECOGNIZED, reason or "")
+
+            forbidden_references = (
+                Path("Program Files/Git/bin/git.exe"),
+                Path(r"\\server\share\Git\bin\git.exe"),
+                Path(r"\\?\D:\Git\bin\git.exe"),
+                Path(r"\\.\D:\Git\bin\git.exe"),
+                Path(r"\??\D:\Git\bin\git.exe"),
+            )
+            for candidate in forbidden_references:
+                with self.subTest(reference=str(candidate)):
+                    derived, reason = ci._trusted_git_installation_root(candidate)
+                    self.assertIsNone(derived)
+                    self.assertIn(ci.GIT_INSTALL_ROOT_UNRECOGNIZED, reason or "")
+        finally:
+            fixture.cleanup()
+
+    def test_other_installation_system_workspace_temp_and_node_modules_bash_fail_closed(self) -> None:
+        fixture, git_root = self.hosted_layout(
+            git_directory="bin",
+            bash_position="bin/bash.exe",
+        )
+        try:
+            fixture.paths["bash"].unlink()
+            fake_directories = (
+                fixture.root / "Program Files" / "Git-Other" / "bin",
+                fixture.root / "Windows" / "System32",
+                fixture.workspace,
+                fixture.runner_temp,
+                fixture.root / "node_modules" / ".bin",
+            )
+            for directory in fake_directories:
+                fixture._write(directory / "bash.exe", b"unapproved-bash")
+            fixture.source["PATH"] = fixture.policy.path_separator.join(
+                (*map(str, fake_directories), fixture.source["PATH"])
+            )
+            tools, errors = fixture.resolve(self.REQUIRED)
+            self.assertIn("git", tools)
+            self.assertNotIn("bash", tools)
+            self.assertTrue(any(ci.BASH_CANDIDATE_ABSENT in error for error in errors), errors)
+            with self.assertRaisesRegex(
+                ci.ToolAuthorityUnavailable,
+                r"^CI_TOOL_AUTHORITY_UNAVAILABLE tool=bash phase=EXECUTION_BINDING$",
+            ):
+                ci.require_tool_set(
+                    tools,
+                    self.REQUIRED,
+                    phase="EXECUTION_BINDING",
+                    resolution_errors=errors,
+                )
+            self.assertFalse((git_root / "usr" / "bin" / "bash.exe").exists())
+        finally:
+            fixture.cleanup()
+
+    def test_near_prefix_and_noncandidate_inside_root_do_not_bind(self) -> None:
+        fixture, git_root = self.hosted_layout(
+            git_directory="cmd",
+            bash_position="bin/bash.exe",
+        )
+        try:
+            near_prefix = fixture._write(
+                fixture.root / "Program Files" / "Git-Evil" / "bin" / "bash.exe",
+                b"near-prefix-bash",
+            )
+            arbitrary_inside = fixture._write(
+                git_root / "tools" / "bash.exe",
+                b"arbitrary-inside-bash",
+            )
+            self.assertIsNone(ci._tool_root_classification(near_prefix, "bash", fixture.policy))
+            self.assertFalse(
+                ci._authority_path_is_within(
+                    near_prefix.resolve(),
+                    git_root.resolve(),
+                    windows=True,
+                )
+            )
+            self.assertIsNone(
+                ci._trusted_git_bash_candidate_position(
+                    arbitrary_inside,
+                    git_root,
+                    windows=True,
+                )
+            )
+        finally:
+            fixture.cleanup()
+
+    def test_symlink_reparse_parent_and_hardlink_alias_matrix_fails_closed(self) -> None:
+        fixture, git_root = self.hosted_layout(
+            git_directory="cmd",
+            bash_position="bin/bash.exe",
+        )
+        try:
+            bash = fixture.paths["bash"]
+            other = fixture._write(
+                fixture.root / "Program Files" / "Git-Other" / "bin" / "bash.exe",
+                b"other-installation-bash",
+            )
+            bash.unlink()
+            os.link(other, bash)
+            _tools, errors = fixture.resolve(self.REQUIRED)
+            self.assertTrue(any(ci.BASH_CANDIDATE_HARDLINK in error for error in errors), errors)
+        finally:
+            fixture.cleanup()
+
+        fixture, _git_root = self.hosted_layout(
+            git_directory="cmd",
+            bash_position="bin/bash.exe",
+        )
+        try:
+            bash = fixture.paths["bash"]
+            target = fixture._write(fixture.root / "symlink-target" / "bash.exe", b"target")
+            bash.unlink()
+            os.symlink(target, bash)
+            _tools, errors = fixture.resolve(self.REQUIRED)
+            self.assertTrue(any(ci.BASH_CANDIDATE_REPARSE in error for error in errors), errors)
+
+            bash.unlink()
+            fixture._write(bash, b"synthetic-bash")
+            original_chain = ci._non_reparse_directory_chain
+
+            def reparse_bin(path: Path, stop: Path) -> bool:
+                if path == bash.parent:
+                    return False
+                return original_chain(path, stop)
+
+            with mock.patch.object(ci, "_non_reparse_directory_chain", side_effect=reparse_bin):
+                _tools, errors = fixture.resolve(self.REQUIRED)
+            self.assertTrue(any(ci.BASH_CANDIDATE_REPARSE in error for error in errors), errors)
+        finally:
+            fixture.cleanup()
+
+    def test_absent_and_unreadable_candidate_reason_schema_is_path_free(self) -> None:
+        fixture, _git_root = self.hosted_layout(
+            git_directory="cmd",
+            bash_position="bin/bash.exe",
+        )
+        try:
+            bash = fixture.paths["bash"]
+            bash.unlink()
+            diagnostics: list[dict[str, object]] = []
+            resolved, errors = ci.resolve_trusted_git_bash(
+                str(fixture.paths["git"]),
+                source_environment=fixture.source,
+                policy=fixture.policy,
+                diagnostics=diagnostics,
+            )
+            self.assertIsNone(resolved)
+            self.assertTrue(any(ci.BASH_CANDIDATE_ABSENT in error for error in errors), errors)
+            self.assertEqual(
+                [item["candidate"] for item in diagnostics],
+                ["bin\\bash.exe", "usr\\bin\\bash.exe"],
+            )
+            self.assertNotIn(str(fixture.root), json.dumps(diagnostics))
+
+            fixture._write(bash, b"synthetic-bash")
+            original_lstat = Path.lstat
+
+            def unreadable_file(path: Path, *args, **kwargs):
+                if path == bash:
+                    raise PermissionError("synthetic unreadable file")
+                return original_lstat(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "lstat", unreadable_file):
+                resolved, errors = ci.resolve_trusted_git_bash(
+                    str(fixture.paths["git"]),
+                    source_environment=fixture.source,
+                    policy=fixture.policy,
+                )
+            self.assertIsNone(resolved)
+            self.assertTrue(any(ci.BASH_CANDIDATE_UNREADABLE in error for error in errors), errors)
+
+            def unreadable_directory(path: Path, *args, **kwargs):
+                if path == bash.parent:
+                    raise PermissionError("synthetic unreadable directory")
+                return original_lstat(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "lstat", unreadable_directory):
+                resolved, errors = ci.resolve_trusted_git_bash(
+                    str(fixture.paths["git"]),
+                    source_environment=fixture.source,
+                    policy=fixture.policy,
+                )
+            self.assertIsNone(resolved)
+            self.assertTrue(any(ci.BASH_CANDIDATE_UNREADABLE in error for error in errors), errors)
+        finally:
+            fixture.cleanup()
+
+    def test_pathex_and_alias_extension_matrix_cannot_redirect_bash(self) -> None:
+        pathext_values = (".CMD;.EXE", ".UNSAFE;.CMD;.EXE", "", ".Exe;.Cmd")
+        aliases = ("bash.cmd", "bash", "BASH.EXE", "bash.unsafe")
+        for pathext, alias_name in itertools.product(pathext_values, aliases):
+            with self.subTest(pathext=pathext, alias=alias_name):
+                fixture, _git_root = self.hosted_layout(
+                    git_directory="bin",
+                    bash_position="bin/bash.exe",
+                )
+                try:
+                    alias_dir = fixture.root / "Users" / "runneradmin" / "AppData" / "Local" / "Microsoft" / "WindowsApps"
+                    fixture._write(alias_dir / alias_name, b"fake-alias")
+                    fixture.source["PATH"] = fixture.policy.path_separator.join(
+                        (str(alias_dir), fixture.source["PATH"])
+                    )
+                    fixture.source["PATHEXT"] = pathext
+                    tools, errors = fixture.resolve(self.REQUIRED)
+                    self.assertEqual(errors, [])
+                    self.assertEqual(Path(tools["bash"]), fixture.paths["bash"])
+                finally:
+                    fixture.cleanup()
+
+        fixture, _git_root = self.hosted_layout(
+            git_directory="bin",
+            bash_position="bin/bash.exe",
+        )
+        try:
+            alias_dir = fixture.root / "git-command-alias"
+            fixture._write(alias_dir / "git.cmd", b"fake-git-command")
+            fixture.source["PATH"] = fixture.policy.path_separator.join(
+                (str(alias_dir), fixture.source["PATH"])
+            )
+            tools, errors = fixture.resolve(self.REQUIRED)
+            self.assertNotIn("git", tools)
+            self.assertTrue(any("required git" in error for error in errors), errors)
+            bash, bash_errors = ci.resolve_trusted_git_bash(
+                str(fixture.paths["git"]),
+                source_environment=fixture.source,
+                policy=fixture.policy,
+            )
+            self.assertEqual(bash_errors, [])
+            self.assertEqual(Path(bash), fixture.paths["bash"])
+        finally:
+            fixture.cleanup()
+
+    def test_missing_bash_has_typed_error_no_partial_binding_or_success_artifact(self) -> None:
+        fixture, _git_root = self.hosted_layout(
+            git_directory="bin",
+            bash_position="bin/bash.exe",
+        )
+        try:
+            fixture.paths["bash"].unlink()
+            tools, errors = fixture.resolve(self.REQUIRED)
+            self.assertEqual(set(tools), set(self.REQUIRED) - {"bash"})
+            with self.assertRaises(ci.ToolAuthorityUnavailable) as captured:
+                ci.require_tool_set(
+                    tools,
+                    self.REQUIRED,
+                    phase="EXECUTION_BINDING",
+                    resolution_errors=errors,
+                )
+            self.assertEqual(
+                str(captured.exception),
+                "CI_TOOL_AUTHORITY_UNAVAILABLE tool=bash phase=EXECUTION_BINDING",
+            )
+            self.assertFalse(ci.OUTPUT_DIR.exists())
+        finally:
+            fixture.cleanup()
+
+    def test_candidate_created_after_failed_capture_does_not_complete_frozen_map(self) -> None:
+        fixture, git_root = self.hosted_layout(
+            git_directory="bin",
+            bash_position="bin/bash.exe",
+        )
+        try:
+            fixture.paths["bash"].unlink()
+            frozen_tools, frozen_errors = fixture.resolve(self.REQUIRED)
+            fixture._write(git_root / "bin" / "bash.exe", b"late-bash")
+            self.assertNotIn("bash", frozen_tools)
+            with self.assertRaises(ci.ToolAuthorityUnavailable):
+                ci.require_tool_set(
+                    frozen_tools,
+                    self.REQUIRED,
+                    phase="EXECUTION_BINDING",
+                    resolution_errors=frozen_errors,
+                )
+            fresh_tools, fresh_errors = fixture.resolve(self.REQUIRED)
+            self.assertEqual(fresh_errors, [])
+            self.assertIn("bash", fresh_tools)
+        finally:
+            fixture.cleanup()
+
+    def test_child_path_inventory_contains_only_approved_directories(self) -> None:
+        fixture, git_root = self.hosted_layout(
+            git_directory="bin",
+            bash_position="usr/bin/bash.exe",
+        )
+        try:
+            windows_apps = fixture.root / "Users" / "runneradmin" / "AppData" / "Local" / "Microsoft" / "WindowsApps"
+            fixture._write(windows_apps / "bash.exe", b"fake-alias")
+            fixture.source["PATH"] = fixture.policy.path_separator.join(
+                (str(windows_apps), fixture.source["PATH"])
+            )
+            tools, errors = fixture.resolve(self.REQUIRED)
+            self.assertEqual(errors, [])
+            child = ci.child_process_environment(
+                tools,
+                source_environment=fixture.source,
+                private_temp_root=fixture.runner_temp,
+                policy=fixture.policy,
+            )
+            entries = [
+                Path(value).resolve(strict=True)
+                for value in child["PATH"].split(fixture.policy.path_separator)
+                if value
+            ]
+            expected = {
+                Path(tools[role]).resolve(strict=True).parent
+                for role in self.REQUIRED
+            } | {fixture.paths["system"]}
+            self.assertEqual(set(entries), expected)
+            self.assertNotIn(fixture.runner_temp, entries)
+            self.assertNotIn(fixture.workspace, entries)
+            self.assertNotIn(windows_apps, entries)
+            self.assertNotIn(fixture.root, entries)
+            self.assertTrue(all(path.is_absolute() for path in entries))
+            self.assertFalse(any("node_modules" in str(path).casefold() for path in entries))
+            self.assertIn(git_root / "bin", entries)
+            self.assertIn(git_root / "usr" / "bin", entries)
+        finally:
+            fixture.cleanup()
+
+    def test_hosted_all_profile_binds_and_static_plan_remains_677_without_execution(self) -> None:
+        baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
+        fixture, _git_root = self.hosted_layout(
+            git_directory="bin",
+            bash_position="bin/bash.exe",
+        )
+        all_runner: ci.FoundationRunner | None = None
+        static_runner: ci.FoundationRunner | None = None
+        try:
+            tools, errors = fixture.resolve(self.REQUIRED)
+            self.assertEqual(errors, [])
+            all_tools = {**tools, "npm": tools["node"]}
+            with mock.patch.object(
+                ci,
+                "execute_command",
+                side_effect=AssertionError("synthetic executable must never run"),
+            ):
+                all_runner = ci.FoundationRunner(
+                    "all",
+                    baseline,
+                    tools=all_tools,
+                    tool_policy=fixture.policy,
+                    source_environment=fixture.source,
+                )
+                static_runner = ci.FoundationRunner(
+                    "static",
+                    baseline,
+                    tools=tools,
+                    tool_policy=fixture.policy,
+                    source_environment=fixture.source,
+                )
+            self.assertTrue(all_runner.tool_authority_frozen)
+            self.assertEqual(
+                set(all_runner.require_all_tools(phase="EXECUTION_BINDING")),
+                {"bash", "git", "node", "npm", "powershell", "python"},
+            )
+            self.assertTrue(all_runner.command_plan)
+            self.assertEqual(all_runner.command_plan_errors, [])
+            self.assertEqual(len(static_runner.command_plan), 677)
+            self.assertEqual(static_runner.command_plan_errors, [])
+            bash_spec = copy.deepcopy(next(
+                item
+                for item in static_runner.command_plan
+                if item["commandId"] == "git-bash-version"
+            ))
+            bash_spec["executionLease"] = {
+                "canonicalPath": bash_spec["resolvedExecutablePath"],
+                "trustedGitRoot": str(Path(tools["git"]).resolve(strict=True).parent.parent),
+                "size": bash_spec["resolvedExecutableSize"],
+                "volumeSerial": "1",
+                "fileIndex": "2",
+                "links": 1,
+                "creationTime": "3",
+                "writeTime": "4",
+                "reparsePoint": False,
+                "sha256": bash_spec["resolvedExecutableSha256"],
+            }
+            bash_record = synthetic_record_from_spec(bash_spec)
+            lease_errors: list[str] = []
+            ci._validate_command_record(bash_record, 0, lease_errors)
+            self.assertFalse(
+                any("trusted Bash execution lease is invalid" in error for error in lease_errors)
+            )
+            forged_record = copy.deepcopy(bash_record)
+            forged_record["executionLease"]["links"] = 2
+            forged_errors: list[str] = []
+            ci._validate_command_record(forged_record, 0, forged_errors)
+            self.assertTrue(
+                any("trusted Bash execution lease is invalid" in error for error in forged_errors)
+            )
+        finally:
+            if all_runner is not None:
+                all_runner.cleanup_task_resources()
+            if static_runner is not None:
+                static_runner.cleanup_task_resources()
+            fixture.cleanup()
+
+    def test_trusted_bash_lease_rejects_arbitrary_same_root_position(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ci-p36-fixed-position-") as temp_dir:
+            git_root = Path(temp_dir) / "Git"
+            git = git_root / "cmd" / "git.exe"
+            arbitrary = git_root / "tools" / "bash.exe"
+            command_processor = Path(
+                os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
+            ).resolve(strict=True)
+            git.parent.mkdir(parents=True)
+            arbitrary.parent.mkdir(parents=True)
+            shutil.copy2(command_processor, git)
+            shutil.copy2(command_processor, arbitrary)
+            with self.assertRaisesRegex(OSError, "fixed installation candidate"):
+                ci.TrustedBashLease(str(arbitrary), str(git))
 
 
 class ProcessTreeContainmentTest(unittest.TestCase):

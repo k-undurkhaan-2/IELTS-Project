@@ -1203,6 +1203,28 @@ def windows_authority_path_prefix(candidate: str, authorized_root: str) -> bool:
     )
 
 
+def windows_authority_path_is_within(candidate: str, authorized_root: str) -> bool:
+    """Compare canonical drive paths by complete ASCII-folded components."""
+
+    candidate_parts = _windows_authority_path_parts(candidate)
+    root_parts = _windows_authority_path_parts(authorized_root)
+    if candidate_parts is None or root_parts is None:
+        return False
+    candidate_form, candidate_components = candidate_parts
+    root_form, root_components = root_parts
+    return (
+        candidate_form == root_form == "drive"
+        and len(candidate_components) >= len(root_components)
+        and all(
+            windows_authority_component_equal(candidate_component, root_component)
+            for candidate_component, root_component in zip(
+                candidate_components,
+                root_components,
+            )
+        )
+    )
+
+
 def _normalization_root_record(value: str | Path, token: str) -> tuple[str, str, bool]:
     text = str(value)
     windows = _windows_authority_path_parts(text) is not None
@@ -1972,6 +1994,18 @@ def _path_is_within(path: Path, parent: Path) -> bool:
     return True
 
 
+def _authority_path_is_within(path: Path, parent: Path, *, windows: bool) -> bool:
+    if windows and os.name == "nt":
+        return windows_authority_path_is_within(str(path), str(parent))
+    return _path_is_within(path, parent)
+
+
+def _authority_paths_equal(left: Path, right: Path, *, windows: bool) -> bool:
+    if windows and os.name == "nt":
+        return windows_authority_path_prefix(str(left), str(right))
+    return left == right
+
+
 def _is_reparse_point(metadata: os.stat_result) -> bool:
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     return bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag)
@@ -1990,6 +2024,25 @@ def _secure_regular_file(path: Path) -> tuple[bool, str]:
 
 
 TOOL_AUTHORITY_UNAVAILABLE_CODE = "CI_TOOL_AUTHORITY_UNAVAILABLE"
+WINDOWS_GIT_EXECUTABLE_SUFFIXES = (
+    ("bin", "git.exe"),
+    ("cmd", "git.exe"),
+)
+WINDOWS_GIT_BASH_CANDIDATE_SUFFIXES = (
+    ("bin", "bash.exe"),
+    ("usr", "bin", "bash.exe"),
+)
+GIT_INSTALL_ROOT_UNRECOGNIZED = "GIT_INSTALL_ROOT_UNRECOGNIZED"
+BASH_CANDIDATE_ABSENT = "BASH_CANDIDATE_ABSENT"
+BASH_CANDIDATE_UNREADABLE = "BASH_CANDIDATE_UNREADABLE"
+BASH_CANDIDATE_OUTSIDE_GIT_ROOT = "BASH_CANDIDATE_OUTSIDE_GIT_ROOT"
+BASH_CANDIDATE_REPARSE = "BASH_CANDIDATE_REPARSE"
+BASH_CANDIDATE_NONREGULAR = "BASH_CANDIDATE_NONREGULAR"
+BASH_CANDIDATE_HARDLINK = "BASH_CANDIDATE_HARDLINK"
+BASH_CANDIDATE_UNSAFE_ROOT = "BASH_CANDIDATE_UNSAFE_ROOT"
+BASH_CANDIDATE_IDENTITY_DRIFT = "BASH_CANDIDATE_IDENTITY_DRIFT"
+BASH_CANDIDATE_VERSION_FAILURE = "BASH_CANDIDATE_VERSION_FAILURE"
+BASH_PARENT_PATH_SHADOW_INERT = "BASH_PARENT_PATH_SHADOW_INERT"
 TOOL_AUTHORITY_PHASES = frozenset(
     {
         "DISCOVERY",
@@ -2007,7 +2060,7 @@ TOOL_AUTHORITY_PHASES = frozenset(
 class ToolAuthorityUnavailable(ValueError):
     """Stable, path-free required-tool failure used at every authority boundary."""
 
-    def __init__(self, tool: str, phase: str) -> None:
+    def __init__(self, tool: str, phase: str, *, reason_code: str | None = None) -> None:
         normalized_tool = str(tool).strip().casefold()
         normalized_phase = str(phase).strip().upper()
         if not normalized_tool or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", normalized_tool):
@@ -2016,6 +2069,7 @@ class ToolAuthorityUnavailable(ValueError):
             normalized_phase = "EXECUTION"
         self.tool = normalized_tool
         self.phase = normalized_phase
+        self.reason_code = reason_code
         super().__init__(
             f"{TOOL_AUTHORITY_UNAVAILABLE_CODE} tool={normalized_tool} phase={normalized_phase}"
         )
@@ -2276,7 +2330,11 @@ def _tool_root_classification(
     if role == "python" and _same_file_identity(resolved, policy.running_python):
         return "running-python-file-identity"
     for label, root in policy.roots_for(role):
-        if not _path_is_within(resolved, root):
+        if not _authority_path_is_within(
+            resolved,
+            root,
+            windows=policy.platform_name == "Windows",
+        ):
             continue
         try:
             if not _non_reparse_directory_chain(resolved.parent, root):
@@ -2322,22 +2380,96 @@ def _windows_system_launcher_path(path: Path, source_environment: Mapping[str, s
     return bool(re.search(r"(?i)/(?:windows/)?(?:system32|sysnative)/", normalized + "/"))
 
 
-def _trusted_git_installation_root(git: Path) -> tuple[Path | None, str | None]:
+def _windows_component_suffix_matches(path: Path, suffix: Sequence[str]) -> bool:
+    parts = path.parts
+    return len(parts) >= len(suffix) and all(
+        windows_authority_component_equal(component, expected)
+        for component, expected in zip(parts[-len(suffix) :], suffix)
+    )
+
+
+def _trusted_git_installation_root(
+    git: Path,
+    *,
+    require_windows_drive: bool | None = None,
+) -> tuple[Path | None, str | None]:
+    """Derive one Git-for-Windows root from an exact executable suffix."""
+
+    strict_windows_namespace = os.name == "nt" if require_windows_drive is None else require_windows_drive
+    if not git.is_absolute():
+        return None, f"{GIT_INSTALL_ROOT_UNRECOGNIZED}: trusted Git path is relative"
+    if (
+        strict_windows_namespace
+        and classify_windows_absolute_reference(str(git)).kind != "drive-absolute"
+    ):
+        return None, f"{GIT_INSTALL_ROOT_UNRECOGNIZED}: trusted Git namespace is forbidden"
+    okay, _reason = _secure_regular_file(git)
+    if not okay:
+        return None, f"{GIT_INSTALL_ROOT_UNRECOGNIZED}: trusted Git is not a regular file"
     try:
         resolved = git.resolve(strict=True)
     except OSError:
-        return None, "trusted Git path does not resolve"
-    if not resolved.is_absolute() or resolved.name.casefold() != "git.exe":
-        return None, "trusted Git must be an absolute git.exe path"
-    if resolved.parent.name.casefold() not in {"cmd", "bin"}:
-        return None, "trusted Git is not rooted in a canonical Git for Windows installation"
-    root = resolved.parent.parent
+        return None, f"{GIT_INSTALL_ROOT_UNRECOGNIZED}: trusted Git path does not resolve"
+    if (
+        not resolved.is_absolute()
+        or (
+            strict_windows_namespace
+            and classify_windows_absolute_reference(str(resolved)).kind != "drive-absolute"
+        )
+    ):
+        return None, f"{GIT_INSTALL_ROOT_UNRECOGNIZED}: canonical Git namespace is forbidden"
+    suffix = next(
+        (
+            candidate_suffix
+            for candidate_suffix in WINDOWS_GIT_EXECUTABLE_SUFFIXES
+            if _windows_component_suffix_matches(resolved, candidate_suffix)
+        ),
+        None,
+    )
+    if suffix is None:
+        return None, (
+            f"{GIT_INSTALL_ROOT_UNRECOGNIZED}: trusted Git executable suffix is unsupported"
+        )
+    if (
+        suffix == ("bin", "git.exe")
+        and len(resolved.parts) >= 3
+        and any(
+            windows_authority_component_equal(resolved.parts[-3], internal_component)
+            for internal_component in ("mingw32", "mingw64", "usr")
+        )
+    ):
+        return None, (
+            f"{GIT_INSTALL_ROOT_UNRECOGNIZED}: internal Git executable suffix is unsupported"
+        )
+    original_suffix = next(
+        (
+            candidate_suffix
+            for candidate_suffix in WINDOWS_GIT_EXECUTABLE_SUFFIXES
+            if _windows_component_suffix_matches(git, candidate_suffix)
+        ),
+        None,
+    )
+    if original_suffix != suffix:
+        return None, f"{GIT_INSTALL_ROOT_UNRECOGNIZED}: Git path crossed a reparse boundary"
+    root = resolved
+    original_root = git
+    for _component in suffix:
+        root = root.parent
+        original_root = original_root.parent
     try:
         metadata = root.lstat()
+        original_chain_ok = _non_reparse_directory_chain(git.parent, original_root)
+        canonical_chain_ok = _non_reparse_directory_chain(resolved.parent, root)
     except OSError:
-        return None, "trusted Git installation root cannot be inspected"
-    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
-        return None, "trusted Git installation root is a link, reparse point, or non-directory"
+        return None, f"{GIT_INSTALL_ROOT_UNRECOGNIZED}: Git installation cannot be inspected"
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or _is_reparse_point(metadata)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or not original_chain_ok
+        or not canonical_chain_ok
+    ):
+        return None, f"{GIT_INSTALL_ROOT_UNRECOGNIZED}: Git installation contains a reparse boundary"
     return root, None
 
 
@@ -2361,6 +2493,7 @@ def resolve_trusted_git_bash(
     source_environment: Mapping[str, str] | None = None,
     repo_root: Path = REPO_ROOT,
     policy: ToolAuthorityPolicy | None = None,
+    diagnostics: list[dict[str, Any]] | None = None,
 ) -> tuple[str | None, list[str]]:
     """Derive Git Bash from the already trusted Git for Windows installation."""
 
@@ -2369,39 +2502,107 @@ def resolve_trusted_git_bash(
     git_path = Path(git)
     okay, reason = _secure_regular_file(git_path)
     if not okay:
-        return None, [f"trusted Git cannot authorize Bash: {reason}"]
-    git_root, root_error = _trusted_git_installation_root(git_path)
+        return None, [f"{GIT_INSTALL_ROOT_UNRECOGNIZED}: trusted Git cannot authorize Bash"]
+    git_root, root_error = _trusted_git_installation_root(
+        git_path,
+        require_windows_drive=(
+            selected_policy.platform_name == "Windows" and not selected_policy.synthetic
+        ),
+    )
     if git_root is None:
-        return None, [root_error or "trusted Git installation root is unavailable"]
+        return None, [
+            root_error
+            or f"{GIT_INSTALL_ROOT_UNRECOGNIZED}: trusted Git installation root is unavailable"
+        ]
     git_root_resolved = git_root.resolve(strict=True)
+    if policy is not None and not any(
+        _authority_paths_equal(
+            git_root_resolved,
+            approved_root.resolve(strict=True),
+            windows=selected_policy.platform_name == "Windows",
+        )
+        for _label, approved_root in selected_policy.roots_for("git")
+    ):
+        return None, [
+            f"{GIT_INSTALL_ROOT_UNRECOGNIZED}: derived Git root is not the approved installation root"
+        ]
     errors: list[str] = []
-    for candidate in (git_root / "bin" / "bash.exe", git_root / "usr" / "bin" / "bash.exe"):
-        if not candidate.exists():
+    for suffix in WINDOWS_GIT_BASH_CANDIDATE_SUFFIXES:
+        candidate = git_root.joinpath(*suffix)
+        relative_candidate = "\\".join(suffix)
+
+        def record(reason_code: str, disposition: str) -> None:
+            if diagnostics is not None:
+                diagnostics.append(
+                    {
+                        "candidate": relative_candidate,
+                        "reasonCode": reason_code,
+                        "disposition": disposition,
+                    }
+                )
+
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            record(BASH_CANDIDATE_ABSENT, "rejected")
             continue
-        okay, reason = _secure_regular_file(candidate)
-        if not okay:
-            errors.append(f"untrusted Git Bash candidate {candidate}: {reason}")
+        except OSError:
+            record(BASH_CANDIDATE_UNREADABLE, "rejected")
+            errors.append(f"{BASH_CANDIDATE_UNREADABLE}: candidate cannot be inspected")
+            continue
+        if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
+            record(BASH_CANDIDATE_REPARSE, "rejected")
+            errors.append(
+                f"{BASH_CANDIDATE_REPARSE}: candidate is a symbolic link or reparse point"
+            )
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            record(BASH_CANDIDATE_NONREGULAR, "rejected")
+            errors.append(f"{BASH_CANDIDATE_NONREGULAR}: candidate is not a regular file")
+            continue
+        if int(getattr(metadata, "st_nlink", 1)) != 1:
+            record(BASH_CANDIDATE_HARDLINK, "rejected")
+            errors.append(f"{BASH_CANDIDATE_HARDLINK}: candidate has another hardlink name")
             continue
         try:
             resolved = candidate.resolve(strict=True)
-            resolved.relative_to(git_root_resolved)
-        except (OSError, ValueError):
-            errors.append(f"Git Bash candidate escapes the trusted Git installation root: {candidate}")
+        except OSError:
+            record(BASH_CANDIDATE_UNREADABLE, "rejected")
+            errors.append(f"{BASH_CANDIDATE_UNREADABLE}: candidate cannot be canonicalized")
+            continue
+        if not _authority_path_is_within(
+            resolved,
+            git_root_resolved,
+            windows=selected_policy.platform_name == "Windows",
+        ):
+            record(BASH_CANDIDATE_OUTSIDE_GIT_ROOT, "rejected")
+            errors.append(
+                f"{BASH_CANDIDATE_OUTSIDE_GIT_ROOT}: candidate escapes the trusted Git root"
+            )
             continue
         try:
             chain_ok = _non_reparse_directory_chain(candidate.parent, git_root)
         except OSError:
-            chain_ok = False
+            record(BASH_CANDIDATE_UNREADABLE, "rejected")
+            errors.append(
+                f"{BASH_CANDIDATE_UNREADABLE}: candidate parent chain cannot be inspected"
+            )
+            continue
         if not chain_ok:
-            errors.append(f"Git Bash candidate has a link or reparse point in its installation chain: {candidate}")
+            record(BASH_CANDIDATE_REPARSE, "rejected")
+            errors.append(f"{BASH_CANDIDATE_REPARSE}: candidate parent chain is reparse-backed")
             continue
         unsafe_reason = _unsafe_tool_path_reason(candidate, repo_root, source)
         classification = _tool_root_classification(candidate, "bash", selected_policy)
         if unsafe_reason and not (selected_policy.synthetic and classification):
-            errors.append(f"untrusted Git Bash candidate {candidate}: {unsafe_reason}")
+            record(BASH_CANDIDATE_UNSAFE_ROOT, "rejected")
+            errors.append(f"{BASH_CANDIDATE_UNSAFE_ROOT}: candidate root is not authoritative")
             continue
         if _windows_system_launcher_path(candidate, source):
-            errors.append(f"Windows System32/Sysnative Bash launcher is forbidden: {candidate}")
+            record(BASH_CANDIDATE_OUTSIDE_GIT_ROOT, "rejected")
+            errors.append(
+                f"{BASH_CANDIDATE_OUTSIDE_GIT_ROOT}: Windows system launcher is forbidden"
+            )
             continue
         if classification is None and not _tool_location_is_allowlisted(
             candidate,
@@ -2410,12 +2611,42 @@ def resolve_trusted_git_bash(
             policy=selected_policy,
             repo_root=repo_root,
         ):
-            errors.append(f"Git Bash is outside the sanitized system/toolcache roots: {candidate}")
+            record(BASH_CANDIDATE_OUTSIDE_GIT_ROOT, "rejected")
+            errors.append(
+                f"{BASH_CANDIDATE_OUTSIDE_GIT_ROOT}: candidate is outside Git authority"
+            )
             continue
+        record("BASH_CANDIDATE_ACCEPTED", "accepted")
         return str(resolved), []
     if not errors:
-        errors.append("required trusted Git Bash executable is unavailable")
+        errors.append(
+            f"{BASH_CANDIDATE_ABSENT}: required trusted Git Bash executable is unavailable"
+        )
     return None, sorted(set(errors))
+
+
+def _trusted_git_bash_candidate_position(
+    bash: Path,
+    git_root: Path,
+    *,
+    windows: bool,
+) -> str | None:
+    canonical = bash.resolve(strict=True)
+    canonical_root = git_root.resolve(strict=True)
+    for suffix in WINDOWS_GIT_BASH_CANDIDATE_SUFFIXES:
+        expected = canonical_root.joinpath(*suffix)
+        try:
+            expected_canonical = expected.resolve(strict=True)
+        except OSError:
+            continue
+        equal = (
+            windows_authority_path_prefix(str(canonical), str(expected_canonical))
+            if windows and os.name == "nt"
+            else canonical == expected_canonical
+        )
+        if equal:
+            return "\\".join(suffix)
+    return None
 
 
 @dataclass(frozen=True)
@@ -2596,6 +2827,7 @@ def resolve_trusted_tools(
     source_environment: Mapping[str, str] | None = None,
     repo_root: Path = REPO_ROOT,
     policy: ToolAuthorityPolicy | None = None,
+    diagnostics: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, str], list[str]]:
     """Resolve role-specific tools and reject only real preceding executable shadows."""
 
@@ -2710,6 +2942,7 @@ def resolve_trusted_tools(
                 source_environment=source,
                 repo_root=repo_root,
                 policy=selected_policy,
+                diagnostics=diagnostics,
             )
             errors.extend(bash_errors)
             if bash is not None:
@@ -2720,9 +2953,15 @@ def resolve_trusted_tools(
                     selected_policy,
                 )
                 if shadow_error:
-                    errors.append(shadow_error)
-                else:
-                    resolved_tools["bash"] = bash
+                    if diagnostics is not None:
+                        diagnostics.append(
+                            {
+                                "candidate": "parent-PATH",
+                                "reasonCode": BASH_PARENT_PATH_SHADOW_INERT,
+                                "disposition": "detected-inert",
+                            }
+                        )
+                resolved_tools["bash"] = bash
     return resolved_tools, sorted(set(errors))
 
 
@@ -3702,7 +3941,13 @@ class TrustedBashLease:
     FILE_ATTRIBUTE_NORMAL = 0x00000080
     FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 
-    def __init__(self, bash_path: str, git_path: str) -> None:
+    def __init__(
+        self,
+        bash_path: str,
+        git_path: str,
+        *,
+        approved_git_roots: Sequence[Path] = (),
+    ) -> None:
         if os.name != "nt":
             raise OSError("trusted Bash leases are Windows-only")
         import ctypes
@@ -3753,11 +3998,22 @@ class TrustedBashLease:
         git_root, root_error = _trusted_git_installation_root(Path(git_path))
         if git_root is None:
             raise OSError(root_error or "trusted Git root is unavailable")
+        if approved_git_roots and not any(
+            _authority_paths_equal(
+                git_root.resolve(strict=True),
+                approved_root.resolve(strict=True),
+                windows=True,
+            )
+            for approved_root in approved_git_roots
+        ):
+            raise OSError("trusted Git root is not the approved installation root")
         canonical = path.resolve(strict=True)
-        try:
-            canonical.relative_to(git_root.resolve(strict=True))
-        except ValueError as exc:
-            raise OSError("trusted Git Bash escapes its Git installation root") from exc
+        if not _authority_path_is_within(canonical, git_root.resolve(strict=True), windows=True):
+            raise OSError("trusted Git Bash escapes its Git installation root")
+        if _trusted_git_bash_candidate_position(canonical, git_root, windows=True) is None:
+            raise OSError("trusted Git Bash is not at a fixed installation candidate position")
+        if int(getattr(path.lstat(), "st_nlink", 1)) != 1:
+            raise OSError("trusted Git Bash has another hardlink name")
         if not _non_reparse_directory_chain(canonical.parent, git_root):
             raise OSError("trusted Git Bash directory chain contains a reparse point")
 
@@ -3779,6 +4035,8 @@ class TrustedBashLease:
             self._initial_info = self._information(self.handle)
             if self._initial_info["reparsePoint"]:
                 raise OSError("trusted Git Bash handle resolves to a reparse point")
+            if self._initial_info["links"] != 1:
+                raise OSError("trusted Git Bash handle has another hardlink name")
             self.expected_sha256 = _sha256_file(canonical)
             self.identity = {
                 "canonicalPath": self.path,
@@ -3806,6 +4064,7 @@ class TrustedBashLease:
             "size": (int(information.nFileSizeHigh) << 32) | int(information.nFileSizeLow),
             "volumeSerial": str(int(information.dwVolumeSerialNumber)),
             "fileIndex": str((int(information.nFileIndexHigh) << 32) | int(information.nFileIndexLow)),
+            "links": int(information.nNumberOfLinks),
             "creationTime": self._filetime(information.ftCreationTime),
             "writeTime": self._filetime(information.ftLastWriteTime),
             "reparsePoint": bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)),
@@ -11712,7 +11971,13 @@ class FoundationRunner:
             bash = self.require_tool("bash", phase="CAPTURE")
             git = self.require_tool("git", phase="CAPTURE")
             try:
-                self.bash_lease = TrustedBashLease(bash, git)
+                self.bash_lease = TrustedBashLease(
+                    bash,
+                    git,
+                    approved_git_roots=tuple(
+                        root for _label, root in self.tool_policy.roots_for("git")
+                    ),
+                )
             except OSError as exc:
                 self.tool_resolution_errors.append(
                     f"trusted Git Bash lease could not be established: {type(exc).__name__}: {exc}"
@@ -11742,16 +12007,25 @@ class FoundationRunner:
                     classification = _tool_root_classification(
                         Path(lease.path), name, self.tool_policy
                     )
-                    version_output = (
-                        "test-injected-not-executed"
-                        if self.tools_injected
-                        else _captured_tool_version(
-                            name,
-                            self.tools,
-                            self.child_environment,
-                            lease,
+                    try:
+                        version_output = (
+                            "test-injected-not-executed"
+                            if self.tools_injected
+                            else _captured_tool_version(
+                                name,
+                                self.tools,
+                                self.child_environment,
+                                lease,
+                            )
                         )
-                    )
+                    except OSError as exc:
+                        raise ToolAuthorityUnavailable(
+                            name,
+                            "CAPTURE",
+                            reason_code=(
+                                BASH_CANDIDATE_VERSION_FAILURE if name == "bash" else None
+                            ),
+                        ) from exc
                     self.tool_authority_evidence[name] = {
                         **lease.evidence(),
                         "trustedRootClassification": classification
@@ -11909,7 +12183,11 @@ class FoundationRunner:
             okay, _error = lease.verify()
             if not okay:
                 self.tool_authority_frozen = False
-                self.tool_authority_failure = ToolAuthorityUnavailable(name, phase)
+                self.tool_authority_failure = ToolAuthorityUnavailable(
+                    name,
+                    phase,
+                    reason_code=(BASH_CANDIDATE_IDENTITY_DRIFT if name == "bash" else None),
+                )
                 if str(self.tool_authority_failure) not in self.tool_resolution_errors:
                     self.tool_resolution_errors.append(str(self.tool_authority_failure))
                 raise self.tool_authority_failure
@@ -11934,7 +12212,11 @@ class FoundationRunner:
         okay, _error = lease.verify()
         if not okay:
             self.tool_authority_frozen = False
-            self.tool_authority_failure = ToolAuthorityUnavailable(name, phase)
+            self.tool_authority_failure = ToolAuthorityUnavailable(
+                name,
+                phase,
+                reason_code=(BASH_CANDIDATE_IDENTITY_DRIFT if name == "bash" else None),
+            )
             raise self.tool_authority_failure
         return lease
 
@@ -14353,6 +14635,7 @@ def _validate_command_record(record: Any, index: int, errors: list[str]) -> bool
             "size",
             "volumeSerial",
             "fileIndex",
+            "links",
             "creationTime",
             "writeTime",
             "reparsePoint",
@@ -14363,6 +14646,7 @@ def _validate_command_record(record: Any, index: int, errors: list[str]) -> bool
             or not isinstance(execution_lease, dict)
             or set(execution_lease) != lease_keys
             or execution_lease.get("reparsePoint") is not False
+            or execution_lease.get("links") != 1
             or execution_lease.get("canonicalPath") != resolved_executable
             or execution_lease.get("size") != executable_size
             or execution_lease.get("sha256") != executable_hash
