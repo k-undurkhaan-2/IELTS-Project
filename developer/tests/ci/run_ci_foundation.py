@@ -76,6 +76,16 @@ REPLAY_AUTHORIZATION_ENVELOPE_SCHEMA_VERSION = 1
 CI_TRUST_FILE_SET_SCHEMA_VERSION = 1
 RUNTIME_DEPENDENCY_CLOSURE_SCHEMA_VERSION = 1
 RUNTIME_DEPENDENCY_GUARD_SCHEMA_VERSION = 1
+RUNTIME_CLOSURE_PRECONDITION_STATUS = "PRECONDITION_NOT_MET"
+RUNTIME_CLOSURE_PRECONDITION_REASONS = frozenset(
+    {
+        "TOOL_AUTHORITY_NOT_FROZEN",
+        "COMMAND_AUTHORITY_INVALID",
+        "DEPENDENCY_ENVIRONMENT_UNAVAILABLE",
+        "MEASUREMENT_NOT_REQUESTED",
+        "MEASUREMENT_FAILED",
+    }
+)
 LINUX_CONTAINMENT_PROTOCOL_VERSION = 1
 POSIX_PROCESS_IDENTITY_SCHEMA_VERSION = 1
 
@@ -228,6 +238,61 @@ WORKFLOW_JOB_PROFILE_AUTHORITY = MappingProxyType(
         ),
     }
 )
+
+
+@dataclass(frozen=True)
+class ExecutionExternalAuthority:
+    """Frozen job context captured outside command planning and evidence parsing."""
+
+    source_kind: str
+    binding_mode: str
+    runner_os: str
+    job_id: str
+    run_id: str
+    run_attempt: str
+    event_name: str
+    repository: str
+    checkout_sha: str
+
+    def __post_init__(self) -> None:
+        if self.source_kind not in {"live", "synthetic-test"}:
+            raise ValueError("external authority source kind is invalid")
+        if self.binding_mode not in {"github-actions", "local"}:
+            raise ValueError("external authority binding mode is invalid")
+        if self.runner_os not in {"Linux", "Windows"}:
+            raise ValueError("external authority runner OS is invalid")
+        values = (
+            self.job_id,
+            self.run_id,
+            self.run_attempt,
+            self.event_name,
+            self.repository,
+            self.checkout_sha,
+        )
+        if any(not isinstance(value, str) for value in values):
+            raise ValueError("external authority field type is invalid")
+        if self.binding_mode == "github-actions":
+            if not self.job_id or self.job_id != self.job_id.strip():
+                raise ValueError("external authority job is invalid")
+            if not re.fullmatch(r"[1-9][0-9]*", self.run_id):
+                raise ValueError("external authority run ID is invalid")
+            if not re.fullmatch(r"[1-9][0-9]*", self.run_attempt):
+                raise ValueError("external authority run attempt is invalid")
+            if not re.fullmatch(r"[A-Za-z0-9_]+", self.event_name):
+                raise ValueError("external authority event is invalid")
+            if not re.fullmatch(r"[^/\s]+/[^/\s]+", self.repository):
+                raise ValueError("external authority repository is invalid")
+            if not re.fullmatch(r"[0-9a-f]{40}", self.checkout_sha):
+                raise ValueError("external authority checkout SHA is invalid")
+        elif (
+            self.job_id
+            or self.run_id != "local"
+            or self.run_attempt != "1"
+            or self.event_name != "local"
+            or self.repository
+            or self.checkout_sha
+        ):
+            raise ValueError("local external authority contains hosted-job fields")
 
 
 @dataclass(frozen=True)
@@ -2042,7 +2107,86 @@ BASH_CANDIDATE_HARDLINK = "BASH_CANDIDATE_HARDLINK"
 BASH_CANDIDATE_UNSAFE_ROOT = "BASH_CANDIDATE_UNSAFE_ROOT"
 BASH_CANDIDATE_IDENTITY_DRIFT = "BASH_CANDIDATE_IDENTITY_DRIFT"
 BASH_CANDIDATE_VERSION_FAILURE = "BASH_CANDIDATE_VERSION_FAILURE"
-BASH_PARENT_PATH_SHADOW_INERT = "BASH_PARENT_PATH_SHADOW_INERT"
+BASH_CANDIDATE_LEASE_FAILURE = "BASH_CANDIDATE_LEASE_FAILURE"
+BASH_CANDIDATE_ACCEPTED = "BASH_CANDIDATE_ACCEPTED"
+PATH_PREDECESSOR_UNINSPECTABLE = "PATH_PREDECESSOR_UNINSPECTABLE"
+PATH_EXECUTABLE_SHADOW = "PATH_EXECUTABLE_SHADOW"
+PATH_REPARSE_ESCAPE = "PATH_REPARSE_ESCAPE"
+PATH_WORKSPACE_OR_TEMP_AUTHORITY = "PATH_WORKSPACE_OR_TEMP_AUTHORITY"
+PATH_ENTRY_UNKNOWN = "PATH_ENTRY_UNKNOWN"
+REQUIRED_TOOL_MISSING = "REQUIRED_TOOL_MISSING"
+TOOL_CANDIDATE_UNREADABLE = "TOOL_CANDIDATE_UNREADABLE"
+TOOL_CANDIDATE_INVALID = "TOOL_CANDIDATE_INVALID"
+TOOL_IDENTITY_DRIFT = "TOOL_IDENTITY_DRIFT"
+UNKNOWN_FAIL_CLOSED = "UNKNOWN_FAIL_CLOSED"
+SAFE_CANONICAL_DIRECTORY = "SAFE_CANONICAL_DIRECTORY"
+SAFE_CANONICAL_SYMLINK_DIRECTORY = "SAFE_CANONICAL_SYMLINK_DIRECTORY"
+INERT_NON_DIRECTORY = "INERT_NON_DIRECTORY"
+INERT_MISSING_ENTRY = "INERT_MISSING_ENTRY"
+INERT_ENTRY_WITH_NO_REQUIRED_EXECUTABLE = "INERT_ENTRY_WITH_NO_REQUIRED_EXECUTABLE"
+UNSAFE_EXECUTABLE_SHADOW = "UNSAFE_EXECUTABLE_SHADOW"
+UNSAFE_UNINSPECTABLE_SHADOW_CAPABLE_ENTRY = (
+    "UNSAFE_UNINSPECTABLE_SHADOW_CAPABLE_ENTRY"
+)
+UNSAFE_REPARSE_ESCAPE = "UNSAFE_REPARSE_ESCAPE"
+UNSAFE_WORKSPACE_OR_TEMP_AUTHORITY = "UNSAFE_WORKSPACE_OR_TEMP_AUTHORITY"
+TOOL_AUTHORITY_TOOLS = frozenset(
+    {"git", "bash", "node", "npm", "python", "powershell", "authority-set"}
+)
+PATH_ENTRY_CLASSIFICATIONS = frozenset(
+    {
+        SAFE_CANONICAL_DIRECTORY,
+        SAFE_CANONICAL_SYMLINK_DIRECTORY,
+        INERT_NON_DIRECTORY,
+        INERT_MISSING_ENTRY,
+        INERT_ENTRY_WITH_NO_REQUIRED_EXECUTABLE,
+        UNSAFE_EXECUTABLE_SHADOW,
+        UNSAFE_UNINSPECTABLE_SHADOW_CAPABLE_ENTRY,
+        UNSAFE_REPARSE_ESCAPE,
+        UNSAFE_WORKSPACE_OR_TEMP_AUTHORITY,
+        UNKNOWN_FAIL_CLOSED,
+    }
+)
+TOOL_AUTHORITY_REASON_CODES = frozenset(
+    {
+        PATH_PREDECESSOR_UNINSPECTABLE,
+        PATH_EXECUTABLE_SHADOW,
+        PATH_REPARSE_ESCAPE,
+        PATH_WORKSPACE_OR_TEMP_AUTHORITY,
+        PATH_ENTRY_UNKNOWN,
+        REQUIRED_TOOL_MISSING,
+        TOOL_CANDIDATE_UNREADABLE,
+        TOOL_CANDIDATE_INVALID,
+        TOOL_IDENTITY_DRIFT,
+        GIT_INSTALL_ROOT_UNRECOGNIZED,
+        BASH_CANDIDATE_ABSENT,
+        BASH_CANDIDATE_UNREADABLE,
+        BASH_CANDIDATE_OUTSIDE_GIT_ROOT,
+        BASH_CANDIDATE_REPARSE,
+        BASH_CANDIDATE_NONREGULAR,
+        BASH_CANDIDATE_HARDLINK,
+        BASH_CANDIDATE_UNSAFE_ROOT,
+        BASH_CANDIDATE_IDENTITY_DRIFT,
+        BASH_CANDIDATE_VERSION_FAILURE,
+        BASH_CANDIDATE_LEASE_FAILURE,
+        UNKNOWN_FAIL_CLOSED,
+    }
+)
+TOOL_AUTHORITY_CANDIDATE_CLASSES = frozenset(
+    {"git-bin", "git-usr-bin", "parent-path", "tool-candidate"}
+)
+TOOL_AUTHORITY_ROOT_CATEGORIES = frozenset(
+    {
+        "approved",
+        "system",
+        "workspace",
+        "runner-temp",
+        "task-temp",
+        "node-modules",
+        "other",
+        "unknown",
+    }
+)
 TOOL_AUTHORITY_PHASES = frozenset(
     {
         "DISCOVERY",
@@ -2060,19 +2204,135 @@ TOOL_AUTHORITY_PHASES = frozenset(
 class ToolAuthorityUnavailable(ValueError):
     """Stable, path-free required-tool failure used at every authority boundary."""
 
-    def __init__(self, tool: str, phase: str, *, reason_code: str | None = None) -> None:
+    def __init__(
+        self,
+        tool: str,
+        phase: str,
+        *,
+        reason_code: str | None = None,
+        path_index: int | None = None,
+        candidate_class: str | None = None,
+        root_category: str | None = None,
+    ) -> None:
         normalized_tool = str(tool).strip().casefold()
         normalized_phase = str(phase).strip().upper()
-        if not normalized_tool or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", normalized_tool):
+        if normalized_tool not in TOOL_AUTHORITY_TOOLS:
             normalized_tool = "authority-set"
         if normalized_phase not in TOOL_AUTHORITY_PHASES:
             normalized_phase = "EXECUTION"
+        normalized_reason = (
+            str(reason_code).strip().upper() if reason_code is not None else None
+        )
+        if normalized_reason is not None and normalized_reason not in TOOL_AUTHORITY_REASON_CODES:
+            normalized_reason = UNKNOWN_FAIL_CLOSED
+        normalized_index = (
+            path_index
+            if type(path_index) is int and 0 <= path_index <= 1_000_000
+            else None
+        )
+        normalized_candidate = (
+            candidate_class
+            if candidate_class in TOOL_AUTHORITY_CANDIDATE_CLASSES
+            else None
+        )
+        normalized_root = (
+            root_category
+            if root_category in TOOL_AUTHORITY_ROOT_CATEGORIES
+            else None
+        )
         self.tool = normalized_tool
         self.phase = normalized_phase
-        self.reason_code = reason_code
-        super().__init__(
-            f"{TOOL_AUTHORITY_UNAVAILABLE_CODE} tool={normalized_tool} phase={normalized_phase}"
+        self.reason_code = normalized_reason
+        self.path_index = normalized_index
+        self.candidate_class = normalized_candidate
+        self.root_category = normalized_root
+        fields = [
+            TOOL_AUTHORITY_UNAVAILABLE_CODE,
+            f"tool={normalized_tool}",
+            f"phase={normalized_phase}",
+        ]
+        if normalized_reason is not None:
+            fields.append(f"reason={normalized_reason}")
+        if normalized_index is not None:
+            fields.append(f"path_index={normalized_index}")
+        if normalized_candidate is not None:
+            fields.append(f"candidate={normalized_candidate}")
+        if normalized_root is not None:
+            fields.append(f"root_category={normalized_root}")
+        super().__init__(" ".join(fields))
+
+
+@dataclass(frozen=True)
+class ToolAuthorityIssue:
+    """One closed, path-free resolver issue that can cross the CLI boundary."""
+
+    tool: str
+    reason_code: str
+    path_index: int | None = None
+    candidate_class: str | None = None
+    root_category: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.tool not in TOOL_AUTHORITY_TOOLS - {"authority-set"}:
+            raise ValueError("tool-authority issue has an invalid tool")
+        if self.reason_code not in TOOL_AUTHORITY_REASON_CODES:
+            raise ValueError("tool-authority issue has an invalid reason")
+        if self.path_index is not None and (
+            type(self.path_index) is not int or self.path_index < 0
+        ):
+            raise ValueError("tool-authority issue has an invalid PATH ordinal")
+        if (
+            self.candidate_class is not None
+            and self.candidate_class not in TOOL_AUTHORITY_CANDIDATE_CLASSES
+        ):
+            raise ValueError("tool-authority issue has an invalid candidate class")
+        if (
+            self.root_category is not None
+            and self.root_category not in TOOL_AUTHORITY_ROOT_CATEGORIES
+        ):
+            raise ValueError("tool-authority issue has an invalid root category")
+
+    def error_text(self) -> str:
+        fields = [self.reason_code, f"tool={self.tool}"]
+        if self.path_index is not None:
+            fields.append(f"path_index={self.path_index}")
+        if self.candidate_class is not None:
+            fields.append(f"candidate={self.candidate_class}")
+        if self.root_category is not None:
+            fields.append(f"root_category={self.root_category}")
+        return " ".join(fields)
+
+    def exception(self, phase: str) -> ToolAuthorityUnavailable:
+        return ToolAuthorityUnavailable(
+            self.tool,
+            phase,
+            reason_code=self.reason_code,
+            path_index=self.path_index,
+            candidate_class=self.candidate_class,
+            root_category=self.root_category,
         )
+
+
+def _tool_authority_issue_from_error(value: str) -> ToolAuthorityIssue | None:
+    match = re.fullmatch(
+        r"(?P<reason>[A-Z][A-Z0-9_]+) tool=(?P<tool>[a-z]+)"
+        r"(?: path_index=(?P<index>[0-9]+))?"
+        r"(?: candidate=(?P<candidate>[a-z-]+))?"
+        r"(?: root_category=(?P<root>[a-z-]+))?",
+        str(value),
+    )
+    if match is None:
+        return None
+    try:
+        return ToolAuthorityIssue(
+            tool=match.group("tool"),
+            reason_code=match.group("reason"),
+            path_index=(int(match.group("index")) if match.group("index") else None),
+            candidate_class=match.group("candidate"),
+            root_category=match.group("root"),
+        )
+    except ValueError:
+        return None
 
 
 def require_tool(
@@ -2085,16 +2345,35 @@ def require_tool(
     """Return one canonical absolute tool or fail with a stable typed result."""
 
     value = tools.get(name)
-    if resolution_errors or not isinstance(value, str) or not value:
-        raise ToolAuthorityUnavailable(name, phase)
+    if resolution_errors:
+        issue = next(
+            (
+                parsed
+                for error in resolution_errors
+                if (parsed := _tool_authority_issue_from_error(error)) is not None
+                and parsed.tool == name
+            ),
+            None,
+        )
+        if issue is not None:
+            raise issue.exception(phase)
+        raise ToolAuthorityUnavailable(
+            name,
+            phase,
+            reason_code=UNKNOWN_FAIL_CLOSED,
+        )
+    if not isinstance(value, str) or not value:
+        raise ToolAuthorityUnavailable(name, phase, reason_code=REQUIRED_TOOL_MISSING)
     candidate = Path(value)
     try:
         canonical = candidate.resolve(strict=True)
     except OSError as exc:
-        raise ToolAuthorityUnavailable(name, phase) from exc
+        raise ToolAuthorityUnavailable(
+            name, phase, reason_code=TOOL_CANDIDATE_UNREADABLE
+        ) from exc
     okay, _reason = _secure_regular_file(canonical)
     if not candidate.is_absolute() or not okay:
-        raise ToolAuthorityUnavailable(name, phase)
+        raise ToolAuthorityUnavailable(name, phase, reason_code=TOOL_CANDIDATE_INVALID)
     return str(canonical)
 
 
@@ -2110,7 +2389,29 @@ def require_tool_set(
     names = sorted(set(required))
     missing = [name for name in names if not isinstance(tools.get(name), str) or not tools.get(name)]
     if resolution_errors or missing:
-        raise ToolAuthorityUnavailable(missing[0] if missing else "authority-set", phase)
+        parsed_issues = [
+            parsed
+            for error in resolution_errors
+            if (parsed := _tool_authority_issue_from_error(error)) is not None
+            and parsed.tool in names
+        ]
+        issue = next(
+            (
+                parsed
+                for parsed in parsed_issues
+                if parsed.reason_code != REQUIRED_TOOL_MISSING
+            ),
+            parsed_issues[0] if parsed_issues else None,
+        )
+        if issue is not None:
+            raise issue.exception(phase)
+        if missing:
+            raise ToolAuthorityUnavailable(
+                missing[0], phase, reason_code=REQUIRED_TOOL_MISSING
+            )
+        raise ToolAuthorityUnavailable(
+            "authority-set", phase, reason_code=UNKNOWN_FAIL_CLOSED
+        )
     return {name: require_tool(tools, name, phase=phase) for name in names}
 
 
@@ -2127,6 +2428,14 @@ class ToolAuthorityPolicy:
 
     def roots_for(self, role: str) -> tuple[tuple[str, Path], ...]:
         return self.role_roots.get(role, ())
+
+
+@dataclass(frozen=True)
+class _ToolRootClassificationResult:
+    """Closed result for one executable's trusted-root inspection."""
+
+    root_label: str | None
+    inspection_failed: bool
 
 
 def _resolved_non_reparse_directory(path: Path) -> Path | None:
@@ -2321,14 +2630,17 @@ def _same_file_identity(left: Path, right: Path) -> bool:
         return False
 
 
-def _tool_root_classification(
+def _tool_root_classification_result(
     path: Path,
     role: str,
     policy: ToolAuthorityPolicy,
-) -> str | None:
-    resolved = path.resolve(strict=True)
+) -> _ToolRootClassificationResult:
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        return _ToolRootClassificationResult(None, True)
     if role == "python" and _same_file_identity(resolved, policy.running_python):
-        return "running-python-file-identity"
+        return _ToolRootClassificationResult("running-python-file-identity", False)
     for label, root in policy.roots_for(role):
         if not _authority_path_is_within(
             resolved,
@@ -2340,9 +2652,17 @@ def _tool_root_classification(
             if not _non_reparse_directory_chain(resolved.parent, root):
                 continue
         except OSError:
-            continue
-        return label
-    return None
+            return _ToolRootClassificationResult(None, True)
+        return _ToolRootClassificationResult(label, False)
+    return _ToolRootClassificationResult(None, False)
+
+
+def _tool_root_classification(
+    path: Path,
+    role: str,
+    policy: ToolAuthorityPolicy,
+) -> str | None:
+    return _tool_root_classification_result(path, role, policy).root_label
 
 
 def _tool_location_is_allowlisted(
@@ -2487,6 +2807,52 @@ def _non_reparse_directory_chain(path: Path, stop: Path) -> bool:
         current = current.parent
 
 
+@dataclass(frozen=True)
+class BashCandidateResult:
+    """Internal fixed-candidate audit without an absolute-path disclosure."""
+
+    candidate_location_class: str
+    exists: bool
+    regular_file: bool | None
+    reparse_safe: bool | None
+    same_installation_root: bool | None
+    link_count: int | None
+    file_identity: tuple[int, int, int, int, int] | None
+    sha256: str | None
+    version_probe: str
+    lease_precheck: str
+    selection_priority: int
+    path_shadow_disposition: str
+    failure_reason: str | None
+    disposition: str
+
+    def diagnostic(self) -> dict[str, Any]:
+        return {
+            "kind": "bash-candidate",
+            "candidateLocationClass": self.candidate_location_class,
+            "exists": self.exists,
+            "regularFile": self.regular_file,
+            "reparseSafe": self.reparse_safe,
+            "sameInstallationRoot": self.same_installation_root,
+            "linkCount": self.link_count,
+            "fileIdentity": (
+                list(self.file_identity) if self.file_identity is not None else None
+            ),
+            "sha256": self.sha256,
+            "versionProbe": self.version_probe,
+            "leasePrecheck": self.lease_precheck,
+            "selectionPriority": self.selection_priority,
+            "pathShadowDisposition": self.path_shadow_disposition,
+            "failureReason": self.failure_reason,
+            "reasonCode": self.failure_reason,
+            "disposition": self.disposition,
+        }
+
+
+def _bash_candidate_location_class(suffix: Sequence[str]) -> str:
+    return "git-bin" if tuple(suffix) == ("bin", "bash.exe") else "git-usr-bin"
+
+
 def resolve_trusted_git_bash(
     git: str,
     *,
@@ -2500,9 +2866,15 @@ def resolve_trusted_git_bash(
     source = dict(os.environ if source_environment is None else source_environment)
     selected_policy = policy or default_tool_authority_policy(source, repo_root=repo_root)
     git_path = Path(git)
-    okay, reason = _secure_regular_file(git_path)
+    okay, _reason = _secure_regular_file(git_path)
     if not okay:
-        return None, [f"{GIT_INSTALL_ROOT_UNRECOGNIZED}: trusted Git cannot authorize Bash"]
+        return None, [
+            ToolAuthorityIssue(
+                "bash",
+                GIT_INSTALL_ROOT_UNRECOGNIZED,
+                candidate_class="tool-candidate",
+            ).error_text()
+        ]
     git_root, root_error = _trusted_git_installation_root(
         git_path,
         require_windows_drive=(
@@ -2511,99 +2883,262 @@ def resolve_trusted_git_bash(
     )
     if git_root is None:
         return None, [
-            root_error
-            or f"{GIT_INSTALL_ROOT_UNRECOGNIZED}: trusted Git installation root is unavailable"
+            ToolAuthorityIssue(
+                "bash",
+                GIT_INSTALL_ROOT_UNRECOGNIZED,
+                candidate_class="tool-candidate",
+            ).error_text()
         ]
-    git_root_resolved = git_root.resolve(strict=True)
+    try:
+        git_root_resolved = git_root.resolve(strict=True)
+        approved_git_roots = tuple(
+            approved_root.resolve(strict=True)
+            for _label, approved_root in selected_policy.roots_for("git")
+        )
+    except OSError:
+        return None, [
+            ToolAuthorityIssue(
+                "bash",
+                GIT_INSTALL_ROOT_UNRECOGNIZED,
+                candidate_class="tool-candidate",
+            ).error_text()
+        ]
     if policy is not None and not any(
         _authority_paths_equal(
             git_root_resolved,
-            approved_root.resolve(strict=True),
+            approved_root,
             windows=selected_policy.platform_name == "Windows",
         )
-        for _label, approved_root in selected_policy.roots_for("git")
+        for approved_root in approved_git_roots
     ):
         return None, [
-            f"{GIT_INSTALL_ROOT_UNRECOGNIZED}: derived Git root is not the approved installation root"
+            ToolAuthorityIssue(
+                "bash",
+                GIT_INSTALL_ROOT_UNRECOGNIZED,
+                candidate_class="tool-candidate",
+            ).error_text()
         ]
-    errors: list[str] = []
-    for suffix in WINDOWS_GIT_BASH_CANDIDATE_SUFFIXES:
-        candidate = git_root.joinpath(*suffix)
-        relative_candidate = "\\".join(suffix)
 
-        def record(reason_code: str, disposition: str) -> None:
-            if diagnostics is not None:
-                diagnostics.append(
-                    {
-                        "candidate": relative_candidate,
-                        "reasonCode": reason_code,
-                        "disposition": disposition,
-                    }
-                )
+    def reject(
+        *,
+        candidate_class: str,
+        priority: int,
+        reason_code: str,
+        exists: bool,
+        metadata: os.stat_result | None = None,
+        regular_file: bool | None = None,
+        reparse_safe: bool | None = None,
+        same_root: bool | None = None,
+        digest: str | None = None,
+        disposition: str = "rejected",
+    ) -> str:
+        result = BashCandidateResult(
+            candidate_location_class=candidate_class,
+            exists=exists,
+            regular_file=regular_file,
+            reparse_safe=reparse_safe,
+            same_installation_root=same_root,
+            link_count=(
+                int(getattr(metadata, "st_nlink", 1)) if metadata is not None else None
+            ),
+            file_identity=(_stat_identity(metadata) if metadata is not None else None),
+            sha256=digest,
+            version_probe="not-run",
+            lease_precheck="not-run",
+            selection_priority=priority,
+            path_shadow_disposition="not-evaluated",
+            failure_reason=reason_code,
+            disposition=disposition,
+        )
+        if diagnostics is not None:
+            diagnostics.append(result.diagnostic())
+        return ToolAuthorityIssue(
+            "bash",
+            reason_code,
+            candidate_class=candidate_class,
+        ).error_text()
+
+    absent_results: list[str] = []
+    for priority, suffix in enumerate(WINDOWS_GIT_BASH_CANDIDATE_SUFFIXES):
+        candidate = git_root.joinpath(*suffix)
+        candidate_class = _bash_candidate_location_class(suffix)
 
         try:
             metadata = candidate.lstat()
         except FileNotFoundError:
-            record(BASH_CANDIDATE_ABSENT, "rejected")
-            continue
-        except OSError:
-            record(BASH_CANDIDATE_UNREADABLE, "rejected")
-            errors.append(f"{BASH_CANDIDATE_UNREADABLE}: candidate cannot be inspected")
-            continue
-        if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
-            record(BASH_CANDIDATE_REPARSE, "rejected")
-            errors.append(
-                f"{BASH_CANDIDATE_REPARSE}: candidate is a symbolic link or reparse point"
+            absent_results.append(
+                reject(
+                    candidate_class=candidate_class,
+                    priority=priority,
+                    reason_code=BASH_CANDIDATE_ABSENT,
+                    exists=False,
+                    disposition="absent-continue",
+                )
             )
             continue
+        except OSError:
+            return None, [
+                reject(
+                    candidate_class=candidate_class,
+                    priority=priority,
+                    reason_code=BASH_CANDIDATE_UNREADABLE,
+                    exists=True,
+                )
+            ]
+        if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
+            return None, [
+                reject(
+                    candidate_class=candidate_class,
+                    priority=priority,
+                    reason_code=BASH_CANDIDATE_REPARSE,
+                    exists=True,
+                    metadata=metadata,
+                    regular_file=stat.S_ISREG(metadata.st_mode),
+                    reparse_safe=False,
+                )
+            ]
         if not stat.S_ISREG(metadata.st_mode):
-            record(BASH_CANDIDATE_NONREGULAR, "rejected")
-            errors.append(f"{BASH_CANDIDATE_NONREGULAR}: candidate is not a regular file")
-            continue
+            return None, [
+                reject(
+                    candidate_class=candidate_class,
+                    priority=priority,
+                    reason_code=BASH_CANDIDATE_NONREGULAR,
+                    exists=True,
+                    metadata=metadata,
+                    regular_file=False,
+                    reparse_safe=True,
+                )
+            ]
         if int(getattr(metadata, "st_nlink", 1)) != 1:
-            record(BASH_CANDIDATE_HARDLINK, "rejected")
-            errors.append(f"{BASH_CANDIDATE_HARDLINK}: candidate has another hardlink name")
-            continue
+            return None, [
+                reject(
+                    candidate_class=candidate_class,
+                    priority=priority,
+                    reason_code=BASH_CANDIDATE_HARDLINK,
+                    exists=True,
+                    metadata=metadata,
+                    regular_file=True,
+                    reparse_safe=True,
+                )
+            ]
         try:
             resolved = candidate.resolve(strict=True)
         except OSError:
-            record(BASH_CANDIDATE_UNREADABLE, "rejected")
-            errors.append(f"{BASH_CANDIDATE_UNREADABLE}: candidate cannot be canonicalized")
-            continue
+            return None, [
+                reject(
+                    candidate_class=candidate_class,
+                    priority=priority,
+                    reason_code=BASH_CANDIDATE_UNREADABLE,
+                    exists=True,
+                    metadata=metadata,
+                    regular_file=True,
+                    reparse_safe=True,
+                )
+            ]
         if not _authority_path_is_within(
             resolved,
             git_root_resolved,
             windows=selected_policy.platform_name == "Windows",
         ):
-            record(BASH_CANDIDATE_OUTSIDE_GIT_ROOT, "rejected")
-            errors.append(
-                f"{BASH_CANDIDATE_OUTSIDE_GIT_ROOT}: candidate escapes the trusted Git root"
-            )
-            continue
+            return None, [
+                reject(
+                    candidate_class=candidate_class,
+                    priority=priority,
+                    reason_code=BASH_CANDIDATE_OUTSIDE_GIT_ROOT,
+                    exists=True,
+                    metadata=metadata,
+                    regular_file=True,
+                    reparse_safe=True,
+                    same_root=False,
+                )
+            ]
         try:
             chain_ok = _non_reparse_directory_chain(candidate.parent, git_root)
         except OSError:
-            record(BASH_CANDIDATE_UNREADABLE, "rejected")
-            errors.append(
-                f"{BASH_CANDIDATE_UNREADABLE}: candidate parent chain cannot be inspected"
-            )
-            continue
+            return None, [
+                reject(
+                    candidate_class=candidate_class,
+                    priority=priority,
+                    reason_code=BASH_CANDIDATE_UNREADABLE,
+                    exists=True,
+                    metadata=metadata,
+                    regular_file=True,
+                    reparse_safe=None,
+                    same_root=True,
+                )
+            ]
         if not chain_ok:
-            record(BASH_CANDIDATE_REPARSE, "rejected")
-            errors.append(f"{BASH_CANDIDATE_REPARSE}: candidate parent chain is reparse-backed")
-            continue
+            return None, [
+                reject(
+                    candidate_class=candidate_class,
+                    priority=priority,
+                    reason_code=BASH_CANDIDATE_REPARSE,
+                    exists=True,
+                    metadata=metadata,
+                    regular_file=True,
+                    reparse_safe=False,
+                    same_root=True,
+                )
+            ]
         unsafe_reason = _unsafe_tool_path_reason(candidate, repo_root, source)
-        classification = _tool_root_classification(candidate, "bash", selected_policy)
+        root_result = _tool_root_classification_result(
+            candidate, "bash", selected_policy
+        )
+        if root_result.inspection_failed:
+            return None, [
+                reject(
+                    candidate_class=candidate_class,
+                    priority=priority,
+                    reason_code=BASH_CANDIDATE_UNREADABLE,
+                    exists=True,
+                    metadata=metadata,
+                    regular_file=True,
+                    reparse_safe=True,
+                    same_root=True,
+                )
+            ]
+        classification = root_result.root_label
         if unsafe_reason and not (selected_policy.synthetic and classification):
-            record(BASH_CANDIDATE_UNSAFE_ROOT, "rejected")
-            errors.append(f"{BASH_CANDIDATE_UNSAFE_ROOT}: candidate root is not authoritative")
-            continue
-        if _windows_system_launcher_path(candidate, source):
-            record(BASH_CANDIDATE_OUTSIDE_GIT_ROOT, "rejected")
-            errors.append(
-                f"{BASH_CANDIDATE_OUTSIDE_GIT_ROOT}: Windows system launcher is forbidden"
-            )
-            continue
+            return None, [
+                reject(
+                    candidate_class=candidate_class,
+                    priority=priority,
+                    reason_code=BASH_CANDIDATE_UNSAFE_ROOT,
+                    exists=True,
+                    metadata=metadata,
+                    regular_file=True,
+                    reparse_safe=True,
+                    same_root=True,
+                )
+            ]
+        try:
+            windows_system_launcher = _windows_system_launcher_path(candidate, source)
+        except OSError:
+            return None, [
+                reject(
+                    candidate_class=candidate_class,
+                    priority=priority,
+                    reason_code=BASH_CANDIDATE_UNREADABLE,
+                    exists=True,
+                    metadata=metadata,
+                    regular_file=True,
+                    reparse_safe=True,
+                    same_root=True,
+                )
+            ]
+        if windows_system_launcher:
+            return None, [
+                reject(
+                    candidate_class=candidate_class,
+                    priority=priority,
+                    reason_code=BASH_CANDIDATE_OUTSIDE_GIT_ROOT,
+                    exists=True,
+                    metadata=metadata,
+                    regular_file=True,
+                    reparse_safe=True,
+                    same_root=False,
+                )
+            ]
         if classification is None and not _tool_location_is_allowlisted(
             candidate,
             source,
@@ -2611,18 +3146,60 @@ def resolve_trusted_git_bash(
             policy=selected_policy,
             repo_root=repo_root,
         ):
-            record(BASH_CANDIDATE_OUTSIDE_GIT_ROOT, "rejected")
-            errors.append(
-                f"{BASH_CANDIDATE_OUTSIDE_GIT_ROOT}: candidate is outside Git authority"
+            return None, [
+                reject(
+                    candidate_class=candidate_class,
+                    priority=priority,
+                    reason_code=BASH_CANDIDATE_OUTSIDE_GIT_ROOT,
+                    exists=True,
+                    metadata=metadata,
+                    regular_file=True,
+                    reparse_safe=True,
+                    same_root=True,
+                )
+            ]
+        try:
+            digest = _sha256_file(resolved)
+        except OSError:
+            return None, [
+                reject(
+                    candidate_class=candidate_class,
+                    priority=priority,
+                    reason_code=BASH_CANDIDATE_UNREADABLE,
+                    exists=True,
+                    metadata=metadata,
+                    regular_file=True,
+                    reparse_safe=True,
+                    same_root=True,
+                )
+            ]
+        if diagnostics is not None:
+            diagnostics.append(
+                BashCandidateResult(
+                    candidate_location_class=candidate_class,
+                    exists=True,
+                    regular_file=True,
+                    reparse_safe=True,
+                    same_installation_root=True,
+                    link_count=int(getattr(metadata, "st_nlink", 1)),
+                    file_identity=_stat_identity(metadata),
+                    sha256=digest,
+                    version_probe="deferred-to-capture",
+                    lease_precheck="eligible",
+                    selection_priority=priority,
+                    path_shadow_disposition="pending",
+                    failure_reason=None,
+                    disposition="accepted",
+                ).diagnostic()
             )
-            continue
-        record("BASH_CANDIDATE_ACCEPTED", "accepted")
         return str(resolved), []
-    if not errors:
-        errors.append(
-            f"{BASH_CANDIDATE_ABSENT}: required trusted Git Bash executable is unavailable"
-        )
-    return None, sorted(set(errors))
+    return None, [
+        absent_results[-1]
+        if absent_results
+        else ToolAuthorityIssue(
+            "bash", BASH_CANDIDATE_ABSENT, candidate_class="git-bin"
+        ).error_text()
+    ]
 
 
 def _trusted_git_bash_candidate_position(
@@ -2652,8 +3229,17 @@ def _trusted_git_bash_candidate_position(
 @dataclass(frozen=True)
 class _TrustedPathEntry:
     index: int
-    resolved: Path
-    unsafe_reason: str | None
+    original: Path
+    resolved: Path | None
+    classification: str
+    root_category: str
+    aliases: Mapping[str, Path]
+    uninspectable_roles: frozenset[str]
+    original_identity: tuple[int, int, int, int, int] | None
+    target_identity: tuple[int, int, int, int, int] | None
+
+    def alias_for(self, role: str) -> Path | None:
+        return self.aliases.get(role)
 
 
 def _tool_alias_names(role: str, policy: ToolAuthorityPolicy) -> tuple[str, ...]:
@@ -2687,7 +3273,7 @@ def _first_tool_alias(
         except FileNotFoundError:
             continue
         except OSError:
-            return None, f"PATH alias inspection failed closed for {role}"
+            return None, PATH_PREDECESSOR_UNINSPECTABLE
         if stat.S_ISDIR(metadata.st_mode):
             continue
         if not (
@@ -2695,7 +3281,7 @@ def _first_tool_alias(
             or stat.S_ISLNK(metadata.st_mode)
             or _is_reparse_point(metadata)
         ):
-            return None, f"PATH alias type is invalid for {role}"
+            return None, PATH_PREDECESSOR_UNINSPECTABLE
         if (
             policy.platform_name != "Windows"
             and not policy.synthetic
@@ -2707,11 +3293,262 @@ def _first_tool_alias(
     return None, None
 
 
+def _path_root_category(
+    path: Path,
+    *,
+    repo_root: Path,
+    source: Mapping[str, str],
+    policy: ToolAuthorityPolicy,
+) -> str:
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        return "unknown"
+    try:
+        repo = repo_root.resolve(strict=True)
+    except OSError:
+        repo = repo_root.resolve()
+    if _path_is_within(resolved, repo):
+        return "workspace"
+    for variable, category in (
+        ("GITHUB_WORKSPACE", "workspace"),
+        ("RUNNER_TEMP", "runner-temp"),
+    ):
+        value = source.get(variable)
+        if not value:
+            continue
+        try:
+            root = Path(value).resolve(strict=True)
+        except OSError:
+            continue
+        if _path_is_within(resolved, root):
+            return category
+    if any(part.casefold() == "node_modules" for part in resolved.parts):
+        return "node-modules"
+    if any(
+        _path_is_within(resolved, root)
+        for role_roots in policy.role_roots.values()
+        for _label, root in role_roots
+    ):
+        return "approved"
+    if any(
+        _path_is_within(resolved, root)
+        for root in policy.minimal_system_directories
+    ):
+        return "system"
+    if (
+        policy.platform_name == "Windows"
+        and resolved.name.casefold() == "windowsapps"
+    ):
+        return "other"
+    try:
+        task_temp = Path(tempfile.gettempdir()).resolve(strict=True)
+    except OSError:
+        task_temp = Path(tempfile.gettempdir()).resolve()
+    if _path_is_within(resolved, task_temp):
+        return "task-temp"
+    return "other"
+
+
+def _path_entry_aliases(
+    directory: Path,
+    required: Iterable[str],
+    policy: ToolAuthorityPolicy,
+) -> tuple[Mapping[str, Path], frozenset[str]]:
+    aliases: dict[str, Path] = {}
+    uninspectable: set[str] = set()
+    for role in sorted(set(required)):
+        alias, inspection_error = _first_tool_alias(directory, role, policy)
+        if inspection_error:
+            uninspectable.add(role)
+        elif alias is not None:
+            aliases[role] = alias
+    return MappingProxyType(aliases), frozenset(uninspectable)
+
+
+def _classify_path_entry(
+    index: int,
+    entry: Path,
+    *,
+    required: Iterable[str],
+    repo_root: Path,
+    source: Mapping[str, str],
+    policy: ToolAuthorityPolicy,
+) -> _TrustedPathEntry:
+    roles = frozenset(required)
+    try:
+        original_metadata = entry.lstat()
+    except FileNotFoundError:
+        return _TrustedPathEntry(
+            index,
+            entry,
+            None,
+            INERT_MISSING_ENTRY,
+            "unknown",
+            MappingProxyType({}),
+            frozenset(),
+            None,
+            None,
+        )
+    except OSError:
+        return _TrustedPathEntry(
+            index,
+            entry,
+            None,
+            UNSAFE_UNINSPECTABLE_SHADOW_CAPABLE_ENTRY,
+            "unknown",
+            MappingProxyType({}),
+            roles,
+            None,
+            None,
+        )
+
+    original_identity = _stat_identity(original_metadata)
+    is_link = stat.S_ISLNK(original_metadata.st_mode) or _is_reparse_point(
+        original_metadata
+    )
+    if not is_link and not stat.S_ISDIR(original_metadata.st_mode):
+        return _TrustedPathEntry(
+            index,
+            entry,
+            None,
+            INERT_NON_DIRECTORY,
+            "other",
+            MappingProxyType({}),
+            frozenset(),
+            original_identity,
+            None,
+        )
+    try:
+        resolved = entry.resolve(strict=True)
+    except FileNotFoundError:
+        if is_link:
+            return _TrustedPathEntry(
+                index,
+                entry,
+                None,
+                INERT_MISSING_ENTRY,
+                "unknown",
+                MappingProxyType({}),
+                frozenset(),
+                original_identity,
+                None,
+            )
+        return _TrustedPathEntry(
+            index,
+            entry,
+            None,
+            UNSAFE_UNINSPECTABLE_SHADOW_CAPABLE_ENTRY,
+            "unknown",
+            MappingProxyType({}),
+            roles,
+            original_identity,
+            None,
+        )
+    except OSError:
+        return _TrustedPathEntry(
+            index,
+            entry,
+            None,
+            UNSAFE_UNINSPECTABLE_SHADOW_CAPABLE_ENTRY,
+            "unknown",
+            MappingProxyType({}),
+            roles,
+            original_identity,
+            None,
+        )
+    try:
+        target_metadata = resolved.lstat()
+    except OSError:
+        return _TrustedPathEntry(
+            index,
+            entry,
+            resolved,
+            UNSAFE_UNINSPECTABLE_SHADOW_CAPABLE_ENTRY,
+            "unknown",
+            MappingProxyType({}),
+            roles,
+            original_identity,
+            None,
+        )
+    target_identity = _stat_identity(target_metadata)
+    if (
+        stat.S_ISLNK(target_metadata.st_mode)
+        or _is_reparse_point(target_metadata)
+        or not stat.S_ISDIR(target_metadata.st_mode)
+    ):
+        return _TrustedPathEntry(
+            index,
+            entry,
+            resolved,
+            INERT_NON_DIRECTORY if not stat.S_ISDIR(target_metadata.st_mode) else UNSAFE_REPARSE_ESCAPE,
+            "unknown",
+            MappingProxyType({}),
+            frozenset() if not stat.S_ISDIR(target_metadata.st_mode) else roles,
+            original_identity,
+            target_identity,
+        )
+    aliases, uninspectable = _path_entry_aliases(resolved, roles, policy)
+    root_results = {
+        role: _tool_root_classification_result(alias, role, policy)
+        for role, alias in aliases.items()
+    }
+    uninspectable = frozenset(
+        {
+            *uninspectable,
+            *(
+                role
+                for role, result in root_results.items()
+                if result.inspection_failed
+            ),
+        }
+    )
+    root_category = _path_root_category(
+        resolved,
+        repo_root=repo_root,
+        source=source,
+        policy=policy,
+    )
+    if uninspectable:
+        classification = UNSAFE_UNINSPECTABLE_SHADOW_CAPABLE_ENTRY
+    elif not aliases:
+        classification = (
+            SAFE_CANONICAL_SYMLINK_DIRECTORY
+            if is_link
+            and root_category
+            not in {"workspace", "runner-temp", "task-temp", "node-modules"}
+            else INERT_ENTRY_WITH_NO_REQUIRED_EXECUTABLE
+        )
+    elif root_category in {"workspace", "runner-temp", "task-temp", "node-modules"}:
+        classification = (
+            UNSAFE_REPARSE_ESCAPE if is_link else UNSAFE_WORKSPACE_OR_TEMP_AUTHORITY
+        )
+    elif any(result.root_label is None for result in root_results.values()):
+        classification = UNSAFE_REPARSE_ESCAPE if is_link else UNSAFE_EXECUTABLE_SHADOW
+    else:
+        classification = (
+            SAFE_CANONICAL_SYMLINK_DIRECTORY if is_link else SAFE_CANONICAL_DIRECTORY
+        )
+    return _TrustedPathEntry(
+        index,
+        entry,
+        resolved,
+        classification,
+        root_category,
+        aliases,
+        uninspectable,
+        original_identity,
+        target_identity,
+    )
+
+
 def _path_entries(
     source: Mapping[str, str],
     *,
+    required: Iterable[str],
     repo_root: Path,
     policy: ToolAuthorityPolicy,
+    diagnostics: list[dict[str, Any]] | None = None,
 ) -> tuple[list[_TrustedPathEntry], list[str]]:
     raw_path = source.get("PATH", source.get("Path", ""))
     raw_entries = raw_path.split(policy.path_separator) if raw_path else []
@@ -2721,29 +3558,43 @@ def _path_entries(
     for index, raw_entry in enumerate(raw_entries):
         if not raw_entry or not Path(raw_entry).is_absolute():
             # Empty/current/relative entries are removed and never inherited.
+            if diagnostics is not None:
+                diagnostics.append(
+                    {
+                        "kind": "path-entry",
+                        "pathIndex": index,
+                        "classification": INERT_ENTRY_WITH_NO_REQUIRED_EXECUTABLE,
+                        "rootCategory": "unknown",
+                        "candidateRoles": [],
+                    }
+                )
             continue
         entry = Path(raw_entry)
-        try:
-            metadata = entry.lstat()
-            resolved = entry.resolve(strict=True)
-        except OSError:
-            errors.append("PATH directory cannot be inspected")
-            continue
-        if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
-            errors.append("PATH entry is a link, reparse point, or non-directory")
-            continue
-        key = str(resolved).casefold() if policy.platform_name == "Windows" else str(resolved)
+        classified = _classify_path_entry(
+            index,
+            entry,
+            required=required,
+            repo_root=repo_root,
+            source=source,
+            policy=policy,
+        )
+        key_path = classified.resolved or classified.original
+        key = str(key_path).casefold() if policy.platform_name == "Windows" else str(key_path)
         if key in seen:
             continue
         seen.add(key)
-        unsafe_reason = _unsafe_tool_path_reason(resolved, repo_root, source)
-        if policy.synthetic and any(
-            _path_is_within(resolved, root)
-            for role_roots in policy.role_roots.values()
-            for _label, root in role_roots
-        ):
-            unsafe_reason = None
-        entries.append(_TrustedPathEntry(index=index, resolved=resolved, unsafe_reason=unsafe_reason))
+        entries.append(classified)
+        if diagnostics is not None:
+            diagnostics.append(
+                {
+                    "kind": "path-entry",
+                    "pathIndex": index,
+                    "classification": classified.classification,
+                    "rootCategory": classified.root_category,
+                    "candidateRoles": sorted(classified.aliases),
+                    "uninspectableRoles": sorted(classified.uninspectable_roles),
+                }
+            )
     return entries, sorted(set(errors))
 
 
@@ -2783,6 +3634,97 @@ def _fallback_tool_candidate(role: str, policy: ToolAuthorityPolicy) -> Path | N
     return next((path for path in candidates if path.is_file()), None)
 
 
+def _trusted_fixed_bash_alias(
+    alias: Path,
+    candidate: Path,
+    policy: ToolAuthorityPolicy,
+) -> bool:
+    if policy.platform_name != "Windows":
+        return False
+    for _label, root in policy.roots_for("bash"):
+        try:
+            if (
+                _trusted_git_bash_candidate_position(alias, root, windows=True) is not None
+                and _trusted_git_bash_candidate_position(candidate, root, windows=True) is not None
+            ):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _preceding_shadow_issue(
+    entries: Sequence[_TrustedPathEntry],
+    candidate: Path,
+    role: str,
+    policy: ToolAuthorityPolicy,
+    *,
+    scan_all_if_absent: bool = True,
+) -> ToolAuthorityIssue | None:
+    try:
+        canonical = candidate.resolve(strict=True)
+    except OSError:
+        return ToolAuthorityIssue(
+            role,
+            TOOL_CANDIDATE_UNREADABLE,
+            candidate_class="tool-candidate",
+        )
+    candidate_parent = canonical.parent
+    candidate_position = next(
+        (
+            offset
+            for offset, entry in enumerate(entries)
+            if entry.resolved == candidate_parent
+        ),
+        len(entries) if scan_all_if_absent else 0,
+    )
+    for entry in entries[:candidate_position]:
+        if role in entry.uninspectable_roles:
+            return ToolAuthorityIssue(
+                role,
+                PATH_PREDECESSOR_UNINSPECTABLE,
+                path_index=entry.index,
+                candidate_class="parent-path",
+                root_category=entry.root_category,
+            )
+        if (
+            role == "bash"
+            and policy.platform_name == "Windows"
+            and any(
+                entry.resolved is not None
+                and _path_is_within(entry.resolved, system_root)
+                for system_root in policy.minimal_system_directories
+            )
+        ):
+            # System32/Sysnative WSL launchers are never Bash candidates;
+            # execution is bound to Git Bash derived from trusted Git.
+            continue
+        alias = entry.alias_for(role)
+        if alias is None:
+            continue
+        comparable_alias = _npm_entry_from_launcher(alias) if role == "npm" else alias
+        if _same_file_identity(comparable_alias, canonical):
+            continue
+        if role == "bash" and _trusted_fixed_bash_alias(
+            comparable_alias, canonical, policy
+        ):
+            continue
+        reason_code = {
+            UNSAFE_REPARSE_ESCAPE: PATH_REPARSE_ESCAPE,
+            UNSAFE_WORKSPACE_OR_TEMP_AUTHORITY: PATH_WORKSPACE_OR_TEMP_AUTHORITY,
+            UNSAFE_UNINSPECTABLE_SHADOW_CAPABLE_ENTRY: PATH_PREDECESSOR_UNINSPECTABLE,
+            UNKNOWN_FAIL_CLOSED: PATH_ENTRY_UNKNOWN,
+        }.get(entry.classification, PATH_EXECUTABLE_SHADOW)
+        return ToolAuthorityIssue(
+            role,
+            reason_code,
+            path_index=entry.index,
+            candidate_class="parent-path",
+            root_category=entry.root_category,
+        )
+    return None
+
+
 def _preceding_shadow_error(
     entries: Sequence[_TrustedPathEntry],
     candidate: Path,
@@ -2791,34 +3733,14 @@ def _preceding_shadow_error(
     *,
     scan_all_if_absent: bool = True,
 ) -> str | None:
-    canonical = candidate.resolve(strict=True)
-    candidate_parent = canonical.parent
-    candidate_position = next(
-        (offset for offset, entry in enumerate(entries) if entry.resolved == candidate_parent),
-        len(entries) if scan_all_if_absent else 0,
+    issue = _preceding_shadow_issue(
+        entries,
+        candidate,
+        role,
+        policy,
+        scan_all_if_absent=scan_all_if_absent,
     )
-    for entry in entries[:candidate_position]:
-        if (
-            role == "bash"
-            and policy.platform_name == "Windows"
-            and any(
-                _path_is_within(entry.resolved, system_root)
-                for system_root in policy.minimal_system_directories
-            )
-        ):
-            # System32/Sysnative WSL launchers are never Bash candidates;
-            # execution is bound to Git Bash derived from trusted Git.
-            continue
-        alias, inspection_error = _first_tool_alias(entry.resolved, role, policy)
-        if inspection_error:
-            return inspection_error
-        if alias is None:
-            continue
-        comparable_alias = _npm_entry_from_launcher(alias) if role == "npm" else alias
-        if _same_file_identity(comparable_alias, canonical):
-            continue
-        return f"untrusted executable shadow blocks required {role}"
-    return None
+    return issue.error_text() if issue is not None else None
 
 
 def resolve_trusted_tools(
@@ -2833,7 +3755,33 @@ def resolve_trusted_tools(
 
     source = dict(os.environ if source_environment is None else source_environment)
     selected_policy = policy or default_tool_authority_policy(source, repo_root=repo_root)
+    requested = set(required)
     errors: list[str] = []
+
+    def record_issue(
+        issue: ToolAuthorityIssue,
+        *,
+        kind: str = "tool-authority",
+        classification: str | None = None,
+    ) -> None:
+        errors.append(issue.error_text())
+        if diagnostics is not None:
+            entry: dict[str, Any] = {
+                "kind": kind,
+                "tool": issue.tool,
+                "reasonCode": issue.reason_code,
+                "disposition": "rejected",
+            }
+            if issue.path_index is not None:
+                entry["pathIndex"] = issue.path_index
+            if issue.candidate_class is not None:
+                entry["candidateLocationClass"] = issue.candidate_class
+            if issue.root_category is not None:
+                entry["rootCategory"] = issue.root_category
+            if classification is not None:
+                entry["classification"] = classification
+            diagnostics.append(entry)
+
     for override in (
         "NODE_EXE",
         "NPM_EXE",
@@ -2843,11 +3791,23 @@ def resolve_trusted_tools(
         "BASH_EXE",
     ):
         if source.get(override):
-            errors.append(f"caller-controlled executable override is forbidden: {override}")
+            override_role = override.removesuffix("_EXE").casefold()
+            record_issue(
+                ToolAuthorityIssue(
+                    override_role,
+                    TOOL_CANDIDATE_INVALID,
+                    candidate_class="tool-candidate",
+                )
+            )
 
-    entries, path_errors = _path_entries(source, repo_root=repo_root, policy=selected_policy)
+    entries, path_errors = _path_entries(
+        source,
+        required=requested,
+        repo_root=repo_root,
+        policy=selected_policy,
+        diagnostics=diagnostics,
+    )
     errors.extend(path_errors)
-    requested = set(required)
     windows_git_bash = selected_policy.platform_name == "Windows" and "bash" in requested
     path_resolved_names = requested - ({"bash"} if windows_git_bash else set())
     captured_runtime_variables = {
@@ -2857,6 +3817,8 @@ def resolve_trusted_tools(
     }
     resolved_tools: dict[str, str] = {}
     for name in sorted(path_resolved_names):
+        candidate_entry: _TrustedPathEntry | None = None
+        candidate_blocked = False
         captured_name = captured_runtime_variables.get(name)
         captured_value = source.get(captured_name, "") if captured_name else ""
         candidate: str | None = captured_value or None
@@ -2864,44 +3826,145 @@ def resolve_trusted_tools(
             candidate = str(selected_policy.running_python)
         if candidate is None:
             for entry in entries:
-                alias, inspection_error = _first_tool_alias(entry.resolved, name, selected_policy)
-                if inspection_error:
-                    errors.append(inspection_error)
+                if name in entry.uninspectable_roles:
+                    record_issue(
+                        ToolAuthorityIssue(
+                            name,
+                            PATH_PREDECESSOR_UNINSPECTABLE,
+                            path_index=entry.index,
+                            candidate_class="parent-path",
+                            root_category=entry.root_category,
+                        ),
+                        kind="path-shadow",
+                        classification=entry.classification,
+                    )
+                    candidate_blocked = True
                     break
+                alias = entry.alias_for(name)
                 if alias is None:
                     continue
                 alias = _npm_entry_from_launcher(alias) if name == "npm" else alias
                 try:
                     alias_canonical = alias.resolve(strict=True)
                 except OSError:
-                    errors.append(f"resolved executable does not exist: {name}")
+                    record_issue(
+                        ToolAuthorityIssue(
+                            name,
+                            PATH_PREDECESSOR_UNINSPECTABLE,
+                            path_index=entry.index,
+                            candidate_class="parent-path",
+                            root_category=entry.root_category,
+                        ),
+                        kind="path-shadow",
+                        classification=UNSAFE_UNINSPECTABLE_SHADOW_CAPABLE_ENTRY,
+                    )
+                    candidate_blocked = True
                     break
-                if _tool_root_classification(alias_canonical, name, selected_policy) is None:
-                    errors.append(f"untrusted executable shadow blocks required {name}")
+                root_result = _tool_root_classification_result(
+                    alias_canonical, name, selected_policy
+                )
+                if root_result.inspection_failed:
+                    record_issue(
+                        ToolAuthorityIssue(
+                            name,
+                            PATH_PREDECESSOR_UNINSPECTABLE,
+                            path_index=entry.index,
+                            candidate_class="parent-path",
+                            root_category=entry.root_category,
+                        ),
+                        kind="path-shadow",
+                        classification=UNSAFE_UNINSPECTABLE_SHADOW_CAPABLE_ENTRY,
+                    )
+                    candidate_blocked = True
+                    break
+                if root_result.root_label is None:
+                    reason_code = {
+                        UNSAFE_REPARSE_ESCAPE: PATH_REPARSE_ESCAPE,
+                        UNSAFE_WORKSPACE_OR_TEMP_AUTHORITY: PATH_WORKSPACE_OR_TEMP_AUTHORITY,
+                        UNSAFE_UNINSPECTABLE_SHADOW_CAPABLE_ENTRY: PATH_PREDECESSOR_UNINSPECTABLE,
+                        UNKNOWN_FAIL_CLOSED: PATH_ENTRY_UNKNOWN,
+                    }.get(entry.classification, PATH_EXECUTABLE_SHADOW)
+                    record_issue(
+                        ToolAuthorityIssue(
+                            name,
+                            reason_code,
+                            path_index=entry.index,
+                            candidate_class="parent-path",
+                            root_category=entry.root_category,
+                        ),
+                        kind="path-shadow",
+                        classification=entry.classification,
+                    )
+                    candidate_blocked = True
                     break
                 candidate = str(alias_canonical)
+                candidate_entry = entry
                 break
-        if candidate is None:
+        if candidate is None and not candidate_blocked:
             fallback = _fallback_tool_candidate(name, selected_policy)
             if fallback is not None:
                 candidate = str(fallback)
+        if candidate_blocked:
+            continue
         if not candidate:
-            errors.append(f"required trusted executable is unavailable: {name}")
+            record_issue(ToolAuthorityIssue(name, REQUIRED_TOOL_MISSING))
             continue
         candidate_path = Path(candidate)
         if not candidate_path.is_absolute():
-            errors.append(f"resolved executable is not absolute: {name}")
+            record_issue(
+                ToolAuthorityIssue(
+                    name,
+                    TOOL_CANDIDATE_INVALID,
+                    candidate_class="tool-candidate",
+                )
+            )
             continue
         try:
             canonical_candidate = candidate_path.resolve(strict=True)
         except OSError:
-            errors.append(f"resolved executable does not exist: {name}")
+            record_issue(
+                ToolAuthorityIssue(
+                    name,
+                    TOOL_CANDIDATE_UNREADABLE,
+                    candidate_class="tool-candidate",
+                )
+            )
             continue
-        okay, reason = _secure_regular_file(canonical_candidate)
+        okay, _reason = _secure_regular_file(canonical_candidate)
         if not okay:
-            errors.append(f"untrusted executable {name}: {reason}")
+            record_issue(
+                ToolAuthorityIssue(
+                    name,
+                    TOOL_CANDIDATE_INVALID,
+                    path_index=(candidate_entry.index if candidate_entry else None),
+                    candidate_class=(
+                        "parent-path" if candidate_entry else "tool-candidate"
+                    ),
+                    root_category=(
+                        candidate_entry.root_category if candidate_entry else None
+                    ),
+                )
+            )
             continue
-        classification = _tool_root_classification(canonical_candidate, name, selected_policy)
+        root_result = _tool_root_classification_result(
+            canonical_candidate, name, selected_policy
+        )
+        if root_result.inspection_failed:
+            record_issue(
+                ToolAuthorityIssue(
+                    name,
+                    TOOL_CANDIDATE_UNREADABLE,
+                    path_index=(candidate_entry.index if candidate_entry else None),
+                    candidate_class=(
+                        "parent-path" if candidate_entry else "tool-candidate"
+                    ),
+                    root_category=(
+                        candidate_entry.root_category if candidate_entry else None
+                    ),
+                )
+            )
+            continue
+        classification = root_result.root_label
         unsafe_reason = _unsafe_tool_path_reason(canonical_candidate, repo_root, source)
         if (
             name == "npm"
@@ -2911,31 +3974,71 @@ def resolve_trusted_tools(
         ):
             unsafe_reason = None
         if unsafe_reason and not (selected_policy.synthetic and classification is not None):
-            errors.append(f"untrusted executable {name}: {unsafe_reason}")
+            unsafe_code = (
+                PATH_WORKSPACE_OR_TEMP_AUTHORITY
+                if unsafe_reason
+                in {
+                    "path is beneath the repository workspace",
+                    "path is beneath runner-controlled temporary storage",
+                    "path is beneath node_modules",
+                }
+                else TOOL_CANDIDATE_INVALID
+            )
+            record_issue(
+                ToolAuthorityIssue(
+                    name,
+                    unsafe_code,
+                    path_index=(candidate_entry.index if candidate_entry else None),
+                    candidate_class=(
+                        "parent-path" if candidate_entry else "tool-candidate"
+                    ),
+                    root_category=(
+                        candidate_entry.root_category if candidate_entry else None
+                    ),
+                )
+            )
             continue
         if classification is None:
-            errors.append(f"executable is outside the sanitized system/toolcache roots: {name}")
+            record_issue(
+                ToolAuthorityIssue(
+                    name,
+                    TOOL_CANDIDATE_INVALID,
+                    path_index=(candidate_entry.index if candidate_entry else None),
+                    candidate_class=(
+                        "parent-path" if candidate_entry else "tool-candidate"
+                    ),
+                    root_category=(
+                        candidate_entry.root_category if candidate_entry else None
+                    ),
+                )
+            )
             continue
-        shadow_error = _preceding_shadow_error(
+        shadow_issue = _preceding_shadow_issue(
             entries,
             canonical_candidate,
             name,
             selected_policy,
             scan_all_if_absent=bool(captured_value),
         )
-        if shadow_error:
-            errors.append(shadow_error)
+        if shadow_issue:
+            record_issue(shadow_issue, kind="path-shadow")
             continue
         if name == "python" and captured_value and not _same_file_identity(
             candidate_path, selected_policy.running_python
         ):
-            errors.append("captured trusted Python file identity does not equal the running verifier")
+            record_issue(
+                ToolAuthorityIssue(
+                    name,
+                    TOOL_IDENTITY_DRIFT,
+                    candidate_class="tool-candidate",
+                )
+            )
             continue
         resolved_tools[name] = str(canonical_candidate)
     if windows_git_bash:
         git = resolved_tools.get("git")
         if git is None:
-            errors.append("trusted Git Bash cannot be derived because trusted Git is unavailable")
+            record_issue(ToolAuthorityIssue("bash", REQUIRED_TOOL_MISSING))
         else:
             bash, bash_errors = resolve_trusted_git_bash(
                 git,
@@ -2946,22 +4049,50 @@ def resolve_trusted_tools(
             )
             errors.extend(bash_errors)
             if bash is not None:
-                shadow_error = _preceding_shadow_error(
+                shadow_issue = _preceding_shadow_issue(
                     entries,
                     Path(bash),
                     "bash",
                     selected_policy,
                 )
-                if shadow_error:
+                if shadow_issue:
+                    errors.append(shadow_issue.error_text())
                     if diagnostics is not None:
-                        diagnostics.append(
-                            {
-                                "candidate": "parent-PATH",
-                                "reasonCode": BASH_PARENT_PATH_SHADOW_INERT,
-                                "disposition": "detected-inert",
-                            }
-                        )
-                resolved_tools["bash"] = bash
+                        for entry in reversed(diagnostics):
+                            if (
+                                entry.get("kind") == "bash-candidate"
+                                and entry.get("disposition") == "accepted"
+                            ):
+                                entry["pathShadowDisposition"] = "rejected"
+                                entry["failureReason"] = shadow_issue.reason_code
+                                entry["reasonCode"] = shadow_issue.reason_code
+                                entry["disposition"] = "rejected"
+                                break
+                        record = {
+                            "kind": "path-shadow",
+                            "tool": "bash",
+                            "reasonCode": shadow_issue.reason_code,
+                            "disposition": "rejected",
+                        }
+                        if shadow_issue.path_index is not None:
+                            record["pathIndex"] = shadow_issue.path_index
+                        if shadow_issue.candidate_class is not None:
+                            record["candidateLocationClass"] = (
+                                shadow_issue.candidate_class
+                            )
+                        if shadow_issue.root_category is not None:
+                            record["rootCategory"] = shadow_issue.root_category
+                        diagnostics.append(record)
+                else:
+                    if diagnostics is not None:
+                        for entry in reversed(diagnostics):
+                            if (
+                                entry.get("kind") == "bash-candidate"
+                                and entry.get("disposition") == "accepted"
+                            ):
+                                entry["pathShadowDisposition"] = "accepted"
+                                break
+                    resolved_tools["bash"] = bash
     return resolved_tools, sorted(set(errors))
 
 
@@ -3005,7 +4136,10 @@ def child_process_environment(
     seen_directories: set[str] = set()
 
     def add_directory(directory: Path, *, synthetic_authority: bool = False) -> None:
-        resolved = directory.resolve(strict=True)
+        try:
+            resolved = directory.resolve(strict=True)
+        except OSError:
+            return
         reason = _unsafe_tool_path_reason(resolved, repo_root, source)
         if reason and not (selected_policy.synthetic and synthetic_authority):
             return
@@ -3019,8 +4153,16 @@ def child_process_environment(
         # npm is an entrypoint executed by captured Node, never a PATH authority.
         if role == "npm":
             continue
-        resolved_executable = Path(executable).resolve(strict=True)
-        classification = _tool_root_classification(resolved_executable, role, selected_policy)
+        try:
+            resolved_executable = Path(executable).resolve(strict=True)
+        except OSError:
+            continue
+        root_result = _tool_root_classification_result(
+            resolved_executable, role, selected_policy
+        )
+        if root_result.inspection_failed:
+            continue
+        classification = root_result.root_label
         add_directory(
             resolved_executable.parent,
             synthetic_authority=classification is not None,
@@ -6805,6 +7947,140 @@ def _canonical_runner_os() -> str:
     raise ValueError("execution binding supports only Linux and Windows runners")
 
 
+def capture_live_external_authority(
+    source_environment: Mapping[str, str] | None = None,
+) -> ExecutionExternalAuthority:
+    """Capture the process-owned external job context exactly once."""
+
+    source = dict(os.environ if source_environment is None else source_environment)
+    github_actions_value = source.get("GITHUB_ACTIONS")
+    if github_actions_value not in {None, "", "false", "true"}:
+        raise ValueError("GITHUB_ACTIONS has an invalid external-authority value")
+    if github_actions_value != "true":
+        return ExecutionExternalAuthority(
+            source_kind="live",
+            binding_mode="local",
+            runner_os=_canonical_runner_os(),
+            job_id="",
+            run_id="local",
+            run_attempt="1",
+            event_name="local",
+            repository="",
+            checkout_sha="",
+        )
+    required = (
+        "GITHUB_JOB",
+        "RUNNER_OS",
+        "GITHUB_RUN_ID",
+        "GITHUB_RUN_ATTEMPT",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_REPOSITORY",
+        "GITHUB_SHA",
+    )
+    values: dict[str, str] = {}
+    for name in required:
+        value = source.get(name)
+        if not isinstance(value, str) or not value or value != value.strip():
+            raise ValueError(f"live external authority is missing {name}")
+        values[name] = value
+    if values["RUNNER_OS"] != _canonical_runner_os():
+        raise ValueError("live external authority runner OS differs from the process platform")
+    return ExecutionExternalAuthority(
+        source_kind="live",
+        binding_mode="github-actions",
+        runner_os=values["RUNNER_OS"],
+        job_id=values["GITHUB_JOB"],
+        run_id=values["GITHUB_RUN_ID"],
+        run_attempt=values["GITHUB_RUN_ATTEMPT"],
+        event_name=values["GITHUB_EVENT_NAME"],
+        repository=values["GITHUB_REPOSITORY"],
+        checkout_sha=values["GITHUB_SHA"],
+    )
+
+
+def select_generation_evidence_output(
+    source_environment: Mapping[str, str],
+    external_authority: ExecutionExternalAuthority,
+    *,
+    repo_root: Path = REPO_ROOT,
+) -> tuple[Path, Path]:
+    """Select the fixed workspace output or a guarded local task-owned root."""
+
+    raw_output = source_environment.get("CI_FOUNDATION_TASK_OUTPUT_ROOT", "")
+    if not raw_output:
+        return repo_root / ".ci-results", repo_root
+    if external_authority.binding_mode == "github-actions":
+        raise ValueError("external evidence output is forbidden in GitHub Actions")
+    raw_task_root = source_environment.get("CI_SECURITY_TASK_TEMP", "")
+    output = Path(raw_output)
+    task_root = Path(raw_task_root)
+    if not output.is_absolute() or not task_root.is_absolute():
+        raise ValueError("external evidence output requires absolute task-owned paths")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", output.name):
+        raise ValueError("external evidence output name is invalid")
+    try:
+        task_metadata = task_root.lstat()
+        task_resolved = task_root.resolve(strict=True)
+        output_parent = output.parent.resolve(strict=True)
+        repo_resolved = repo_root.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(
+            f"external evidence authority cannot be inspected: {type(exc).__name__}"
+        ) from exc
+    if (
+        not stat.S_ISDIR(task_metadata.st_mode)
+        or stat.S_ISLNK(task_metadata.st_mode)
+        or _is_reparse_point(task_metadata)
+        or output_parent != task_resolved
+        or _path_is_within(task_resolved, repo_resolved)
+    ):
+        raise ValueError("external evidence output is outside the guarded task root")
+    return output, task_root
+
+
+def synthetic_execution_external_authority(
+    *,
+    runner_os: str,
+    job_id: str,
+    run_id: str = "999999999",
+    run_attempt: str = "1",
+    event_name: str = "push",
+    repository: str = "synthetic/repository",
+    checkout_sha: str = BASELINE_COMMIT,
+) -> ExecutionExternalAuthority:
+    """Build an explicit test-only hosted authority without reading os.environ."""
+
+    return ExecutionExternalAuthority(
+        source_kind="synthetic-test",
+        binding_mode="github-actions",
+        runner_os=runner_os,
+        job_id=job_id,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        event_name=event_name,
+        repository=repository,
+        checkout_sha=checkout_sha,
+    )
+
+
+def synthetic_local_execution_external_authority(
+    *, runner_os: str
+) -> ExecutionExternalAuthority:
+    """Build an explicit test-only local authority for synthetic topology tests."""
+
+    return ExecutionExternalAuthority(
+        source_kind="synthetic-test",
+        binding_mode="local",
+        runner_os=runner_os,
+        job_id="",
+        run_id="local",
+        run_attempt="1",
+        event_name="local",
+        repository="",
+        checkout_sha="",
+    )
+
+
 def _local_repository_identity_projection(repo_root: Path) -> bytes:
     resolved = str(repo_root.resolve(strict=True))
     if os.name == "nt":
@@ -7017,12 +8293,13 @@ def build_externally_expected_verification_context(
     baseline: Mapping[str, Any],
     git: str,
     child_environment: Mapping[str, str],
-    source_environment: Mapping[str, str] | None = None,
+    external_authority: ExecutionExternalAuthority,
     repo_root: Path = REPO_ROOT,
 ) -> ExternallyExpectedVerificationContext:
     """Construct all replay selectors without consulting the evidence root."""
 
-    source = os.environ if source_environment is None else source_environment
+    if not isinstance(external_authority, ExecutionExternalAuthority):
+        raise ValueError("explicit external authority is required")
     if expected_profile not in PROFILES:
         raise ValueError("expected profile is not in the fixed profile registry")
     if not re.fullmatch(r"[0-9a-f]{64}", command_plan_digest_value):
@@ -7044,10 +8321,7 @@ def build_externally_expected_verification_context(
     if baseline_commit != BASELINE_COMMIT or baseline_tree != BASELINE_TREE:
         raise ValueError("baseline commit/tree cannot construct execution-binding authority")
 
-    github_actions_value = source.get("GITHUB_ACTIONS")
-    if github_actions_value not in {None, "", "false", "true"}:
-        raise ValueError("GITHUB_ACTIONS has an invalid execution-binding value")
-    github_actions = github_actions_value == "true"
+    github_actions = external_authority.binding_mode == "github-actions"
     if github_actions:
         if (
             expected_producer_job is None
@@ -7059,21 +8333,15 @@ def build_externally_expected_verification_context(
             )
         if expected_invocation_id is not None:
             raise ValueError("GitHub Actions run identity must come from GitHub-controlled context")
-        required_names = (
-            "GITHUB_JOB",
-            "RUNNER_OS",
-            "GITHUB_RUN_ID",
-            "GITHUB_RUN_ATTEMPT",
-            "GITHUB_EVENT_NAME",
-            "GITHUB_REPOSITORY",
-            "GITHUB_SHA",
-        )
-        values: dict[str, str] = {}
-        for name in required_names:
-            value = source.get(name)
-            if not isinstance(value, str) or not value or value != value.strip():
-                raise ValueError(f"GitHub Actions execution binding is missing {name}")
-            values[name] = value
+        values = {
+            "GITHUB_JOB": external_authority.job_id,
+            "RUNNER_OS": external_authority.runner_os,
+            "GITHUB_RUN_ID": external_authority.run_id,
+            "GITHUB_RUN_ATTEMPT": external_authority.run_attempt,
+            "GITHUB_EVENT_NAME": external_authority.event_name,
+            "GITHUB_REPOSITORY": external_authority.repository,
+            "GITHUB_SHA": external_authority.checkout_sha,
+        }
         authority = WORKFLOW_JOB_PROFILE_AUTHORITY.get(expected_verifier_job)
         if authority is None:
             raise ValueError("expected verifier workflow job is outside fixed authority")
@@ -7083,7 +8351,10 @@ def build_externally_expected_verification_context(
             raise ValueError("external expected verifier job does not equal GITHUB_JOB")
         if values["RUNNER_OS"] != expected_runner_os:
             raise ValueError("external expected runner OS does not equal RUNNER_OS")
-        if _canonical_runner_os() != expected_runner_os:
+        if (
+            external_authority.source_kind == "live"
+            and _canonical_runner_os() != expected_runner_os
+        ):
             raise ValueError("external expected runner OS does not equal the current platform")
         if authority["verifierJobId"] != expected_verifier_job:
             raise ValueError("verifier workflow job authority identity mismatch")
@@ -7151,6 +8422,8 @@ def build_externally_expected_verification_context(
         event_name = values["GITHUB_EVENT_NAME"]
         repository = values["GITHUB_REPOSITORY"]
     else:
+        if external_authority.source_kind != "live":
+            raise ValueError("synthetic authority cannot construct local production verification")
         if (
             expected_producer_job is not None
             or expected_verifier_job is not None
@@ -7214,13 +8487,14 @@ def _runner_required_tool(runner: Any, name: str, *, phase: str) -> str:
     return require_tool(tools, name, phase=phase, resolution_errors=errors)
 
 
-def build_generation_execution_binding(
+def _build_generation_execution_binding(
     runner: Any,
     *,
-    source_environment: Mapping[str, str] | None = None,
+    external_authority: ExecutionExternalAuthority,
     repo_root: Path = REPO_ROOT,
 ) -> dict[str, Any]:
-    source = os.environ if source_environment is None else source_environment
+    if not isinstance(external_authority, ExecutionExternalAuthority):
+        raise ValueError("explicit external authority is required")
     git = _runner_required_tool(runner, "git", phase="EXECUTION_BINDING")
     checkout_commit, checkout_tree = current_checkout_identity(
         git=git,
@@ -7232,23 +8506,20 @@ def build_generation_execution_binding(
         environment=runner.child_environment,
         repo_root=repo_root,
     )
-    if source.get("GITHUB_ACTIONS") == "true":
-        producer_job_id = str(source.get("GITHUB_JOB", ""))
+    if external_authority.binding_mode == "github-actions":
+        producer_job_id = external_authority.job_id
         authority = _workflow_authority_for_producer(producer_job_id)
         if authority is None:
             raise ValueError("generation job is outside fixed producer authority")
-        runner_os = str(source.get("RUNNER_OS", ""))
+        runner_os = external_authority.runner_os
         if authority["runnerOS"] != runner_os or authority["profile"] != runner.profile:
             raise ValueError("producer job/profile/OS authority mismatch")
         values = {
-            key: str(source.get(key, ""))
-            for key in (
-                "GITHUB_RUN_ID",
-                "GITHUB_RUN_ATTEMPT",
-                "GITHUB_EVENT_NAME",
-                "GITHUB_REPOSITORY",
-                "GITHUB_SHA",
-            )
+            "GITHUB_RUN_ID": external_authority.run_id,
+            "GITHUB_RUN_ATTEMPT": external_authority.run_attempt,
+            "GITHUB_EVENT_NAME": external_authority.event_name,
+            "GITHUB_REPOSITORY": external_authority.repository,
+            "GITHUB_SHA": external_authority.checkout_sha,
         }
         if values["GITHUB_SHA"] != checkout_commit:
             raise ValueError("producer GITHUB_SHA does not equal checkout commit")
@@ -7289,13 +8560,49 @@ def build_generation_execution_binding(
     return partial
 
 
+def build_generation_execution_binding(
+    runner: Any,
+    *,
+    external_authority: ExecutionExternalAuthority,
+    repo_root: Path = REPO_ROOT,
+) -> dict[str, Any]:
+    """Build a production binding only from a once-captured live authority."""
+
+    if external_authority.source_kind != "live":
+        raise ValueError("synthetic external authority is forbidden in production binding")
+    return _build_generation_execution_binding(
+        runner,
+        external_authority=external_authority,
+        repo_root=repo_root,
+    )
+
+
+def build_synthetic_generation_execution_binding(
+    runner: Any,
+    *,
+    external_authority: ExecutionExternalAuthority,
+    repo_root: Path = REPO_ROOT,
+) -> dict[str, Any]:
+    """Test-only binding path; production CLI never calls this function."""
+
+    if external_authority.source_kind != "synthetic-test":
+        raise ValueError("synthetic binding requires test-only external authority")
+    return _build_generation_execution_binding(
+        runner,
+        external_authority=external_authority,
+        repo_root=repo_root,
+    )
+
+
 def rebuild_external_verification_context(
     context: ExternallyExpectedVerificationContext,
     runner: Any,
     *,
-    source_environment: Mapping[str, str] | None = None,
     repo_root: Path = REPO_ROOT,
 ) -> ExternallyExpectedVerificationContext:
+    external_authority = getattr(runner, "execution_external_authority", None)
+    if not isinstance(external_authority, ExecutionExternalAuthority):
+        raise ValueError("verification runner lacks frozen external authority")
     return build_externally_expected_verification_context(
         expected_profile=context.expected_profile,
         expected_producer_job=(
@@ -7313,7 +8620,7 @@ def rebuild_external_verification_context(
         baseline=runner.baseline,
         git=_runner_required_tool(runner, "git", phase="EXECUTION_BINDING"),
         child_environment=runner.child_environment,
-        source_environment=source_environment,
+        external_authority=external_authority,
         repo_root=repo_root,
     )
 
@@ -9827,6 +11134,46 @@ def _runtime_version(argv: Sequence[str], environment: Mapping[str, str]) -> str
     return value
 
 
+class RuntimeClosurePreconditionError(ValueError):
+    """Typed indication that no runtime-closure measurement was attempted."""
+
+    def __init__(self, reason: str) -> None:
+        normalized = str(reason).strip().upper()
+        if normalized not in RUNTIME_CLOSURE_PRECONDITION_REASONS:
+            normalized = "MEASUREMENT_FAILED"
+        self.code = RUNTIME_CLOSURE_PRECONDITION_STATUS
+        self.reason = normalized
+        super().__init__(f"{self.code} reason={self.reason}")
+
+
+def _runtime_precondition_document(
+    profile: str,
+    reason: str,
+) -> tuple[dict[str, Any], str, str]:
+    error = RuntimeClosurePreconditionError(reason)
+    dependency_digest = hashlib.sha256(
+        _canonical_frame(
+            {
+                "state": RUNTIME_CLOSURE_PRECONDITION_STATUS,
+                "dependencyRoots": [],
+                "profile": profile,
+            }
+        )
+    ).hexdigest()
+    document = {
+        "closureSchemaVersion": RUNTIME_DEPENDENCY_CLOSURE_SCHEMA_VERSION,
+        "measurementStatus": RUNTIME_CLOSURE_PRECONDITION_STATUS,
+        "preconditionReason": error.reason,
+        "profile": profile,
+        "runnerOS": _canonical_runner_os(),
+        "dependencyClosureDigest": dependency_digest,
+        "dependencyMemberCount": 0,
+    }
+    closure_digest = hashlib.sha256(_canonical_frame(document)).hexdigest()
+    document["closureDigest"] = closure_digest
+    return document, closure_digest, dependency_digest
+
+
 @dataclass
 class RuntimeDependencyClosure:
     document: dict[str, Any]
@@ -11896,6 +13243,7 @@ class FoundationRunner:
         target_phase_hook: Any | None = None,
         enable_runtime_closure: bool = False,
         require_fresh_runtime_closure: bool = False,
+        execution_external_authority: ExecutionExternalAuthority | None = None,
     ) -> None:
         self.profile = profile
         self.baseline = baseline
@@ -11913,6 +13261,7 @@ class FoundationRunner:
         )
         self.enable_runtime_closure = enable_runtime_closure
         self.require_fresh_runtime_closure = require_fresh_runtime_closure
+        self.execution_external_authority = execution_external_authority
         self.private_temp_handle = tempfile.TemporaryDirectory(prefix="cf-")
         self.private_temp_root = Path(self.private_temp_handle.name).resolve(strict=True)
         required_tools = required_tool_names(
@@ -11936,12 +13285,14 @@ class FoundationRunner:
             )
             self.runtime["platform"] = self.platform
         self.tools_injected = tools is not None or self.tool_policy.synthetic
+        self.tool_authority_diagnostics: list[dict[str, Any]] = []
         if tools is None:
             self.tools, self.tool_resolution_errors = resolve_trusted_tools(
                 required_tools,
                 source_environment=self.source_environment,
                 repo_root=REPO_ROOT,
                 policy=self.tool_policy,
+                diagnostics=self.tool_authority_diagnostics,
             )
         else:
             self.tools = dict(tools)
@@ -11978,11 +13329,51 @@ class FoundationRunner:
                         root for _label, root in self.tool_policy.roots_for("git")
                     ),
                 )
+                for diagnostic in reversed(self.tool_authority_diagnostics):
+                    if (
+                        diagnostic.get("kind") == "bash-candidate"
+                        and diagnostic.get("disposition") == "accepted"
+                    ):
+                        diagnostic["leasePrecheck"] = "passed"
+                        break
             except OSError as exc:
-                self.tool_resolution_errors.append(
-                    f"trusted Git Bash lease could not be established: {type(exc).__name__}: {exc}"
+                lease_text = str(exc).casefold()
+                lease_reason = (
+                    BASH_CANDIDATE_HARDLINK
+                    if "hardlink" in lease_text
+                    else BASH_CANDIDATE_REPARSE
+                    if "reparse" in lease_text
+                    else BASH_CANDIDATE_OUTSIDE_GIT_ROOT
+                    if "root" in lease_text or "candidate position" in lease_text
+                    else BASH_CANDIDATE_IDENTITY_DRIFT
+                    if "identity" in lease_text or "drift" in lease_text
+                    else BASH_CANDIDATE_LEASE_FAILURE
                 )
-                self.tool_authority_failure = ToolAuthorityUnavailable("bash", "CAPTURE")
+                self.tool_authority_failure = ToolAuthorityUnavailable(
+                    "bash",
+                    "CAPTURE",
+                    reason_code=lease_reason,
+                    candidate_class="tool-candidate",
+                )
+                self.tool_resolution_errors.append(str(self.tool_authority_failure))
+                self.tool_authority_diagnostics.append(
+                    {
+                        "kind": "bash-candidate",
+                        "candidateLocationClass": "tool-candidate",
+                        "reasonCode": lease_reason,
+                        "disposition": "rejected",
+                    }
+                )
+                for diagnostic in reversed(self.tool_authority_diagnostics[:-1]):
+                    if (
+                        diagnostic.get("kind") == "bash-candidate"
+                        and diagnostic.get("disposition") == "accepted"
+                    ):
+                        diagnostic["leasePrecheck"] = "failed"
+                        diagnostic["failureReason"] = lease_reason
+                        diagnostic["reasonCode"] = lease_reason
+                        diagnostic["disposition"] = "rejected"
+                        break
                 self.tool_authority_frozen = False
         self.child_environment = child_process_environment(
             self.tools if self.tool_authority_frozen else {},
@@ -12004,9 +13395,17 @@ class FoundationRunner:
                     )
                     self.tool_leases[name] = lease
                 for name, lease in self.tool_leases.items():
-                    classification = _tool_root_classification(
+                    root_result = _tool_root_classification_result(
                         Path(lease.path), name, self.tool_policy
                     )
+                    if root_result.inspection_failed:
+                        raise ToolAuthorityUnavailable(
+                            name,
+                            "CAPTURE",
+                            reason_code=TOOL_CANDIDATE_UNREADABLE,
+                            candidate_class="tool-candidate",
+                        )
+                    classification = root_result.root_label
                     try:
                         version_output = (
                             "test-injected-not-executed"
@@ -12019,6 +13418,23 @@ class FoundationRunner:
                             )
                         )
                     except OSError as exc:
+                        if name == "bash":
+                            for diagnostic in reversed(
+                                self.tool_authority_diagnostics
+                            ):
+                                if (
+                                    diagnostic.get("kind") == "bash-candidate"
+                                    and diagnostic.get("disposition") == "accepted"
+                                ):
+                                    diagnostic["versionProbe"] = "failed"
+                                    diagnostic["failureReason"] = (
+                                        BASH_CANDIDATE_VERSION_FAILURE
+                                    )
+                                    diagnostic["reasonCode"] = (
+                                        BASH_CANDIDATE_VERSION_FAILURE
+                                    )
+                                    diagnostic["disposition"] = "rejected"
+                                    break
                         raise ToolAuthorityUnavailable(
                             name,
                             "CAPTURE",
@@ -12026,6 +13442,14 @@ class FoundationRunner:
                                 BASH_CANDIDATE_VERSION_FAILURE if name == "bash" else None
                             ),
                         ) from exc
+                    if name == "bash":
+                        for diagnostic in reversed(self.tool_authority_diagnostics):
+                            if (
+                                diagnostic.get("kind") == "bash-candidate"
+                                and diagnostic.get("disposition") == "accepted"
+                            ):
+                                diagnostic["versionProbe"] = "passed"
+                                break
                     self.tool_authority_evidence[name] = {
                         **lease.evidence(),
                         "trustedRootClassification": classification
@@ -12039,10 +13463,15 @@ class FoundationRunner:
                 if self.bash_lease is not None:
                     self.bash_lease.close()
                     self.bash_lease = None
-                failed_role = getattr(exc, "tool", "authority-set")
-                self.tool_authority_failure = ToolAuthorityUnavailable(
-                    failed_role, "CAPTURE"
-                )
+                if isinstance(exc, ToolAuthorityUnavailable):
+                    self.tool_authority_failure = exc
+                else:
+                    failed_role = getattr(exc, "tool", "authority-set")
+                    self.tool_authority_failure = ToolAuthorityUnavailable(
+                        failed_role,
+                        "CAPTURE",
+                        reason_code=UNKNOWN_FAIL_CLOSED,
+                    )
                 self.tool_resolution_errors.append(str(self.tool_authority_failure))
                 self.tool_authority_frozen = False
                 self.child_environment = child_process_environment(
@@ -12051,69 +13480,6 @@ class FoundationRunner:
                     private_temp_root=self.private_temp_root,
                     repo_root=REPO_ROOT,
                     policy=self.tool_policy,
-                )
-        self.runtime_dependency_closure: RuntimeDependencyClosure | None = None
-        self.runtime_dependency_guard: RuntimeDependencyClosureGuard | None = None
-        self.runtime_closure_errors: list[str] = []
-        self.runtime_closure_digest = hashlib.sha256(
-            _canonical_frame(
-                {
-                    "mode": "producer-untrusted-unmeasured",
-                    "profile": profile,
-                    "runnerOS": _canonical_runner_os(),
-                }
-            )
-        ).hexdigest()
-        self.dependency_closure_digest = hashlib.sha256(
-            _canonical_frame({"dependencyRoots": [], "profile": profile})
-        ).hexdigest()
-        self.dependency_member_count = 0
-        self.runtime_closure_document: dict[str, Any] = {
-            "closureSchemaVersion": RUNTIME_DEPENDENCY_CLOSURE_SCHEMA_VERSION,
-            "measurementStatus": "unmeasured-local-producer",
-            "profile": profile,
-            "runnerOS": _canonical_runner_os(),
-            "dependencyClosureDigest": self.dependency_closure_digest,
-            "dependencyMemberCount": 0,
-            "closureDigest": self.runtime_closure_digest,
-        }
-        self.runtime_closure_guard_evidence: dict[str, Any] = {
-            "guardSchemaVersion": RUNTIME_DEPENDENCY_GUARD_SCHEMA_VERSION,
-            "watcherBackend": "not-active",
-            "active": False,
-            "activeDuringReplay": False,
-            "mutationState": "unmeasured",
-            "queueOverflow": False,
-            "mutationEventCount": 0,
-        }
-        if enable_runtime_closure and self.tool_authority_frozen:
-            try:
-                closure = RuntimeDependencyClosure.build(
-                    profile,
-                    self.tools,
-                    self.child_environment,
-                    repo_root=REPO_ROOT,
-                    require_fresh_dependencies=require_fresh_runtime_closure,
-                    source_environment=self.source_environment,
-                )
-                self.runtime_dependency_closure = closure
-                self.runtime_closure_digest = closure.runtime_digest
-                self.dependency_closure_digest = closure.dependency_digest
-                self.dependency_member_count = closure.member_count
-                self.runtime_closure_document = copy.deepcopy(closure.document)
-                self.runtime_dependency_guard = RuntimeDependencyClosureGuard(
-                    closure,
-                    repo_root=REPO_ROOT,
-                )
-                self.runtime_closure_guard_evidence = (
-                    self.runtime_dependency_guard.evidence()
-                )
-            except Exception as exc:
-                if self.runtime_dependency_closure is not None:
-                    self.runtime_dependency_closure.close()
-                    self.runtime_dependency_closure = None
-                self.runtime_closure_errors.append(
-                    f"runtime dependency closure setup failed: {type(exc).__name__}: {exc}"
                 )
         self.planned_candidate_paths, self.command_plan_errors = deterministic_candidate_paths(
             REPO_ROOT
@@ -12147,6 +13513,82 @@ class FoundationRunner:
         }
         if len(self.command_plan_by_id) != len(self.command_plan):
             self.command_plan_errors.append("immutable command plan contains duplicate command IDs")
+        self.runtime_dependency_closure: RuntimeDependencyClosure | None = None
+        self.runtime_dependency_guard: RuntimeDependencyClosureGuard | None = None
+        initial_precondition = (
+            "MEASUREMENT_NOT_REQUESTED"
+            if not enable_runtime_closure
+            else "TOOL_AUTHORITY_NOT_FROZEN"
+            if not self.tool_authority_frozen
+            else "COMMAND_AUTHORITY_INVALID"
+            if self.command_plan_errors or not self.command_plan
+            else "MEASUREMENT_FAILED"
+        )
+        (
+            self.runtime_closure_document,
+            self.runtime_closure_digest,
+            self.dependency_closure_digest,
+        ) = _runtime_precondition_document(profile, initial_precondition)
+        self.dependency_member_count = 0
+        self.runtime_closure_errors: list[str] = [
+            str(RuntimeClosurePreconditionError(initial_precondition))
+        ]
+        self.runtime_closure_guard_evidence: dict[str, Any] = {
+            "guardSchemaVersion": RUNTIME_DEPENDENCY_GUARD_SCHEMA_VERSION,
+            "watcherBackend": "not-active",
+            "active": False,
+            "activeDuringReplay": False,
+            "mutationState": "precondition-not-met",
+            "queueOverflow": False,
+            "mutationEventCount": 0,
+        }
+        if (
+            enable_runtime_closure
+            and self.tool_authority_frozen
+            and not self.command_plan_errors
+            and bool(self.command_plan)
+        ):
+            try:
+                closure = RuntimeDependencyClosure.build(
+                    profile,
+                    self.tools,
+                    self.child_environment,
+                    repo_root=REPO_ROOT,
+                    require_fresh_dependencies=require_fresh_runtime_closure,
+                    source_environment=self.source_environment,
+                )
+                self.runtime_dependency_closure = closure
+                self.runtime_closure_digest = closure.runtime_digest
+                self.dependency_closure_digest = closure.dependency_digest
+                self.dependency_member_count = closure.member_count
+                self.runtime_closure_document = copy.deepcopy(closure.document)
+                self.runtime_dependency_guard = RuntimeDependencyClosureGuard(
+                    closure,
+                    repo_root=REPO_ROOT,
+                )
+                self.runtime_closure_guard_evidence = (
+                    self.runtime_dependency_guard.evidence()
+                )
+                self.runtime_closure_errors = []
+            except Exception as exc:
+                if self.runtime_dependency_closure is not None:
+                    self.runtime_dependency_closure.close()
+                    self.runtime_dependency_closure = None
+                failure_reason = (
+                    "TOOL_AUTHORITY_NOT_FROZEN"
+                    if isinstance(exc, ToolAuthorityUnavailable)
+                    else "DEPENDENCY_ENVIRONMENT_UNAVAILABLE"
+                    if isinstance(exc, (OSError, ValueError))
+                    else "MEASUREMENT_FAILED"
+                )
+                (
+                    self.runtime_closure_document,
+                    self.runtime_closure_digest,
+                    self.dependency_closure_digest,
+                ) = _runtime_precondition_document(profile, failure_reason)
+                self.runtime_closure_errors = [
+                    str(RuntimeClosurePreconditionError(failure_reason))
+                ]
         self.captures: list[CommandCapture] = []
         self.target_execution_leases: list[
             tuple[TargetExecutionLease, dict[str, Any]]
@@ -12176,8 +13618,24 @@ class FoundationRunner:
 
     def require_tool(self, name: str, *, phase: str) -> str:
         if not self.tool_authority_frozen:
-            raise ToolAuthorityUnavailable(name, phase)
-        path = require_tool(self.tools, name, phase=phase)
+            if self.tool_authority_failure is not None:
+                raise ToolAuthorityUnavailable(
+                    name,
+                    phase,
+                    reason_code=self.tool_authority_failure.reason_code,
+                    path_index=self.tool_authority_failure.path_index,
+                    candidate_class=self.tool_authority_failure.candidate_class,
+                    root_category=self.tool_authority_failure.root_category,
+                )
+            raise ToolAuthorityUnavailable(
+                name, phase, reason_code=UNKNOWN_FAIL_CLOSED
+            )
+        path = require_tool(
+            self.tools,
+            name,
+            phase=phase,
+            resolution_errors=self.tool_resolution_errors,
+        )
         lease = getattr(self, "tool_leases", {}).get(name)
         if lease is not None:
             okay, _error = lease.verify()
@@ -12195,8 +13653,12 @@ class FoundationRunner:
 
     def require_all_tools(self, *, phase: str) -> dict[str, str]:
         if not self.tool_authority_frozen:
-            missing = sorted(name for name in self.required_tools if name not in self.tools)
-            raise ToolAuthorityUnavailable(missing[0] if missing else "authority-set", phase)
+            return require_tool_set(
+                self.tools,
+                self.required_tools,
+                phase=phase,
+                resolution_errors=self.tool_resolution_errors,
+            )
         return {
             name: self.require_tool(name, phase=phase)
             for name in sorted(self.required_tools)
@@ -12599,7 +14061,7 @@ class FoundationRunner:
     def run_runtime_policy(self, *, require_npm: bool = False) -> None:
         self.add_hard_gate(
             "RUNTIME-DEPENDENCY-CLOSURE-SETUP",
-            (not self.enable_runtime_closure) or not self.runtime_closure_errors,
+            not self.runtime_closure_errors,
             (
                 f"runtime closure digest={self.runtime_closure_digest} members={self.dependency_member_count}"
                 if not self.runtime_closure_errors
@@ -12631,6 +14093,25 @@ class FoundationRunner:
             python_ok,
             f"Python {platform.python_version()} (required family 3.12)",
         )
+        if not self.tool_authority_frozen:
+            self.add_hard_gate(
+                "NODE-CI-FAMILY",
+                False,
+                "Node execution was blocked by trusted-tool authority",
+            )
+            if require_npm:
+                self.add_hard_gate(
+                    "NPM-REQUIRED",
+                    False,
+                    "npm execution was blocked by trusted-tool authority",
+                )
+            if self.profile in {"static", "standalone", "all"}:
+                self.add_hard_gate(
+                    "GIT-BASH-TRUSTED-RUNTIME",
+                    False,
+                    "Git Bash execution was blocked by trusted-tool authority",
+                )
+            return
         node = self.require_tool("node", phase="EXECUTION")
         node_lease = self.require_tool_lease("node", phase="EXECUTION")
         capture = execute_command(
@@ -14096,10 +15577,11 @@ def _validate_runtime_dependency_closure(
         errors.append(f"{label}: closure must be an object")
         return
     measurement = closure.get("measurementStatus")
-    if measurement == "unmeasured-local-producer":
+    if measurement == RUNTIME_CLOSURE_PRECONDITION_STATUS:
         expected = {
             "closureSchemaVersion",
             "measurementStatus",
+            "preconditionReason",
             "profile",
             "runnerOS",
             "dependencyClosureDigest",
@@ -14108,7 +15590,18 @@ def _validate_runtime_dependency_closure(
         }
         _exact_document_keys(closure, expected, label, errors)
         if closure.get("dependencyMemberCount") != 0:
-            errors.append(f"{label}: unmeasured closure must have zero members")
+            errors.append(f"{label}: precondition failure must have zero members")
+        if closure.get("preconditionReason") not in RUNTIME_CLOSURE_PRECONDITION_REASONS:
+            errors.append(f"{label}: precondition reason is invalid")
+        without_digest = {
+            key: value for key, value in closure.items() if key != "closureDigest"
+        }
+        if closure.get("closureDigest") != hashlib.sha256(
+            _canonical_frame(without_digest)
+        ).hexdigest():
+            errors.append(f"{label}: precondition closure digest is invalid")
+        if status == "PASS":
+            errors.append(f"{label}: PASS cannot contain a runtime precondition failure")
     elif measurement in {
         "measured-complete",
         "local-nondependency-npm-unavailable",
@@ -14294,7 +15787,7 @@ def _validate_runtime_dependency_closure(
             errors.append(f"{guard_label}: active state is invalid")
         if type(guard.get("queueOverflow")) is not bool or type(guard.get("mutationEventCount")) is not int:
             errors.append(f"{guard_label}: mutation state is invalid")
-        if status == "PASS" and measurement != "unmeasured-local-producer" and (
+        if status == "PASS" and (
             guard.get("activeDuringReplay") is not True
             or guard.get("mutationState") != "clean"
             or guard.get("queueOverflow") is not False
@@ -15921,6 +17414,7 @@ def verify_evidence_with_replay(
     expected_context: ExternallyExpectedVerificationContext,
     verification_runner: FoundationRunner,
     repo_root: Path = REPO_ROOT,
+    evidence_authority_root: Path | None = None,
 ) -> tuple[list[str], dict[str, Any] | None]:
     if verification_runner.profile != expected_context.expected_profile:
         return ["verification runner profile differs from external expected profile"], None
@@ -15928,7 +17422,7 @@ def verify_evidence_with_replay(
         return ["verification runner command plan differs from external expected context"], None
     errors = verify_evidence_file_set(
         output_dir,
-        repo_root=repo_root,
+        repo_root=evidence_authority_root or repo_root,
         expected_command_plan=verification_runner.command_plan,
         expected_context=expected_context,
     )
@@ -16104,8 +17598,16 @@ def write_evidence(
     comparison: Mapping[str, Any],
     *,
     runner_error: str | None = None,
+    output_dir: Path | None = None,
+    evidence_authority_root: Path | None = None,
 ) -> dict[str, Any]:
-    root_errors = validate_evidence_root(OUTPUT_DIR, repo_root=REPO_ROOT)
+    output_dir = OUTPUT_DIR if output_dir is None else output_dir
+    evidence_authority_root = (
+        REPO_ROOT if evidence_authority_root is None else evidence_authority_root
+    )
+    root_errors = validate_evidence_root(
+        output_dir, repo_root=evidence_authority_root
+    )
     if root_errors:
         raise RuntimeError("; ".join(root_errors))
     if active_containment_count() != 0:
@@ -16172,13 +17674,47 @@ def write_evidence(
             runner.violations.append(violation)
             existing_violation_keys.add(key)
     runtime = {key: str(value) for key, value in runner.runtime.items()}
-    runtime.setdefault("runtimeClosureDigest", hashlib.sha256(
-        _canonical_frame({"mode": "synthetic-unmeasured", "profile": runner.profile})
-    ).hexdigest())
-    runtime.setdefault("dependencyClosureDigest", hashlib.sha256(
-        _canonical_frame({"dependencyRoots": [], "profile": runner.profile})
-    ).hexdigest())
+    runtime_closure_document = copy.deepcopy(
+        getattr(runner, "runtime_closure_document", None)
+    )
+    if not isinstance(runtime_closure_document, dict):
+        (
+            runtime_closure_document,
+            fallback_runtime_digest,
+            fallback_dependency_digest,
+        ) = _runtime_precondition_document(runner.profile, "MEASUREMENT_FAILED")
+        runtime["runtimeClosureDigest"] = fallback_runtime_digest
+        runtime["dependencyClosureDigest"] = fallback_dependency_digest
+        runtime["dependencyMemberCount"] = "0"
+    runtime.setdefault(
+        "runtimeClosureDigest", str(runtime_closure_document.get("closureDigest", ""))
+    )
+    runtime.setdefault(
+        "dependencyClosureDigest",
+        str(runtime_closure_document.get("dependencyClosureDigest", "")),
+    )
     runtime.setdefault("dependencyMemberCount", "0")
+    if (
+        runtime_closure_document.get("measurementStatus")
+        == RUNTIME_CLOSURE_PRECONDITION_STATUS
+    ):
+        precondition_violation = {
+            "id": "RUNTIME-CLOSURE-PRECONDITION",
+            "detail": str(
+                RuntimeClosurePreconditionError(
+                    str(runtime_closure_document.get("preconditionReason", ""))
+                )
+            ),
+        }
+        key = json.dumps(
+            precondition_violation,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if key not in existing_violation_keys:
+            runner.violations.append(precondition_violation)
+            existing_violation_keys.add(key)
     started_at = utc_now()
     invocation_without_id = {
         "startedAt": started_at,
@@ -16193,19 +17729,6 @@ def write_evidence(
         "invocationId": _invocation_identity(invocation_without_id, runtime),
         **invocation_without_id,
     }
-    runtime_closure_document = copy.deepcopy(
-        getattr(runner, "runtime_closure_document", None)
-    )
-    if not isinstance(runtime_closure_document, dict):
-        runtime_closure_document = {
-            "closureSchemaVersion": RUNTIME_DEPENDENCY_CLOSURE_SCHEMA_VERSION,
-            "measurementStatus": "unmeasured-local-producer",
-            "profile": runner.profile,
-            "runnerOS": _canonical_runner_os(),
-            "dependencyClosureDigest": runtime["dependencyClosureDigest"],
-            "dependencyMemberCount": int(runtime["dependencyMemberCount"]),
-            "closureDigest": runtime["runtimeClosureDigest"],
-        }
     runtime_guard_document = copy.deepcopy(
         getattr(runner, "runtime_closure_guard_evidence", None)
     )
@@ -16215,7 +17738,7 @@ def write_evidence(
             "watcherBackend": "not-active",
             "active": False,
             "activeDuringReplay": False,
-            "mutationState": "unmeasured",
+            "mutationState": "precondition-not-met",
             "queueOverflow": False,
             "mutationEventCount": 0,
         }
@@ -16426,12 +17949,16 @@ def write_evidence(
         if len(payload) > EVIDENCE_FILE_BYTE_LIMITS[name]:
             raise RuntimeError(f"{name} exceeds its fixed evidence byte limit")
     for name in EVIDENCE_FILE_NAMES:
-        _exclusive_write(OUTPUT_DIR / name, payloads[name], repo_root=REPO_ROOT)
+        _exclusive_write(
+            output_dir / name,
+            payloads[name],
+            repo_root=evidence_authority_root,
+        )
     if active_containment_count() != 0:
         raise RuntimeError("repository-controlled process containment became active before evidence verification")
     verification_errors = verify_evidence_file_set(
-        OUTPUT_DIR,
-        repo_root=REPO_ROOT,
+        output_dir,
+        repo_root=evidence_authority_root,
         expected_command_plan=runner.command_plan,
     )
     if verification_errors:
@@ -16660,6 +18187,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def prepare_verification_authority(
     args: argparse.Namespace,
     *,
+    external_authority: ExecutionExternalAuthority,
     repo_root: Path = REPO_ROOT,
     source_environment: Mapping[str, str] | None = None,
 ) -> tuple[ExternallyExpectedVerificationContext, FoundationRunner]:
@@ -16673,8 +18201,10 @@ def prepare_verification_authority(
     schema_errors = validate_baseline_document(baseline)
     if schema_errors:
         raise ValueError("verification baseline schema is invalid: " + "; ".join(schema_errors))
+    if external_authority.source_kind != "live":
+        raise ValueError("production verification requires live external authority")
     source = dict(os.environ if source_environment is None else source_environment)
-    github_actions = source.get("GITHUB_ACTIONS") == "true"
+    github_actions = external_authority.binding_mode == "github-actions"
     if github_actions:
         if not args.untrusted_evidence_root:
             raise ValueError("GitHub verifier requires an explicit untrusted evidence root")
@@ -16705,6 +18235,7 @@ def prepare_verification_authority(
         source_environment=source_environment,
         enable_runtime_closure=True,
         require_fresh_runtime_closure=bool(args.require_fresh_runtime_closure),
+        execution_external_authority=external_authority,
     )
     runner.require_all_tools(phase="VERIFICATION_PREPARATION")
     runner.linux_containment_self_test = {
@@ -16738,7 +18269,7 @@ def prepare_verification_authority(
             baseline=baseline,
             git=runner.require_tool("git", phase="EXECUTION_BINDING"),
             child_environment=runner.child_environment,
-            source_environment=source_environment,
+            external_authority=external_authority,
             repo_root=repo_root,
         )
     except Exception:
@@ -16765,6 +18296,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.list_profiles:
         print("\n".join(PROFILES))
         return EXIT_SUCCESS
+    source_environment = dict(os.environ)
+    try:
+        external_authority = capture_live_external_authority(source_environment)
+    except ValueError as exc:
+        print(
+            "CI foundation external-authority configuration error: "
+            + sanitize_text(str(exc)),
+            file=sys.stderr,
+        )
+        return EXIT_CONFIGURATION_ERROR
+    local_parent_path = source_environment.get("CI_FOUNDATION_LOCAL_PARENT_PATH", "")
+    if local_parent_path:
+        if external_authority.binding_mode == "github-actions":
+            print(
+                "CI foundation external-authority configuration error: "
+                "local parent PATH override is forbidden in GitHub Actions",
+                file=sys.stderr,
+            )
+            return EXIT_CONFIGURATION_ERROR
+        if (
+            "\0" in local_parent_path
+            or "\r" in local_parent_path
+            or "\n" in local_parent_path
+            or len(local_parent_path.encode("utf-8", errors="strict")) > 32_768
+        ):
+            print(
+                "CI foundation external-authority configuration error: "
+                "local parent PATH override is malformed",
+                file=sys.stderr,
+            )
+            return EXIT_CONFIGURATION_ERROR
+        source_environment["PATH"] = local_parent_path
+        source_environment["Path"] = local_parent_path
     if args.verify_evidence:
         evidence_root = (
             REPO_ROOT / args.untrusted_evidence_root
@@ -16785,7 +18349,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             expected_context, verification_runner = prepare_verification_authority(
                 args,
+                external_authority=external_authority,
                 repo_root=REPO_ROOT,
+                source_environment=source_environment,
             )
         except (OSError, KeyError, ValueError) as exc:
             print(
@@ -16799,6 +18365,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 expected_context=expected_context,
                 verification_runner=verification_runner,
                 repo_root=REPO_ROOT,
+                evidence_authority_root=evidence_root.parent,
             )
         finally:
             verification_runner.cleanup_task_resources()
@@ -16813,7 +18380,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"replay={replay_status}"
         )
         return EXIT_SUCCESS
-    evidence_errors = validate_evidence_root_absent(OUTPUT_DIR, repo_root=REPO_ROOT)
+    try:
+        evidence_output_dir, evidence_authority_root = (
+            select_generation_evidence_output(
+                source_environment,
+                external_authority,
+                repo_root=REPO_ROOT,
+            )
+        )
+    except ValueError as exc:
+        print(
+            "CI foundation evidence-output configuration error: "
+            + sanitize_text(str(exc)),
+            file=sys.stderr,
+        )
+        return EXIT_CONFIGURATION_ERROR
+    evidence_errors = validate_evidence_root_absent(
+        evidence_output_dir, repo_root=evidence_authority_root
+    )
     if evidence_errors:
         print(
             "CI foundation evidence-root guard violation: " + sanitize_text("; ".join(evidence_errors)),
@@ -16846,7 +18430,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.profile,
         baseline,
         require_install_tools=args.require_install_tools,
-        enable_runtime_closure=os.environ.get("GITHUB_ACTIONS") == "true",
+        source_environment=source_environment,
+        enable_runtime_closure=True,
+        execution_external_authority=external_authority,
     )
     try:
         runner.require_all_tools(
@@ -16860,6 +18446,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             runner.execution_binding = build_generation_execution_binding(
                 runner,
+                external_authority=external_authority,
                 repo_root=REPO_ROOT,
             )
         except (OSError, ValueError) as exc:
@@ -16873,7 +18460,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             return EXIT_CONFIGURATION_ERROR
         try:
-            create_fresh_evidence_root(OUTPUT_DIR, repo_root=REPO_ROOT)
+            create_fresh_evidence_root(
+                evidence_output_dir,
+                repo_root=evidence_authority_root,
+            )
         except Exception as exc:
             runner.close_execution_leases()
             print(
@@ -16907,7 +18497,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"CI foundation profile={args.profile} verify-only status={status}")
         return EXIT_SUCCESS if status == "PASS" else EXIT_POLICY_VIOLATION
     try:
-        summary = write_evidence(runner, comparison, runner_error=runner_error)
+        summary = write_evidence(
+            runner,
+            comparison,
+            runner_error=runner_error,
+            output_dir=evidence_output_dir,
+            evidence_authority_root=evidence_authority_root,
+        )
     except Exception as exc:  # pragma: no cover - evidence failure must be loud
         print(f"CI foundation evidence error: {type(exc).__name__}: {sanitize_text(str(exc))}", file=sys.stderr)
         return EXIT_RUNNER_ERROR
@@ -16919,7 +18515,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "Local verification invocation authority: "
             + summary["executionBinding"]["producerInvocationId"]
         )
-    print("Sanitized summary: .ci-results/summary.md")
+    print(
+        "Sanitized summary: "
+        + (
+            ".ci-results/summary.md"
+            if evidence_output_dir == OUTPUT_DIR
+            else "task-authorized-external/summary.md"
+        )
+    )
     return EXIT_SUCCESS if summary["status"] == "PASS" else EXIT_POLICY_VIOLATION
 
 

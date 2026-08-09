@@ -379,9 +379,13 @@ revalidation. The runner resolves and verifies the complete tool set for the
 selected profile before it constructs the immutable command plan or any
 authorization binding. A missing or partial map fails with the stable,
 path-free typed diagnostic
-`CI_TOOL_AUTHORITY_UNAVAILABLE tool=<role> phase=<phase>`, a nonzero result, no
-Python traceback, no `KeyError`, no partial binding, and no pass-shaped
-evidence. Policy requires Python, Node, and Git; static and standalone also
+`CI_TOOL_AUTHORITY_UNAVAILABLE tool=<role> phase=<phase>
+reason=<closed-reason> [path_index=<ordinal>] [candidate=<class>]
+[root_category=<class>]`, a nonzero result, no Python traceback, no `KeyError`,
+no partial binding, and no pass-shaped evidence. Roles, phases, reasons,
+candidate classes, and root categories are closed enums. Absolute paths,
+usernames, arbitrary exception text, and environment values never cross this
+terminal diagnostic boundary. Policy requires Python, Node, and Git; static and standalone also
 require Bash and PowerShell/pwsh because the unchanged standalone packaging
 producer invokes both shells; dependency-using profiles explicitly require the
 npm entrypoint.
@@ -411,27 +415,52 @@ System32, Sysnative, WindowsApps, the workspace, runner temporary storage,
 `node_modules`, or another Git installation. It is enumerated only from the
 derived Git root, in the fixed priority
 `<TrustedGitRoot>\bin\bash.exe` then
-`<TrustedGitRoot>\usr\bin\bash.exe`. The chosen path must be the exact fixed
+`<TrustedGitRoot>\usr\bin\bash.exe`. Absence of the priority candidate permits
+inspection of the second candidate. If the priority candidate exists but
+fails regular-file, reparse, installation-root, single-link, identity, hash,
+version, or lease validation, selection fails closed and does not fall back.
+The chosen path must be the exact fixed
 candidate under the same component-equal root, not a near-prefix root or an
 arbitrary descendant. A missing or invalid candidate retains the stable typed
 tool-authority failure and cannot yield a partial authorization binding or a
 pass-shaped artifact.
 
-PATH order and executable shadowing are distinct facts. The resolver inspects
-each absolute, non-link directory and enumerates the platform aliases for the
-role being resolved. An earlier workspace, runner-temp, `node_modules/.bin`, or
-other untrusted directory is harmless when it contains no relevant alias. If
-it contains a different executable, script, shim, or alias that could shadow
-an ordinarily PATH-resolved role, resolution fails closed. An uninspectable
-directory, invalid entry type, or ambiguous identity also fails closed. Empty,
-current-directory, relative, and duplicate entries are removed and never
-inherited. An alias in an earlier directory may match only when file identity
-proves it is the same approved executable; capture still records and executes
-the canonical approved path, never the alias. Windows Git Bash is the narrow
-exception to shadow authority because it is not PATH-resolved: a parent-PATH
-Bash alias is detected for audit, but it cannot replace or veto the fixed
-same-installation absolute candidate and is absent from the rebuilt child
-PATH. The alias itself receives no authority and is never executed.
+PATH order and executable shadowing are distinct facts. Each absolute entry is
+classified per required role as `SAFE_CANONICAL_DIRECTORY`,
+`SAFE_CANONICAL_SYMLINK_DIRECTORY`, `INERT_NON_DIRECTORY`,
+`INERT_MISSING_ENTRY`, `INERT_ENTRY_WITH_NO_REQUIRED_EXECUTABLE`,
+`UNSAFE_EXECUTABLE_SHADOW`,
+`UNSAFE_UNINSPECTABLE_SHADOW_CAPABLE_ENTRY`, `UNSAFE_REPARSE_ESCAPE`,
+`UNSAFE_WORKSPACE_OR_TEMP_AUTHORITY`, or `UNKNOWN_FAIL_CLOSED`. A canonical
+symlink directory is safe only when its readable directory target, identity,
+root, and role aliases can all be evaluated and the target is outside the
+workspace, temporary storage, and `node_modules`. A broken link, missing entry,
+non-directory, or readable empty directory is inert only when it cannot change
+resolution of any required alias. Empty/current/relative entries are removed;
+duplicates are collapsed.
+
+For each role the resolver checks exact basenames, Python family aliases,
+PowerShell aliases, Windows launcher suffixes, and the fixed npm launcher form.
+An earlier workspace, runner-temp, `node_modules/.bin`, or other untrusted
+directory is harmless only when inspection proves it has no relevant alias.
+An actual different alias blocks with `PATH_EXECUTABLE_SHADOW` or the more
+specific forbidden-root/reparse reason. If inspection cannot establish whether
+a predecessor can shadow that role, it blocks with
+`PATH_PREDECESSOR_UNINSPECTABLE`; inability to inspect is never globally
+ignored. An alias may match only when stable file identity proves it is the
+same approved executable. Capture records the canonical approved path, never
+the alias. The same predecessor rule applies to the fixed Windows Git Bash
+candidate: System32/Sysnative WSL launchers are known inert because they are
+not Git Bash candidates, but WindowsApps, workspace, temporary, other-install,
+or ambiguous Bash aliases veto binding and are removed from the rebuilt child
+PATH.
+
+Local security-review processes whose host wrapper fixes `PATH` may supply an
+explicit `CI_FOUNDATION_LOCAL_PARENT_PATH` inspection input. It is still passed
+through the complete resolver and grants no root or executable authority; it
+only replaces the ambient parent list being classified. The channel is
+malformed-input checked and rejected whenever the frozen authority is
+`github-actions`.
 
 Each captured tool record contains its canonical absolute path, stable file
 identity, byte length, SHA-256, version output, and trusted-root
@@ -449,6 +478,12 @@ SHA-256 are captured; version inspection invokes that captured absolute path;
 and the held identity is checked before and after every authorized execution.
 Identity, same-size, hardlink, or change-and-restore drift fails closed before
 an unverified replacement can run.
+Each fixed Bash candidate also has an internal path-free result containing its
+location class (`git-bin` or `git-usr-bin`), existence, regular/reparse/root
+checks, link count, stable file identity, SHA-256, version-probe state,
+lease-precheck state, priority, PATH-shadow disposition, final disposition,
+and a closed failure reason. Only the closed reason, candidate class, and safe
+ordinal/category fields may be emitted at the CLI.
 
 A new real hosted Windows producer and independent verifier run remains
 required before merge eligibility. Local synthetic layout evidence validates
@@ -694,8 +729,18 @@ dependency cache is enabled.
 
 ### Runtime and dependency closure
 
+Runtime measurement begins only after the complete tool authority is frozen
+and the immutable command plan is valid. If tool authority, command authority,
+or the required dependency environment is unavailable, no closure measurement
+is claimed: the versioned document records `measurementStatus:
+PRECONDITION_NOT_MET` plus one closed `preconditionReason`. That typed state is
+always failure-shaped and is invalid in `PASS` evidence. The former
+success-shaped `unmeasured-local-producer` state is not accepted.
+
 Every GitHub verifier independently constructs `RuntimeDependencyClosure`
-before replay. Its versioned document binds profile and runner OS; canonical
+before replay. Local production generation also requests the closure and may
+use only the narrow nondependency omission described below. The versioned
+document binds profile and runner OS; canonical
 Python, Node, and npm paths; product versions; byte sizes and SHA-256 values;
 stable executable identities; the two lockfiles; the ordered complete manifests
 of required dependency roots; member type, mode, size, hash, and authorized
@@ -729,6 +774,16 @@ and Linux-kernel containment therefore remain accurately labelled
 
 ### Job-local skips and run-wide OS coverage
 
+Before executing any test, the test runner flattens the complete selected
+suite, freezes the sorted test IDs, prints their SHA-256 inventory digest, and
+prints per-class counts. Execution accounting separately reports discovered,
+executed, passed, failed, errored, skipped, class-setup errors, and methods
+blocked by class setup. A `setUpClass` abort is blocking; every discovered
+method in that class that never reached `startTest` is reported as
+`blocked-by-class-setup`, never passed, covered, or absent. Thus run-wide
+coverage consumes the pre-execution inventory rather than inferring existence
+from unittest's executed count.
+
 Test reporting distinguishes four facts: job-local discovered tests,
 job-local passes, job-local skips caused by platform applicability, and the
 required live run-wide coverage for each security family. A Windows Job Object
@@ -753,6 +808,14 @@ runner validates every existing ancestor beneath the repository root, rejects
 links, junctions, reparse points, non-directories, and resolution outside the
 workspace, then creates a fresh directory. Each evidence file is created
 exclusively as a regular file with no-follow behavior where supported.
+For local security-review runs only, `CI_FOUNDATION_TASK_OUTPUT_ROOT` may name
+one bounded direct child of the explicit absolute `CI_SECURITY_TASK_TEMP` root.
+The task root must already exist, be a non-reparse directory outside the
+repository, and be the output's exact resolved parent. This channel is rejected
+when the frozen external authority is `github-actions`; workflow production
+therefore remains fixed to `.ci-results`. The external local directory has the
+same exclusive-create, exact-membership, replay, and immutability checks and
+does not authorize any additional evidence filename.
 
 The only allowed files are:
 
@@ -1114,6 +1177,19 @@ then compares the claim with the independently built external context. A
 coherent rewrite of every JSON file, Markdown, manifest, binding, digest,
 command-plan claim, and replay-shaped field cannot replace that external
 authority.
+
+The production entrypoint captures GitHub/local job context once as an
+immutable `ExecutionExternalAuthority` before runner construction, command
+planning, binding, or evidence access. Generation, expected-context
+construction, and replay revalidation receive that object explicitly and do
+not reread ambient GitHub variables. Synthetic topology tests use a separate
+test-only factory and a separate synthetic binding API; the production binding
+API rejects that source kind. No producer `--runner-os`, `--github-job`, JSON,
+summary field, evidence field, or environment override can inject a synthetic
+authority into the production CLI. Opposite-OS ambient GitHub environments are
+therefore irrelevant to an explicit synthetic fixture, while production still
+validates the once-captured live job, OS, run, event, repository, and checkout
+identity.
 
 When `GITHUB_ACTIONS == true`, the binding mode is `github-actions`. The
 verifier fails closed unless all of `GITHUB_JOB`, `RUNNER_OS`, `GITHUB_RUN_ID`,

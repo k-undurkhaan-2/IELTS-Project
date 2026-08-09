@@ -13,6 +13,7 @@ import itertools
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import stat
@@ -132,6 +133,107 @@ def _explicit_security_task_temp() -> Path:
         or tempfile.gettempdir()
     )
     return Path(selected).resolve(strict=True)
+
+
+def _explicit_local_test_tool_map(*roles: str) -> dict[str, str]:
+    """Bind non-resolver fixtures to explicit local executables.
+
+    These tests exercise command protocols, target leases, or plan construction;
+    PATH classification has its own dedicated matrices below.  Keeping their
+    executable precondition explicit prevents an unrelated ambient PATH entry
+    from aborting an entire test class while retaining production fail-closed
+    behavior.
+    """
+
+    dependency_root = Path(sys.executable).resolve(strict=True).parent.parent
+    names = {
+        "node": "node.exe" if os.name == "nt" else "node",
+        "git": "git.exe" if os.name == "nt" else "git",
+    }
+    windows_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    candidates: dict[str, tuple[str | Path | None, ...]] = {
+        "python": (sys.executable,),
+        "node": (
+            os.environ.get("CI_TRUSTED_NODE"),
+            dependency_root / "node" / "bin" / names["node"],
+            shutil.which("node"),
+        ),
+        "git": (
+            os.environ.get("GIT_EXE"),
+            Path(r"D:\Git\cmd\git.exe") if os.name == "nt" else None,
+            shutil.which("git"),
+        ),
+        "bash": (
+            os.environ.get("CI_TRUSTED_BASH"),
+            Path(r"D:\Git\bin\bash.exe") if os.name == "nt" else None,
+            shutil.which("bash"),
+        ),
+        "powershell": (
+            os.environ.get("CI_TRUSTED_POWERSHELL"),
+            (
+                windows_root
+                / "System32"
+                / "WindowsPowerShell"
+                / "v1.0"
+                / "powershell.exe"
+                if os.name == "nt"
+                else None
+            ),
+            shutil.which("pwsh"),
+            shutil.which("powershell"),
+        ),
+    }
+    result: dict[str, str] = {}
+    for role in roles:
+        if role not in candidates:
+            raise AssertionError(f"unsupported explicit local test tool role: {role}")
+        for candidate in candidates[role]:
+            if not candidate:
+                continue
+            try:
+                resolved = Path(candidate).resolve(strict=True)
+                metadata = resolved.stat()
+            except OSError:
+                continue
+            if stat.S_ISREG(metadata.st_mode):
+                result[role] = str(resolved)
+                break
+        if role not in result:
+            raise AssertionError(f"explicit local test tool is unavailable: {role}")
+    return result
+
+
+def _explicit_local_test_environment() -> dict[str, str]:
+    """Return a local fixture source isolated from ambient hosted-job claims."""
+
+    source = dict(os.environ)
+    source["GITHUB_ACTIONS"] = "false"
+    for name in (
+        "GITHUB_JOB",
+        "GITHUB_RUN_ID",
+        "GITHUB_RUN_ATTEMPT",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_REPOSITORY",
+        "GITHUB_SHA",
+        "RUNNER_OS",
+        "RUNNER_ENVIRONMENT",
+    ):
+        source.pop(name, None)
+    return source
+
+
+def _explicit_live_local_external_authority() -> ci.ExecutionExternalAuthority:
+    return ci.ExecutionExternalAuthority(
+        source_kind="live",
+        binding_mode="local",
+        runner_os=ci._canonical_runner_os(),
+        job_id="",
+        run_id="local",
+        run_attempt="1",
+        event_name="local",
+        repository="",
+        checkout_sha="",
+    )
 
 
 @contextlib.contextmanager
@@ -791,6 +893,53 @@ def synthetic_external_context(binding: dict) -> ci.ExternallyExpectedVerificati
 
 def fake_runner(baseline: dict) -> SimpleNamespace:
     command_plan = ci.expected_command_authority("policy", baseline=baseline)
+    executable = Path(sys.executable).resolve(strict=True)
+    executable_record = {
+        "role": "synthetic-test-runtime",
+        "canonicalPath": str(executable),
+        "size": executable.stat().st_size,
+        "sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+        "stableIdentity": ci._stable_file_identity(executable.stat()),
+        "leaseHeld": True,
+    }
+    lockfiles = [
+        {
+            "relativePath": relative,
+            "mode": "100644",
+            "size": 1,
+            "sha256": hashlib.sha256(relative.encode("utf-8")).hexdigest(),
+        }
+        for relative in ("developer/package-lock.json", "backend/package-lock.json")
+    ]
+    dependency_semantic = {
+        "lockfiles": lockfiles,
+        "dependencyRoots": [],
+        "vitest": None,
+        "nodePath": [],
+    }
+    dependency_digest = hashlib.sha256(
+        ci._canonical_frame(dependency_semantic)
+    ).hexdigest()
+    runtime_closure_document = {
+        "closureSchemaVersion": ci.RUNTIME_DEPENDENCY_CLOSURE_SCHEMA_VERSION,
+        "measurementStatus": "measured-complete",
+        "profile": "policy",
+        "runnerOS": ci._canonical_runner_os(),
+        "pythonExecutable": copy.deepcopy(executable_record),
+        "nodeExecutable": copy.deepcopy(executable_record),
+        "npmEntrypoint": {**copy.deepcopy(executable_record), "available": True},
+        "gitExecutable": None,
+        "lockfiles": lockfiles,
+        "dependencyRoots": [],
+        "vitest": None,
+        "nodePath": [],
+        "dependencyClosureDigest": dependency_digest,
+        "dependencyMemberCount": 0,
+    }
+    runtime_digest = hashlib.sha256(
+        ci._canonical_frame(runtime_closure_document)
+    ).hexdigest()
+    runtime_closure_document["closureDigest"] = runtime_digest
     runner = SimpleNamespace(
         profile="policy",
         platform="windows",
@@ -804,8 +953,8 @@ def fake_runner(baseline: dict) -> SimpleNamespace:
             "pythonImplementation": "CPython",
             "node": "v24.0.0",
             "npm": "11.0.0",
-            "runtimeClosureDigest": "4" * 64,
-            "dependencyClosureDigest": "6" * 64,
+            "runtimeClosureDigest": runtime_digest,
+            "dependencyClosureDigest": dependency_digest,
             "dependencyMemberCount": "0",
         },
         command_results=[],
@@ -813,6 +962,17 @@ def fake_runner(baseline: dict) -> SimpleNamespace:
         completed_classes=set(),
         command_plan=command_plan,
         command_plan_digest=ci.command_plan_digest(command_plan),
+        runtime_closure_document=runtime_closure_document,
+        runtime_closure_errors=[],
+        runtime_closure_guard_evidence={
+            "guardSchemaVersion": ci.RUNTIME_DEPENDENCY_GUARD_SCHEMA_VERSION,
+            "watcherBackend": "synthetic-test-fixture",
+            "active": True,
+            "activeDuringReplay": True,
+            "mutationState": "clean",
+            "queueOverflow": False,
+            "mutationEventCount": 0,
+        },
     )
     runner.command_results = [synthetic_record_from_spec(spec) for spec in command_plan]
     runner.execution_binding = synthetic_execution_binding(
@@ -1786,11 +1946,25 @@ class AuthoritativeEvidenceDerivationTest(unittest.TestCase):
         completed: set[str] | None = None,
     ) -> tuple[Path, dict]:
         runner = self.build_runner(observations, completed=completed)
+        self.fixture_expected_context = synthetic_external_context(
+            copy.deepcopy(runner.execution_binding)
+        )
         output = repo / ".ci-results"
         ci.create_fresh_evidence_root(output, repo_root=repo)
         with mock.patch.multiple(ci, OUTPUT_DIR=output, REPO_ROOT=repo):
             summary = ci.write_evidence(runner, empty_comparison())
         return output, summary
+
+    def verify_fixture(self, output: Path, repo: Path) -> list[str]:
+        try:
+            return ci.verify_evidence_file_set(
+                output,
+                repo_root=repo,
+                expected_command_plan=self.static_plan,
+                expected_context=self.fixture_expected_context,
+            )
+        except ci.ToolAuthorityUnavailable as exc:
+            self.fail(f"fixture unexpectedly rediscovered tool authority: {exc}")
 
     def rewrite_coherently(self, output: Path, mutate) -> None:
         summary = ci.strict_json_load_file(output / "summary.json")
@@ -1859,7 +2033,7 @@ class AuthoritativeEvidenceDerivationTest(unittest.TestCase):
                         commands["observations"][0]["commandId"] = forged_value
 
                 self.rewrite_coherently(output, mutate)
-                errors = ci.verify_evidence_file_set(output, repo_root=repo)
+                errors = self.verify_fixture(output, repo)
             self.assertTrue(errors, (field_name, errors))
 
     def test_omission_and_release_skip_collection_relabelling_is_rejected(self) -> None:
@@ -1885,7 +2059,7 @@ class AuthoritativeEvidenceDerivationTest(unittest.TestCase):
                     observed[destination_key].append(record)
 
                 self.rewrite_coherently(output, mutate)
-                errors = ci.verify_evidence_file_set(output, repo_root=repo)
+                errors = self.verify_fixture(output, repo)
             self.assertTrue(errors)
 
     def test_resolved_candidate_requires_success_and_absence_of_original_failure(self) -> None:
@@ -1911,7 +2085,7 @@ class AuthoritativeEvidenceDerivationTest(unittest.TestCase):
                         commands["observations"].append(self.observation_for_entry(entry))
 
                 self.rewrite_coherently(output, mutate)
-                errors = ci.verify_evidence_file_set(output, repo_root=repo)
+                errors = self.verify_fixture(output, repo)
             self.assertTrue(errors)
 
     def test_duplicate_debt_split_across_command_records_is_rejected(self) -> None:
@@ -1933,7 +2107,7 @@ class AuthoritativeEvidenceDerivationTest(unittest.TestCase):
                 commands["observations"].append(second)
 
             self.rewrite_coherently(output, mutate)
-            errors = ci.verify_evidence_file_set(output, repo_root=repo)
+            errors = self.verify_fixture(output, repo)
         self.assertTrue(errors)
 
     def test_complete_command_plan_coherent_forgery_matrix_is_rejected(self) -> None:
@@ -2081,7 +2255,7 @@ class AuthoritativeEvidenceDerivationTest(unittest.TestCase):
                         commands["commandPlanDigest"] = ci.command_plan_digest(authority)
 
                     self.rewrite_coherently(output, mutate)
-                    errors = ci.verify_evidence_file_set(output, repo_root=repo)
+                    errors = self.verify_fixture(output, repo)
                     self.assertTrue(errors, case)
                     self.assertTrue(
                         any("command" in error.casefold() or "derived" in error.casefold() for error in errors),
@@ -2632,7 +2806,10 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 self.assertIn(needle, raw)
                 (output / "summary.json").write_bytes(raw.replace(needle, replacement, 1))
                 errors = ci.verify_evidence_file_set(output, repo_root=repo)
-            self.assertTrue(any("DuplicateJsonKeyError" in error for error in errors), errors)
+                self.assertTrue(
+                    any("DuplicateJsonKeyError" in error for error in errors),
+                    errors,
+                )
 
         nested_replacements = {
             "exit-code": (b'"exitCode": 0,', b'"exitCode": 0,\n      "exitCode": 0,'),
@@ -2649,7 +2826,10 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 forged = raw.replace(needle, replacement, 1)
                 self.rewrite_manifested_raw_json(output, "command-results.json", forged)
                 errors = ci.verify_evidence_file_set(output, repo_root=repo)
-            self.assertTrue(any("DuplicateJsonKeyError" in error for error in errors), errors)
+                self.assertTrue(
+                    any("DuplicateJsonKeyError" in error for error in errors),
+                    errors,
+                )
 
     def test_nonfinite_json_constants_and_overflow_are_rejected(self) -> None:
         for literal in ("NaN", "Infinity", "-Infinity", "1e309", "-1e309"):
@@ -2900,6 +3080,10 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                     return_value=(context, verification_runner),
                 ), mock.patch.object(
                     ci,
+                    "capture_live_external_authority",
+                    return_value=_explicit_live_local_external_authority(),
+                ), mock.patch.object(
+                    ci,
                     "verify_evidence_with_replay",
                     return_value=([], {"kind": "VerificationReplayTranscript"}),
                 ) as replay:
@@ -2926,6 +3110,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
             expected_context=context,
             verification_runner=verification_runner,
             repo_root=repo,
+            evidence_authority_root=repo,
         )
 
     def assert_redacted(self, source: str, *forbidden: str) -> str:
@@ -3278,11 +3463,9 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
                 mock.patch.object(ci, "execute_planned_static_suite", side_effect=fake_snapshot),
                 mock.patch.object(ci.FoundationRunner, "run_direct_syntax", autospec=True),
             ):
-                trusted_tools, tool_errors = ci.resolve_trusted_tools(
-                    ci.required_tool_names("static"),
-                    source_environment=os.environ,
+                trusted_tools = _explicit_local_test_tool_map(
+                    *sorted(ci.required_tool_names("static"))
                 )
-                self.assertEqual(tool_errors, [])
                 runner = ci.FoundationRunner(
                     "static",
                     copy.deepcopy(self.baseline),
@@ -3600,8 +3783,14 @@ class TrustedExecutionTest(unittest.TestCase):
             "BASH_EXE": "C:/workspace/bash.exe",
         }
         _tools, errors = ci.resolve_trusted_tools({"python"}, source_environment=source)
-        for override in source.keys() - {"PATH"}:
-            self.assertTrue(any(override in error for error in errors), (override, errors))
+        for role in ("node", "npm", "python", "git", "powershell", "bash"):
+            self.assertTrue(
+                any(
+                    ci.TOOL_CANDIDATE_INVALID in error and f"tool={role}" in error
+                    for error in errors
+                ),
+                (role, errors),
+            )
 
     def test_workspace_first_path_and_fake_tools_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3620,7 +3809,10 @@ class TrustedExecutionTest(unittest.TestCase):
                 repo_root=repo,
             )
             self.assertTrue(errors)
-            self.assertTrue(any("precedes" in error or "unavailable" in error for error in errors), errors)
+            self.assertTrue(
+                any(ci.PATH_WORKSPACE_OR_TEMP_AUTHORITY in error for error in errors),
+                errors,
+            )
 
     def test_minimal_child_does_not_inherit_credentials(self) -> None:
         source = {
@@ -3813,25 +4005,444 @@ class HostedRunnerToolResolutionTest(unittest.TestCase):
                             policy=fixture.policy,
                             diagnostics=diagnostics,
                         )
-                        if platform_name == "Windows" and role == "bash":
-                            self.assertEqual(errors, [])
-                            self.assertEqual(Path(tools["bash"]), fixture.paths["bash"])
-                            self.assertTrue(
-                                any(
-                                    item.get("reasonCode")
-                                    == ci.BASH_PARENT_PATH_SHADOW_INERT
-                                    for item in diagnostics
-                                ),
-                                diagnostics,
-                            )
-                            continue
                         self.assertNotIn(role, tools)
                         self.assertTrue(
-                            any(f"required {role}" in error for error in errors),
+                            any(
+                                f"tool={role}" in error
+                                and (
+                                    ci.PATH_WORKSPACE_OR_TEMP_AUTHORITY in error
+                                    or ci.PATH_EXECUTABLE_SHADOW in error
+                                )
+                                for error in errors
+                            ),
                             errors,
+                        )
+                        self.assertFalse(
+                            any(str(fixture.root) in json.dumps(item) for item in diagnostics),
+                            diagnostics,
                         )
                     finally:
                         fixture.cleanup()
+
+    def test_ubuntu_style_safe_symlink_broken_non_directory_and_empty_entry_matrix(self) -> None:
+        fixture = _HostedToolFixture("Ubuntu")
+        try:
+            safe_link = fixture.root / "standard-bin-link"
+            os.symlink(fixture.paths["system"], safe_link, target_is_directory=True)
+            broken_link = fixture.root / "broken-standard-link"
+            os.symlink(
+                fixture.root / "absent-standard-target",
+                broken_link,
+                target_is_directory=True,
+            )
+            non_directory = fixture._write(
+                fixture.root / "path-entry-file", b"not-a-directory"
+            )
+            empty_directory = fixture.root / "safe-empty-directory"
+            empty_directory.mkdir()
+            source = dict(fixture.source)
+            source["PATH"] = fixture.policy.path_separator.join(
+                (
+                    str(safe_link),
+                    str(broken_link),
+                    str(non_directory),
+                    str(empty_directory),
+                    source["PATH"],
+                )
+            )
+            diagnostics: list[dict[str, object]] = []
+            tools, errors = ci.resolve_trusted_tools(
+                self.REQUIRED,
+                source_environment=source,
+                policy=fixture.policy,
+                diagnostics=diagnostics,
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(set(tools), set(self.REQUIRED))
+            classifications = {
+                item.get("pathIndex"): item.get("classification")
+                for item in diagnostics
+                if item.get("kind") == "path-entry"
+            }
+            self.assertEqual(
+                classifications[0], ci.SAFE_CANONICAL_SYMLINK_DIRECTORY
+            )
+            self.assertEqual(classifications[1], ci.INERT_MISSING_ENTRY)
+            self.assertEqual(classifications[2], ci.INERT_NON_DIRECTORY)
+            self.assertEqual(
+                classifications[3], ci.INERT_ENTRY_WITH_NO_REQUIRED_EXECUTABLE
+            )
+            self.assertIn(ci.SAFE_CANONICAL_DIRECTORY, classifications.values())
+        finally:
+            fixture.cleanup()
+
+    def test_ubuntu_style_uninspectable_predecessor_is_typed_and_blocking(self) -> None:
+        fixture = _HostedToolFixture("Ubuntu")
+        try:
+            ambiguous = fixture.root / "ambiguous-predecessor"
+            ambiguous.mkdir()
+            source = dict(fixture.source)
+            source["PATH"] = fixture.policy.path_separator.join(
+                (str(ambiguous), source["PATH"])
+            )
+            original_lstat = Path.lstat
+
+            def deny_candidate_inspection(path: Path, *args, **kwargs):
+                if path.parent == ambiguous:
+                    raise PermissionError("private absolute fixture path")
+                return original_lstat(path, *args, **kwargs)
+
+            diagnostics: list[dict[str, object]] = []
+            with mock.patch.object(Path, "lstat", deny_candidate_inspection):
+                tools, errors = ci.resolve_trusted_tools(
+                    self.REQUIRED,
+                    source_environment=source,
+                    policy=fixture.policy,
+                    diagnostics=diagnostics,
+                )
+            for role in self.REQUIRED:
+                self.assertNotIn(role, tools)
+                self.assertTrue(
+                    any(
+                        ci.PATH_PREDECESSOR_UNINSPECTABLE in error
+                        and f"tool={role}" in error
+                        and "path_index=0" in error
+                        for error in errors
+                    ),
+                    (role, errors),
+                )
+            serialized = json.dumps(diagnostics, sort_keys=True)
+            self.assertNotIn(str(fixture.root), serialized)
+            self.assertNotIn("private absolute fixture path", serialized)
+        finally:
+            fixture.cleanup()
+
+    def test_uninspectable_windows_app_alias_is_typed_path_free_and_fail_closed(
+        self,
+    ) -> None:
+        fixture = _HostedToolFixture("Windows")
+        try:
+            alias_directory = fixture.root / "WindowsApps"
+            alias_directory.mkdir()
+            alias = fixture.shadow("python", directory=alias_directory)
+            source = dict(fixture.source)
+            source["PATH"] = fixture.policy.path_separator.join(
+                (str(alias_directory), source["PATH"])
+            )
+            original_resolve = Path.resolve
+
+            failure_cases = (
+                (
+                    "winerror-1920",
+                    lambda path: OSError(
+                        5,
+                        "private alias resolution failure",
+                        str(path),
+                        1920,
+                    ),
+                ),
+                (
+                    "deletion-race",
+                    lambda path: FileNotFoundError(
+                        2, "private alias deleted after lstat", str(path)
+                    ),
+                ),
+                (
+                    "target-inaccessible",
+                    lambda path: PermissionError(
+                        13, "private alias target inaccessible", str(path)
+                    ),
+                ),
+            )
+            for case_name, exception_factory in failure_cases:
+                with self.subTest(case=case_name):
+                    observed_lstat: list[os.stat_result] = []
+
+                    def fail_alias_resolution(path: Path, *args, **kwargs):
+                        if path == alias:
+                            observed_lstat.append(path.lstat())
+                            raise exception_factory(path)
+                        return original_resolve(path, *args, **kwargs)
+
+                    diagnostics: list[dict[str, object]] = []
+                    with mock.patch.object(Path, "resolve", fail_alias_resolution):
+                        root_result = ci._tool_root_classification_result(
+                            alias, "python", fixture.policy
+                        )
+                        self.assertTrue(root_result.inspection_failed)
+                        self.assertIsNone(
+                            ci._tool_root_classification(
+                                alias, "python", fixture.policy
+                            )
+                        )
+                        classified = ci._classify_path_entry(
+                            0,
+                            alias_directory,
+                            required={"python", "git"},
+                            repo_root=fixture.workspace,
+                            source=source,
+                            policy=fixture.policy,
+                        )
+                        tools, errors = ci.resolve_trusted_tools(
+                            {"python", "git"},
+                            source_environment=source,
+                            repo_root=fixture.workspace,
+                            policy=fixture.policy,
+                            diagnostics=diagnostics,
+                        )
+
+                    self.assertTrue(observed_lstat)
+                    self.assertEqual(
+                        classified.classification,
+                        ci.UNSAFE_UNINSPECTABLE_SHADOW_CAPABLE_ENTRY,
+                    )
+                    self.assertEqual(classified.uninspectable_roles, {"python"})
+                    self.assertIn("python", classified.aliases)
+                    self.assertNotIn("python", tools)
+                    self.assertIn("git", tools)
+                    self.assertFalse(
+                        any("tool=git" in error for error in errors), errors
+                    )
+                    matching = [
+                        error
+                        for error in errors
+                        if ci.PATH_PREDECESSOR_UNINSPECTABLE in error
+                        and "tool=python" in error
+                        and "path_index=0" in error
+                    ]
+                    self.assertEqual(len(matching), 1, errors)
+                    with self.assertRaises(ci.ToolAuthorityUnavailable) as raised:
+                        ci.require_tool(
+                            tools,
+                            "python",
+                            phase="DISCOVERY",
+                            resolution_errors=errors,
+                        )
+                    self.assertEqual(
+                        raised.exception.reason_code,
+                        ci.PATH_PREDECESSOR_UNINSPECTABLE,
+                    )
+                    self.assertEqual(raised.exception.tool, "python")
+                    rendered = "\n".join(
+                        (
+                            *errors,
+                            json.dumps(diagnostics, sort_keys=True),
+                            str(raised.exception),
+                        )
+                    )
+                    for forbidden in (
+                        str(fixture.root),
+                        str(fixture.root).replace("\\", "\\\\"),
+                        "private alias",
+                        "WinError",
+                        "Traceback",
+                    ):
+                        self.assertNotIn(forbidden, rendered)
+                    self.assertFalse(ci.OUTPUT_DIR.exists())
+
+            entry = fixture.root / "entry-resolution-race"
+            entry.mkdir()
+            entry_metadata = entry.lstat()
+            reparse_metadata = SimpleNamespace(
+                st_mode=entry_metadata.st_mode,
+                st_dev=entry_metadata.st_dev,
+                st_ino=entry_metadata.st_ino,
+                st_size=entry_metadata.st_size,
+                st_mtime_ns=entry_metadata.st_mtime_ns,
+                st_ctime_ns=entry_metadata.st_ctime_ns,
+                st_file_attributes=(
+                    getattr(entry_metadata, "st_file_attributes", 0)
+                    | getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+                ),
+            )
+            original_lstat = Path.lstat
+            entry_cases = (
+                (
+                    "present-entry-oserror",
+                    entry_metadata,
+                    lambda path: OSError(
+                        5, "private entry resolution failure", str(path), 1920
+                    ),
+                ),
+                (
+                    "present-entry-deletion-race",
+                    entry_metadata,
+                    lambda path: FileNotFoundError(
+                        2, "private entry deleted after lstat", str(path)
+                    ),
+                ),
+                (
+                    "reparse-like-entry-resolution-failure",
+                    reparse_metadata,
+                    lambda path: PermissionError(
+                        13, "private reparse target inaccessible", str(path)
+                    ),
+                ),
+            )
+            for case_name, metadata, exception_factory in entry_cases:
+                with self.subTest(case=case_name):
+                    lstat_calls = 0
+
+                    def controlled_lstat(path: Path, *args, **kwargs):
+                        nonlocal lstat_calls
+                        if path == entry:
+                            lstat_calls += 1
+                            return metadata
+                        return original_lstat(path, *args, **kwargs)
+
+                    def fail_entry_resolution(path: Path, *args, **kwargs):
+                        if path == entry:
+                            raise exception_factory(path)
+                        return original_resolve(path, *args, **kwargs)
+
+                    with (
+                        mock.patch.object(Path, "lstat", controlled_lstat),
+                        mock.patch.object(Path, "resolve", fail_entry_resolution),
+                    ):
+                        classified = ci._classify_path_entry(
+                            0,
+                            entry,
+                            required={"python", "git"},
+                            repo_root=fixture.workspace,
+                            source={"PATH": str(entry)},
+                            policy=fixture.policy,
+                        )
+                    self.assertEqual(lstat_calls, 1)
+                    self.assertEqual(
+                        classified.classification,
+                        ci.UNSAFE_UNINSPECTABLE_SHADOW_CAPABLE_ENTRY,
+                    )
+                    self.assertEqual(
+                        classified.uninspectable_roles, {"python", "git"}
+                    )
+
+            def raise_programmer_error(path: Path, *args, **kwargs):
+                if path == alias:
+                    raise TypeError("programmer error remains visible")
+                return original_resolve(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "resolve", raise_programmer_error):
+                with self.assertRaisesRegex(TypeError, "programmer error"):
+                    ci._tool_root_classification(alias, "python", fixture.policy)
+
+            git_root = fixture.paths["git"].parents[1]
+
+            def fail_git_root_resolution(path: Path, *args, **kwargs):
+                if path == git_root:
+                    raise OSError(
+                        5, "private Git root resolution failure", str(path), 1920
+                    )
+                return original_resolve(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    ci,
+                    "_trusted_git_installation_root",
+                    return_value=(git_root, None),
+                ),
+                mock.patch.object(Path, "resolve", fail_git_root_resolution),
+            ):
+                bash, bash_errors = ci.resolve_trusted_git_bash(
+                    str(fixture.paths["git"]),
+                    source_environment=fixture.source,
+                    repo_root=fixture.workspace,
+                    policy=fixture.policy,
+                )
+            self.assertIsNone(bash)
+            self.assertEqual(len(bash_errors), 1)
+            self.assertIn(ci.GIT_INSTALL_ROOT_UNRECOGNIZED, bash_errors[0])
+            self.assertIn("tool=bash", bash_errors[0])
+            self.assertNotIn(str(fixture.root), bash_errors[0])
+            self.assertNotIn("private Git root", bash_errors[0])
+        finally:
+            fixture.cleanup()
+
+    def test_path_shadow_root_and_reason_matrix_is_fail_closed(self) -> None:
+        cases = (
+            ("node", "workspace", ci.PATH_WORKSPACE_OR_TEMP_AUTHORITY),
+            ("python", "runner-temp", ci.PATH_WORKSPACE_OR_TEMP_AUTHORITY),
+            ("npm", "node-modules", ci.PATH_WORKSPACE_OR_TEMP_AUTHORITY),
+            ("git", "other", ci.PATH_EXECUTABLE_SHADOW),
+        )
+        for role, root_kind, expected_reason in cases:
+            with self.subTest(role=role, root=root_kind):
+                fixture = _HostedToolFixture("Ubuntu")
+                try:
+                    directory = {
+                        "workspace": fixture.workspace,
+                        "runner-temp": fixture.runner_temp,
+                        "node-modules": fixture.root / "node_modules" / ".bin",
+                        "other": fixture.root / "untrusted-standard-bin",
+                    }[root_kind]
+                    if role == "npm":
+                        fixture._write(directory / "npm", b"untrusted-npm-shadow")
+                    else:
+                        fixture.shadow(role, directory=directory)
+                    source = dict(fixture.source)
+                    source["PATH"] = fixture.policy.path_separator.join(
+                        (str(directory), source["PATH"])
+                    )
+                    if root_kind == "other":
+                        original_category = ci._path_root_category
+
+                        def category(path: Path, **kwargs):
+                            if path.resolve(strict=True) == directory.resolve(strict=True):
+                                return "other"
+                            return original_category(path, **kwargs)
+
+                        category_patch = mock.patch.object(
+                            ci, "_path_root_category", side_effect=category
+                        )
+                    else:
+                        category_patch = contextlib.nullcontext()
+                    with category_patch:
+                        tools, errors = ci.resolve_trusted_tools(
+                            self.REQUIRED | {role},
+                            source_environment=source,
+                            policy=fixture.policy,
+                        )
+                    self.assertNotIn(role, tools)
+                    self.assertTrue(
+                        any(
+                            expected_reason in error and f"tool={role}" in error
+                            for error in errors
+                        ),
+                        errors,
+                    )
+                finally:
+                    fixture.cleanup()
+
+    def test_closed_diagnostic_reason_grammar_and_path_privacy(self) -> None:
+        forbidden_paths = (
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"D:\a\IELTS-Project\attacker.exe",
+            "/home/runner/work/IELTS-Project/attacker",
+            "/opt/hostedtoolcache/Python/3.12/bin/python",
+        )
+        for reason in sorted(ci.TOOL_AUTHORITY_REASON_CODES):
+            with self.subTest(reason=reason):
+                diagnostic = str(
+                    ci.ToolAuthorityUnavailable(
+                        "bash" if reason.startswith("BASH_") else "node",
+                        "EXECUTION_BINDING",
+                        reason_code=reason,
+                        path_index=3,
+                        candidate_class=(
+                            "git-bin" if reason.startswith("BASH_") else "parent-path"
+                        ),
+                        root_category="other",
+                    )
+                )
+                self.assertRegex(
+                    diagnostic,
+                    r"^CI_TOOL_AUTHORITY_UNAVAILABLE tool=(?:bash|node) "
+                    r"phase=EXECUTION_BINDING reason=[A-Z][A-Z0-9_]+ "
+                    r"path_index=3 candidate=(?:git-bin|parent-path) "
+                    r"root_category=other$",
+                )
+                self.assertIn(f"reason={reason}", diagnostic)
+                for forbidden in forbidden_paths:
+                    self.assertNotIn(forbidden, diagnostic)
 
     def test_minimal_child_path_and_post_capture_shadow_race_remain_inert(self) -> None:
         for platform_name in ("Ubuntu", "Windows"):
@@ -3919,7 +4530,8 @@ class HostedRunnerToolResolutionTest(unittest.TestCase):
                     ci.require_tool({}, role, phase="EXECUTION_BINDING")
                 self.assertEqual(
                     str(raised.exception),
-                    f"CI_TOOL_AUTHORITY_UNAVAILABLE tool={role} phase=EXECUTION_BINDING",
+                    f"CI_TOOL_AUTHORITY_UNAVAILABLE tool={role} phase=EXECUTION_BINDING "
+                    "reason=REQUIRED_TOOL_MISSING",
                 )
                 self.assertNotIsInstance(raised.exception, KeyError)
 
@@ -3998,6 +4610,11 @@ class HostedRunnerToolResolutionTest(unittest.TestCase):
                 "resolve_trusted_tools",
                 return_value=({}, ["fixture resolver failure with a private path"]),
             ),
+            mock.patch.object(
+                ci,
+                "capture_live_external_authority",
+                return_value=_explicit_live_local_external_authority(),
+            ),
             contextlib.redirect_stderr(stderr),
             contextlib.redirect_stdout(stdout),
         ):
@@ -4048,7 +4665,14 @@ class HostedRunnerToolResolutionTest(unittest.TestCase):
                             ),
                             mock.patch.object(ci, "_canonical_runner_os", return_value=canonical_os),
                         ):
-                            binding = ci.build_generation_execution_binding(runner)
+                            binding = ci.build_synthetic_generation_execution_binding(
+                                runner,
+                                external_authority=(
+                                    ci.synthetic_local_execution_external_authority(
+                                        runner_os=canonical_os
+                                    )
+                                ),
+                            )
                         self.assertEqual(binding.get("producerProfile"), "static")
                         self.assertRegex(
                             str(binding.get("producerInvocationId", "")),
@@ -4247,16 +4871,27 @@ class WindowsGitBashResolutionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="ci-git-bash-chain-") as temp_dir:
             root = Path(temp_dir) / "GitA"
             git = self.make_git_install(root, bin_bash=True)
+            original_chain = ci._non_reparse_directory_chain
+
+            def reject_bash_chain(path: Path, stop: Path) -> bool:
+                if path == root / "bin":
+                    return False
+                return original_chain(path, stop)
+
             with (
                 mock.patch.object(ci, "_unsafe_tool_path_reason", return_value=None),
                 mock.patch.object(ci, "_tool_location_is_allowlisted", return_value=True),
-                mock.patch.object(ci, "_non_reparse_directory_chain", return_value=False),
+                mock.patch.object(
+                    ci,
+                    "_non_reparse_directory_chain",
+                    side_effect=reject_bash_chain,
+                ),
             ):
                 bash, errors = ci.resolve_trusted_git_bash(
                     str(git), source_environment={"SystemRoot": r"C:\Windows"}
-                )
+            )
             self.assertIsNone(bash)
-            self.assertTrue(any("reparse" in error for error in errors), errors)
+            self.assertTrue(any(ci.BASH_CANDIDATE_REPARSE in error for error in errors), errors)
 
             (root / "bin" / "bash.exe").unlink()
             other = Path(temp_dir) / "GitB" / "bin" / "bash.exe"
@@ -4264,7 +4899,7 @@ class WindowsGitBashResolutionTest(unittest.TestCase):
             other.write_bytes(b"bash")
             bash, errors = self.resolve_fixture(git, Path(temp_dir) / "repo")
             self.assertIsNone(bash)
-            self.assertTrue(any("unavailable" in error for error in errors), errors)
+            self.assertTrue(any(ci.BASH_CANDIDATE_ABSENT in error for error in errors), errors)
 
     def test_system32_first_never_drives_bash_selection(self) -> None:
         git_cmd = Path(r"D:\Git\cmd")
@@ -4597,16 +5232,60 @@ class WindowsGitInstallationAuthorityRegressionTest(unittest.TestCase):
                 policy=fixture.policy,
                 diagnostics=diagnostics,
             )
-            self.assertEqual(errors, [])
-            self.assertEqual(Path(tools["bash"]), (git_root / "bin" / "bash.exe").resolve())
+            self.assertNotIn("bash", tools)
             self.assertTrue(
                 any(
-                    item.get("reasonCode") == ci.BASH_PARENT_PATH_SHADOW_INERT
+                    item.get("reasonCode") == ci.PATH_EXECUTABLE_SHADOW
+                    and item.get("disposition") == "rejected"
                     for item in diagnostics
                 ),
                 diagnostics,
             )
+            self.assertTrue(
+                any(
+                    ci.PATH_EXECUTABLE_SHADOW in error and "tool=bash" in error
+                    for error in errors
+                ),
+                errors,
+            )
             self.assertFalse(any(str(fixture.root) in json.dumps(item) for item in diagnostics))
+        finally:
+            fixture.cleanup()
+
+    def test_existing_invalid_priority_candidate_never_falls_back_to_usr_bin(self) -> None:
+        fixture, git_root = self.hosted_layout(
+            git_directory="cmd",
+            bash_position="bin/bash.exe",
+            both_bash_candidates=True,
+        )
+        try:
+            priority = git_root / "bin" / "bash.exe"
+            secondary = git_root / "usr" / "bin" / "bash.exe"
+            hardlink = fixture.root / "priority-bash-hardlink.exe"
+            os.link(priority, hardlink)
+            diagnostics: list[dict[str, object]] = []
+            tools, errors = ci.resolve_trusted_tools(
+                self.REQUIRED,
+                source_environment=fixture.source,
+                policy=fixture.policy,
+                diagnostics=diagnostics,
+            )
+            self.assertNotIn("bash", tools)
+            self.assertTrue(
+                any(ci.BASH_CANDIDATE_HARDLINK in error for error in errors), errors
+            )
+            self.assertTrue(secondary.is_file())
+            bash_diagnostics = [
+                item for item in diagnostics if item.get("kind") == "bash-candidate"
+            ]
+            self.assertEqual(len(bash_diagnostics), 1)
+            self.assertEqual(
+                bash_diagnostics[0]["candidateLocationClass"], "git-bin"
+            )
+            self.assertEqual(
+                bash_diagnostics[0]["reasonCode"], ci.BASH_CANDIDATE_HARDLINK
+            )
+            self.assertEqual(bash_diagnostics[0]["disposition"], "rejected")
         finally:
             fixture.cleanup()
 
@@ -4673,7 +5352,8 @@ class WindowsGitInstallationAuthorityRegressionTest(unittest.TestCase):
             self.assertTrue(any(ci.BASH_CANDIDATE_ABSENT in error for error in errors), errors)
             with self.assertRaisesRegex(
                 ci.ToolAuthorityUnavailable,
-                r"^CI_TOOL_AUTHORITY_UNAVAILABLE tool=bash phase=EXECUTION_BINDING$",
+                r"^CI_TOOL_AUTHORITY_UNAVAILABLE tool=bash phase=EXECUTION_BINDING "
+                r"reason=BASH_CANDIDATE_ABSENT candidate=git-usr-bin$",
             ):
                 ci.require_tool_set(
                     tools,
@@ -4780,8 +5460,8 @@ class WindowsGitInstallationAuthorityRegressionTest(unittest.TestCase):
             self.assertIsNone(resolved)
             self.assertTrue(any(ci.BASH_CANDIDATE_ABSENT in error for error in errors), errors)
             self.assertEqual(
-                [item["candidate"] for item in diagnostics],
-                ["bin\\bash.exe", "usr\\bin\\bash.exe"],
+                [item["candidateLocationClass"] for item in diagnostics],
+                ["git-bin", "git-usr-bin"],
             )
             self.assertNotIn(str(fixture.root), json.dumps(diagnostics))
 
@@ -4835,8 +5515,19 @@ class WindowsGitInstallationAuthorityRegressionTest(unittest.TestCase):
                     )
                     fixture.source["PATHEXT"] = pathext
                     tools, errors = fixture.resolve(self.REQUIRED)
-                    self.assertEqual(errors, [])
-                    self.assertEqual(Path(tools["bash"]), fixture.paths["bash"])
+                    if alias_name == "bash.unsafe":
+                        self.assertEqual(errors, [])
+                        self.assertEqual(Path(tools["bash"]), fixture.paths["bash"])
+                    else:
+                        self.assertNotIn("bash", tools)
+                        self.assertTrue(
+                            any(
+                                ci.PATH_EXECUTABLE_SHADOW in error
+                                and "tool=bash" in error
+                                for error in errors
+                            ),
+                            errors,
+                        )
                 finally:
                     fixture.cleanup()
 
@@ -4852,7 +5543,14 @@ class WindowsGitInstallationAuthorityRegressionTest(unittest.TestCase):
             )
             tools, errors = fixture.resolve(self.REQUIRED)
             self.assertNotIn("git", tools)
-            self.assertTrue(any("required git" in error for error in errors), errors)
+            self.assertTrue(
+                any(
+                    ci.PATH_WORKSPACE_OR_TEMP_AUTHORITY in error
+                    and "tool=git" in error
+                    for error in errors
+                ),
+                errors,
+            )
             bash, bash_errors = ci.resolve_trusted_git_bash(
                 str(fixture.paths["git"]),
                 source_environment=fixture.source,
@@ -4880,8 +5578,8 @@ class WindowsGitInstallationAuthorityRegressionTest(unittest.TestCase):
                     resolution_errors=errors,
                 )
             self.assertEqual(
-                str(captured.exception),
-                "CI_TOOL_AUTHORITY_UNAVAILABLE tool=bash phase=EXECUTION_BINDING",
+                captured.exception.reason_code,
+                ci.BASH_CANDIDATE_ABSENT,
             )
             self.assertFalse(ci.OUTPUT_DIR.exists())
         finally:
@@ -4917,7 +5615,7 @@ class WindowsGitInstallationAuthorityRegressionTest(unittest.TestCase):
         )
         try:
             windows_apps = fixture.root / "Users" / "runneradmin" / "AppData" / "Local" / "Microsoft" / "WindowsApps"
-            fixture._write(windows_apps / "bash.exe", b"fake-alias")
+            windows_apps.mkdir(parents=True)
             fixture.source["PATH"] = fixture.policy.path_separator.join(
                 (str(windows_apps), fixture.source["PATH"])
             )
@@ -6308,7 +7006,13 @@ class CI9FrozenReleaseSkipDualSignatureTest(unittest.TestCase):
         )
 
     def test_static_profile_command_count_remains_exact(self) -> None:
-        runner = ci.FoundationRunner("static", self.baseline)
+        runner = ci.FoundationRunner(
+            "static",
+            self.baseline,
+            tools=_explicit_local_test_tool_map(
+                *sorted(ci.required_tool_names("static"))
+            ),
+        )
         try:
             self.assertEqual(runner.command_plan_errors, [])
             self.assertEqual(runner.tool_resolution_errors, [])
@@ -6320,9 +7024,7 @@ class CI9FrozenReleaseSkipDualSignatureTest(unittest.TestCase):
 class CI5TargetExecutionLeaseTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        tools, errors = ci.resolve_trusted_tools({"python", "node"})
-        if errors or "node" not in tools:
-            raise AssertionError(f"trusted Node is required for CI5 target tests: {errors}")
+        tools = _explicit_local_test_tool_map("python", "node")
         cls.node = ci.require_tool(tools, "node", phase="CAPTURE")
         cls.environment = ci.child_process_environment(
             {"python": tools.get("python", sys.executable), "node": cls.node}
@@ -7578,6 +8280,101 @@ class CI7ExternalAuthorityBindingTest(unittest.TestCase):
         binding["producerInvocationId"] = ci._github_binding_invocation_id(binding)
         return binding
 
+    def binding_runner(self, profile: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            profile=profile,
+            baseline={
+                "baselineCommit": ci.BASELINE_COMMIT,
+                "baselineTree": ci.BASELINE_TREE,
+            },
+            command_plan_digest="9" * 64,
+            child_environment={},
+            tools={"git": sys.executable},
+            tool_resolution_errors=[],
+        )
+
+    def test_explicit_synthetic_authority_isolated_from_opposite_ambient_github_os(self) -> None:
+        cases = (
+            (
+                "Windows",
+                "windows-compatibility-producer",
+                {
+                    "GITHUB_ACTIONS": "true",
+                    "GITHUB_JOB": "ubuntu-canonical-producer",
+                    "RUNNER_OS": "Linux",
+                    "GITHUB_RUN_ID": "7001",
+                    "GITHUB_RUN_ATTEMPT": "3",
+                    "GITHUB_EVENT_NAME": "push",
+                    "GITHUB_REPOSITORY": "ambient/linux",
+                    "GITHUB_SHA": "a" * 40,
+                },
+            ),
+            (
+                "Linux",
+                "ubuntu-canonical-producer",
+                {
+                    "GITHUB_ACTIONS": "true",
+                    "GITHUB_JOB": "windows-compatibility-producer",
+                    "RUNNER_OS": "Windows",
+                    "GITHUB_RUN_ID": "8001",
+                    "GITHUB_RUN_ATTEMPT": "4",
+                    "GITHUB_EVENT_NAME": "workflow_dispatch",
+                    "GITHUB_REPOSITORY": "ambient/windows",
+                    "GITHUB_SHA": "b" * 40,
+                },
+            ),
+        )
+        with mock.patch.object(
+            ci,
+            "current_checkout_identity",
+            return_value=(ci.BASELINE_COMMIT, ci.BASELINE_TREE),
+        ), mock.patch.object(
+            ci, "ci_trust_file_set_authority", return_value=([], "8" * 64)
+        ):
+            for runner_os, producer_job, ambient in cases:
+                with self.subTest(runner_os=runner_os), mock.patch.dict(
+                    os.environ, ambient, clear=False
+                ):
+                    authority = ci.synthetic_execution_external_authority(
+                        runner_os=runner_os,
+                        job_id=producer_job,
+                        run_id="999999999",
+                        run_attempt="7",
+                        event_name="push",
+                        repository="synthetic/fixture",
+                        checkout_sha=ci.BASELINE_COMMIT,
+                    )
+                    binding = ci.build_synthetic_generation_execution_binding(
+                        self.binding_runner("all"),
+                        external_authority=authority,
+                    )
+                    self.assertEqual(binding["producerRunnerOS"], runner_os)
+                    self.assertEqual(binding["producerJobId"], producer_job)
+                    self.assertEqual(binding["repository"], "synthetic/fixture")
+                    self.assertNotEqual(binding["repository"], ambient["GITHUB_REPOSITORY"])
+
+    def test_production_binding_rejects_synthetic_authority_and_has_no_override_flag(self) -> None:
+        synthetic = ci.synthetic_execution_external_authority(
+            runner_os="Windows",
+            job_id="windows-compatibility-producer",
+            checkout_sha=ci.BASELINE_COMMIT,
+        )
+        with self.assertRaisesRegex(ValueError, "forbidden in production"):
+            ci.build_generation_execution_binding(
+                self.binding_runner("all"),
+                external_authority=synthetic,
+            )
+        for option in ("--runner-os", "--github-job", "--external-authority-json"):
+            with self.subTest(option=option), self.assertRaises((ValueError, SystemExit)):
+                ci.parse_args(["--profile", "policy", option, "attacker-value"])
+        source = {
+            "CI_SYNTHETIC_EXTERNAL_AUTHORITY": "attacker",
+            "GITHUB_ACTIONS": "false",
+        }
+        captured = ci.capture_live_external_authority(source)
+        self.assertEqual(captured.source_kind, "live")
+        self.assertEqual(captured.binding_mode, "local")
+
     def test_missing_expected_profile_and_invalid_cli_matrix_fails_before_authority(self) -> None:
         with mock.patch.object(ci, "prepare_verification_authority") as prepare, mock.patch.object(
             ci, "verify_evidence_with_replay"
@@ -7619,7 +8416,7 @@ class CI7ExternalAuthorityBindingTest(unittest.TestCase):
                     baseline=ci.strict_json_load_file(ci.BASELINE_PATH),
                     git=sys.executable,
                     child_environment={},
-                    source_environment={},
+                    external_authority=ci.capture_live_external_authority({}),
                 )
 
     def test_cross_profile_substitution_matrix_is_rejected(self) -> None:
@@ -7714,7 +8511,9 @@ class CI7ExternalAuthorityBindingTest(unittest.TestCase):
                             baseline=baseline,
                             git=sys.executable,
                             child_environment={},
-                            source_environment=environment,
+                            external_authority=ci.capture_live_external_authority(
+                                environment
+                            ),
                         )
 
     def test_cross_run_attempt_event_and_repository_substitution_matrix_is_rejected(self) -> None:
@@ -7770,7 +8569,22 @@ class CI7ExternalAuthorityBindingTest(unittest.TestCase):
                     )
                 )
 
-        runner = ci.FoundationRunner("policy", ci.strict_json_load_file(ci.BASELINE_PATH))
+        policy = ci.default_tool_authority_policy(os.environ)
+        node = ci._fallback_tool_candidate("node", policy)
+        git = ci._fallback_tool_candidate("git", policy)
+        self.assertIsNotNone(node)
+        self.assertIsNotNone(git)
+        runner = ci.FoundationRunner(
+            "policy",
+            ci.strict_json_load_file(ci.BASELINE_PATH),
+            tools={
+                "python": sys.executable,
+                "node": str(node),
+                "git": str(git),
+            },
+            tool_policy=policy,
+            source_environment=os.environ,
+        )
         try:
             records, digest = ci.ci_trust_file_set_authority(
                 git=runner.require_tool("git", phase="EXECUTION_BINDING"),
@@ -8373,6 +9187,20 @@ class _CI8FixtureLease:
 
 
 class CI8RuntimeDependencyClosureTest(unittest.TestCase):
+    def local_tool_authority(self) -> tuple[ci.ToolAuthorityPolicy, dict[str, str]]:
+        policy = ci.default_tool_authority_policy(
+            _explicit_local_test_environment()
+        )
+        node = ci._fallback_tool_candidate("node", policy)
+        git = ci._fallback_tool_candidate("git", policy)
+        self.assertIsNotNone(node)
+        self.assertIsNotNone(git)
+        return policy, {
+            "python": sys.executable,
+            "node": str(node),
+            "git": str(git),
+        }
+
     def make_guard(
         self, root: Path
     ) -> tuple[ci.RuntimeDependencyClosure, ci.RuntimeDependencyClosureGuard, Path]:
@@ -8426,9 +9254,14 @@ class CI8RuntimeDependencyClosureTest(unittest.TestCase):
         return closure, guard, helper
 
     def test_runtime_dependency_closure_schema_and_digest(self) -> None:
+        policy, tools = self.local_tool_authority()
+        local_source = _explicit_local_test_environment()
         runner = ci.FoundationRunner(
             "policy",
             ci.strict_json_load_file(ci.BASELINE_PATH),
+            tools=tools,
+            tool_policy=policy,
+            source_environment=local_source,
             enable_runtime_closure=True,
         )
         try:
@@ -8451,19 +9284,85 @@ class CI8RuntimeDependencyClosureTest(unittest.TestCase):
         finally:
             runner.cleanup_task_resources()
 
+    def test_tool_authority_failure_is_a_typed_unmeasured_precondition(self) -> None:
+        runner = ci.FoundationRunner(
+            "policy",
+            ci.strict_json_load_file(ci.BASELINE_PATH),
+            tools={},
+            enable_runtime_closure=True,
+        )
+        try:
+            self.assertIsNone(runner.runtime_dependency_closure)
+            self.assertEqual(
+                runner.runtime_closure_document["measurementStatus"],
+                ci.RUNTIME_CLOSURE_PRECONDITION_STATUS,
+            )
+            self.assertEqual(
+                runner.runtime_closure_document["preconditionReason"],
+                "TOOL_AUTHORITY_NOT_FROZEN",
+            )
+            self.assertEqual(
+                runner.runtime_closure_errors,
+                ["PRECONDITION_NOT_MET reason=TOOL_AUTHORITY_NOT_FROZEN"],
+            )
+            runner.run_runtime_policy()
+            gate = next(
+                item
+                for item in runner.hard_gate_results
+                if item["id"] == "RUNTIME-DEPENDENCY-CLOSURE-SETUP"
+            )
+            self.assertEqual(gate["status"], "fail")
+        finally:
+            runner.cleanup_task_resources()
+
+    def test_local_nondependency_and_full_measurement_status_matrix(self) -> None:
+        baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
+        policy, tools = self.local_tool_authority()
+        local_source = _explicit_local_test_environment()
+        local_runner = ci.FoundationRunner(
+            "policy",
+            baseline,
+            tools=tools,
+            tool_policy=policy,
+            source_environment=local_source,
+            enable_runtime_closure=True,
+        )
+        try:
+            self.assertEqual(
+                local_runner.runtime_closure_document["measurementStatus"],
+                "local-nondependency-npm-unavailable",
+            )
+            with tempfile.TemporaryDirectory(prefix="ci8-measured-npm-") as temp_dir:
+                npm_entry = Path(temp_dir) / "npm-fixture.js"
+                npm_entry.write_text(
+                    "console.log('11.0.0');\n", encoding="utf-8"
+                )
+                closure = ci.RuntimeDependencyClosure.build(
+                    "policy",
+                    {**tools, "npm": str(npm_entry)},
+                    ci.child_process_environment(
+                        {**tools, "npm": str(npm_entry)},
+                        source_environment=local_source,
+                        policy=policy,
+                    ),
+                    repo_root=ci.REPO_ROOT,
+                    source_environment={},
+                )
+                try:
+                    self.assertEqual(
+                        closure.document["measurementStatus"],
+                        "measured-complete",
+                    )
+                finally:
+                    closure.close()
+        finally:
+            local_runner.cleanup_task_resources()
+
     def test_unplanned_node_path_and_workspace_runtime_shadowing_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ci8-node-path-") as temp_dir:
             root = Path(temp_dir)
-            approved_tools, setup_errors = ci.resolve_trusted_tools(
-                {"node"},
-                source_environment=os.environ,
-            )
-            self.assertEqual(setup_errors, [], f"positive Node capture failed: {setup_errors}")
-            approved_node = ci.require_tool(
-                approved_tools,
-                "node",
-                phase="RUNTIME_CLOSURE",
-            )
+            _policy, approved_tools = self.local_tool_authority()
+            approved_node = approved_tools["node"]
             with self.assertRaisesRegex(ValueError, "NODE_PATH"):
                 ci.RuntimeDependencyClosure.build(
                     "policy",
@@ -8495,7 +9394,10 @@ class CI8RuntimeDependencyClosureTest(unittest.TestCase):
                 repo_root=workspace,
             )
             self.assertNotIn("node", tools)
-            self.assertTrue(any("shadow" in error for error in errors), errors)
+            self.assertTrue(
+                any(ci.PATH_WORKSPACE_OR_TEMP_AUTHORITY in error for error in errors),
+                errors,
+            )
             fake_npm = workspace / ("npm.cmd" if os.name == "nt" else "npm")
             fake_npm.write_bytes(b"fake-npm")
             npm_tools, npm_errors = ci.resolve_trusted_tools(
@@ -8507,13 +9409,8 @@ class CI8RuntimeDependencyClosureTest(unittest.TestCase):
             self.assertTrue(npm_errors)
 
     def test_runtime_node_shadow_matrix_rejects_workspace_temp_and_node_modules_bin(self) -> None:
-        approved_tools, setup_errors = ci.resolve_trusted_tools(
-            {"node"}, source_environment=os.environ
-        )
-        self.assertEqual(setup_errors, [], f"positive Node capture failed: {setup_errors}")
-        approved_node = ci.require_tool(
-            approved_tools, "node", phase="RUNTIME_CLOSURE"
-        )
+        _policy, approved_tools = self.local_tool_authority()
+        approved_node = approved_tools["node"]
         with tempfile.TemporaryDirectory(prefix="ci8-node-shadow-matrix-") as temp_dir:
             root = Path(temp_dir)
             workspace = root / "workspace"
@@ -8541,7 +9438,13 @@ class CI8RuntimeDependencyClosureTest(unittest.TestCase):
                         repo_root=workspace,
                     )
                     self.assertNotIn("node", tools)
-                    self.assertTrue(any("shadow" in error for error in errors), errors)
+                    self.assertTrue(
+                        any(
+                            ci.PATH_WORKSPACE_OR_TEMP_AUTHORITY in error
+                            for error in errors
+                        ),
+                        errors,
+                    )
                     fake.unlink()
 
     def test_vitest_change_and_restore_is_sticky(self) -> None:
@@ -10250,5 +11153,162 @@ class CI11AuthorityAndCanonicalSpecificationTest(unittest.TestCase):
             ci._canonical_frame(duplicate_normalized_key)
 
 
+def _flatten_test_suite(test: unittest.TestSuite | unittest.TestCase) -> list[unittest.TestCase]:
+    flattened: list[unittest.TestCase] = []
+    if isinstance(test, unittest.TestSuite):
+        for child in test:
+            flattened.extend(_flatten_test_suite(child))
+    else:
+        flattened.append(test)
+    return flattened
+
+
+def _test_inventory(
+    test: unittest.TestSuite | unittest.TestCase,
+) -> tuple[tuple[str, ...], dict[str, tuple[str, ...]], str]:
+    identifiers = tuple(sorted(item.id() for item in _flatten_test_suite(test)))
+    if len(identifiers) != len(set(identifiers)):
+        raise ValueError("test inventory contains duplicate IDs")
+    by_class: dict[str, list[str]] = {}
+    for identifier in identifiers:
+        by_class.setdefault(identifier.rsplit(".", 1)[0], []).append(identifier)
+    frozen_by_class = {
+        class_name: tuple(class_ids)
+        for class_name, class_ids in sorted(by_class.items())
+    }
+    digest = hashlib.sha256("\n".join(identifiers).encode("utf-8")).hexdigest()
+    return identifiers, frozen_by_class, digest
+
+
+class InventoryTextTestResult(unittest.TextTestResult):
+    def __init__(
+        self,
+        *args,
+        inventory_ids: tuple[str, ...],
+        inventory_by_class: dict[str, tuple[str, ...]],
+        inventory_digest: str,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.inventory_ids = inventory_ids
+        self.inventory_by_class = inventory_by_class
+        self.inventory_digest = inventory_digest
+        self.executed_test_ids: set[str] = set()
+        self.successful_test_ids: set[str] = set()
+        self.class_setup_error_classes: set[str] = set()
+        self.blocked_test_ids: tuple[str, ...] = ()
+
+    def startTest(self, test: unittest.TestCase) -> None:
+        self.executed_test_ids.add(test.id())
+        super().startTest(test)
+
+    def addSuccess(self, test: unittest.TestCase) -> None:
+        self.successful_test_ids.add(test.id())
+        super().addSuccess(test)
+
+    def addError(self, test: unittest.TestCase, err) -> None:
+        match = re.fullmatch(r"setUpClass \((?P<class_name>[^)]+)\)", test.id())
+        if match is not None:
+            self.class_setup_error_classes.add(match.group("class_name"))
+        super().addError(test, err)
+
+    def finalize_inventory_accounting(self) -> None:
+        blocked = {
+            identifier
+            for class_name in self.class_setup_error_classes
+            for identifier in self.inventory_by_class.get(class_name, ())
+            if identifier not in self.executed_test_ids
+        }
+        self.blocked_test_ids = tuple(sorted(blocked))
+
+
+class InventoryTextTestRunner(unittest.TextTestRunner):
+    resultclass = InventoryTextTestResult
+
+    def _makeResult(self) -> InventoryTextTestResult:
+        return self.resultclass(
+            self.stream,
+            self.descriptions,
+            self.verbosity,
+            inventory_ids=self._inventory_ids,
+            inventory_by_class=self._inventory_by_class,
+            inventory_digest=self._inventory_digest,
+        )
+
+    def run(self, test):
+        (
+            self._inventory_ids,
+            self._inventory_by_class,
+            self._inventory_digest,
+        ) = _test_inventory(test)
+        self.stream.writeln(
+            f"TEST_INVENTORY TOTAL_DISCOVERED_IDS={len(self._inventory_ids)}"
+        )
+        self.stream.writeln(
+            f"TEST_INVENTORY SORTED_ID_SHA256={self._inventory_digest}"
+        )
+        for class_name, identifiers in self._inventory_by_class.items():
+            self.stream.writeln(
+                f"TEST_INVENTORY CLASS={class_name} COUNT={len(identifiers)}"
+            )
+        result = super().run(test)
+        result.finalize_inventory_accounting()
+        actual_test_errors = sum(
+            1
+            for error_test, _traceback in result.errors
+            if not error_test.id().startswith("setUpClass (")
+        )
+        verdict = (
+            "BLOCKING"
+            if result.failures
+            or result.errors
+            or result.unexpectedSuccesses
+            or result.blocked_test_ids
+            else "PASS"
+        )
+        self.stream.writeln(
+            "TEST_ACCOUNTING "
+            f"DISCOVERED={len(result.inventory_ids)} "
+            f"EXECUTED={len(result.executed_test_ids)} "
+            f"PASSED={len(result.successful_test_ids)} "
+            f"FAILED={len(result.failures)} "
+            f"ERRORS={actual_test_errors} "
+            f"SKIPPED={len(result.skipped)} "
+            f"CLASS_SETUP_ERRORS={len(result.class_setup_error_classes)} "
+            f"CLASS_SETUP_BLOCKED_METHODS={len(result.blocked_test_ids)} "
+            f"VERDICT={verdict}"
+        )
+        for identifier in result.blocked_test_ids:
+            self.stream.writeln(f"TEST_ACCOUNTING BLOCKED_ID={identifier}")
+        return result
+
+
+class TestInventoryAccountingTest(unittest.TestCase):
+    def test_class_setup_abort_accounts_for_every_blocked_method(self) -> None:
+        class BlockedFixture(unittest.TestCase):
+            @classmethod
+            def setUpClass(cls) -> None:
+                raise RuntimeError("intentional class setup failure")
+
+            def test_alpha(self) -> None:
+                self.fail("blocked test executed")
+
+            def test_beta(self) -> None:
+                self.fail("blocked test executed")
+
+            def test_gamma(self) -> None:
+                self.fail("blocked test executed")
+
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(BlockedFixture)
+        stream = io.StringIO()
+        result = InventoryTextTestRunner(stream=stream, verbosity=0).run(suite)
+        self.assertEqual(len(result.inventory_ids), 3)
+        self.assertEqual(len(result.executed_test_ids), 0)
+        self.assertEqual(len(result.class_setup_error_classes), 1)
+        self.assertEqual(len(result.blocked_test_ids), 3)
+        self.assertIn("CLASS_SETUP_BLOCKED_METHODS=3", stream.getvalue())
+        self.assertIn("VERDICT=BLOCKING", stream.getvalue())
+
+
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=2, testRunner=InventoryTextTestRunner)
