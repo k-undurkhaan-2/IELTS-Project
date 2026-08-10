@@ -81,14 +81,10 @@ def _process_is_alive(pid: int) -> bool:
 
 
 def _candidate_worktree_roots() -> tuple[Path, ...]:
-    git_candidates = []
-    configured = os.environ.get("GIT_EXE")
-    if configured:
-        git_candidates.append(Path(configured))
-    git_candidates.append(Path(r"D:\Git\cmd\git.exe"))
-    discovered = shutil.which("git")
-    if discovered:
-        git_candidates.append(Path(discovered))
+    try:
+        git_candidates = [Path(_explicit_local_test_tool_map("git")["git"])]
+    except AssertionError:
+        git_candidates = []
 
     for git in git_candidates:
         try:
@@ -136,71 +132,10 @@ def _explicit_security_task_temp() -> Path:
 
 
 def _explicit_local_test_tool_map(*roles: str) -> dict[str, str]:
-    """Bind non-resolver fixtures to explicit local executables.
+    """Bind local fixtures through the same fail-closed production resolver."""
 
-    These tests exercise command protocols, target leases, or plan construction;
-    PATH classification has its own dedicated matrices below.  Keeping their
-    executable precondition explicit prevents an unrelated ambient PATH entry
-    from aborting an entire test class while retaining production fail-closed
-    behavior.
-    """
-
-    dependency_root = Path(sys.executable).resolve(strict=True).parent.parent
-    names = {
-        "node": "node.exe" if os.name == "nt" else "node",
-        "git": "git.exe" if os.name == "nt" else "git",
-    }
-    windows_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
-    candidates: dict[str, tuple[str | Path | None, ...]] = {
-        "python": (sys.executable,),
-        "node": (
-            os.environ.get("CI_TRUSTED_NODE"),
-            dependency_root / "node" / "bin" / names["node"],
-            shutil.which("node"),
-        ),
-        "git": (
-            os.environ.get("GIT_EXE"),
-            Path(r"D:\Git\cmd\git.exe") if os.name == "nt" else None,
-            shutil.which("git"),
-        ),
-        "bash": (
-            os.environ.get("CI_TRUSTED_BASH"),
-            Path(r"D:\Git\bin\bash.exe") if os.name == "nt" else None,
-            shutil.which("bash"),
-        ),
-        "powershell": (
-            os.environ.get("CI_TRUSTED_POWERSHELL"),
-            (
-                windows_root
-                / "System32"
-                / "WindowsPowerShell"
-                / "v1.0"
-                / "powershell.exe"
-                if os.name == "nt"
-                else None
-            ),
-            shutil.which("pwsh"),
-            shutil.which("powershell"),
-        ),
-    }
-    result: dict[str, str] = {}
-    for role in roles:
-        if role not in candidates:
-            raise AssertionError(f"unsupported explicit local test tool role: {role}")
-        for candidate in candidates[role]:
-            if not candidate:
-                continue
-            try:
-                resolved = Path(candidate).resolve(strict=True)
-                metadata = resolved.stat()
-            except OSError:
-                continue
-            if stat.S_ISREG(metadata.st_mode):
-                result[role] = str(resolved)
-                break
-        if role not in result:
-            raise AssertionError(f"explicit local test tool is unavailable: {role}")
-    return result
+    _policy, tools = _resolved_local_test_authority(*roles)
+    return tools
 
 
 def _explicit_local_test_environment() -> dict[str, str]:
@@ -220,6 +155,57 @@ def _explicit_local_test_environment() -> dict[str, str]:
     ):
         source.pop(name, None)
     return source
+
+
+def _resolved_local_test_authority(
+    *roles: str,
+) -> tuple[ci.ToolAuthorityPolicy, dict[str, str]]:
+    """Use the production resolver for every executable self-test authority."""
+
+    requested = set(roles)
+    source = _explicit_local_test_environment()
+    try:
+        policy = ci.default_tool_authority_policy(source, repo_root=ci.REPO_ROOT)
+        for key in tuple(source):
+            if ci._ascii_lower_authority_text(key) in {
+                "path",
+                "node_exe",
+                "npm_exe",
+                "python_exe",
+                "git_exe",
+                "powershell_exe",
+                "bash_exe",
+                "ci_trusted_python",
+                "ci_trusted_node",
+                "ci_trusted_npm_entry",
+            }:
+                source.pop(key)
+        path_directories = [policy.running_python.parent]
+        for role in sorted(requested - {"python", "bash"}):
+            candidate = ci._fallback_tool_candidate(role, policy)
+            if candidate is not None:
+                path_directories.append(candidate.parent)
+        path_directories.extend(policy.minimal_system_directories)
+        source["PATH"] = policy.path_separator.join(
+            str(path) for path in dict.fromkeys(path_directories)
+        )
+        tools, errors = ci.resolve_trusted_tools(
+            requested,
+            source_environment=source,
+            repo_root=ci.REPO_ROOT,
+            policy=policy,
+        )
+        authoritative = ci.require_tool_set(
+            tools,
+            requested,
+            phase="SELF_TEST_CAPTURE",
+            resolution_errors=errors,
+        )
+    except (OSError, ValueError, ci.ToolAuthorityUnavailable) as exc:
+        raise AssertionError(
+            f"TEST-TOOL-AUTHORITY-UNAVAILABLE: {type(exc).__name__}: {exc}"
+        ) from exc
+    return policy, authoritative
 
 
 def _explicit_live_local_external_authority() -> ci.ExecutionExternalAuthority:
@@ -1250,6 +1236,145 @@ def coherently_rebind_claimed_transcript(documents: dict) -> None:
                 )
             )
     commands["observations"] = rebound
+
+
+def p52_compact_replay_fixture() -> tuple[SimpleNamespace, dict, dict]:
+    target_a = ci._target_authority(ci.REPO_ROOT, ci.STATIC_SUITE_RELATIVE_PATH)
+    target_b = ci._target_authority(ci.REPO_ROOT, ".github/workflows/ci.yml")
+    target_c = ci._target_authority(
+        ci.REPO_ROOT,
+        "developer/tests/ci/phase1-ci-baseline.json",
+    )
+    specs = [
+        synthetic_command_spec(
+            "p52-compact-alpha",
+            "p52-compact-class-alpha",
+            0,
+            targets=[target_a, target_b],
+            execution_input_mode="PROTECTED-TARGET-BUNDLE",
+        ),
+        synthetic_command_spec(
+            "p52-compact-beta",
+            "p52-compact-class-beta",
+            1,
+            targets=[target_b, target_c],
+            execution_input_mode="PROTECTED-TARGET-BUNDLE",
+        ),
+    ]
+    records = [synthetic_record_from_spec(spec) for spec in specs]
+    runner = SimpleNamespace(
+        profile="static",
+        platform=ci.platform_key(),
+        command_plan=specs,
+        command_results=records,
+        observations=[],
+        completed_classes=set(),
+        hard_gate_results=[],
+        violations=[],
+    )
+    runner.execution_binding = synthetic_execution_binding(
+        runner.profile,
+        ci.command_plan_digest(specs),
+        platform_name=runner.platform,
+    )
+    runner.runtime_closure_digest = "4" * 64
+    runner.dependency_closure_digest = "6" * 64
+    runner.dependency_member_count = 0
+    runner.verifier_execution_binding = synthetic_external_context(
+        runner.execution_binding
+    ).verifier_binding()
+    comparison = empty_comparison()
+    transcript = ci.verification_replay_transcript(runner)
+    commands = {
+        "executionBinding": copy.deepcopy(runner.execution_binding),
+        "executionBindingDigest": ci.execution_binding_digest(
+            runner.execution_binding
+        ),
+        "authorizationContextBinding": copy.deepcopy(
+            runner.authorization_context_binding
+        ),
+        "authorizationContextBindingDigest": (
+            runner.authorization_context_binding_digest
+        ),
+        "commandAuthority": copy.deepcopy(runner.command_plan),
+        "commandPlanDigest": transcript["commandPlanDigest"],
+        "commandCount": transcript["commandCount"],
+        "records": [
+            ci._compact_command_record_for_evidence(record)
+            for record in runner.command_results
+        ],
+        "observations": copy.deepcopy(runner.observations),
+        "completedCommandClasses": copy.deepcopy(
+            transcript["actualCompletedCommandClasses"]
+        ),
+        **{
+            key: copy.deepcopy(transcript[key])
+            for key in (
+                "expectedCompletedCommandClasses",
+                "actualCompletedCommandClasses",
+                "expectedCompletedCommandClassSetDigest",
+                "completedCommandClassSetDigest",
+                "producerObservationCount",
+                "producerObservationUniverseDigest",
+                "producerTranscriptDigest",
+                "missingCommandIds",
+                "extraCommandIds",
+                "duplicateCommandIds",
+            )
+        },
+    }
+    summary = {
+        "status": "PASS",
+        "profile": runner.profile,
+        "executionBinding": copy.deepcopy(runner.execution_binding),
+        "executionBindingDigest": ci.execution_binding_digest(
+            runner.execution_binding
+        ),
+        "authorizationContextBinding": copy.deepcopy(
+            runner.authorization_context_binding
+        ),
+        "authorizationContextBindingDigest": (
+            runner.authorization_context_binding_digest
+        ),
+        "knownDebtsObserved": [],
+        "resolvedCandidates": [],
+        "expectedOmissions": [],
+        "releaseOnlySkips": [],
+    }
+    return (
+        runner,
+        {"summary.json": summary, "command-results.json": commands},
+        comparison,
+    )
+
+
+def p52_execution_input_from_target(target: Mapping[str, object]) -> dict:
+    return {
+        "logicalPath": target["path"],
+        "canonicalSourcePath": target["canonicalSourcePath"],
+        "plannedByteLength": target["size"],
+        "plannedSha256": target["sha256"],
+        "plannedStableIdentity": target["fileIdentity"],
+        "actualByteLength": target["size"],
+        "actualSha256": target["sha256"],
+        "inputMode": "PROTECTED-TARGET-BUNDLE",
+    }
+
+
+def coherently_refresh_p52_compact_record(record: dict) -> None:
+    inputs = [
+        p52_execution_input_from_target(target) for target in record["targets"]
+    ]
+    record["executionInputs"] = inputs
+    record["executionInputBundleDigest"] = ci.execution_input_bundle_digest(inputs)
+    bundle = record["protectedTargetBundle"]
+    bundle["executionInputBundleDigest"] = record["executionInputBundleDigest"]
+    bundle["preExecutionIdentities"] = (
+        ci._protected_bundle_compact_identity_digests(record, phase="pre")
+    )
+    bundle["postExecutionIdentities"] = (
+        ci._protected_bundle_compact_identity_digests(record, phase="post")
+    )
 
 
 def contained_capture(
@@ -3260,6 +3385,168 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
             self.assertEqual(summary["status"], "FAIL")
             command_results = ci.strict_json_load_file(output / "command-results.json")
             self.assertEqual(command_results["records"][0]["outputLimitStatus"], "OUTPUT-LIMIT-EXCEEDED")
+            self.assertEqual(len(command_results["records"]), 1)
+            self.assertEqual(
+                command_results["records"][0]["commandId"],
+                "command-results-size-limit",
+            )
+            self.assertTrue(
+                any(
+                    item.get("id") == "COMMAND-RESULT-JSON-LIMIT"
+                    for item in summary["policyViolations"]
+                )
+            )
+
+    def test_full_scale_command_results_retain_705_records_under_fixed_limit(self) -> None:
+        baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
+        stable_identity = {
+            "deviceOrVolume": "fixture-volume",
+            "inodeOrFileIndex": "fixture-index",
+            "creationOrChangeTimeNs": "1",
+            "writeTimeNs": "1",
+            "reparsePoint": False,
+        }
+        targets = [
+            {
+                "path": f"frontend/security/target-{index:04d}.js",
+                "canonicalSourcePath": str(
+                    (
+                        ci.REPO_ROOT
+                        / "frontend"
+                        / "security"
+                        / f"target-{index:04d}.js"
+                    ).resolve()
+                ),
+                "size": 128 + index,
+                "sha256": hashlib.sha256(f"target-{index}".encode()).hexdigest(),
+                "fileIdentity": copy.deepcopy(stable_identity),
+                "modeType": "regular-file",
+                "reparsePoint": False,
+            }
+            for index in range(904)
+        ]
+        command_classes = [f"required-class-{index:02d}" for index in range(16)]
+        plan: list[dict] = []
+        for ordinal in range(705):
+            if ordinal == 0:
+                selected_targets = targets
+                input_mode = "PROTECTED-TARGET-BUNDLE"
+            elif ordinal == 1:
+                selected_targets = targets[:37]
+                input_mode = "PROTECTED-TARGET-BUNDLE"
+            elif ordinal == 2:
+                selected_targets = targets[:4]
+                input_mode = "PROTECTED-TARGET-BUNDLE"
+            elif ordinal == 3:
+                selected_targets = targets[:1]
+                input_mode = "PROTECTED-TARGET-BUNDLE"
+            elif ordinal < 701:
+                selected_targets = [targets[(ordinal - 4) % len(targets)]]
+                input_mode = "TARGET-BYTES-STDIN"
+            else:
+                selected_targets = []
+                input_mode = "NONE"
+            spec = synthetic_command_spec(
+                f"scale-command-{ordinal:04d}",
+                command_classes[ordinal % len(command_classes)],
+                ordinal,
+                targets=selected_targets,
+                execution_input_mode=input_mode,
+            )
+            spec["profile"] = "policy"
+            plan.append(spec)
+        records = [synthetic_record_from_spec(spec) for spec in plan]
+        runner = fake_runner(baseline)
+        runner.command_plan = plan
+        runner.command_results = records
+        runner.observations = []
+        runner.completed_classes = set()
+        runner.command_plan_digest = ci.command_plan_digest(plan)
+        runner.execution_binding = synthetic_execution_binding(
+            "policy",
+            runner.command_plan_digest,
+            platform_name=runner.platform,
+        )
+        with tempfile.TemporaryDirectory(prefix="ci-scale-evidence-") as temp_dir:
+            repo = Path(temp_dir)
+            output = repo / ".ci-results"
+            ci.create_fresh_evidence_root(output, repo_root=repo)
+            ci.write_evidence(
+                runner,
+                empty_comparison(),
+                output_dir=output,
+                evidence_authority_root=repo,
+            )
+            data = (output / "command-results.json").read_bytes()
+            self.assertLess(len(data), ci.MAX_COMMAND_RESULTS_JSON_BYTES)
+            document = ci.strict_json_loads(data)
+            self.assertEqual(
+                [record["commandId"] for record in document["records"]],
+                [spec["commandId"] for spec in plan],
+            )
+            self.assertEqual(len(document["records"]), 705)
+            self.assertEqual(
+                document["completedCommandClasses"], sorted(command_classes)
+            )
+            self.assertEqual(
+                document["commandAuthority"], ci._portable_command_plan_value(plan)
+            )
+            for record, expected_target_count in zip(
+                document["records"][:4], (904, 37, 4, 1)
+            ):
+                self.assertEqual(len(record["targets"]), expected_target_count)
+                self.assertEqual(
+                    len(record["executionInputs"]), expected_target_count
+                )
+                self.assertEqual(
+                    record["executionInputBundleDigest"],
+                    ci.execution_input_bundle_digest(record["executionInputs"]),
+                )
+                bundle = record["protectedTargetBundle"]
+                for key in ci._PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS:
+                    self.assertEqual(bundle[key], [])
+                self.assertEqual(
+                    len(bundle["preExecutionIdentities"]),
+                    expected_target_count,
+                )
+            self.assertEqual(
+                ci.verify_evidence_file_set(
+                    output,
+                    repo_root=repo,
+                    expected_command_plan=plan,
+                ),
+                [],
+            )
+            forged_document = copy.deepcopy(document)
+            for record in forged_document["records"][:4]:
+                bundle = record["protectedTargetBundle"]
+                bundle["preExecutionIdentities"] = [
+                    "0" * 64 for _identity in bundle["preExecutionIdentities"]
+                ]
+                bundle["postExecutionIdentities"] = [
+                    "0" * 64 for _identity in bundle["postExecutionIdentities"]
+                ]
+            coherently_rebind_claimed_transcript(
+                {"command-results.json": forged_document}
+            )
+            self.rewrite_manifested_json(
+                output,
+                "command-results.json",
+                forged_document,
+            )
+            verification_errors = ci.verify_evidence_file_set(
+                output,
+                repo_root=repo,
+                expected_command_plan=plan,
+            )
+            self.assertTrue(verification_errors)
+            self.assertTrue(
+                any(
+                    "independently reconstructed command authority" in error
+                    for error in verification_errors
+                ),
+                verification_errors,
+            )
 
 
 class StaticProducerProtocolTest(unittest.TestCase):
@@ -3939,8 +4226,678 @@ class TrustedExecutionTest(unittest.TestCase):
         self.assertRegex(evidence["stdoutSha256"], r"^[0-9a-f]{64}$")
 
 
+class CanonicalLockedGitIdentityTest(unittest.TestCase):
+    @staticmethod
+    def git_run(git: str, root: Path, *arguments: str) -> str:
+        result = subprocess.run(
+            [
+                git,
+                "-c",
+                f"safe.directory={root.resolve(strict=True)}",
+                "-c",
+                "commit.gpgSign=false",
+                "-C",
+                str(root.resolve(strict=True)),
+                *arguments,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise AssertionError(
+                f"fixture Git command failed: {arguments!r} rc={result.returncode}"
+            )
+        return result.stdout.decode("utf-8", errors="strict").strip()
+
+    def make_repository(
+        self, root: Path
+    ) -> tuple[str, ci.ToolAuthorityPolicy, dict[str, str], str, bytes, dict[str, str], dict[str, str]]:
+        policy, tools = _resolved_local_test_authority("git")
+        git = tools["git"]
+        self.git_run(git, root, "init", "--quiet")
+        self.git_run(git, root, "config", "user.name", "CI Fixture")
+        self.git_run(git, root, "config", "user.email", "ci@example.invalid")
+        self.git_run(git, root, "config", "core.autocrlf", "false")
+        relative = "developer/package.json"
+        canonical = (
+            b'{"name":"fixture","dependencies":{"alpha":"1.0.0"}}\n'
+            b'{"integrity":"sha512-fixture"}\n'
+        )
+        path = root / relative
+        path.parent.mkdir(parents=True)
+        path.write_bytes(canonical)
+        self.git_run(git, root, "add", "--", relative)
+        self.git_run(git, root, "commit", "--quiet", "-m", "fixture")
+        object_id = self.git_run(git, root, "rev-parse", f"HEAD:{relative}")
+        expected_sha = {relative: hashlib.sha256(canonical).hexdigest()}
+        expected_oids = {relative: object_id}
+        environment = ci.child_process_environment(
+            tools,
+            source_environment=_explicit_local_test_environment(),
+            repo_root=root,
+            policy=policy,
+        )
+        return (
+            git,
+            policy,
+            environment,
+            relative,
+            canonical,
+            expected_sha,
+            expected_oids,
+        )
+
+    def capture(
+        self,
+        *,
+        git: str,
+        environment: Mapping[str, str],
+        root: Path,
+        expected_sha: Mapping[str, str],
+        expected_oids: Mapping[str, str],
+    ) -> tuple[dict[str, dict], list[str]]:
+        return ci.capture_locked_file_git_identities(
+            git=git,
+            environment=environment,
+            repo_root=root,
+            expected_sha256=expected_sha,
+            expected_blob_oids=expected_oids,
+        )
+
+    def test_lf_crlf_and_semantic_mutation_matrix_uses_git_blob_authority(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ci-locked-git-") as temp_dir:
+            root = Path(temp_dir)
+            (
+                git,
+                _policy,
+                environment,
+                relative,
+                canonical,
+                expected_sha,
+                expected_oids,
+            ) = self.make_repository(root)
+            path = root / relative
+
+            identities, errors = self.capture(
+                git=git,
+                environment=environment,
+                root=root,
+                expected_sha=expected_sha,
+                expected_oids=expected_oids,
+            )
+            self.assertEqual(errors, [])
+            lf_snapshot, errors = ci.snapshot_trusted_files(
+                repo_root=root,
+                paths=(relative,),
+                locked_identities=identities,
+                locked_sha256=expected_sha,
+                locked_blob_oids=expected_oids,
+            )
+            self.assertEqual(errors, [])
+
+            crlf = canonical.replace(b"\n", b"\r\n")
+            path.write_bytes(crlf)
+            crlf_identities, errors = self.capture(
+                git=git,
+                environment=environment,
+                root=root,
+                expected_sha=expected_sha,
+                expected_oids=expected_oids,
+            )
+            self.assertEqual(errors, [])
+            crlf_snapshot, errors = ci.snapshot_trusted_files(
+                repo_root=root,
+                paths=(relative,),
+                locked_identities=crlf_identities,
+                locked_sha256=expected_sha,
+                locked_blob_oids=expected_oids,
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(lf_snapshot, crlf_snapshot)
+
+            invalid_presentations = {
+                "mixed-line-endings": canonical.splitlines(keepends=True)[0].replace(
+                    b"\n", b"\r\n"
+                )
+                + canonical.splitlines(keepends=True)[1],
+                "single-byte": canonical.replace(b"fixture", b"fixturf", 1),
+                "dependency": canonical.replace(b'"alpha":"1.0.0"', b'"beta":"2.0.0"'),
+                "same-size": canonical.replace(b'"1.0.0"', b'"2.0.0"'),
+            }
+            for name, presented in invalid_presentations.items():
+                with self.subTest(name=name):
+                    path.write_bytes(presented)
+                    _identities, errors = self.capture(
+                        git=git,
+                        environment=environment,
+                        root=root,
+                        expected_sha=expected_sha,
+                        expected_oids=expected_oids,
+                    )
+                    self.assertTrue(errors)
+
+            path.write_bytes(canonical)
+            self.git_run(git, root, "rm", "--cached", "--quiet", "--", relative)
+            _identities, errors = self.capture(
+                git=git,
+                environment=environment,
+                root=root,
+                expected_sha=expected_sha,
+                expected_oids=expected_oids,
+            )
+            self.assertTrue(errors, "an untracked look-alike must not authorize itself")
+            self.git_run(git, root, "add", "--", relative)
+
+            lf_target = ci._target_authority(root, relative)
+            lf_lease = ci.TargetExecutionLease(
+                lf_target,
+                repo_root=root,
+                execution_adapter="TARGET-BYTES-STDIN",
+            )
+            try:
+                lf_lease.materialize()
+                lf_raw_hash = lf_lease.evidence()["executedInputSha256"]
+            finally:
+                lf_lease.close()
+            path.write_bytes(crlf)
+            crlf_target = ci._target_authority(root, relative)
+            crlf_lease = ci.TargetExecutionLease(
+                crlf_target,
+                repo_root=root,
+                execution_adapter="TARGET-BYTES-STDIN",
+            )
+            try:
+                crlf_lease.materialize()
+                crlf_raw_hash = crlf_lease.evidence()["executedInputSha256"]
+            finally:
+                crlf_lease.close()
+            self.assertNotEqual(lf_raw_hash, crlf_raw_hash)
+
+            path.write_bytes(canonical.replace(b"alpha", b"omega"))
+            self.git_run(git, root, "add", "--", relative)
+            self.git_run(git, root, "commit", "--quiet", "-m", "different blob")
+            _identities, errors = self.capture(
+                git=git,
+                environment=environment,
+                root=root,
+                expected_sha=expected_sha,
+                expected_oids=expected_oids,
+            )
+            self.assertTrue(errors, "a different HEAD/index blob must fail closed")
+
+    def test_symlink_or_reparse_substitution_is_rejected_before_blob_credit(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ci-locked-link-") as temp_dir:
+            root = Path(temp_dir)
+            (
+                git,
+                _policy,
+                environment,
+                relative,
+                _canonical,
+                expected_sha,
+                expected_oids,
+            ) = self.make_repository(root)
+            target_path = (root / relative).resolve(strict=True)
+            original_secure = ci._secure_regular_file
+
+            def reject_substitution(path: Path, *args, **kwargs):
+                if Path(path).resolve() == target_path:
+                    return False, "path is a symbolic link or reparse point"
+                return original_secure(path, *args, **kwargs)
+
+            with mock.patch.object(
+                ci, "_secure_regular_file", side_effect=reject_substitution
+            ):
+                _identities, errors = self.capture(
+                    git=git,
+                    environment=environment,
+                    root=root,
+                    expected_sha=expected_sha,
+                    expected_oids=expected_oids,
+                )
+            self.assertTrue(
+                any("symbolic link or reparse" in error for error in errors), errors
+            )
+
+
+class InternalPythonExecutionAuthorityTest(unittest.TestCase):
+    def test_canonical_and_same_file_alias_normalize_to_approved_python(self) -> None:
+        approved = Path(sys.executable).resolve(strict=True)
+        expected = [str(approved), "<internal>", "internal-fixture"]
+        self.assertEqual(
+            ci.canonical_internal_execution_argv(
+                approved, approved, "internal-fixture"
+            ),
+            expected,
+        )
+        with tempfile.TemporaryDirectory(prefix="ci-python-alias-") as temp_dir:
+            approved_fixture = Path(temp_dir) / "approved-python.exe"
+            approved_fixture.write_bytes(b"same-file-identity-fixture")
+            alias = Path(temp_dir) / "python-alias.exe"
+            os.link(approved_fixture, alias)
+            fixture_expected = [
+                str(approved_fixture.resolve(strict=True)),
+                "<internal>",
+                "internal-fixture",
+            ]
+            self.assertEqual(
+                ci.canonical_internal_execution_argv(
+                    approved_fixture, alias, "internal-fixture"
+                ),
+                fixture_expected,
+            )
+            result = ci.make_internal_result(
+                "internal-fixture",
+                "unit",
+                True,
+                "ok",
+                execution_authority=approved_fixture,
+                observed_execution_authority=alias,
+            )
+            self.assertEqual(result["actualExecutionArgv"], fixture_expected)
+
+    def test_distinct_binary_and_workspace_same_basename_are_rejected(self) -> None:
+        approved = Path(sys.executable).resolve(strict=True)
+        with tempfile.TemporaryDirectory(prefix="ci-python-substitution-") as temp_dir:
+            distinct = Path(temp_dir) / "distinct-python.exe"
+            distinct.write_bytes(approved.read_bytes()[:4096] or b"distinct")
+            workspace_alias = Path(temp_dir) / "workspace" / approved.name
+            workspace_alias.parent.mkdir()
+            workspace_alias.write_bytes(b"not-the-approved-python")
+            for candidate in (distinct, workspace_alias):
+                with self.subTest(candidate=candidate.name):
+                    with self.assertRaisesRegex(
+                        ValueError, "differs from approved file identity"
+                    ):
+                        ci.canonical_internal_execution_argv(
+                            approved, candidate, "internal-fixture"
+                        )
+
+    def test_internal_argument_mutation_remains_strictly_rejected(self) -> None:
+        spec = synthetic_command_spec("internal-fixture", "unit", 0)
+        record = synthetic_record_from_spec(spec)
+        record["actualExecutionArgv"] = [
+            record["executionArgv"][0],
+            "<internal>",
+            "mutated-argument",
+        ]
+        errors: list[str] = []
+        ci._validate_command_record(record, 0, errors)
+        self.assertTrue(
+            any("actualExecutionArgv" in error for error in errors), errors
+        )
+
+
 class HostedRunnerToolResolutionTest(unittest.TestCase):
     REQUIRED = frozenset({"python", "node", "git", "bash", "powershell"})
+
+    def test_policy_root_fallback_models_hosted_sibling_products_and_local_host(self) -> None:
+        for platform_name in ("Ubuntu", "Windows"):
+            with self.subTest(platform=platform_name):
+                fixture = _HostedToolFixture(platform_name)
+                try:
+                    self.assertEqual(
+                        ci._fallback_tool_candidate("node", fixture.policy),
+                        fixture.paths["node"],
+                    )
+                    self.assertEqual(
+                        ci._fallback_tool_candidate("git", fixture.policy),
+                        fixture.paths["git"],
+                    )
+                finally:
+                    fixture.cleanup()
+        policy, tools = _resolved_local_test_authority("python", "node", "git")
+        self.assertEqual(set(tools), {"python", "node", "git"})
+        for role, path in tools.items():
+            self.assertIsNotNone(ci._tool_root_classification(Path(path), role, policy))
+
+    def test_local_authority_absence_is_typed_and_explainable(self) -> None:
+        with mock.patch.object(
+            ci,
+            "resolve_trusted_tools",
+            return_value=({}, ["REQUIRED_TOOL_MISSING tool=node"]),
+        ):
+            with self.assertRaisesRegex(
+                AssertionError, "TEST-TOOL-AUTHORITY-UNAVAILABLE.*node"
+            ):
+                _resolved_local_test_authority("node")
+
+    def test_windows_environment_case_variants_and_collision_semantics(self) -> None:
+        fixture = _HostedToolFixture("Windows")
+        try:
+            program_files = fixture.root / "Program Files"
+            program_files_x86 = fixture.root / "Program Files (x86)"
+            (program_files_x86 / "Git").mkdir(parents=True)
+            for spelling in ("PROGRAMFILES", "ProgramFiles", "pRoGrAmFiLeS"):
+                with self.subTest(key=spelling):
+                    source = {
+                        key: value
+                        for key, value in fixture.source.items()
+                        if ci._ascii_lower_authority_text(key) != "programfiles"
+                    }
+                    source[spelling] = str(program_files)
+                    policy = ci.default_tool_authority_policy(
+                        source,
+                        repo_root=fixture.workspace,
+                        platform_name="Windows",
+                    )
+                    self.assertIn(
+                        program_files / "Git",
+                        [root for _label, root in policy.roots_for("git")],
+                    )
+            for spelling in (
+                "PROGRAMFILES(X86)",
+                "ProgramFiles(x86)",
+                "pRoGrAmFiLeS(X86)",
+            ):
+                with self.subTest(key=spelling):
+                    source = dict(fixture.source)
+                    source[spelling] = str(program_files_x86)
+                    policy = ci.default_tool_authority_policy(
+                        source,
+                        repo_root=fixture.workspace,
+                        platform_name="Windows",
+                    )
+                    self.assertIn(
+                        program_files_x86 / "Git",
+                        [root for _label, root in policy.roots_for("git")],
+                    )
+            collision = dict(fixture.source)
+            collision["PROGRAMFILES"] = str(program_files)
+            collision["ProgramFiles"] = str(program_files_x86)
+            with self.assertRaises(ci.EnvironmentAuthorityConflict):
+                ci.default_tool_authority_policy(
+                    collision,
+                    repo_root=fixture.workspace,
+                    platform_name="Windows",
+                )
+            tools, errors = ci.resolve_trusted_tools(
+                {"git"},
+                source_environment=collision,
+                policy=fixture.policy,
+            )
+            self.assertEqual(tools, {})
+            self.assertEqual(errors, ["ENVIRONMENT-AUTHORITY-CONFLICT key=ProgramFiles"])
+
+            mixed_path = dict(fixture.source)
+            mixed_path["pAtH"] = mixed_path.pop("PATH")
+            tools, errors = ci.resolve_trusted_tools(
+                self.REQUIRED,
+                source_environment=mixed_path,
+                policy=fixture.policy,
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(set(tools), set(self.REQUIRED))
+            self.assertEqual(
+                ci._environment_authority_value(
+                    {"PATH": "upper", "Path": "mixed"},
+                    "PATH",
+                    windows=False,
+                ),
+                "upper",
+            )
+        finally:
+            fixture.cleanup()
+
+    def test_windows_child_environment_collision_authority_is_deterministic(
+        self,
+    ) -> None:
+        with make_task_owned_tempdir(
+            _explicit_security_task_temp(),
+            "p52-env-",
+        ) as root:
+            private_temp = root / "private"
+            private_temp.mkdir()
+            executable = Path(sys.executable).resolve(strict=True)
+            windows_policy = ci.synthetic_tool_authority_policy(
+                "Windows",
+                running_python=executable,
+                role_roots={
+                    "python": (("fixture-python", executable.parent),),
+                },
+                minimal_system_directories=(),
+                path_separator=";",
+            )
+            tools = {"python": str(executable)}
+            base = {
+                "HOME": str(root),
+                "LANG": "C.UTF-8",
+                "PATH": str(executable.parent),
+            }
+
+            private_collision = {
+                **base,
+                "TEMP": "parent-temp",
+                "Temp": "attacker-temp",
+                "TMP": "parent-tmp",
+                "tmp": "attacker-tmp",
+            }
+            environment = ci.child_process_environment(
+                tools,
+                source_environment=private_collision,
+                private_temp_root=private_temp,
+                policy=windows_policy,
+            )
+            self.assertEqual(
+                [
+                    key
+                    for key in environment
+                    if ci._ascii_lower_authority_text(key) == "temp"
+                ],
+                ["TEMP"],
+            )
+            self.assertEqual(
+                [
+                    key
+                    for key in environment
+                    if ci._ascii_lower_authority_text(key) == "tmp"
+                ],
+                ["TMP"],
+            )
+            self.assertEqual(environment["TEMP"], str(private_temp.resolve()))
+            self.assertEqual(environment["TMP"], str(private_temp.resolve()))
+            self.assertEqual(environment["HOME"], str(root))
+            self.assertEqual(environment["LANG"], "C.UTF-8")
+
+            equal_aliases = {**base, "TEMP": "same", "Temp": "same"}
+            coalesced = ci.child_process_environment(
+                tools,
+                source_environment=equal_aliases,
+                policy=windows_policy,
+            )
+            self.assertEqual(coalesced["TEMP"], "same")
+            self.assertNotIn("Temp", coalesced)
+
+            collision_matrices = (
+                ("TEMP", "Temp", "TEMP"),
+                ("TMP", "tmp", "TMP"),
+                ("PATH", "Path", "PATH"),
+                ("ProgramFiles", "PROGRAMFILES", "ProgramFiles"),
+            )
+            for first_key, second_key, expected_key in collision_matrices:
+                for reverse in (False, True):
+                    with self.subTest(
+                        first=first_key,
+                        second=second_key,
+                        reverse=reverse,
+                    ):
+                        pairs = [(first_key, "A"), (second_key, "B")]
+                        if reverse:
+                            pairs.reverse()
+                        source = dict(base)
+                        for key, value in pairs:
+                            source[key] = value
+                        with self.assertRaisesRegex(
+                            ci.EnvironmentAuthorityConflict,
+                            rf"key={re.escape(expected_key)}$",
+                        ):
+                            ci.child_process_environment(
+                                tools,
+                                source_environment=source,
+                                policy=windows_policy,
+                            )
+
+            posix_policy = ci.synthetic_tool_authority_policy(
+                "Ubuntu",
+                running_python=executable,
+                role_roots={
+                    "python": (("fixture-python", executable.parent),),
+                },
+                minimal_system_directories=(),
+                path_separator=os.pathsep,
+            )
+            posix_environment = ci.child_process_environment(
+                tools,
+                source_environment={
+                    **base,
+                    "TEMP": "posix-upper-temp",
+                    "Temp": "posix-mixed-temp",
+                    "TMP": "posix-upper-tmp",
+                    "tmp": "posix-lower-tmp",
+                },
+                policy=posix_policy,
+            )
+            self.assertEqual(posix_environment["TEMP"], "posix-upper-temp")
+            self.assertEqual(posix_environment["TMP"], "posix-upper-tmp")
+            self.assertNotIn("Temp", posix_environment)
+            self.assertNotIn("tmp", posix_environment)
+
+    def test_windows_private_temp_is_single_authority_observed_by_real_child(
+        self,
+    ) -> None:
+        with make_task_owned_tempdir(
+            _explicit_security_task_temp(),
+            "p52-child-",
+        ) as root:
+            private_temp = root / "private"
+            parent_temp = root / "parent"
+            attacker_temp = root / "attacker"
+            for path in (private_temp, parent_temp, attacker_temp):
+                path.mkdir()
+            executable = Path(sys.executable).resolve(strict=True)
+            policy = ci.synthetic_tool_authority_policy(
+                "Windows",
+                running_python=executable,
+                role_roots={
+                    "python": (("fixture-python", executable.parent),),
+                },
+                minimal_system_directories=(),
+                path_separator=";",
+            )
+            environment = ci.child_process_environment(
+                {"python": str(executable)},
+                source_environment={
+                    "PATH": str(executable.parent),
+                    "HOME": str(root),
+                    "TEMP": str(parent_temp),
+                    "Temp": str(attacker_temp),
+                    "TMP": str(parent_temp),
+                    "tmp": str(attacker_temp),
+                },
+                private_temp_root=private_temp,
+                policy=policy,
+            )
+            child_code = """import json, os, tempfile
+print(json.dumps({
+    "entries": [[key, value] for key, value in os.environ.items()
+                if key.upper() in {"TEMP", "TMP"}],
+    "TEMP": os.environ.get("TEMP"),
+    "TMP": os.environ.get("TMP"),
+    "runtimeTemp": tempfile.gettempdir(),
+}))
+"""
+            completed = subprocess.run(
+                [str(executable), "-B", "-c", child_code],
+                env=environment,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=20,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            observed = ci.strict_json_loads(
+                completed.stdout,
+                label="P52 child environment observation",
+            )
+            entries = observed["entries"]
+            self.assertEqual(
+                sum(key.casefold() == "temp" for key, _value in entries),
+                1,
+            )
+            self.assertEqual(
+                sum(key.casefold() == "tmp" for key, _value in entries),
+                1,
+            )
+            expected = private_temp.resolve()
+            self.assertEqual(Path(observed["TEMP"]).resolve(), expected)
+            self.assertEqual(Path(observed["TMP"]).resolve(), expected)
+            self.assertEqual(Path(observed["runtimeTemp"]).resolve(), expected)
+            self.assertNotIn(str(attacker_temp.resolve()), json.dumps(observed))
+
+    def test_windows_trusted_git_alternates_and_predecessor_ordering(self) -> None:
+        fixture = _HostedToolFixture("Windows")
+        try:
+            git_root = fixture.paths["git"].parents[1]
+            bin_git = fixture._write(git_root / "bin" / "git.exe", b"alternate-git")
+            tools, errors = fixture.resolve(self.REQUIRED)
+            self.assertEqual(errors, [])
+            self.assertEqual(Path(tools["git"]), fixture.paths["git"])
+
+            entries = fixture.source["PATH"].split(fixture.policy.path_separator)
+            cmd_root = str(git_root / "cmd")
+            bin_root = str(git_root / "bin")
+            bin_first = [entry for entry in entries if entry != cmd_root]
+            bin_first.remove(bin_root)
+            bin_first.insert(4, bin_root)
+            source = dict(fixture.source)
+            source["PATH"] = fixture.policy.path_separator.join(bin_first)
+            tools, errors = ci.resolve_trusted_tools(
+                self.REQUIRED,
+                source_environment=source,
+                policy=fixture.policy,
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(Path(tools["git"]), bin_git.resolve(strict=True))
+
+            successor = fixture.root / "foreign-successor"
+            fixture.shadow("git", directory=successor)
+            source = dict(fixture.source)
+            source["PATH"] += fixture.policy.path_separator + str(successor)
+            tools, errors = ci.resolve_trusted_tools(
+                self.REQUIRED,
+                source_environment=source,
+                policy=fixture.policy,
+            )
+            self.assertIn("git", tools)
+            self.assertFalse(any("tool=git" in error for error in errors), errors)
+
+            near_prefix = fixture.root / "Program Files" / "Git-Evil" / "cmd"
+            fixture.shadow("git", directory=near_prefix)
+            source = dict(fixture.source)
+            source["PATH"] = fixture.policy.path_separator.join(
+                (str(near_prefix), fixture.source["PATH"])
+            )
+            tools, errors = ci.resolve_trusted_tools(
+                self.REQUIRED,
+                source_environment=source,
+                policy=fixture.policy,
+            )
+            self.assertNotIn("git", tools)
+            self.assertTrue(
+                any(
+                    reason in error
+                    for reason in (
+                        ci.PATH_EXECUTABLE_SHADOW,
+                        ci.PATH_WORKSPACE_OR_TEMP_AUTHORITY,
+                    )
+                    for error in errors
+                ),
+                errors,
+            )
+        finally:
+            fixture.cleanup()
 
     def test_github_ubuntu_hosted_path_resolves_role_specific_tools(self) -> None:
         fixture = _HostedToolFixture("Ubuntu")
@@ -5893,6 +6850,46 @@ class StreamedSecretScanTest(unittest.TestCase):
             path.write_bytes(content)
             return ci.scan_file_for_secrets(path)
 
+    def test_cookie_header_requires_a_cookie_pair_not_a_bare_source_identifier(self) -> None:
+        benign = (
+            b"const options = {\n  cookie: sessionCookieOptions\n};\n",
+            b"const options = {\r\n  cookie: sessionCookieOptions\r\n};\r\n",
+            b"const options: Config = { cookie: sessionCookieOptions };\n",
+            b'{"cookie": "sessionCookieOptions"}\n',
+        )
+        for content in benign:
+            with self.subTest(content=content[:24]):
+                result = self.scan_bytes(content, "benign-source.ts")
+                self.assertTrue(result["passed"], result)
+                self.assertNotIn("cookie-header", result["hits"])
+
+    def test_real_cookie_header_line_endings_pairs_and_authorization_remain_detected(self) -> None:
+        credentials = (
+            b"Cookie: session=private-value\n",
+            b"cookie: session=private-value\r\n",
+            b"Set-Cookie: session=private-value; HttpOnly\n",
+            b"Cookie: first=one; second=two\r\n",
+            b"Cookie: author" + b"ization=BearerPrivateValue123\n",
+        )
+        for content in credentials:
+            with self.subTest(content=content):
+                result = self.scan_bytes(content, "headers.txt")
+                self.assertFalse(result["passed"], result)
+                self.assertIn("cookie-header", result["hits"])
+
+    def test_real_cookie_headers_survive_utf16_and_raw_chunk_boundaries(self) -> None:
+        header = "Cookie: sess" + "ion=PrivateCookieValue987654321"
+        for encoding in ("utf-16le", "utf-16be"):
+            with self.subTest(encoding=encoding):
+                result = self.scan_bytes(("safe\r\n" + header).encode(encoding))
+                self.assertFalse(result["passed"], result)
+                self.assertIn("cookie-header", result["hits"])
+        prefix = b"x" * (ci.SECRET_SCAN_CHUNK_BYTES - len(b"Cookie: ses"))
+        content = prefix + b"\nCookie: session=chunk-boundary-private\n"
+        result = self.scan_bytes(content, "boundary.txt")
+        self.assertFalse(result["passed"], result)
+        self.assertIn("cookie-header", result["hits"])
+
     def test_utf16le_and_utf16be_credential_matrix_fails(self) -> None:
         github = "github_" + "pat_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
         credentials = {
@@ -7744,6 +8741,156 @@ class CI6ReplayVerificationTest(unittest.TestCase):
         self.assertTrue(required_record.issubset(transcript["records"][0]))
 
 
+class P52CompactIdentitySecurityTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.runner, cls.documents, cls.comparison = p52_compact_replay_fixture()
+
+    def compare(self, documents: dict | None = None) -> list[str]:
+        return ci.compare_verification_replay_claims(
+            copy.deepcopy(documents or self.documents),
+            self.runner,
+            self.comparison,
+        )[1]
+
+    def test_compact_protected_bundle_identity_is_recomputed_from_independent_authority(
+        self,
+    ) -> None:
+        self.assertEqual(self.compare(), [])
+        records = self.documents["command-results.json"]["records"]
+        for index, (record, expected_command) in enumerate(
+            zip(records, self.runner.command_plan)
+        ):
+            with self.subTest(command=index):
+                bundle = record["protectedTargetBundle"]
+                for key in ci._PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS:
+                    self.assertEqual(bundle[key], [])
+                independently_expected_pre = (
+                    ci._protected_bundle_compact_identity_digests(
+                        expected_command,
+                        phase="pre",
+                    )
+                )
+                independently_expected_post = (
+                    ci._protected_bundle_compact_identity_digests(
+                        expected_command,
+                        phase="post",
+                    )
+                )
+                self.assertEqual(
+                    bundle["preExecutionIdentities"],
+                    independently_expected_pre,
+                )
+                self.assertEqual(
+                    bundle["postExecutionIdentities"],
+                    independently_expected_post,
+                )
+                self.assertNotEqual(
+                    bundle["preExecutionIdentities"],
+                    bundle["postExecutionIdentities"],
+                )
+                self.assertEqual(
+                    ci._canonical_transcript_record(record),
+                    ci._canonical_transcript_record(
+                        self.runner.command_results[index]
+                    ),
+                )
+
+    def test_compact_bundle_digest_forgery_cannot_self_authorize(self) -> None:
+        modes = (
+            "zero-all",
+            "single-pre",
+            "single-post",
+            "cross-command-digest-swap",
+            "pre-post-swap",
+            "target-omission",
+            "target-reorder",
+            "target-duplicate",
+            "foreign-target-substitution",
+            "reuse-other-command-bundle",
+            "execution-input-substitution",
+            "manifest-preserving-compact-change",
+        )
+        for mode in modes:
+            with self.subTest(mode=mode):
+                forged = copy.deepcopy(self.documents)
+                commands = forged["command-results.json"]
+                first, second = commands["records"]
+                first_bundle = first["protectedTargetBundle"]
+                second_bundle = second["protectedTargetBundle"]
+                zero = "0" * 64
+                if mode == "zero-all":
+                    for record in commands["records"]:
+                        bundle = record["protectedTargetBundle"]
+                        bundle["preExecutionIdentities"] = [
+                            zero for _item in bundle["preExecutionIdentities"]
+                        ]
+                        bundle["postExecutionIdentities"] = [
+                            zero for _item in bundle["postExecutionIdentities"]
+                        ]
+                elif mode == "single-pre":
+                    first_bundle["preExecutionIdentities"][0] = zero
+                elif mode == "single-post":
+                    first_bundle["postExecutionIdentities"][0] = zero
+                elif mode == "cross-command-digest-swap":
+                    (
+                        first_bundle["preExecutionIdentities"][0],
+                        second_bundle["preExecutionIdentities"][0],
+                    ) = (
+                        second_bundle["preExecutionIdentities"][0],
+                        first_bundle["preExecutionIdentities"][0],
+                    )
+                elif mode == "pre-post-swap":
+                    (
+                        first_bundle["preExecutionIdentities"],
+                        first_bundle["postExecutionIdentities"],
+                    ) = (
+                        first_bundle["postExecutionIdentities"],
+                        first_bundle["preExecutionIdentities"],
+                    )
+                elif mode == "target-omission":
+                    first["targets"] = first["targets"][:-1]
+                    coherently_refresh_p52_compact_record(first)
+                elif mode == "target-reorder":
+                    first["targets"] = list(reversed(first["targets"]))
+                    coherently_refresh_p52_compact_record(first)
+                elif mode == "target-duplicate":
+                    first["targets"] = [
+                        copy.deepcopy(first["targets"][0]),
+                        copy.deepcopy(first["targets"][0]),
+                    ]
+                    coherently_refresh_p52_compact_record(first)
+                elif mode == "foreign-target-substitution":
+                    first["targets"][1] = copy.deepcopy(second["targets"][1])
+                    coherently_refresh_p52_compact_record(first)
+                elif mode == "reuse-other-command-bundle":
+                    first_bundle["preExecutionIdentities"] = copy.deepcopy(
+                        second_bundle["preExecutionIdentities"]
+                    )
+                    first_bundle["postExecutionIdentities"] = copy.deepcopy(
+                        second_bundle["postExecutionIdentities"]
+                    )
+                elif mode == "execution-input-substitution":
+                    first["executionInputs"][0]["plannedSha256"] = "f" * 64
+                    first["executionInputs"][0]["actualSha256"] = "f" * 64
+                    first["executionInputBundleDigest"] = (
+                        ci.execution_input_bundle_digest(first["executionInputs"])
+                    )
+                    first_bundle["executionInputBundleDigest"] = first[
+                        "executionInputBundleDigest"
+                    ]
+                else:
+                    first_bundle["preExecutionIdentities"][0] = zero
+                if mode != "manifest-preserving-compact-change":
+                    coherently_rebind_claimed_transcript(forged)
+                errors = self.compare(forged)
+                self.assertTrue(errors, mode)
+                self.assertTrue(
+                    any("transcript" in error.casefold() for error in errors),
+                    errors,
+                )
+
+
 class CI6ProtectedPolicyInputTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="ci6-protected-policy-")
@@ -8569,21 +9716,14 @@ class CI7ExternalAuthorityBindingTest(unittest.TestCase):
                     )
                 )
 
-        policy = ci.default_tool_authority_policy(os.environ)
-        node = ci._fallback_tool_candidate("node", policy)
-        git = ci._fallback_tool_candidate("git", policy)
-        self.assertIsNotNone(node)
-        self.assertIsNotNone(git)
+        policy, tools = _resolved_local_test_authority("python", "node", "git")
+        local_source = _explicit_local_test_environment()
         runner = ci.FoundationRunner(
             "policy",
             ci.strict_json_load_file(ci.BASELINE_PATH),
-            tools={
-                "python": sys.executable,
-                "node": str(node),
-                "git": str(git),
-            },
+            tools=tools,
             tool_policy=policy,
-            source_environment=os.environ,
+            source_environment=local_source,
         )
         try:
             records, digest = ci.ci_trust_file_set_authority(
@@ -9082,6 +10222,83 @@ class CI8PosixContainmentStateMachineTest(unittest.TestCase):
         self.assertEqual([item.key() for item in state.active_identities()], [daemon.key()])
         self.assertFalse(state.clean())
 
+    def test_parent_reaped_grandchild_retires_only_after_exact_death_proof(self) -> None:
+        state = ci.PosixContainmentStateMachine(10)
+        parent = self.identity(20, 10)
+        grandchild = self.identity(30, 20)
+        state.observe({20: parent, 30: grandchild})
+        state.observe({20: parent})
+        self.assertIn(grandchild.key(), state.active_keys)
+        state.retire_proven_dead_non_children({20: parent})
+        self.assertNotIn(grandchild.key(), state.active_keys)
+        self.assertIn(grandchild.key(), state.proven_dead_keys)
+        state.mark_reaped(parent.pid)
+        self.assertTrue(state.clean(), state.failures)
+
+    def test_direct_child_disappearance_requires_supervisor_reap(self) -> None:
+        state = ci.PosixContainmentStateMachine(10)
+        child = self.identity(20, 10)
+        state.observe({20: child})
+        state.observe({})
+        state.retire_proven_dead_non_children({})
+        self.assertIn(child.key(), state.active_keys)
+        self.assertFalse(state.clean())
+        state.mark_reaped(child.pid)
+        self.assertTrue(state.clean(), state.failures)
+
+    def test_pidfd_exit_retires_non_child_but_never_direct_child(self) -> None:
+        state = ci.PosixContainmentStateMachine(10)
+        parent = self.identity(20, 10)
+        grandchild = self.identity(30, 20)
+        state.observe({20: parent, 30: grandchild})
+        state.retire_proven_dead_non_children(
+            {20: parent, 30: grandchild},
+            pidfd_exited={grandchild.key(), parent.key()},
+        )
+        self.assertNotIn(grandchild.key(), state.active_keys)
+        self.assertIn(parent.key(), state.active_keys)
+
+    def test_live_daemon_setsid_and_parent_first_exit_remain_blocking(self) -> None:
+        state = ci.PosixContainmentStateMachine(10)
+        parent = self.identity(20, 10)
+        daemon = self.identity(30, 20, group=30, session=30)
+        state.observe({20: parent, 30: daemon})
+        state.mark_reaped(parent.pid)
+        reparented = self.identity(
+            30,
+            10,
+            start=daemon.starttime,
+            group=99,
+            session=99,
+            generation=2,
+        )
+        state.observe({30: reparented})
+        state.retire_proven_dead_non_children({30: reparented})
+        self.assertIn(daemon.key(), state.active_keys)
+        self.assertFalse(state.clean())
+
+    def test_pid_reuse_and_unavailable_proc_evidence_fail_closed(self) -> None:
+        state = ci.PosixContainmentStateMachine(10)
+        parent = self.identity(20, 10)
+        grandchild = self.identity(30, 20, start=3000)
+        state.observe({20: parent, 30: grandchild})
+        reused = self.identity(30, 1, start=3001, generation=2)
+        state.observe({20: parent, 30: reused})
+        state.retire_proven_dead_non_children({20: parent, 30: reused})
+        self.assertIn(grandchild.key(), state.active_keys)
+        self.assertTrue(any("PID reuse" in error for error in state.failures))
+
+        unavailable = ci.PosixContainmentStateMachine(10)
+        parent = self.identity(40, 10)
+        grandchild = self.identity(50, 40)
+        unavailable.observe({40: parent, 50: grandchild})
+        unavailable.retire_proven_dead_non_children(None)
+        self.assertIn(grandchild.key(), unavailable.active_keys)
+        self.assertTrue(
+            any("evidence is unavailable" in error for error in unavailable.failures),
+            unavailable.failures,
+        )
+
     def test_orphan_reparent_model_requires_explicit_reap(self) -> None:
         state = ci.PosixContainmentStateMachine(10)
         orphan = self.identity(40, 10)
@@ -9188,18 +10405,7 @@ class _CI8FixtureLease:
 
 class CI8RuntimeDependencyClosureTest(unittest.TestCase):
     def local_tool_authority(self) -> tuple[ci.ToolAuthorityPolicy, dict[str, str]]:
-        policy = ci.default_tool_authority_policy(
-            _explicit_local_test_environment()
-        )
-        node = ci._fallback_tool_candidate("node", policy)
-        git = ci._fallback_tool_candidate("git", policy)
-        self.assertIsNotNone(node)
-        self.assertIsNotNone(git)
-        return policy, {
-            "python": sys.executable,
-            "node": str(node),
-            "git": str(git),
-        }
+        return _resolved_local_test_authority("python", "node", "git")
 
     def make_guard(
         self, root: Path

@@ -438,10 +438,19 @@ TRUSTED_FILE_PATHS = (
 
 LOCKED_FILE_SHA256 = MappingProxyType(
     {
-        "developer/package.json": "7f90adcb5862ca5340b31e1fcf2cdefada42d06ddbc46c93b1dbcb5dc426d8de",
-        "developer/package-lock.json": "9d1226d8bcf53e712a5ceec1421899243f0d316c0497f0400c251d9fe30f5b6e",
-        "backend/package.json": "2a4f5fc9c2587ff92598f83e9516212ced6304d5c4bceecf0797084423c7bdf7",
-        "backend/package-lock.json": "bfce9f62f140f8a73579f84dd4258a8ce9a0c1738676efad215e380cdb7a560c",
+        "developer/package.json": "dab60726da59723c6579fde313e7f7de4eb3f1edcbb74ce1df5e0296b1b0f287",
+        "developer/package-lock.json": "f63dd2bdb95943d6758fff92dcfdd46652c4dbdf74b904855e76b7caecc17fed",
+        "backend/package.json": "64b7da71131e3012c15ca83dc9e434286763e5caa4deed5a1df27d59ff34ad4c",
+        "backend/package-lock.json": "bec82fc24a8ae667a8ecc76712244c00929f558a85a3638ef55549c6b8e325db",
+    }
+)
+
+LOCKED_FILE_GIT_BLOB_OIDS = MappingProxyType(
+    {
+        "developer/package.json": "201e47b52ce92504b6cbbe298ff0ae81bf171123",
+        "developer/package-lock.json": "12adc3250fed7a6944c928641e0c503ce9aef2f0",
+        "backend/package.json": "98de1aeca0ada9aa3dff4127bb2baf5bb84ae1b5",
+        "backend/package-lock.json": "3a0a9400f4a5bb57fa08fef16ab5f092d7566f49",
     }
 )
 
@@ -779,7 +788,10 @@ SECRET_SCAN_BYTE_PATTERNS: tuple[tuple[re.Pattern[bytes], str], ...] = (
         "authorization-credential",
     ),
     (
-        re.compile(rb"(?im)^[ \t]*(?:Cookie|Set-Cookie)[ \t]*:[^\r\n\x00]{4,4096}$"),
+        re.compile(
+            rb"(?im)^[ \t]*(?:Cookie|Set-Cookie)[ \t]*:[ \t]*"
+            rb"[!#$%&'*+\-.^_`|~0-9A-Za-z]+[ \t]*=[^\r\n\x00]{1,4096}\r?$"
+        ),
         "cookie-header",
     ),
     (
@@ -978,6 +990,153 @@ def _ascii_authority_startswith(value: str, prefix: str) -> bool:
 
 def _ascii_lower_authority_text(value: str) -> str:
     return "".join(_ascii_authority_fold(character) for character in value)
+
+
+class EnvironmentAuthorityConflict(ValueError):
+    """A Windows environment contains conflicting spellings of one key."""
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+        super().__init__(f"ENVIRONMENT-AUTHORITY-CONFLICT key={key}")
+
+
+_WINDOWS_ENVIRONMENT_PREFERRED_KEYS = {
+    _ascii_lower_authority_text(key): key
+    for key in (
+        "PATH",
+        "SystemRoot",
+        "WINDIR",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "HOME",
+        "USERPROFILE",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "CI",
+        "GITHUB_ACTIONS",
+        "GITHUB_WORKSPACE",
+        "RUNNER_OS",
+        "RUNNER_ARCH",
+        "RUNNER_TEMP",
+        "RUNNER_TOOL_CACHE",
+        "LANG",
+        "LC_ALL",
+        "COMSPEC",
+        "PATHEXT",
+        "NODE_EXE",
+        "NPM_EXE",
+        "PYTHON_EXE",
+        "GIT_EXE",
+        "POWERSHELL_EXE",
+        "BASH_EXE",
+        "CI_TRUSTED_PYTHON",
+        "CI_TRUSTED_NODE",
+        "CI_TRUSTED_NPM_ENTRY",
+    )
+}
+
+
+class _EnvironmentKeyAuthority:
+    """Apply one deterministic environment-key authority model per platform."""
+
+    def __init__(
+        self,
+        source: Mapping[str, str],
+        *,
+        windows: bool,
+        excluded_keys: Iterable[str] = (),
+    ) -> None:
+        self.windows = windows
+        self.source = {str(key): value for key, value in source.items()}
+        self.excluded = {
+            _ascii_lower_authority_text(key) if windows else key
+            for key in excluded_keys
+        }
+        self.groups: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        for key, value in self.source.items():
+            authority_key = _ascii_lower_authority_text(key) if windows else key
+            if authority_key in self.excluded:
+                continue
+            self.groups[authority_key].append((key, value))
+
+    @staticmethod
+    def _raw_utf8_sort_key(value: str) -> bytes:
+        return value.encode("utf-8", errors="strict")
+
+    def _canonical_key(self, authority_key: str) -> str:
+        preferred = _WINDOWS_ENVIRONMENT_PREFERRED_KEYS.get(authority_key)
+        if preferred is not None:
+            return preferred
+        return min(
+            (key for key, _value in self.groups[authority_key]),
+            key=self._raw_utf8_sort_key,
+        )
+
+    def _coalesced_value(
+        self,
+        authority_key: str,
+        *,
+        display_key: str | None = None,
+    ) -> str | None:
+        matches = self.groups.get(authority_key, [])
+        if not matches:
+            return None
+        first_value = matches[0][1]
+        if any(value != first_value for _key, value in matches[1:]):
+            raise EnvironmentAuthorityConflict(
+                display_key or self._canonical_key(authority_key)
+            )
+        return first_value
+
+    def value(self, key: str, default: str | None = None) -> str | None:
+        authority_key = (
+            _ascii_lower_authority_text(key) if self.windows else key
+        )
+        value = self._coalesced_value(authority_key, display_key=key)
+        return default if value is None else value
+
+    def canonical_subset(self, allowlist: Iterable[str]) -> dict[str, str]:
+        if not self.windows:
+            allowed = set(allowlist)
+            return {
+                key: value
+                for key, value in self.source.items()
+                if key in allowed and key not in self.excluded
+            }
+
+        # Validate every non-excluded parent key before constructing any child
+        # environment so an unrelated collision cannot choose authority by
+        # insertion order.  Equal aliases are emitted once under the explicit
+        # allowlist spelling.
+        for authority_key in sorted(self.groups, key=self._raw_utf8_sort_key):
+            self._coalesced_value(authority_key)
+        result: dict[str, str] = {}
+        for key in sorted(set(allowlist), key=self._raw_utf8_sort_key):
+            authority_key = _ascii_lower_authority_text(key)
+            if authority_key in self.excluded:
+                continue
+            value = self._coalesced_value(authority_key, display_key=key)
+            if value is not None:
+                result[key] = value
+        return result
+
+
+def _environment_authority_value(
+    source: Mapping[str, str],
+    key: str,
+    *,
+    windows: bool,
+    default: str | None = None,
+) -> str | None:
+    """Read one environment authority with Windows' ASCII key semantics.
+
+    POSIX keys remain byte-for-byte case-sensitive.  On Windows, duplicate
+    ASCII-case spellings are accepted only when every spelling has the same
+    value; a conflicting collision cannot select authority by insertion order.
+    """
+
+    return _EnvironmentKeyAuthority(source, windows=windows).value(key, default)
 
 
 def windows_authority_component_equal(left: str, right: str) -> bool:
@@ -2468,34 +2627,46 @@ def default_tool_authority_policy(
     source_environment: Mapping[str, str],
     *,
     repo_root: Path = REPO_ROOT,
+    platform_name: str | None = None,
 ) -> ToolAuthorityPolicy:
     """Construct production authority without accepting caller-selected role roots."""
 
     running_python = Path(sys.executable).resolve(strict=True)
+    windows = (
+        platform_name.casefold().startswith("win")
+        if platform_name is not None
+        else os.name == "nt"
+    )
     runtime_roots: list[tuple[str, Path]] = []
     if len(running_python.parents) >= 2:
         runtime_roots.append(("approved-local-runtime", running_python.parents[1]))
     toolcache_roots: list[tuple[str, Path]] = []
-    if source_environment.get("RUNNER_TOOL_CACHE"):
+    runner_tool_cache = _environment_authority_value(
+        source_environment, "RUNNER_TOOL_CACHE", windows=windows
+    )
+    if runner_tool_cache:
         toolcache_roots.append(
-            ("github-hosted-toolcache", Path(source_environment["RUNNER_TOOL_CACHE"]))
+            ("github-hosted-toolcache", Path(runner_tool_cache))
         )
 
-    windows = os.name == "nt"
     system_directories: list[Path] = []
     git_roots: list[tuple[str, Path]] = []
     bash_roots: list[tuple[str, Path]] = []
     powershell_roots: list[tuple[str, Path]] = []
     if windows:
         for key in ("SystemRoot", "WINDIR"):
-            if value := source_environment.get(key):
+            if value := _environment_authority_value(
+                source_environment, key, windows=True
+            ):
                 root = Path(value)
                 system_directories.extend((root / "System32", root))
                 powershell_roots.append(
                     ("windows-system-powershell", root / "System32" / "WindowsPowerShell")
                 )
         for key in ("ProgramFiles", "ProgramFiles(x86)"):
-            if value := source_environment.get(key):
+            if value := _environment_authority_value(
+                source_environment, key, windows=True
+            ):
                 root = Path(value)
                 git_roots.append(("program-files-git", root / "Git"))
                 powershell_roots.append(("program-files-powershell", root / "PowerShell"))
@@ -2584,6 +2755,8 @@ def _unsafe_tool_path_reason(
     path: Path,
     repo_root: Path,
     source_environment: Mapping[str, str] | None = None,
+    *,
+    windows: bool = os.name == "nt",
 ) -> str | None:
     try:
         resolved = path.resolve(strict=True)
@@ -2611,7 +2784,7 @@ def _unsafe_tool_path_reason(
         ("GITHUB_WORKSPACE", "GitHub workspace"),
         ("RUNNER_TEMP", "runner temporary directory"),
     ):
-        value = source.get(variable)
+        value = _environment_authority_value(source, variable, windows=windows)
         if not value:
             continue
         try:
@@ -2689,7 +2862,11 @@ def _windows_system_launcher_path(path: Path, source_environment: Mapping[str, s
     roots = {
         str(Path(value).resolve(strict=True)).replace("\\", "/").casefold()
         for key in ("SystemRoot", "WINDIR")
-        if (value := source_environment.get(key))
+        if (
+            value := _environment_authority_value(
+                source_environment, key, windows=True
+            )
+        )
     }
     if any(
         normalized.startswith(root.rstrip("/") + suffix)
@@ -2864,7 +3041,23 @@ def resolve_trusted_git_bash(
     """Derive Git Bash from the already trusted Git for Windows installation."""
 
     source = dict(os.environ if source_environment is None else source_environment)
-    selected_policy = policy or default_tool_authority_policy(source, repo_root=repo_root)
+    try:
+        selected_policy = policy or default_tool_authority_policy(
+            source, repo_root=repo_root
+        )
+        for authority_key in (
+            "SystemRoot",
+            "WINDIR",
+            "GITHUB_WORKSPACE",
+            "RUNNER_TEMP",
+        ):
+            _environment_authority_value(
+                source,
+                authority_key,
+                windows=selected_policy.platform_name == "Windows",
+            )
+    except EnvironmentAuthorityConflict as exc:
+        return None, [str(exc)]
     git_path = Path(git)
     okay, _reason = _secure_regular_file(git_path)
     if not okay:
@@ -3080,7 +3273,12 @@ def resolve_trusted_git_bash(
                     same_root=True,
                 )
             ]
-        unsafe_reason = _unsafe_tool_path_reason(candidate, repo_root, source)
+        unsafe_reason = _unsafe_tool_path_reason(
+            candidate,
+            repo_root,
+            source,
+            windows=selected_policy.platform_name == "Windows",
+        )
         root_result = _tool_root_classification_result(
             candidate, "bash", selected_policy
         )
@@ -3314,7 +3512,11 @@ def _path_root_category(
         ("GITHUB_WORKSPACE", "workspace"),
         ("RUNNER_TEMP", "runner-temp"),
     ):
-        value = source.get(variable)
+        value = _environment_authority_value(
+            source,
+            variable,
+            windows=policy.platform_name == "Windows",
+        )
         if not value:
             continue
         try:
@@ -3550,7 +3752,12 @@ def _path_entries(
     policy: ToolAuthorityPolicy,
     diagnostics: list[dict[str, Any]] | None = None,
 ) -> tuple[list[_TrustedPathEntry], list[str]]:
-    raw_path = source.get("PATH", source.get("Path", ""))
+    raw_path = _environment_authority_value(
+        source,
+        "PATH",
+        windows=policy.platform_name == "Windows",
+        default="",
+    )
     raw_entries = raw_path.split(policy.path_separator) if raw_path else []
     entries: list[_TrustedPathEntry] = []
     errors: list[str] = []
@@ -3606,21 +3813,43 @@ def _npm_entry_from_launcher(candidate: Path) -> Path:
 
 
 def _fallback_tool_candidate(role: str, policy: ToolAuthorityPolicy) -> Path | None:
-    runtime_root = policy.running_python.parent.parent
-    names = {
-        "node": (
-            runtime_root / "node" / "bin" / ("node.exe" if os.name == "nt" else "node"),
-            runtime_root / "node" / ("node.exe" if os.name == "nt" else "bin/node"),
-        ),
-        "npm": (
-            runtime_root / "node" / "node_modules" / "npm" / "bin" / "npm-cli.js",
-            runtime_root / "node" / "bin" / "node_modules" / "npm" / "bin" / "npm-cli.js",
-        ),
-        "git": (Path("D:/Git/cmd/git.exe"), Path("D:/Git/bin/git.exe")),
-    }
-    candidates = list(names.get(role, ()))
-    if role in {"powershell", "pwsh"}:
-        for _label, root in policy.roots_for(role):
+    windows = policy.platform_name == "Windows"
+    candidates: list[Path] = []
+    for _label, root in policy.roots_for(role):
+        if role == "node":
+            executable = "node.exe" if windows else "node"
+            candidates.extend(
+                (
+                    root / executable,
+                    root / "bin" / executable,
+                    root / "node" / executable,
+                    root / "node" / "bin" / executable,
+                )
+            )
+        elif role == "npm":
+            candidates.extend(
+                (
+                    root / "node_modules" / "npm" / "bin" / "npm-cli.js",
+                    root / "bin" / "node_modules" / "npm" / "bin" / "npm-cli.js",
+                    root / "node" / "node_modules" / "npm" / "bin" / "npm-cli.js",
+                    root
+                    / "node"
+                    / "bin"
+                    / "node_modules"
+                    / "npm"
+                    / "bin"
+                    / "npm-cli.js",
+                )
+            )
+        elif role == "git":
+            candidates.extend(
+                (
+                    root / ("git.exe" if windows else "git"),
+                    root / "cmd" / "git.exe",
+                    root / "bin" / ("git.exe" if windows else "git"),
+                )
+            )
+        elif role in {"powershell", "pwsh"}:
             candidates.extend(
                 (
                     root / "powershell.exe",
@@ -3754,9 +3983,40 @@ def resolve_trusted_tools(
     """Resolve role-specific tools and reject only real preceding executable shadows."""
 
     source = dict(os.environ if source_environment is None else source_environment)
-    selected_policy = policy or default_tool_authority_policy(source, repo_root=repo_root)
+    try:
+        selected_policy = policy or default_tool_authority_policy(
+            source, repo_root=repo_root
+        )
+    except EnvironmentAuthorityConflict as exc:
+        return {}, [str(exc)]
     requested = set(required)
     errors: list[str] = []
+    windows_environment = selected_policy.platform_name == "Windows"
+    try:
+        for authority_key in (
+            "PATH",
+            "RUNNER_TOOL_CACHE",
+            "SystemRoot",
+            "WINDIR",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "GITHUB_WORKSPACE",
+            "RUNNER_TEMP",
+            "NODE_EXE",
+            "NPM_EXE",
+            "PYTHON_EXE",
+            "GIT_EXE",
+            "POWERSHELL_EXE",
+            "BASH_EXE",
+            "CI_TRUSTED_PYTHON",
+            "CI_TRUSTED_NODE",
+            "CI_TRUSTED_NPM_ENTRY",
+        ):
+            _environment_authority_value(
+                source, authority_key, windows=windows_environment
+            )
+    except EnvironmentAuthorityConflict as exc:
+        return {}, [str(exc)]
 
     def record_issue(
         issue: ToolAuthorityIssue,
@@ -3790,7 +4050,9 @@ def resolve_trusted_tools(
         "POWERSHELL_EXE",
         "BASH_EXE",
     ):
-        if source.get(override):
+        if _environment_authority_value(
+            source, override, windows=windows_environment
+        ):
             override_role = override.removesuffix("_EXE").casefold()
             record_issue(
                 ToolAuthorityIssue(
@@ -3820,7 +4082,16 @@ def resolve_trusted_tools(
         candidate_entry: _TrustedPathEntry | None = None
         candidate_blocked = False
         captured_name = captured_runtime_variables.get(name)
-        captured_value = source.get(captured_name, "") if captured_name else ""
+        captured_value = (
+            _environment_authority_value(
+                source,
+                captured_name,
+                windows=windows_environment,
+                default="",
+            )
+            if captured_name
+            else ""
+        )
         candidate: str | None = captured_value or None
         if candidate is None and name == "python":
             candidate = str(selected_policy.running_python)
@@ -3965,7 +4236,12 @@ def resolve_trusted_tools(
             )
             continue
         classification = root_result.root_label
-        unsafe_reason = _unsafe_tool_path_reason(canonical_candidate, repo_root, source)
+        unsafe_reason = _unsafe_tool_path_reason(
+            canonical_candidate,
+            repo_root,
+            source,
+            windows=selected_policy.platform_name == "Windows",
+        )
         if (
             name == "npm"
             and unsafe_reason == "path is beneath node_modules"
@@ -4127,11 +4403,14 @@ def child_process_environment(
 ) -> dict[str, str]:
     source = os.environ if source_environment is None else source_environment
     selected_policy = policy or default_tool_authority_policy(source, repo_root=repo_root)
-    environment = {
-        key: value
-        for key, value in source.items()
-        if key.upper() in CHILD_ENVIRONMENT_ALLOWLIST
-    }
+    windows_environment = selected_policy.platform_name == "Windows"
+    private_temp_keys = ("TEMP", "TMP", "TMPDIR") if private_temp_root is not None else ()
+    source_authority = _EnvironmentKeyAuthority(
+        source,
+        windows=windows_environment,
+        excluded_keys=private_temp_keys,
+    )
+    environment = source_authority.canonical_subset(CHILD_ENVIRONMENT_ALLOWLIST)
     tool_directories: list[str] = []
     seen_directories: set[str] = set()
 
@@ -4140,7 +4419,12 @@ def child_process_environment(
             resolved = directory.resolve(strict=True)
         except OSError:
             return
-        reason = _unsafe_tool_path_reason(resolved, repo_root, source)
+        reason = _unsafe_tool_path_reason(
+            resolved,
+            repo_root,
+            source,
+            windows=selected_policy.platform_name == "Windows",
+        )
         if reason and not (selected_policy.synthetic and synthetic_authority):
             return
         key = str(resolved).casefold() if selected_policy.platform_name == "Windows" else str(resolved)
@@ -4425,7 +4709,9 @@ class PosixContainmentStateMachine:
         self.generation = 0
         self.registry: dict[tuple[int, int], PosixProcessIdentity] = {}
         self.active_keys: set[tuple[int, int]] = set()
+        self.direct_child_keys: set[tuple[int, int]] = set()
         self.reaped_keys: set[tuple[int, int]] = set()
+        self.proven_dead_keys: set[tuple[int, int]] = set()
         self.failures: list[str] = []
 
     def fail(self, reason: str) -> None:
@@ -4455,12 +4741,15 @@ class PosixContainmentStateMachine:
             if identity.key() not in self.registry:
                 self.registry[identity.key()] = identity
                 discovered.append(identity)
+            if identity.parent_pid == self.supervisor_pid:
+                self.direct_child_keys.add(identity.key())
             active.add(identity.key())
         # A known descendant is not allowed to become "clean" merely by
-        # changing session/parent or racing between proc scans.  Only an
-        # explicit waitpid reap retires its stable PID/starttime identity.
+        # changing session/parent or racing between proc scans.  Missing
+        # identities remain active until a separate complete snapshot or
+        # pidfd observation proves death; direct children require waitpid.
         for key in self.active_keys:
-            if key in self.reaped_keys or key in active:
+            if key in self.reaped_keys or key in self.proven_dead_keys or key in active:
                 continue
             known = self.registry[key]
             current = by_pid.get(known.pid)
@@ -4477,6 +4766,30 @@ class PosixContainmentStateMachine:
             self.fail("descendant registry overflow")
         self.active_keys = active
         return discovered
+
+    def retire_proven_dead_non_children(
+        self,
+        snapshot: Mapping[int, PosixProcessIdentity] | None,
+        *,
+        pidfd_exited: Iterable[tuple[int, int]] = (),
+    ) -> None:
+        """Retire only frozen non-child identities with positive death evidence."""
+
+        exited = set(pidfd_exited)
+        if snapshot is None and not exited:
+            self.fail("non-child descendant death evidence is unavailable")
+            return
+        for key in tuple(self.active_keys):
+            if key in self.direct_child_keys:
+                continue
+            known = self.registry[key]
+            current = snapshot.get(known.pid) if snapshot is not None else None
+            if key in exited or (snapshot is not None and current is None):
+                self.proven_dead_keys.add(key)
+                self.active_keys.discard(key)
+                continue
+            if current is not None and current.key() != key:
+                self.fail(f"PID reuse ambiguity for active PID {known.pid}")
 
     def mark_reaped(self, pid: int) -> None:
         candidates = [key for key in self.active_keys if key[0] == pid]
@@ -4504,7 +4817,7 @@ class PosixContainmentStateMachine:
 
         excluded = {root_key} if root_key is not None else set()
         observed = set(self.registry) - excluded
-        reaped = self.reaped_keys & observed
+        reaped = (self.reaped_keys | self.proven_dead_keys) & observed
         surviving = self.active_keys & observed
         cleanup_complete = not self.failures and not self.active_keys
         if self.failures:
@@ -4602,6 +4915,36 @@ def _read_linux_proc_snapshot(generation: int) -> dict[int, PosixProcessIdentity
 def _pidfd_capability_check() -> None:
     if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
         raise OSError("pidfd_open/pidfd_send_signal capability is unavailable")
+
+
+def _pidfd_reports_exit(pidfd: int) -> bool:
+    watcher = select.poll()
+    watcher.register(
+        pidfd,
+        select.POLLIN | select.POLLHUP | select.POLLERR | select.POLLNVAL,
+    )
+    events = watcher.poll(0)
+    for _descriptor, mask in events:
+        if mask & select.POLLNVAL:
+            raise OSError("pidfd became invalid during containment")
+        if mask & select.POLLERR:
+            raise OSError("pidfd reported an uninspectable containment error")
+        if mask & (select.POLLIN | select.POLLHUP):
+            return True
+    return False
+
+
+def _retire_linux_non_child_exits(
+    state: PosixContainmentStateMachine,
+    snapshot: Mapping[int, PosixProcessIdentity],
+    pidfds: Mapping[tuple[int, int], int],
+) -> None:
+    exited = {
+        key
+        for key in state.active_keys - state.direct_child_keys
+        if (pidfd := pidfds.get(key)) is not None and _pidfd_reports_exit(pidfd)
+    }
+    state.retire_proven_dead_non_children(snapshot, pidfd_exited=exited)
 
 
 def _pidfd_send_checked(
@@ -4722,6 +5065,7 @@ def _linux_containment_supervisor_entrypoint(arguments: Sequence[str]) -> int:
         pidfds[root_identity.key()] = root_pidfd
         state.registry[root_identity.key()] = root_identity
         state.active_keys.add(root_identity.key())
+        state.direct_child_keys.add(root_identity.key())
         _linux_supervisor_write(
             result_fd,
             {
@@ -4750,7 +5094,11 @@ def _linux_containment_supervisor_entrypoint(arguments: Sequence[str]) -> int:
                 try:
                     pidfds[identity.key()] = os.pidfd_open(identity.pid, 0)
                 except OSError as exc:
-                    state.fail(f"pidfd_open failed for PID {identity.pid}: {type(exc).__name__}")
+                    if exc.errno not in {errno.ESRCH, errno.ENOENT}:
+                        state.fail(
+                            f"pidfd_open failed for PID {identity.pid}: {type(exc).__name__}"
+                        )
+            _retire_linux_non_child_exits(state, snapshot, pidfds)
             while True:
                 try:
                     reaped_pid, status = os.waitpid(-1, os.WNOHANG)
@@ -4777,14 +5125,19 @@ def _linux_containment_supervisor_entrypoint(arguments: Sequence[str]) -> int:
                 try:
                     pidfds[identity.key()] = os.pidfd_open(identity.pid, 0)
                 except OSError as exc:
-                    state.fail(f"pidfd_open failed for PID {identity.pid}: {type(exc).__name__}")
+                    if exc.errno not in {errno.ESRCH, errno.ENOENT}:
+                        state.fail(
+                            f"pidfd_open failed for PID {identity.pid}: {type(exc).__name__}"
+                        )
+            _retire_linux_non_child_exits(state, snapshot, pidfds)
             active = state.active_identities()
             if active:
                 stable_count = 0
                 for identity in active:
                     pidfd = pidfds.get(identity.key())
                     if pidfd is None:
-                        state.fail(f"active PID lacks pidfd: {identity.pid}")
+                        if identity.key() in state.direct_child_keys:
+                            state.fail(f"active direct child lacks pidfd: {identity.pid}")
                         continue
                     _pidfd_send_checked(identity, pidfd, signal.SIGSTOP)
                 if not term_sent:
@@ -4820,6 +5173,7 @@ def _linux_containment_supervisor_entrypoint(arguments: Sequence[str]) -> int:
             state.fail("descendant cleanup settle timeout")
         final_snapshot = _read_linux_proc_snapshot(state.generation + 1)
         state.observe(final_snapshot)
+        _retire_linux_non_child_exits(state, final_snapshot, pidfds)
         if state.active_keys:
             state.fail("command-domain descendant registry is not empty")
         if root_exit_code is None:
@@ -6079,6 +6433,27 @@ def execute_command(
     )
 
 
+def canonical_internal_execution_argv(
+    approved_python: str | Path,
+    observed_python: str | Path,
+    command_id: str,
+) -> list[str]:
+    """Bind in-process execution to the approved Python file identity."""
+
+    try:
+        approved = Path(approved_python).resolve(strict=True)
+        observed = Path(observed_python).resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("internal Python execution authority does not resolve") from exc
+    for label, candidate in (("approved", approved), ("observed", observed)):
+        okay, reason = _secure_regular_file(candidate)
+        if not okay:
+            raise ValueError(f"{label} internal Python authority is invalid: {reason}")
+    if not _same_file_identity(approved, observed):
+        raise ValueError("observed internal Python differs from approved file identity")
+    return [str(approved), "<internal>", command_id]
+
+
 def make_internal_result(
     command_id: str,
     command_class: str,
@@ -6086,9 +6461,16 @@ def make_internal_result(
     detail: str,
     *,
     required: bool = True,
+    execution_authority: str | Path = sys.executable,
+    observed_execution_authority: str | Path = sys.executable,
 ) -> dict[str, Any]:
     safe_detail = sanitize_text(detail)
     empty_digest = hashlib.sha256(b"").hexdigest()
+    actual_execution_argv = canonical_internal_execution_argv(
+        execution_authority,
+        observed_execution_authority,
+        command_id,
+    )
     return {
         "commandId": command_id,
         "commandClass": command_class,
@@ -6113,7 +6495,7 @@ def make_internal_result(
         "descendantsReaped": 0,
         "descendantsSurviving": 0,
         "containmentDisposition": "not-applicable",
-        "actualExecutionArgv": [sys.executable, "<internal>", command_id],
+        "actualExecutionArgv": actual_execution_argv,
         "actualExecutionInputMode": "NONE",
         "actualExecutionInputSize": None,
         "actualExecutionInputSha256": None,
@@ -10074,8 +10456,293 @@ def _canonical_replay_value(value: Any) -> Any:
     return value
 
 
+_PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS = (
+    "orderedLogicalTargetPaths",
+    "canonicalSourcePaths",
+    "plannedByteLengths",
+    "plannedSha256Values",
+    "plannedStableIdentities",
+    "executionInputs",
+)
+
+
+_PROTECTED_BUNDLE_COMPACT_IDENTITY_DOMAIN = (
+    "ieltmps-protected-target-bundle-compact-identity-v1"
+)
+
+
+def _portable_protected_target_authority(
+    target: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the cross-checkout target identity independently rebuilt by replay."""
+
+    return {
+        "logicalPath": target.get("path"),
+        "byteLength": target.get("size"),
+        "sha256": target.get("sha256"),
+        "modeType": target.get("modeType"),
+        "reparsePoint": target.get("reparsePoint"),
+    }
+
+
+def _portable_protected_execution_input_authority(
+    target: Mapping[str, Any],
+    execution_adapter: Any,
+) -> dict[str, Any]:
+    """Derive successful input authority without producer filesystem aliases."""
+
+    return {
+        "logicalPath": target.get("path"),
+        "plannedByteLength": target.get("size"),
+        "plannedSha256": target.get("sha256"),
+        "actualByteLength": target.get("size"),
+        "actualSha256": target.get("sha256"),
+        "inputMode": execution_adapter,
+    }
+
+
+def _protected_bundle_compact_identity_digests(
+    command: Mapping[str, Any],
+    *,
+    phase: str,
+) -> list[str]:
+    """Derive compact bundle identities from portable command-plan authority.
+
+    The preimage deliberately excludes checkout-local canonical paths, inode/file
+    indexes, and timestamps: a fresh verifier checkout has different values.
+    Those values remain protected by each producer/replay TargetExecutionLease.
+    The portable semantic identity instead binds the ordered path/content/input
+    plan, the command association, the bundle version/adapter, and the pre/post
+    phase, all of which the verifier reconstructs without trusting these digests.
+    """
+
+    targets = command.get("targets")
+    if not isinstance(targets, list) or not targets:
+        return []
+    execution_adapter = command.get("executionInputMode")
+    ordered_authority = [
+        {
+            "targetIndex": index,
+            "target": _portable_protected_target_authority(target),
+            "executionInput": _portable_protected_execution_input_authority(
+                target,
+                execution_adapter,
+            ),
+        }
+        for index, target in enumerate(targets)
+        if isinstance(target, Mapping)
+    ]
+    if len(ordered_authority) != len(targets):
+        return []
+    portable_input_digest = hashlib.sha256(
+        _canonical_frame(
+            {
+                "digestDomain": (
+                    "ieltmps-protected-target-bundle-portable-input-v1"
+                ),
+                "orderedExecutionInputs": [
+                    item["executionInput"] for item in ordered_authority
+                ],
+            }
+        )
+    ).hexdigest()
+    bundle_authority = {
+        "digestDomain": _PROTECTED_BUNDLE_COMPACT_IDENTITY_DOMAIN,
+        "bundleVersion": PROTECTED_TARGET_BUNDLE_VERSION,
+        "executionAdapter": execution_adapter,
+        "commandAssociation": {
+            "commandId": command.get("commandId"),
+            "ordinal": command.get("ordinal"),
+            "commandClass": command.get("commandClass"),
+            "profile": command.get("profile"),
+            "toolRole": command.get("toolRole"),
+        },
+        "targetCount": len(targets),
+        "orderedTargetAndInputAuthority": ordered_authority,
+        "portableExecutionInputBundleDigest": portable_input_digest,
+    }
+    bundle_authority_digest = hashlib.sha256(
+        _canonical_frame(bundle_authority)
+    ).hexdigest()
+    return [
+        hashlib.sha256(
+            _canonical_frame(
+                {
+                    "digestDomain": (
+                        "ieltmps-protected-target-bundle-compact-identity-leaf-v1"
+                    ),
+                    "bundleAuthorityDigest": bundle_authority_digest,
+                    "phase": phase,
+                    "identityTargetIndex": index,
+                    "targetAuthority": ordered_authority[index],
+                }
+            )
+        ).hexdigest()
+        for index in range(len(targets))
+    ]
+
+
+def _protected_source_identity_matches_target(
+    identity: Any,
+    target: Mapping[str, Any],
+) -> bool:
+    if not isinstance(identity, Mapping) or set(identity) != {
+        "pathStableIdentity",
+        "heldStableIdentity",
+        "canonicalPath",
+    }:
+        return False
+    held = identity.get("heldStableIdentity")
+    return (
+        identity.get("pathStableIdentity") == target.get("fileIdentity")
+        and identity.get("canonicalPath") == target.get("canonicalSourcePath")
+        and isinstance(held, Mapping)
+        and held.get("reparsePoint") is False
+    )
+
+
+def _full_protected_identity_array_matches_authority(
+    command: Mapping[str, Any],
+    identities: Any,
+) -> bool:
+    targets = command.get("targets")
+    return (
+        isinstance(targets, list)
+        and bool(targets)
+        and isinstance(identities, list)
+        and len(identities) == len(targets)
+        and all(
+            isinstance(target, Mapping)
+            and _protected_source_identity_matches_target(identity, target)
+            for identity, target in zip(identities, targets)
+        )
+    )
+
+
+def _canonical_protected_identity_array(
+    command: Mapping[str, Any],
+    identities: Any,
+    *,
+    phase: str,
+) -> Any:
+    if _full_protected_identity_array_matches_authority(command, identities):
+        return _protected_bundle_compact_identity_digests(command, phase=phase)
+    return copy.deepcopy(identities)
+
+
+def _compact_command_record_for_evidence(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Replace only validated protected-bundle duplication with digest references."""
+
+    source = dict(record)
+    if source.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE":
+        return copy.deepcopy(source)
+    bundle = source.get("protectedTargetBundle")
+    targets = source.get("targets")
+    inputs = source.get("executionInputs")
+    if not isinstance(bundle, dict) or not isinstance(targets, list) or not targets:
+        return copy.deepcopy(source)
+    if not isinstance(inputs, list) or len(inputs) != len(targets):
+        return copy.deepcopy(source)
+    pre = bundle.get("preExecutionIdentities")
+    post = bundle.get("postExecutionIdentities")
+    expected_duplicates = {
+        "orderedLogicalTargetPaths": [target.get("path") for target in targets],
+        "canonicalSourcePaths": [
+            target.get("canonicalSourcePath") for target in targets
+        ],
+        "plannedByteLengths": [target.get("size") for target in targets],
+        "plannedSha256Values": [target.get("sha256") for target in targets],
+        "plannedStableIdentities": [
+            target.get("fileIdentity") for target in targets
+        ],
+        "executionInputs": inputs,
+    }
+    if (
+        bundle.get("bundleVersion") != PROTECTED_TARGET_BUNDLE_VERSION
+        or bundle.get("executionAdapter") != "PROTECTED-TARGET-BUNDLE"
+        or bundle.get("executionInputBundleDigest")
+        != source.get("executionInputBundleDigest")
+        or source.get("executionInputBundleDigest")
+        != execution_input_bundle_digest(inputs)
+        or bundle.get("mutationDetected") is not False
+        or bundle.get("cleanupState") != "closed"
+        or not isinstance(pre, list)
+        or not isinstance(post, list)
+        or len(pre) != len(targets)
+        or len(post) != len(targets)
+        or any(item is None for item in pre)
+        or any(item is None for item in post)
+        or any(bundle.get(key) != value for key, value in expected_duplicates.items())
+        or not _full_protected_identity_array_matches_authority(source, pre)
+        or not _full_protected_identity_array_matches_authority(source, post)
+    ):
+        return copy.deepcopy(source)
+    if pre != post:
+        return copy.deepcopy(source)
+    pre_digests = _protected_bundle_compact_identity_digests(source, phase="pre")
+    post_digests = _protected_bundle_compact_identity_digests(source, phase="post")
+    compact = {
+        key: copy.deepcopy(value)
+        for key, value in source.items()
+        if key != "protectedTargetBundle"
+    }
+    compact_bundle = {
+        key: copy.deepcopy(value)
+        for key, value in bundle.items()
+        if key
+        not in {
+            *_PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS,
+            "preExecutionIdentities",
+            "postExecutionIdentities",
+        }
+    }
+    for key in _PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS:
+        compact_bundle[key] = []
+    compact_bundle["preExecutionIdentities"] = pre_digests
+    compact_bundle["postExecutionIdentities"] = post_digests
+    compact["protectedTargetBundle"] = compact_bundle
+    return compact
+
+
 def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
-    canonical = _canonical_replay_value(copy.deepcopy(dict(record)))
+    source = dict(record)
+    protected_source = source.get("protectedTargetBundle")
+    if isinstance(protected_source, Mapping):
+        source = {
+            key: copy.deepcopy(value)
+            for key, value in source.items()
+            if key != "protectedTargetBundle"
+        }
+        protected_projection = {
+            key: copy.deepcopy(value)
+            for key, value in protected_source.items()
+            if key
+            not in {
+                *_PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS,
+                "preExecutionIdentities",
+                "postExecutionIdentities",
+            }
+        }
+        for key in _PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS:
+            protected_projection[key] = []
+        protected_projection["preExecutionIdentities"] = (
+            _canonical_protected_identity_array(
+                source,
+                protected_source.get("preExecutionIdentities"),
+                phase="pre",
+            )
+        )
+        protected_projection["postExecutionIdentities"] = (
+            _canonical_protected_identity_array(
+                source,
+                protected_source.get("postExecutionIdentities"),
+                phase="post",
+            )
+        )
+        source["protectedTargetBundle"] = protected_projection
+    canonical = _canonical_replay_value(source)
     canonical.pop("durationSeconds", None)
     tool_role = str(canonical.get("toolRole", "unknown"))
     for field_name in (
@@ -10114,10 +10781,8 @@ def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
                 lease[key] = None
     protected = canonical.get("protectedTargetBundle")
     if isinstance(protected, dict):
-        for execution_input in protected.get("executionInputs", []):
-            if isinstance(execution_input, dict):
-                execution_input["canonicalSourcePath"] = None
-                execution_input["plannedStableIdentity"] = None
+        for key in _PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS:
+            protected[key] = []
     canonical["executionDurationClass"] = record.get("executionDurationClass")
     return canonical
 
@@ -12297,10 +12962,164 @@ def build_profile_command_plan(
     return plan
 
 
+def _locked_checkout_presentation_matches(
+    canonical_blob: bytes,
+    checkout_bytes: bytes,
+) -> bool:
+    """Accept only Git's exact bytes or a complete LF-to-CRLF presentation."""
+
+    if checkout_bytes == canonical_blob:
+        return True
+    if b"\r" in canonical_blob:
+        return False
+    return checkout_bytes == canonical_blob.replace(b"\n", b"\r\n")
+
+
+def capture_locked_file_git_identities(
+    *,
+    git: str,
+    environment: Mapping[str, str],
+    repo_root: Path = REPO_ROOT,
+    expected_sha256: Mapping[str, str] = LOCKED_FILE_SHA256,
+    expected_blob_oids: Mapping[str, str] = LOCKED_FILE_GIT_BLOB_OIDS,
+    executable_lease: Any | None = None,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Capture package authorities from HEAD, index stage 0, and Git blobs."""
+
+    identities: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    paths = tuple(expected_sha256)
+    if set(paths) != set(expected_blob_oids):
+        return {}, ["locked Git blob authority key set is inconsistent"]
+
+    def git_bytes(command_id: str, arguments: Sequence[str]) -> bytes:
+        capture = execute_command(
+            command_id,
+            "locked-git-blob-authority",
+            [
+                git,
+                "-c",
+                f"safe.directory={repo_root.resolve(strict=True)}",
+                "-C",
+                str(repo_root.resolve(strict=True)),
+                *arguments,
+            ],
+            timeout=60,
+            env=environment,
+            include_preview=False,
+            cwd=repo_root,
+            max_stdout_bytes=1_048_576,
+            executable_lease=executable_lease,
+        )
+        if not capture.execution_passed() or capture.stdout_raw is None:
+            raise ValueError(
+                f"trusted Git could not capture {command_id} authority"
+            )
+        return capture.stdout_raw
+
+    try:
+        tree_raw = git_bytes(
+            "locked-files-head-tree",
+            ("ls-tree", "-z", "HEAD", "--", *paths),
+        )
+        index_raw = git_bytes(
+            "locked-files-index-stage-zero",
+            ("ls-files", "--stage", "-z", "--", *paths),
+        )
+    except (OSError, ValueError) as exc:
+        return {}, [f"locked Git authority capture failed: {type(exc).__name__}: {exc}"]
+
+    tree: dict[str, tuple[str, str]] = {}
+    index: dict[str, tuple[str, str]] = {}
+    try:
+        for raw_record in tree_raw.split(b"\0"):
+            if not raw_record:
+                continue
+            header, raw_path = raw_record.split(b"\t", 1)
+            mode, object_type, object_id = header.decode("ascii").split(" ", 2)
+            relative = raw_path.decode("utf-8", errors="strict")
+            if (
+                relative not in expected_sha256
+                or relative in tree
+                or object_type != "blob"
+                or mode not in {"100644", "100755"}
+                or not re.fullmatch(r"[0-9a-f]{40,64}", object_id)
+            ):
+                raise ValueError("HEAD tree record is not exact")
+            tree[relative] = (mode, object_id)
+        for raw_record in index_raw.split(b"\0"):
+            if not raw_record:
+                continue
+            header, raw_path = raw_record.split(b"\t", 1)
+            mode, object_id, stage = header.decode("ascii").split(" ", 2)
+            relative = raw_path.decode("utf-8", errors="strict")
+            if (
+                relative not in expected_sha256
+                or relative in index
+                or stage != "0"
+                or mode not in {"100644", "100755"}
+                or not re.fullmatch(r"[0-9a-f]{40,64}", object_id)
+            ):
+                raise ValueError("index stage-zero record is not exact")
+            index[relative] = (mode, object_id)
+    except (UnicodeError, ValueError) as exc:
+        return {}, [f"locked Git authority framing failed: {type(exc).__name__}: {exc}"]
+
+    for relative in paths:
+        path = repo_root / relative
+        okay, reason = _secure_regular_file(path)
+        if not okay:
+            errors.append(f"{relative}: {reason}")
+            continue
+        tree_identity = tree.get(relative)
+        index_identity = index.get(relative)
+        expected_oid = expected_blob_oids[relative]
+        if (
+            tree_identity is None
+            or index_identity is None
+            or tree_identity != index_identity
+            or tree_identity[1] != expected_oid
+        ):
+            errors.append(
+                f"{relative}: HEAD/index Git blob authority differs from the frozen identity"
+            )
+            continue
+        try:
+            canonical = git_bytes(
+                f"locked-file-blob-{len(identities)}",
+                ("cat-file", "blob", expected_oid),
+            )
+            checkout = path.read_bytes()
+        except (OSError, ValueError) as exc:
+            errors.append(
+                f"{relative}: Git blob materialization failed ({type(exc).__name__})"
+            )
+            continue
+        canonical_sha = hashlib.sha256(canonical).hexdigest()
+        if canonical_sha != expected_sha256[relative]:
+            errors.append(f"{relative}: canonical Git blob SHA-256 is not frozen")
+            continue
+        if not _locked_checkout_presentation_matches(canonical, checkout):
+            errors.append(
+                f"{relative}: checkout bytes are neither the Git blob nor its complete CRLF presentation"
+            )
+            continue
+        identities[relative] = {
+            "mode": tree_identity[0],
+            "objectId": expected_oid,
+            "sha256": canonical_sha,
+            "canonicalBytes": canonical,
+        }
+    return identities, sorted(set(errors))
+
+
 def snapshot_trusted_files(
     *,
     repo_root: Path = REPO_ROOT,
     paths: Sequence[str] = TRUSTED_FILE_PATHS,
+    locked_identities: Mapping[str, Mapping[str, Any]] | None = None,
+    locked_sha256: Mapping[str, str] = LOCKED_FILE_SHA256,
+    locked_blob_oids: Mapping[str, str] = LOCKED_FILE_GIT_BLOB_OIDS,
 ) -> tuple[dict[str, str], list[str]]:
     snapshot: dict[str, str] = {}
     errors: list[str] = []
@@ -12310,13 +13129,35 @@ def snapshot_trusted_files(
         if not okay:
             errors.append(f"{relative}: {reason}")
             continue
+        if relative in locked_sha256:
+            identity = (
+                locked_identities.get(relative)
+                if locked_identities is not None
+                else None
+            )
+            canonical = identity.get("canonicalBytes") if identity is not None else None
+            if (
+                not isinstance(identity, Mapping)
+                or identity.get("objectId") != locked_blob_oids.get(relative)
+                or identity.get("sha256") != locked_sha256[relative]
+                or not isinstance(canonical, bytes)
+            ):
+                errors.append(f"{relative}: canonical Git blob authority is unavailable")
+                continue
+            try:
+                checkout = path.read_bytes()
+            except OSError as exc:
+                errors.append(f"{relative}: could not read ({type(exc).__name__})")
+                continue
+            if not _locked_checkout_presentation_matches(canonical, checkout):
+                errors.append(f"{relative}: candidate-local package/lockfile identity changed")
+                continue
+            snapshot[relative] = str(identity["sha256"])
+            continue
         try:
             snapshot[relative] = _sha256_file(path)
         except OSError as exc:
             errors.append(f"{relative}: could not hash ({type(exc).__name__})")
-    for relative, expected in LOCKED_FILE_SHA256.items():
-        if relative in paths and snapshot.get(relative) != expected:
-            errors.append(f"{relative}: candidate-local package/lockfile identity changed")
     return snapshot, errors
 
 
@@ -13594,7 +14435,32 @@ class FoundationRunner:
             tuple[TargetExecutionLease, dict[str, Any]]
         ] = []
         self.static_machine_report: dict[str, Any] | None = None
-        self.initial_trusted_snapshot, self.initial_trusted_errors = snapshot_trusted_files()
+        self.locked_file_git_identities: dict[str, dict[str, Any]] = {}
+        locked_identity_errors: list[str] = []
+        if self.tool_authority_frozen and not self.tool_policy.synthetic:
+            self.locked_file_git_identities, locked_identity_errors = (
+                capture_locked_file_git_identities(
+                    git=self.require_tool("git", phase="CAPTURE"),
+                    environment=self.child_environment,
+                    repo_root=REPO_ROOT,
+                    executable_lease=self.tool_leases.get("git"),
+                )
+            )
+        elif self.tool_policy.synthetic:
+            locked_identity_errors.append(
+                "locked Git blob authority is intentionally unavailable to synthetic test tools"
+            )
+        else:
+            locked_identity_errors.append(
+                "locked Git blob authority is unavailable because tool authority is not frozen"
+            )
+        (
+            self.initial_trusted_snapshot,
+            self.initial_trusted_errors,
+        ) = snapshot_trusted_files(
+            locked_identities=self.locked_file_git_identities
+        )
+        self.initial_trusted_errors.extend(locked_identity_errors)
         self.runtime.update(
             {
                 "runtimeClosureDigest": self.runtime_closure_digest,
@@ -13875,6 +14741,12 @@ class FoundationRunner:
             passed,
             detail,
             required=bool(plan_record["required"]),
+            execution_authority=self.require_tool("python", phase="EXECUTION"),
+            observed_execution_authority=(
+                self.require_tool("python", phase="EXECUTION")
+                if self.tool_policy.synthetic
+                else sys.executable
+            ),
         )
         if not policy_started:
             record["executed"] = False
@@ -14990,11 +15862,24 @@ class FoundationRunner:
 
     def run_lockfile_integrity(self) -> None:
         def evaluate(bundle: ProtectedTargetBundle) -> tuple[bool, str, Any]:
-            failures = [
-                relative
-                for relative, expected in LOCKED_FILE_SHA256.items()
-                if hashlib.sha256(bundle.bytes_for(relative)).hexdigest() != expected
-            ]
+            failures: list[str] = []
+            for relative, expected in LOCKED_FILE_SHA256.items():
+                identity = self.locked_file_git_identities.get(relative)
+                canonical = (
+                    identity.get("canonicalBytes")
+                    if isinstance(identity, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(canonical, bytes)
+                    or identity.get("objectId")
+                    != LOCKED_FILE_GIT_BLOB_OIDS[relative]
+                    or identity.get("sha256") != expected
+                    or not _locked_checkout_presentation_matches(
+                        canonical, bundle.bytes_for(relative)
+                    )
+                ):
+                    failures.append(relative)
             return (
                 not failures,
                 f"checked={len(LOCKED_FILE_SHA256)} failures={len(failures)}",
@@ -15035,7 +15920,21 @@ class FoundationRunner:
         return errors
 
     def verify_trusted_integrity(self, phase: str) -> None:
-        current, errors = snapshot_trusted_files()
+        locked_identities: dict[str, dict[str, Any]] = {}
+        identity_errors: list[str] = []
+        try:
+            locked_identities, identity_errors = capture_locked_file_git_identities(
+                git=self.require_tool("git", phase=phase.upper()),
+                environment=self.child_environment,
+                repo_root=REPO_ROOT,
+                executable_lease=self.tool_leases.get("git"),
+            )
+        except ToolAuthorityUnavailable as exc:
+            identity_errors.append(str(exc))
+        current, errors = snapshot_trusted_files(
+            locked_identities=locked_identities
+        )
+        errors.extend(identity_errors)
         errors.extend(compare_trusted_snapshots(self.initial_trusted_snapshot, current))
         self.add_hard_gate(
             f"TRUSTED-FILE-INTEGRITY-{phase.upper()}",
@@ -15912,7 +16811,13 @@ def execution_binding_external_context_errors(
     return sorted(set(errors))
 
 
-def _validate_command_record(record: Any, index: int, errors: list[str]) -> bool:
+def _validate_command_record(
+    record: Any,
+    index: int,
+    errors: list[str],
+    *,
+    expected_record: Mapping[str, Any] | None = None,
+) -> bool:
     label = f"command-results.json.records[{index}]"
     required = {
         "commandId",
@@ -16309,6 +17214,10 @@ def _validate_command_record(record: Any, index: int, errors: list[str]) -> bool
         }
         if target_execution is not None:
             errors.append(f"{label}: protected bundle command claims a single target lease")
+        if not targets:
+            errors.append(
+                f"{label}: protected target bundle requires nonempty command authority"
+            )
         if (
             record.get("executionInputSize") is not None
             or record.get("executionInputSha256") is not None
@@ -16325,33 +17234,110 @@ def _validate_command_record(record: Any, index: int, errors: list[str]) -> bool
                 errors.append(f"{label}: protectedTargetBundle identity arrays are invalid")
                 pre_identities = []
                 post_identities = []
-            if (
-                protected_bundle.get("bundleVersion") != PROTECTED_TARGET_BUNDLE_VERSION
+            compact_reference = all(
+                protected_bundle.get(key) == []
+                for key in _PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS
+            )
+            common_invalid = (
+                protected_bundle.get("bundleVersion")
+                != PROTECTED_TARGET_BUNDLE_VERSION
                 or protected_bundle.get("executionAdapter") != execution_input_mode
-                or protected_bundle.get("orderedLogicalTargetPaths")
-                != [target.get("path") for target in targets]
-                or protected_bundle.get("canonicalSourcePaths")
-                != [target.get("canonicalSourcePath") for target in targets]
-                or protected_bundle.get("plannedByteLengths")
-                != [target.get("size") for target in targets]
-                or protected_bundle.get("plannedSha256Values")
-                != [target.get("sha256") for target in targets]
-                or protected_bundle.get("plannedStableIdentities")
-                != [target.get("fileIdentity") for target in targets]
-                or protected_bundle.get("executionInputs") != execution_inputs
                 or protected_bundle.get("executionInputBundleDigest")
                 != execution_input_digest
                 or protected_bundle.get("cleanupState") != "closed"
-            ):
-                errors.append(f"{label}: protectedTargetBundle does not bind the command plan")
-            if record.get("executed") is True and (
-                len(execution_inputs) != len(targets)
-                or protected_bundle.get("mutationDetected") is not False
-                or len(pre_identities) != len(targets)
-                or len(post_identities) != len(targets)
-                or any(identity is None for identity in pre_identities + post_identities)
-            ):
-                errors.append(f"{label}: protected target execution drifted or is incomplete")
+            )
+            if compact_reference:
+                independently_expected_pre = (
+                    _protected_bundle_compact_identity_digests(
+                        expected_record,
+                        phase="pre",
+                    )
+                    if isinstance(expected_record, Mapping)
+                    and expected_record.get("executionInputMode")
+                    == "PROTECTED-TARGET-BUNDLE"
+                    else []
+                )
+                independently_expected_post = (
+                    _protected_bundle_compact_identity_digests(
+                        expected_record,
+                        phase="post",
+                    )
+                    if isinstance(expected_record, Mapping)
+                    and expected_record.get("executionInputMode")
+                    == "PROTECTED-TARGET-BUNDLE"
+                    else []
+                )
+                identity_digests_valid = (
+                    len(pre_identities) == len(targets)
+                    and len(post_identities) == len(targets)
+                    and all(
+                        isinstance(identity, str)
+                        and re.fullmatch(r"[0-9a-f]{64}", identity)
+                        for identity in pre_identities + post_identities
+                    )
+                    and pre_identities == independently_expected_pre
+                    and post_identities == independently_expected_post
+                )
+                if (
+                    common_invalid
+                    or record.get("executed") is not True
+                    or not targets
+                    or len(execution_inputs) != len(targets)
+                    or len(
+                        {
+                            target.get("path")
+                            for target in targets
+                            if isinstance(target, Mapping)
+                        }
+                    )
+                    != len(targets)
+                    or protected_bundle.get("mutationDetected") is not False
+                    or not identity_digests_valid
+                ):
+                    errors.append(
+                        f"{label}: protected target digest reference does not match "
+                        "independently reconstructed command authority"
+                    )
+            else:
+                if (
+                    common_invalid
+                    or protected_bundle.get("orderedLogicalTargetPaths")
+                    != [target.get("path") for target in targets]
+                    or protected_bundle.get("canonicalSourcePaths")
+                    != [target.get("canonicalSourcePath") for target in targets]
+                    or protected_bundle.get("plannedByteLengths")
+                    != [target.get("size") for target in targets]
+                    or protected_bundle.get("plannedSha256Values")
+                    != [target.get("sha256") for target in targets]
+                    or protected_bundle.get("plannedStableIdentities")
+                    != [target.get("fileIdentity") for target in targets]
+                    or protected_bundle.get("executionInputs") != execution_inputs
+                ):
+                    errors.append(
+                        f"{label}: protectedTargetBundle does not bind the command plan"
+                    )
+                if record.get("executed") is True and (
+                    len(execution_inputs) != len(targets)
+                    or protected_bundle.get("mutationDetected") is not False
+                    or len(pre_identities) != len(targets)
+                    or len(post_identities) != len(targets)
+                    or pre_identities != post_identities
+                    or any(
+                        identity is None
+                        for identity in pre_identities + post_identities
+                    )
+                    or not _full_protected_identity_array_matches_authority(
+                        record,
+                        pre_identities,
+                    )
+                    or not _full_protected_identity_array_matches_authority(
+                        record,
+                        post_identities,
+                    )
+                ):
+                    errors.append(
+                        f"{label}: protected target execution drifted or is incomplete"
+                    )
     elif (
         record.get("executionInputSize") is not None
         or record.get("executionInputSha256") is not None
@@ -16816,7 +17802,8 @@ def _validate_evidence_semantics(
     expected_authority = list(expected_command_plan) if expected_command_plan is not None else expected_command_authority(
         authority_profile,
     )
-    if command_authority != expected_authority:
+    portable_expected_authority = _portable_command_plan_value(expected_authority)
+    if command_authority != portable_expected_authority:
         errors.append("command-results.json: command authority does not match the immutable profile plan")
     expected_plan_digest = command_plan_digest(expected_authority)
     if commands.get("commandPlanDigest") != expected_plan_digest:
@@ -16971,9 +17958,39 @@ def _validate_evidence_semantics(
 
     command_hard_failure = False
     for index, record in enumerate(command_records):
-        command_hard_failure |= _validate_command_record(record, index, errors)
+        independently_expected_record = (
+            expected_authority[index]
+            if index < len(expected_authority)
+            and isinstance(expected_authority[index], Mapping)
+            and not (
+                isinstance(record, Mapping)
+                and record.get("commandId") == "command-results-size-limit"
+            )
+            else None
+        )
+        command_hard_failure |= _validate_command_record(
+            record,
+            index,
+            errors,
+            expected_record=independently_expected_record,
+        )
         if isinstance(record, dict) and record.get("ordinal") != index:
             errors.append(f"command-results.json.records[{index}]: ordinal does not match order")
+        if (
+            isinstance(record, dict)
+            and record.get("commandId") != "command-results-size-limit"
+            and index < len(expected_authority)
+        ):
+            expected_record = expected_authority[index]
+            authority_projection = {
+                key: record.get(key) for key in expected_record
+            }
+            if _portable_command_plan_value([authority_projection]) != (
+                [portable_expected_authority[index]]
+            ):
+                errors.append(
+                    f"command-results.json.records[{index}]: execution record does not bind the immutable command authority"
+                )
     if command_hard_failure and summary.get("status") == "PASS":
         errors.append("summary.json reports PASS while command-results records an execution failure")
 
@@ -17742,6 +18759,11 @@ def write_evidence(
             "queueOverflow": False,
             "mutationEventCount": 0,
         }
+    evidence_records = [
+        _compact_command_record_for_evidence(record)
+        for record in runner.command_results
+    ]
+    portable_command_authority = _portable_command_plan_value(runner.command_plan)
     command_document: dict[str, Any] = {
         "documentKind": EVIDENCE_DOCUMENT_KINDS["command-results.json"],
         "schemaVersion": 2,
@@ -17755,7 +18777,7 @@ def write_evidence(
         ),
         "profile": runner.profile,
         "platform": runner.platform,
-        "records": runner.command_results,
+        "records": evidence_records,
         "observations": observations,
         "completedCommandClasses": completed_command_classes,
         "expectedCompletedCommandClasses": list(
@@ -17777,7 +18799,7 @@ def write_evidence(
         "extraCommandIds": list(runner.extra_command_ids),
         "duplicateCommandIds": list(runner.duplicate_command_ids),
         "commandPlanDigest": runner.command_plan_digest,
-        "commandAuthority": runner.command_plan,
+        "commandAuthority": portable_command_authority,
         "runtimeDependencyClosure": runtime_closure_document,
         "runtimeDependencyGuard": runtime_guard_document,
     }
@@ -17789,23 +18811,39 @@ def write_evidence(
                 "detail": "OUTPUT-LIMIT-EXCEEDED for command-results.json",
             }
         )
+        runner_tools = getattr(runner, "tools", {})
+        approved_python = (
+            runner_tools.get("python", sys.executable)
+            if isinstance(runner_tools, Mapping)
+            else sys.executable
+        )
+        observed_python = (
+            approved_python
+            if getattr(getattr(runner, "tool_policy", None), "synthetic", False)
+            else sys.executable
+        )
+        internal_argv = canonical_internal_execution_argv(
+            approved_python,
+            observed_python,
+            "command-results-size-limit",
+        )
         executable_size, executable_hash, executable_identity = _measured_file_authority(
-            Path(sys.executable)
+            Path(internal_argv[0])
         )
         limited_record = {
             "ordinal": 0,
             "commandRole": "required-execution",
             "profile": runner.profile,
             "platform": runner.platform,
-            "argv": [sys.executable, "<internal>", "command-results-size-limit"],
-            "logicalArgv": [sys.executable, "<internal>", "command-results-size-limit"],
-            "executionArgv": [sys.executable, "<internal>", "command-results-size-limit"],
+            "argv": list(internal_argv),
+            "logicalArgv": list(internal_argv),
+            "executionArgv": list(internal_argv),
             "executionInputMode": "NONE",
             "executionInputSize": None,
             "executionInputSha256": None,
             "cwd": ".",
             "toolRole": "python-in-process",
-            "resolvedExecutablePath": str(Path(sys.executable).resolve()),
+            "resolvedExecutablePath": internal_argv[0],
             "resolvedExecutableSize": executable_size,
             "resolvedExecutableSha256": executable_hash,
             "resolvedExecutableFileIdentity": executable_identity,
@@ -17818,6 +18856,8 @@ def write_evidence(
                 "evidence-size-limit",
                 False,
                 "command result evidence exceeded its fixed JSON limit",
+                execution_authority=approved_python,
+                observed_execution_authority=observed_python,
             ),
         }
         limited_record["exitCode"] = 125
@@ -17830,7 +18870,7 @@ def write_evidence(
             completed_command_class_set_digest([])
         )
         command_document["commandPlanDigest"] = runner.command_plan_digest
-        command_document["commandAuthority"] = runner.command_plan
+        command_document["commandAuthority"] = portable_command_authority
         command_document["producerObservationCount"] = 0
         command_document["producerObservationUniverseDigest"] = (
             producer_observation_universe_digest(command_document["records"])
@@ -18010,7 +19050,15 @@ def prepare_developer_esbuild() -> list[str]:
     git = require_tool(tools, "git", phase="EXECUTION_BINDING")
     node = require_tool(tools, "node", phase="EXECUTION_BINDING")
     environment = child_process_environment(tools)
-    before, snapshot_errors = snapshot_trusted_files()
+    locked_identities, locked_identity_errors = capture_locked_file_git_identities(
+        git=git,
+        environment=environment,
+        repo_root=REPO_ROOT,
+    )
+    before, snapshot_errors = snapshot_trusted_files(
+        locked_identities=locked_identities
+    )
+    snapshot_errors.extend(locked_identity_errors)
     errors.extend(snapshot_errors)
     lock_path = REPO_ROOT / "developer" / "package-lock.json"
     try:
@@ -18097,7 +19145,17 @@ def prepare_developer_esbuild() -> list[str]:
             "exact locked esbuild installer failed: "
             + bounded_preview("\n".join(part for part in (capture.error or "", capture.stdout, capture.stderr) if part), max_lines=8)
         )
-    after, after_errors = snapshot_trusted_files()
+    after_locked_identities, after_identity_errors = (
+        capture_locked_file_git_identities(
+            git=git,
+            environment=environment,
+            repo_root=REPO_ROOT,
+        )
+    )
+    after, after_errors = snapshot_trusted_files(
+        locked_identities=after_locked_identities
+    )
+    after_errors.extend(after_identity_errors)
     errors.extend(after_errors)
     errors.extend(compare_trusted_snapshots(before, after))
     after_diff = execute_command(
