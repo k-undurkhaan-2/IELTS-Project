@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import collections
 import copy
 import contextlib
 import ast
@@ -17,6 +18,7 @@ import re
 import shutil
 import subprocess
 import stat
+import struct
 import sys
 import tempfile
 import threading
@@ -166,29 +168,6 @@ def _resolved_local_test_authority(
     source = _explicit_local_test_environment()
     try:
         policy = ci.default_tool_authority_policy(source, repo_root=ci.REPO_ROOT)
-        for key in tuple(source):
-            if ci._ascii_lower_authority_text(key) in {
-                "path",
-                "node_exe",
-                "npm_exe",
-                "python_exe",
-                "git_exe",
-                "powershell_exe",
-                "bash_exe",
-                "ci_trusted_python",
-                "ci_trusted_node",
-                "ci_trusted_npm_entry",
-            }:
-                source.pop(key)
-        path_directories = [policy.running_python.parent]
-        for role in sorted(requested - {"python", "bash"}):
-            candidate = ci._fallback_tool_candidate(role, policy)
-            if candidate is not None:
-                path_directories.append(candidate.parent)
-        path_directories.extend(policy.minimal_system_directories)
-        source["PATH"] = policy.path_separator.join(
-            str(path) for path in dict.fromkeys(path_directories)
-        )
         tools, errors = ci.resolve_trusted_tools(
             requested,
             source_environment=source,
@@ -1365,7 +1344,7 @@ def coherently_refresh_p52_compact_record(record: dict) -> None:
     inputs = [
         p52_execution_input_from_target(target) for target in record["targets"]
     ]
-    record["executionInputs"] = inputs
+    record["executionInputs"] = []
     record["executionInputBundleDigest"] = ci.execution_input_bundle_digest(inputs)
     bundle = record["protectedTargetBundle"]
     bundle["executionInputBundleDigest"] = record["executionInputBundleDigest"]
@@ -2155,7 +2134,17 @@ class AuthoritativeEvidenceDerivationTest(unittest.TestCase):
                     summary["knownDebtsObserved"][0][field_name] = forged_value
                     observed["records"][0][field_name] = forged_value
                     if field_name == "sourceCommandId":
-                        commands["observations"][0]["commandId"] = forged_value
+                        source = next(
+                            record
+                            for record in commands["records"]
+                            if record["commandId"] == self.observation_for_entry(entry)["commandId"]
+                        )
+                        source["producerObservations"][0]["commandId"] = forged_value
+                        source["producerObservationSetDigest"] = (
+                            ci.producer_observation_set_digest(
+                                source["producerObservations"]
+                            )
+                        )
 
                 self.rewrite_coherently(output, mutate)
                 errors = self.verify_fixture(output, repo)
@@ -2207,7 +2196,18 @@ class AuthoritativeEvidenceDerivationTest(unittest.TestCase):
                     )
                     source["exitCode"] = 1
                     if mode == "original-failure-present":
-                        commands["observations"].append(self.observation_for_entry(entry))
+                        raw = copy.deepcopy(
+                            self.observation_for_entry(entry)["rawObservation"]
+                        )
+                        raw["observationOrdinal"] = len(
+                            source["producerObservations"]
+                        )
+                        source["producerObservations"].append(raw)
+                        source["producerObservationSetDigest"] = (
+                            ci.producer_observation_set_digest(
+                                source["producerObservations"]
+                            )
+                        )
 
                 self.rewrite_coherently(output, mutate)
                 errors = self.verify_fixture(output, repo)
@@ -2224,12 +2224,23 @@ class AuthoritativeEvidenceDerivationTest(unittest.TestCase):
             output, _ = self.create_evidence(repo, [observation])
 
             def mutate(_summary, _observed, _resolved, commands):
-                duplicate = copy.deepcopy(commands["records"][-1])
+                source = next(
+                    record
+                    for record in commands["records"]
+                    if record["commandId"] == observation["commandId"]
+                )
+                duplicate = copy.deepcopy(source)
                 duplicate["commandId"] = "node-check:forged-second-source.js"
-                commands["records"].append(duplicate)
-                second = copy.deepcopy(commands["observations"][0])
+                duplicate["ordinal"] = len(commands["records"])
+                second = copy.deepcopy(duplicate["producerObservations"][0])
                 second["commandId"] = duplicate["commandId"]
-                commands["observations"].append(second)
+                duplicate["producerObservations"] = [second]
+                duplicate["producerObservationSetDigest"] = (
+                    ci.producer_observation_set_digest(
+                        duplicate["producerObservations"]
+                    )
+                )
+                commands["records"].append(duplicate)
 
             self.rewrite_coherently(output, mutate)
             errors = self.verify_fixture(output, repo)
@@ -3396,90 +3407,228 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                     for item in summary["policyViolations"]
                 )
             )
+            violation = next(
+                item
+                for item in summary["policyViolations"]
+                if item.get("id") == "COMMAND-RESULT-JSON-LIMIT"
+            )
+            detail = violation["detail"]
+            self.assertIn("total_bytes=", detail)
+            self.assertIn("limit_bytes=256", detail)
+            self.assertIn("approx_contributions=", detail)
+            self.assertLessEqual(len(detail.encode("utf-8")), 512)
+            self.assertNotIn(str(repo), detail)
+            self.assertIn(
+                "approx_contributions=",
+                command_results["records"][0]["parsedFailureSummary"][
+                    "diagnostic"
+                ],
+            )
 
     def test_full_scale_command_results_retain_705_records_under_fixed_limit(self) -> None:
         baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
-        stable_identity = {
-            "deviceOrVolume": "fixture-volume",
-            "inodeOrFileIndex": "fixture-index",
-            "creationOrChangeTimeNs": "1",
-            "writeTimeNs": "1",
-            "reparsePoint": False,
+        candidate_paths, path_errors = ci.deterministic_candidate_paths(ci.REPO_ROOT)
+        self.assertEqual(path_errors, [])
+        tools = {
+            role: str(Path(sys.executable).resolve(strict=True))
+            for role in ci.required_tool_names("all")
         }
-        targets = [
-            {
-                "path": f"frontend/security/target-{index:04d}.js",
-                "canonicalSourcePath": str(
-                    (
-                        ci.REPO_ROOT
-                        / "frontend"
-                        / "security"
-                        / f"target-{index:04d}.js"
-                    ).resolve()
-                ),
-                "size": 128 + index,
-                "sha256": hashlib.sha256(f"target-{index}".encode()).hexdigest(),
-                "fileIdentity": copy.deepcopy(stable_identity),
-                "modeType": "regular-file",
-                "reparsePoint": False,
-            }
-            for index in range(904)
-        ]
-        command_classes = [f"required-class-{index:02d}" for index in range(16)]
-        plan: list[dict] = []
-        for ordinal in range(705):
-            if ordinal == 0:
-                selected_targets = targets
-                input_mode = "PROTECTED-TARGET-BUNDLE"
-            elif ordinal == 1:
-                selected_targets = targets[:37]
-                input_mode = "PROTECTED-TARGET-BUNDLE"
-            elif ordinal == 2:
-                selected_targets = targets[:4]
-                input_mode = "PROTECTED-TARGET-BUNDLE"
-            elif ordinal == 3:
-                selected_targets = targets[:1]
-                input_mode = "PROTECTED-TARGET-BUNDLE"
-            elif ordinal < 701:
-                selected_targets = [targets[(ordinal - 4) % len(targets)]]
-                input_mode = "TARGET-BYTES-STDIN"
-            else:
-                selected_targets = []
-                input_mode = "NONE"
-            spec = synthetic_command_spec(
-                f"scale-command-{ordinal:04d}",
-                command_classes[ordinal % len(command_classes)],
-                ordinal,
-                targets=selected_targets,
-                execution_input_mode=input_mode,
-            )
-            spec["profile"] = "policy"
-            plan.append(spec)
+        plan = ci.build_profile_command_plan(
+            "all",
+            tools=tools,
+            candidate_paths=candidate_paths,
+            baseline=baseline,
+            current_platform="ubuntu",
+            static_invocation_id=ci.deterministic_static_invocation_id(ci.REPO_ROOT),
+            repo_root=ci.REPO_ROOT,
+        )
+        command_classes = sorted({spec["commandClass"] for spec in plan})
+        target_universe = {
+            target["path"] for spec in plan for target in spec["targets"]
+        }
+        self.assertEqual(len(plan), 705)
+        self.assertEqual(len(command_classes), 16)
+        self.assertEqual(len(target_universe), 904)
         records = [synthetic_record_from_spec(spec) for spec in plan]
+        observations: list[dict] = []
+        executable = Path(sys.executable).resolve(strict=True)
+        executable_hash = ci._sha256_file(executable)
+        closure_guard = {
+            "guardSchemaVersion": ci.RUNTIME_DEPENDENCY_GUARD_SCHEMA_VERSION,
+            "watcherBackend": "live-shaped-fixture",
+            "active": True,
+            "activeDuringReplay": True,
+            "mutationState": "clean",
+            "queueOverflow": False,
+            "mutationEventCount": 0,
+        }
+        for spec, record in zip(plan, records):
+            if spec["commandId"] == "tracked-secret-scan":
+                record["fileScans"] = [
+                    {
+                        "path": target["path"],
+                        "fileSize": int(target["size"] or 0),
+                        "classification": "text-scanned",
+                        "scannedBytes": int(target["size"] or 0),
+                        "rawBytesScanned": int(target["size"] or 0),
+                        "encodingViewsApplied": [
+                            "raw-bytes",
+                            *ci.UTF16_ASCII_CREDENTIAL_VIEWS,
+                        ],
+                        "utf16LeDecodedUnits": 0,
+                        "utf16BeDecodedUnits": 0,
+                        "patternFamiliesApplied": list(
+                            ci.SECRET_SCAN_PATTERN_FAMILIES
+                        ),
+                        "hitCount": 0,
+                    }
+                    for target in spec["targets"]
+                ]
+            if spec["toolRole"] in ci.DEPENDENCY_BACKED_TOOL_ROLES:
+                record.update(
+                    {
+                        "dependencyBacked": True,
+                        "runtimeClosureDigest": "4" * 64,
+                        "dependencyClosureDigest": "5" * 64,
+                        "nodePath": [],
+                        "resolvedTestRunnerEntrypoint": str(executable),
+                        "resolvedTestRunnerSha256": executable_hash,
+                        "closureWatcherActive": True,
+                        "closureMutationState": "clean",
+                        "runtimeClosureGuard": copy.deepcopy(closure_guard),
+                    }
+                )
+            observation_count = (
+                1 if spec["commandRole"] == "observation-producing" else 0
+            )
+            if observation_count:
+                record["diagnosticPreview"] = "live-shaped bounded diagnostic" * 8
+            for observation_ordinal in range(observation_count):
+                scope = (
+                    f"live-shaped:{spec['commandId']}:{observation_ordinal:03d}"
+                )
+                raw = ci.make_raw_observation(
+                    spec["commandId"],
+                    spec["ordinal"],
+                    observation_ordinal,
+                    "normalized-fields-v1",
+                    scope,
+                    spec["targets"][0]["path"] if spec["targets"] else None,
+                    {"scope": scope, "outcome": "pass"},
+                    ci.command_output_digest(record),
+                )
+                record["producerObservations"].append(raw)
+                observations.append(
+                    {"commandId": spec["commandId"], "rawObservation": raw}
+                )
         runner = fake_runner(baseline)
+        runner.profile = "all"
+        runner.platform = "ubuntu"
         runner.command_plan = plan
         runner.command_results = records
-        runner.observations = []
+        runner.observations = observations
         runner.completed_classes = set()
         runner.command_plan_digest = ci.command_plan_digest(plan)
+        empty_member_digest = hashlib.sha256(
+            ci._canonical_frame([])
+        ).hexdigest()
+        dependency_roots = [
+            {
+                "logicalRoot": logical_root,
+                "memberCount": 0,
+                "members": [],
+                "memberManifestDigest": empty_member_digest,
+            }
+            for logical_root in (
+                "developer/node_modules",
+                "backend/node_modules",
+            )
+        ]
+        vitest = {
+            "resolvedEntrypoint": str(executable),
+            "packageVersion": "live-shaped-fixture",
+            "entrypointSha256": executable_hash,
+        }
+        dependency_semantic = {
+            "lockfiles": runner.runtime_closure_document["lockfiles"],
+            "dependencyRoots": dependency_roots,
+            "vitest": vitest,
+            "nodePath": [],
+        }
+        dependency_digest = hashlib.sha256(
+            ci._canonical_frame(dependency_semantic)
+        ).hexdigest()
+        runner.runtime_closure_document.update(
+            {
+                "profile": "all",
+                "runnerOS": "Linux",
+                "dependencyRoots": dependency_roots,
+                "vitest": vitest,
+                "nodePath": [],
+                "dependencyClosureDigest": dependency_digest,
+                "dependencyMemberCount": 0,
+            }
+        )
+        runner.runtime_closure_document.pop("closureDigest", None)
+        runtime_digest = hashlib.sha256(
+            ci._canonical_frame(runner.runtime_closure_document)
+        ).hexdigest()
+        runner.runtime_closure_document["closureDigest"] = runtime_digest
+        runner.runtime.update(
+            {
+                "platform": "ubuntu",
+                "os": "synthetic-github-hosted-linux",
+                "runtimeClosureDigest": runtime_digest,
+                "dependencyClosureDigest": dependency_digest,
+                "dependencyMemberCount": "0",
+            }
+        )
+        for record in records:
+            if record.get("dependencyBacked") is True:
+                record["runtimeClosureDigest"] = runtime_digest
+                record["dependencyClosureDigest"] = dependency_digest
         runner.execution_binding = synthetic_execution_binding(
-            "policy",
+            "all",
             runner.command_plan_digest,
-            platform_name=runner.platform,
+            platform_name="ubuntu",
         )
         with tempfile.TemporaryDirectory(prefix="ci-scale-evidence-") as temp_dir:
             repo = Path(temp_dir)
             output = repo / ".ci-results"
             ci.create_fresh_evidence_root(output, repo_root=repo)
-            ci.write_evidence(
-                runner,
-                empty_comparison(),
-                output_dir=output,
-                evidence_authority_root=repo,
-            )
+            independent_results: list[list[str]] = []
+            independent_verify = ci.verify_evidence_file_set
+
+            def tracked_independent_verify(*args, **kwargs):
+                result = independent_verify(*args, **kwargs)
+                independent_results.append(result)
+                return result
+
+            with mock.patch.object(
+                ci,
+                "verify_evidence_file_set",
+                side_effect=tracked_independent_verify,
+            ):
+                ci.write_evidence(
+                    runner,
+                    empty_comparison(),
+                    output_dir=output,
+                    evidence_authority_root=repo,
+                )
+            self.assertEqual(independent_results, [[]])
             data = (output / "command-results.json").read_bytes()
             self.assertLess(len(data), ci.MAX_COMMAND_RESULTS_JSON_BYTES)
             document = ci.strict_json_loads(data)
+            if document["records"][0]["commandId"] == "command-results-size-limit":
+                self.fail(
+                    next(
+                        item["detail"]
+                        for item in ci.strict_json_load_file(
+                            output / "summary.json"
+                        )["policyViolations"]
+                        if item.get("id") == "COMMAND-RESULT-JSON-LIMIT"
+                    )
+                )
             self.assertEqual(
                 [record["commandId"] for record in document["records"]],
                 [spec["commandId"] for spec in plan],
@@ -3491,61 +3640,71 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
             self.assertEqual(
                 document["commandAuthority"], ci._portable_command_plan_value(plan)
             )
-            for record, expected_target_count in zip(
-                document["records"][:4], (904, 37, 4, 1)
-            ):
+            self.assertEqual(document["missingCommandIds"], [])
+            self.assertEqual(document["extraCommandIds"], [])
+            self.assertEqual(document["duplicateCommandIds"], [])
+            self.assertNotIn(
+                "command-results-size-limit",
+                {record["commandId"] for record in document["records"]},
+            )
+            self.assertGreaterEqual(document["producerObservationCount"], 670)
+            protected_records = [
+                record
+                for record in document["records"]
+                if record["executionInputMode"] == "PROTECTED-TARGET-BUNDLE"
+            ]
+            self.assertTrue(protected_records)
+            for record in protected_records:
+                expected_target_count = len(record["targets"])
                 self.assertEqual(len(record["targets"]), expected_target_count)
-                self.assertEqual(
-                    len(record["executionInputs"]), expected_target_count
+                self.assertEqual(record["executionInputs"], [])
+                reconstructed_inputs = (
+                    ci._reconstructed_protected_execution_inputs(record)
                 )
+                self.assertEqual(len(reconstructed_inputs), expected_target_count)
                 self.assertEqual(
                     record["executionInputBundleDigest"],
-                    ci.execution_input_bundle_digest(record["executionInputs"]),
+                    ci.execution_input_bundle_digest(reconstructed_inputs),
                 )
                 bundle = record["protectedTargetBundle"]
                 for key in ci._PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS:
                     self.assertEqual(bundle[key], [])
+                self.assertEqual(record["executionInputs"], [])
+                reconstructed_inputs = (
+                    ci._reconstructed_protected_execution_inputs(record)
+                )
+                self.assertEqual(
+                    record["executionInputBundleDigest"],
+                    ci.execution_input_bundle_digest(reconstructed_inputs),
+                )
                 self.assertEqual(
                     len(bundle["preExecutionIdentities"]),
                     expected_target_count,
                 )
-            self.assertEqual(
-                ci.verify_evidence_file_set(
-                    output,
-                    repo_root=repo,
-                    expected_command_plan=plan,
-                ),
-                [],
+            field_units: collections.Counter[str] = collections.Counter()
+            largest_record = max(
+                (
+                    len(ci._json_bytes(record)),
+                    record["commandId"],
+                    record["commandClass"],
+                )
+                for record in document["records"]
             )
-            forged_document = copy.deepcopy(document)
-            for record in forged_document["records"][:4]:
-                bundle = record["protectedTargetBundle"]
-                bundle["preExecutionIdentities"] = [
-                    "0" * 64 for _identity in bundle["preExecutionIdentities"]
-                ]
-                bundle["postExecutionIdentities"] = [
-                    "0" * 64 for _identity in bundle["postExecutionIdentities"]
-                ]
-            coherently_rebind_claimed_transcript(
-                {"command-results.json": forged_document}
-            )
-            self.rewrite_manifested_json(
-                output,
-                "command-results.json",
-                forged_document,
-            )
-            verification_errors = ci.verify_evidence_file_set(
-                output,
-                repo_root=repo,
-                expected_command_plan=plan,
-            )
-            self.assertTrue(verification_errors)
-            self.assertTrue(
-                any(
-                    "independently reconstructed command authority" in error
-                    for error in verification_errors
-                ),
-                verification_errors,
+            for record in document["records"]:
+                for key, value in record.items():
+                    field_units[key] += ci._bounded_json_contribution_units(value)
+            largest_field, largest_field_units = field_units.most_common(1)[0]
+            print(
+                "LIVE_SHAPED_COMMAND_RESULTS "
+                f"BYTES={len(data)} "
+                f"HEADROOM={ci.MAX_COMMAND_RESULTS_JSON_BYTES - len(data)} "
+                f"RECORDS={len(document['records'])} "
+                f"CLASSES={len(document['completedCommandClasses'])} "
+                f"TARGETS={len(target_universe)} "
+                f"LARGEST_RECORD_BYTES={largest_record[0]} "
+                f"LARGEST_RECORD_ID={largest_record[1]} "
+                f"LARGEST_FIELD={largest_field} "
+                f"LARGEST_FIELD_UNITS={largest_field_units}"
             )
 
 
@@ -3931,7 +4090,7 @@ class _HostedToolFixture:
 
         if platform_name == "Windows":
             python_dir = toolcache / "windows" / "Python" / "3.12.13" / "x64"
-            node_dir = toolcache / "windows" / "node" / "24.18.1" / "x64"
+            node_dir = toolcache / "windows" / "node" / "24.18.0" / "x64"
             git_root = self.root / "Program Files" / "Git"
             system_root = self.root / "Windows"
             system_bin = system_root / "System32"
@@ -3968,7 +4127,7 @@ class _HostedToolFixture:
             }
         else:
             python_dir = toolcache / "Python" / "3.12.13" / "x64" / "bin"
-            node_dir = toolcache / "node" / "24.18.1" / "x64" / "bin"
+            node_dir = toolcache / "node" / "24.18.0" / "x64" / "bin"
             system_bin = self.root / "usr" / "bin"
             usr_local = self.root / "usr" / "local" / "bin"
             usr_local.mkdir(parents=True)
@@ -4056,6 +4215,44 @@ class _HostedToolFixture:
 
     def cleanup(self) -> None:
         self.temporary.cleanup()
+
+    def use_run5_production_toolcache_roots(self) -> None:
+        """Mirror default Linux policy roots for the exact Run-5 tool topology."""
+
+        if self.platform_name != "Ubuntu":
+            raise ValueError("Run-5 repository-policy topology is Ubuntu-only")
+        toolcache = self.root / "hostedtoolcache"
+        python = self.paths["python"]
+        system = self.paths["system"]
+        self.policy = ci.synthetic_tool_authority_policy(
+            "Ubuntu",
+            running_python=python,
+            role_roots={
+                "python": (("github-hosted-toolcache", toolcache),),
+                "node": (
+                    ("github-hosted-toolcache", toolcache),
+                    ("approved-local-runtime", python.parents[1]),
+                ),
+                "npm": (
+                    ("github-hosted-toolcache", toolcache),
+                    ("approved-local-runtime", python.parents[1]),
+                ),
+                "git": (("posix-system-git", system),),
+                "bash": (("posix-system-bash", system),),
+                "powershell": (("posix-system-pwsh", system),),
+                "pwsh": (("posix-system-pwsh", system),),
+            },
+            minimal_system_directories=(system,),
+            path_separator=os.pathsep,
+        )
+        self.source.update(
+            {
+                "GITHUB_ACTIONS": "true",
+                "RUNNER_OS": "Linux",
+                "RUNNER_ENVIRONMENT": "github-hosted",
+                "RUNNER_TOOL_CACHE": str(toolcache),
+            }
+        )
 
 
 class TrustedExecutionTest(unittest.TestCase):
@@ -4531,6 +4728,213 @@ class InternalPythonExecutionAuthorityTest(unittest.TestCase):
 
 class HostedRunnerToolResolutionTest(unittest.TestCase):
     REQUIRED = frozenset({"python", "node", "git", "bash", "powershell"})
+
+    def run5_repository_policy_helper(
+        self,
+        fixture: _HostedToolFixture,
+        *roles: str,
+        source: dict[str, str] | None = None,
+    ) -> tuple[ci.ToolAuthorityPolicy, dict[str, str]]:
+        selected_source = dict(fixture.source if source is None else source)
+        with (
+            mock.patch.dict(os.environ, selected_source, clear=True),
+            mock.patch.object(
+                ci, "default_tool_authority_policy", return_value=fixture.policy
+            ),
+        ):
+            return _resolved_local_test_authority(*roles)
+
+    def test_run5_repository_policy_helper_binds_exact_setup_node_topology_and_selected_sibling(
+        self,
+    ) -> None:
+        fixture = _HostedToolFixture("Ubuntu")
+        try:
+            fixture.use_run5_production_toolcache_roots()
+            self.assertEqual(
+                fixture.paths["node"].relative_to(
+                    fixture.root / "hostedtoolcache"
+                ).as_posix(),
+                "node/24.18.0/x64/bin/node",
+            )
+            with mock.patch.object(
+                ci,
+                "_fallback_tool_candidate",
+                side_effect=AssertionError("selected hosted Node must not use fallback"),
+            ):
+                policy, tools = self.run5_repository_policy_helper(
+                    fixture, "python", "node"
+                )
+            self.assertEqual(Path(tools["python"]), fixture.paths["python"])
+            self.assertEqual(Path(tools["node"]), fixture.paths["node"])
+            self.assertIsNotNone(
+                ci._tool_root_classification(Path(tools["node"]), "node", policy)
+            )
+
+            sibling = fixture._write(
+                fixture.root
+                / "hostedtoolcache"
+                / "node"
+                / "24.17.0"
+                / "x64"
+                / "bin"
+                / "node",
+                b"synthetic-selected-sibling-node",
+            ).resolve(strict=True)
+            sibling_source = dict(fixture.source)
+            sibling_source["PATH"] = fixture.policy.path_separator.join(
+                (
+                    str(sibling.parent),
+                    *(
+                        entry
+                        for entry in fixture.source["PATH"].split(
+                            fixture.policy.path_separator
+                        )
+                        if Path(entry) != fixture.paths["node"].parent
+                    ),
+                )
+            )
+            _sibling_policy, sibling_tools = self.run5_repository_policy_helper(
+                fixture, "python", "node", source=sibling_source
+            )
+            self.assertEqual(Path(sibling_tools["node"]), sibling)
+        finally:
+            fixture.cleanup()
+
+    def test_run5_repository_policy_helper_rejects_untrusted_node_path_matrix(
+        self,
+    ) -> None:
+        fixture = _HostedToolFixture("Ubuntu")
+        try:
+            fixture.use_run5_production_toolcache_roots()
+            fake_directories = {
+                "workspace": fixture.workspace / "fake-bin",
+                "runner-temp": fixture.runner_temp / "fake-bin",
+                "node-modules": fixture.root / "node_modules" / ".bin",
+                "near-prefix-toolcache": fixture.root / "hostedtoolcache-evil" / "bin",
+            }
+            for label, directory in fake_directories.items():
+                with self.subTest(label=label):
+                    fixture._write(directory / "node", b"untrusted-node")
+                    source = dict(fixture.source)
+                    source["PATH"] = fixture.policy.path_separator.join(
+                        (str(directory), source["PATH"])
+                    )
+                    with self.assertRaises(AssertionError) as raised:
+                        self.run5_repository_policy_helper(
+                            fixture, "python", "node", source=source
+                        )
+                    rendered = str(raised.exception)
+                    self.assertIn("TEST-TOOL-AUTHORITY-UNAVAILABLE", rendered)
+                    self.assertIn("tool=node", rendered)
+                    self.assertTrue(
+                        ci.PATH_WORKSPACE_OR_TEMP_AUTHORITY in rendered
+                        or ci.PATH_EXECUTABLE_SHADOW in rendered,
+                        rendered,
+                    )
+        finally:
+            fixture.cleanup()
+
+    def test_run5_repository_policy_helper_rejects_reparse_escape_and_post_capture_replacement(
+        self,
+    ) -> None:
+        fixture = _HostedToolFixture("Ubuntu")
+        lease: ci.ExecutableIdentityLease | None = None
+        try:
+            fixture.use_run5_production_toolcache_roots()
+            outside = fixture.root / "reparse-target"
+            fixture._write(outside / "node", b"reparse-escape-node")
+            link = fixture.root / "hostedtoolcache" / "reparse-bin"
+            lstat_patch = contextlib.nullcontext()
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except OSError:
+                link.mkdir()
+                fixture._write(link / "node", b"simulated-reparse-node")
+                original_lstat = Path.lstat
+                metadata = original_lstat(link)
+                reparse_metadata = SimpleNamespace(
+                    st_mode=metadata.st_mode,
+                    st_dev=metadata.st_dev,
+                    st_ino=metadata.st_ino,
+                    st_size=metadata.st_size,
+                    st_mtime_ns=metadata.st_mtime_ns,
+                    st_ctime_ns=metadata.st_ctime_ns,
+                    st_file_attributes=(
+                        getattr(metadata, "st_file_attributes", 0)
+                        | getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+                    ),
+                )
+
+                def simulated_reparse(path: Path, *args, **kwargs):
+                    if path == link:
+                        return reparse_metadata
+                    return original_lstat(path, *args, **kwargs)
+
+                lstat_patch = mock.patch.object(Path, "lstat", simulated_reparse)
+            source = dict(fixture.source)
+            source["PATH"] = fixture.policy.path_separator.join(
+                (str(link), source["PATH"])
+            )
+            with lstat_patch, self.assertRaises(AssertionError) as raised:
+                self.run5_repository_policy_helper(
+                    fixture, "python", "node", source=source
+                )
+            self.assertIn("tool=node", str(raised.exception))
+
+            _policy, tools = self.run5_repository_policy_helper(
+                fixture, "python", "node"
+            )
+            node = Path(tools["node"])
+            lease = ci.ExecutableIdentityLease(node, "run5-hosted-node")
+            try:
+                node.write_bytes(b"post-capture-replacement")
+            except OSError:
+                self.assertEqual(lease.verify(), (True, None))
+            else:
+                okay, error = lease.verify()
+                self.assertFalse(okay)
+                self.assertIsNotNone(error)
+        finally:
+            if lease is not None:
+                lease.close()
+            fixture.cleanup()
+
+    def test_run5_repository_policy_helper_absent_and_partial_authority_fail_typed(
+        self,
+    ) -> None:
+        fixture = _HostedToolFixture("Ubuntu")
+        try:
+            fixture.use_run5_production_toolcache_roots()
+            source = dict(fixture.source)
+            source["PATH"] = fixture.policy.path_separator.join(
+                entry
+                for entry in source["PATH"].split(fixture.policy.path_separator)
+                if Path(entry) != fixture.paths["node"].parent
+            )
+            with self.assertRaises(AssertionError) as absent:
+                self.run5_repository_policy_helper(
+                    fixture, "python", "node", source=source
+                )
+            self.assertIsInstance(
+                absent.exception.__cause__, ci.ToolAuthorityUnavailable
+            )
+            self.assertEqual(absent.exception.__cause__.tool, "node")
+            self.assertIn(ci.REQUIRED_TOOL_MISSING, str(absent.exception))
+
+            with mock.patch.object(
+                ci,
+                "resolve_trusted_tools",
+                return_value=({"python": str(fixture.paths["python"])}, []),
+            ):
+                with self.assertRaises(AssertionError) as partial:
+                    self.run5_repository_policy_helper(fixture, "python", "node")
+            self.assertIsInstance(
+                partial.exception.__cause__, ci.ToolAuthorityUnavailable
+            )
+            self.assertNotIsInstance(partial.exception.__cause__, KeyError)
+            self.assertEqual(partial.exception.__cause__.tool, "node")
+        finally:
+            fixture.cleanup()
 
     def test_policy_root_fallback_models_hosted_sibling_products_and_local_host(self) -> None:
         for platform_name in ("Ubuntu", "Windows"):
@@ -8871,6 +9275,10 @@ class P52CompactIdentitySecurityTest(unittest.TestCase):
                         second_bundle["postExecutionIdentities"]
                     )
                 elif mode == "execution-input-substitution":
+                    first["executionInputs"] = [
+                        p52_execution_input_from_target(target)
+                        for target in first["targets"]
+                    ]
                     first["executionInputs"][0]["plannedSha256"] = "f" * 64
                     first["executionInputs"][0]["actualSha256"] = "f" * 64
                     first["executionInputBundleDigest"] = (
@@ -8883,6 +9291,43 @@ class P52CompactIdentitySecurityTest(unittest.TestCase):
                     first_bundle["preExecutionIdentities"][0] = zero
                 if mode != "manifest-preserving-compact-change":
                     coherently_rebind_claimed_transcript(forged)
+                errors = self.compare(forged)
+                self.assertTrue(errors, mode)
+                self.assertTrue(
+                    any("transcript" in error.casefold() for error in errors),
+                    errors,
+                )
+
+    def test_compact_execution_input_reference_rejects_digest_and_expansion_forgery(
+        self,
+    ) -> None:
+        self.assertEqual(self.compare(), [])
+        for mode in ("digest", "forged-expansion", "coherent-target-content"):
+            with self.subTest(mode=mode):
+                forged = copy.deepcopy(self.documents)
+                record = forged["command-results.json"]["records"][0]
+                self.assertEqual(record["executionInputs"], [])
+                if mode == "digest":
+                    record["executionInputBundleDigest"] = "f" * 64
+                    record["protectedTargetBundle"][
+                        "executionInputBundleDigest"
+                    ] = "f" * 64
+                elif mode == "forged-expansion":
+                    record["executionInputs"] = [
+                        p52_execution_input_from_target(target)
+                        for target in record["targets"]
+                    ]
+                    record["executionInputs"][0]["actualSha256"] = "f" * 64
+                    record["executionInputBundleDigest"] = (
+                        ci.execution_input_bundle_digest(record["executionInputs"])
+                    )
+                    record["protectedTargetBundle"][
+                        "executionInputBundleDigest"
+                    ] = record["executionInputBundleDigest"]
+                else:
+                    record["targets"][0]["sha256"] = "f" * 64
+                    coherently_refresh_p52_compact_record(record)
+                coherently_rebind_claimed_transcript(forged)
                 errors = self.compare(forged)
                 self.assertTrue(errors, mode)
                 self.assertTrue(
@@ -9187,6 +9632,67 @@ class CI6ProtectedPolicyInputTest(unittest.TestCase):
             [item["actualSha256"] for item in evidence["executionInputs"]],
             [item["plannedSha256"] for item in evidence["executionInputs"]],
         )
+
+    def test_bundle_snapshot_gets_only_derived_git_membership_ignore_and_attribute_authority(
+        self,
+    ) -> None:
+        git = _explicit_local_test_tool_map("git")["git"]
+        fixture_files = {
+            ".gitattributes": "*.txt text eol=lf\n",
+            ".gitignore": "*.tmp\n",
+            "tracked.txt": "protected bytes\n",
+            "check_git.py": (
+                "import os, subprocess\n"
+                "def run(*args):\n"
+                "    return subprocess.run(['git', *args], text=True, encoding='utf-8', "
+                "errors='replace', stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n"
+                "tracked = run('ls-files', '--error-unmatch', '--', 'tracked.txt')\n"
+                "ignored = run('check-ignore', '--quiet', '--no-index', '--', 'tracked.txt')\n"
+                "attribute = run('-c', 'core.autocrlf=true', 'check-attr', 'eol', '--', 'tracked.txt')\n"
+                "inventory = run('ls-files')\n"
+                "assert tracked.returncode == 0, tracked.stderr\n"
+                "assert ignored.returncode == 1, ignored.stderr\n"
+                "assert attribute.returncode == 0 and attribute.stdout.endswith(': eol: lf\\n'), "
+                "attribute.stderr + attribute.stdout\n"
+                "assert '.git/' not in inventory.stdout\n"
+                "assert os.environ['GIT_CONFIG_NOSYSTEM'] == '1'\n"
+                "assert os.environ['GIT_ATTR_NOSYSTEM'] == '1'\n"
+                "assert run('config', '--global', '--list').stdout == ''\n"
+                "print('protected-git-projection-ok')\n"
+            ),
+        }
+        for relative, value in fixture_files.items():
+            (self.root / relative).write_text(value, encoding="utf-8", newline="")
+        targets = [
+            ci._target_authority(self.root, relative)
+            for relative in fixture_files
+        ]
+        spec = synthetic_command_spec(
+            "bundle-normalization",
+            "bundle-parity",
+            0,
+            targets=targets,
+            execution_input_mode="PROTECTED-TARGET-BUNDLE",
+        )
+        argv = [sys.executable, "-B", "check_git.py"]
+        spec["argv"] = argv
+        spec["logicalArgv"] = argv
+        spec["executionArgv"] = argv
+        environment = ci.child_process_environment(
+            {"python": sys.executable, "git": git},
+            source_environment=_explicit_local_test_environment(),
+        )
+        capture, evidence = ci.execute_planned_static_suite(
+            spec,
+            repo_root=self.root,
+            env=environment,
+            timeout=30,
+        )
+        self.assertTrue(capture.execution_passed(), capture.stdout + capture.stderr)
+        self.assertEqual(capture.stdout.strip(), "protected-git-projection-ok")
+        self.assertEqual(evidence["cleanupState"], "closed")
+        self.assertFalse(evidence["mutationDetected"])
+        self.assertEqual(len(evidence["executionInputs"]), len(fixture_files))
 
 
 class CI6LocaleJunctionTest(unittest.TestCase):
@@ -10408,7 +10914,11 @@ class CI8RuntimeDependencyClosureTest(unittest.TestCase):
         return _resolved_local_test_authority("python", "node", "git")
 
     def make_guard(
-        self, root: Path
+        self,
+        root: Path,
+        *,
+        watcher_factory=ci._ModelMutationWatcher,
+        lease_path: Path | None = None,
     ) -> tuple[ci.RuntimeDependencyClosure, ci.RuntimeDependencyClosureGuard, Path]:
         developer = root / "developer"
         backend = root / "backend"
@@ -10426,8 +10936,9 @@ class CI8RuntimeDependencyClosureTest(unittest.TestCase):
         )
         helper = bin_root / "helper"
         helper.write_bytes(b"AAAA")
-        tool = root / "trusted-node"
-        tool.write_bytes(b"trusted-tool")
+        tool = root / "trusted-node" if lease_path is None else lease_path
+        if lease_path is None:
+            tool.write_bytes(b"trusted-tool")
         vitest_record = {
             "resolvedEntrypoint": "developer/node_modules/vitest/vitest.mjs",
             "packageVersion": "1.0.0",
@@ -10455,9 +10966,17 @@ class CI8RuntimeDependencyClosureTest(unittest.TestCase):
         guard = ci.RuntimeDependencyClosureGuard(
             closure,
             repo_root=root,
-            watcher_factory=ci._ModelMutationWatcher,
+            watcher_factory=watcher_factory,
         )
         return closure, guard, helper
+
+    def wait_for_guard(self, predicate, label: str, *, timeout: float = 3.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.02)
+        self.fail(f"timed out waiting for runtime dependency watcher: {label}")
 
     def test_runtime_dependency_closure_schema_and_digest(self) -> None:
         policy, tools = self.local_tool_authority()
@@ -10731,6 +11250,238 @@ class CI8RuntimeDependencyClosureTest(unittest.TestCase):
                     errors = guard.verify(operation)
                     self.assertTrue(errors)
                     self.assertTrue(guard.mutated)
+                finally:
+                    guard.close()
+                    closure.close()
+
+    def test_windows_notification_buffer_preserves_action_root_and_relative_path(self) -> None:
+        first_name = "tool.tmp".encode("utf-16-le")
+        first_size = 12 + len(first_name)
+        first_offset = (first_size + 3) & ~3
+        second_name = "nested\\tool.exe".encode("utf-16-le")
+        payload = (
+            struct.pack("<III", first_offset, 1, len(first_name))
+            + first_name
+            + (b"\x00" * (first_offset - first_size))
+            + struct.pack("<III", 0, 5, len(second_name))
+            + second_name
+        )
+        events = ci._windows_directory_change_events(payload, r"D:\trusted-root")
+        self.assertEqual(
+            [(event["action"], event["relativePath"]) for event in events],
+            [("added", "tool.tmp"), ("renamed-new-name", "nested/tool.exe")],
+        )
+        self.assertEqual({event["root"] for event in events}, {r"D:\trusted-root"})
+        unknown_name = "unknown.bin".encode("utf-16-le")
+        unknown = ci._windows_directory_change_events(
+            struct.pack("<III", 0, 99, len(unknown_name)) + unknown_name,
+            r"D:\trusted-root",
+        )
+        self.assertEqual(unknown[0]["action"], "unknown-99")
+        with self.assertRaisesRegex(ValueError, "truncated"):
+            ci._windows_directory_change_events(b"\x00" * 8, r"D:\trusted-root")
+
+    @unittest.skipUnless(os.name == "nt", "requires the real ReadDirectoryChangesW backend")
+    def test_windows_real_watcher_read_only_enumeration_process_startup_and_private_temp_are_clean(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="ci8-rdcw-benign-") as temp_dir:
+            root = Path(temp_dir)
+            closure, guard, helper = self.make_guard(
+                root,
+                watcher_factory=ci._WindowsDirectoryMutationWatcher,
+            )
+            closed = False
+            try:
+                self.assertEqual(helper.read_bytes(), b"AAAA")
+                self.assertIn(helper.name, {path.name for path in helper.parent.iterdir()})
+                subprocess.run(
+                    [sys.executable, "-B", "-c", "pass"],
+                    cwd=root,
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=30,
+                    check=True,
+                )
+                (root / "private-output.tmp").write_bytes(b"unprotected output")
+                self.wait_for_guard(
+                    lambda: guard.ignored_event_count > 0,
+                    "unprotected sibling event classification",
+                )
+                self.assertFalse(guard.mutated)
+                self.assertEqual(guard.verify("benign-read-enumerate-process-temp"), [])
+                self.assertTrue(
+                    all(
+                        event["protectedClass"] == "unprotected-watched-sibling"
+                        for event in guard.ignored_events
+                    ),
+                    guard.ignored_events,
+                )
+                self.assertTrue(
+                    any(event["temporaryOrGenerated"] for event in guard.ignored_events),
+                    guard.ignored_events,
+                )
+                self.assertEqual(guard.close(), [])
+                closed = True
+            finally:
+                if not closed:
+                    guard.close()
+                closure.close()
+            process_root = root / "leased-process-startup"
+            process_closure, process_guard, _process_helper = self.make_guard(
+                process_root,
+                watcher_factory=ci._WindowsDirectoryMutationWatcher,
+                lease_path=Path(sys.executable),
+            )
+            process_closed = False
+            try:
+                subprocess.run(
+                    [sys.executable, "-B", "-c", "pass"],
+                    cwd=process_root,
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=30,
+                    check=True,
+                )
+                time.sleep(0.2)
+                self.assertFalse(process_guard.mutated)
+                self.assertEqual(process_guard.verify("leased-process-startup"), [])
+                self.assertEqual(process_guard.close(), [])
+                process_closed = True
+            finally:
+                if not process_closed:
+                    process_guard.close()
+                process_closure.close()
+
+    @unittest.skipUnless(os.name == "nt", "requires the real ReadDirectoryChangesW backend")
+    def test_windows_real_watcher_protected_write_restore_and_same_size_are_sticky(
+        self,
+    ) -> None:
+        for operation in ("content-write", "change-and-restore", "same-size-replacement"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory(
+                prefix=f"ci8-rdcw-{operation}-"
+            ) as temp_dir:
+                closure, guard, helper = self.make_guard(
+                    Path(temp_dir),
+                    watcher_factory=ci._WindowsDirectoryMutationWatcher,
+                )
+                original = helper.read_bytes()
+                try:
+                    if operation == "content-write":
+                        helper.write_bytes(b"protected-content-changed")
+                    elif operation == "change-and-restore":
+                        helper.write_bytes(b"BBBB")
+                        helper.write_bytes(original)
+                    else:
+                        self.assertEqual(len(original), len(b"CCCC"))
+                        helper.write_bytes(b"CCCC")
+                    self.wait_for_guard(lambda: guard.mutated, operation)
+                    errors = guard.verify(operation)
+                    self.assertTrue(any("sticky" in error for error in errors), errors)
+                    self.assertTrue(
+                        any(
+                            event["protectedClass"] == "dependency-tree"
+                            and event["action"] == "modified"
+                            for event in guard.mutation_events
+                        ),
+                        guard.mutation_events,
+                    )
+                finally:
+                    guard.close()
+                    closure.close()
+
+    @unittest.skipUnless(os.name == "nt", "requires the real ReadDirectoryChangesW backend")
+    def test_windows_real_watcher_rename_delete_recreate_and_link_mutations_are_sticky(
+        self,
+    ) -> None:
+        for operation in ("rename-and-restore", "delete-recreate", "hardlink", "symlink-if-available"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory(
+                prefix=f"ci8-rdcw-{operation}-"
+            ) as temp_dir:
+                closure, guard, helper = self.make_guard(
+                    Path(temp_dir),
+                    watcher_factory=ci._WindowsDirectoryMutationWatcher,
+                )
+                original = helper.read_bytes()
+                attempted = True
+                try:
+                    alternate = helper.with_name(f"{helper.name}.alternate")
+                    if operation == "rename-and-restore":
+                        helper.rename(alternate)
+                        alternate.rename(helper)
+                    elif operation == "delete-recreate":
+                        helper.unlink()
+                        helper.write_bytes(original)
+                    elif operation == "hardlink":
+                        os.link(helper, alternate)
+                        alternate.write_bytes(b"BBBB")
+                    else:
+                        try:
+                            os.symlink(helper.name, alternate)
+                        except OSError:
+                            attempted = False
+                    if not attempted:
+                        self.assertFalse(alternate.exists())
+                        continue
+                    self.wait_for_guard(lambda: guard.mutated, operation)
+                    self.assertTrue(guard.verify(operation))
+                    actions = {event["action"] for event in guard.mutation_events}
+                    if operation == "rename-and-restore":
+                        self.assertTrue(
+                            {"renamed-old-name", "renamed-new-name"} & actions,
+                            guard.mutation_events,
+                        )
+                    elif operation == "delete-recreate":
+                        self.assertTrue({"removed", "added"} & actions, guard.mutation_events)
+                    self.assertTrue(
+                        all(event["protected"] for event in guard.mutation_events),
+                        guard.mutation_events,
+                    )
+                finally:
+                    guard.close()
+                    closure.close()
+
+    def test_windows_watcher_read_failure_unknown_event_and_overflow_fail_closed(self) -> None:
+        event_cases = (
+            ("read-failure", "ReadDirectoryChangesW failure=5 root=fixture", False),
+            (
+                "unknown-event",
+                {
+                    "backend": "ReadDirectoryChangesW",
+                    "kind": "filesystem-notification",
+                    "action": "unknown-99",
+                    "actionCode": 99,
+                    "root": "fixture",
+                    "relativePath": "member.bin",
+                },
+                False,
+            ),
+            ("overflow", "ReadDirectoryChangesW queue overflow root=fixture", True),
+        )
+        for label, event, overflow in event_cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory(
+                prefix=f"ci8-rdcw-failure-{label}-"
+            ) as temp_dir:
+                closure, guard, _helper = self.make_guard(Path(temp_dir))
+                try:
+                    guard.watcher.emit(event, overflow=overflow)
+                    errors = guard.verify(label)
+                    self.assertTrue(errors)
+                    self.assertTrue(guard.mutated)
+                    if overflow:
+                        self.assertTrue(guard.evidence()["queueOverflow"])
+                    if label == "unknown-event":
+                        self.assertTrue(
+                            any(
+                                item.get("failClosedReason") == "unknown watcher action"
+                                for item in guard.mutation_events
+                            ),
+                            guard.mutation_events,
+                        )
                 finally:
                     guard.close()
                     closure.close()

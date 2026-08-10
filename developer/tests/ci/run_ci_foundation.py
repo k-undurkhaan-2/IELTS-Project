@@ -9724,7 +9724,9 @@ def derive_canonical_failure_material(
             "executionInputMode": validated_command_record.get("actualExecutionInputMode"),
             "executionInputSize": validated_command_record.get("actualExecutionInputSize"),
             "executionInputSha256": validated_command_record.get("actualExecutionInputSha256"),
-            "executionInputs": validated_command_record.get("executionInputs"),
+            "executionInputs": _canonical_protected_execution_inputs(
+                validated_command_record
+            ),
             "executionInputBundleDigest": validated_command_record.get(
                 "executionInputBundleDigest"
             ),
@@ -10501,6 +10503,52 @@ def _portable_protected_execution_input_authority(
     }
 
 
+def _reconstructed_protected_execution_inputs(
+    command: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Rebuild successful bundle inputs from retained ordered target authority."""
+
+    if command.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE":
+        return []
+    targets = command.get("targets")
+    if not isinstance(targets, list) or not targets or any(
+        not isinstance(target, Mapping) for target in targets
+    ):
+        return []
+    return [
+        {
+            "logicalPath": target.get("path"),
+            "canonicalSourcePath": target.get("canonicalSourcePath"),
+            "plannedByteLength": target.get("size"),
+            "plannedSha256": target.get("sha256"),
+            "plannedStableIdentity": copy.deepcopy(target.get("fileIdentity")),
+            "actualByteLength": target.get("size"),
+            "actualSha256": target.get("sha256"),
+            "inputMode": command.get("executionInputMode"),
+        }
+        for target in targets
+    ]
+
+
+def _canonical_protected_execution_inputs(
+    command: Mapping[str, Any],
+) -> Any:
+    """Normalize full and compact valid bundle inputs to one replay value."""
+
+    inputs = command.get("executionInputs")
+    reconstructed = _reconstructed_protected_execution_inputs(command)
+    if reconstructed and (
+        inputs == reconstructed
+        or (
+            inputs == []
+            and command.get("executionInputBundleDigest")
+            == execution_input_bundle_digest(reconstructed)
+        )
+    ):
+        return []
+    return copy.deepcopy(inputs)
+
+
 def _protected_bundle_compact_identity_digests(
     command: Mapping[str, Any],
     *,
@@ -10645,6 +10693,9 @@ def _compact_command_record_for_evidence(
         return copy.deepcopy(source)
     if not isinstance(inputs, list) or len(inputs) != len(targets):
         return copy.deepcopy(source)
+    reconstructed_inputs = _reconstructed_protected_execution_inputs(source)
+    if inputs != reconstructed_inputs:
+        return copy.deepcopy(source)
     pre = bundle.get("preExecutionIdentities")
     post = bundle.get("postExecutionIdentities")
     expected_duplicates = {
@@ -10702,12 +10753,15 @@ def _compact_command_record_for_evidence(
         compact_bundle[key] = []
     compact_bundle["preExecutionIdentities"] = pre_digests
     compact_bundle["postExecutionIdentities"] = post_digests
+    compact["executionInputs"] = []
     compact["protectedTargetBundle"] = compact_bundle
     return compact
 
 
 def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
     source = dict(record)
+    if "executionInputs" in source:
+        source["executionInputs"] = _canonical_protected_execution_inputs(source)
     protected_source = source.get("protectedTargetBundle")
     if isinstance(protected_source, Mapping):
         source = {
@@ -10932,10 +10986,20 @@ def _command_authority_violations(
         len(command_records) == 1
         and command_records[0].get("commandId") == "command-results-size-limit"
     ):
+        parsed = command_records[0].get("parsedFailureSummary")
+        bounded_detail = (
+            parsed.get("diagnostic")
+            if isinstance(parsed, Mapping)
+            and isinstance(parsed.get("diagnostic"), str)
+            and parsed.get("diagnostic", "").startswith(
+                "OUTPUT-LIMIT-EXCEEDED for command-results.json "
+            )
+            else "OUTPUT-LIMIT-EXCEEDED for command-results.json"
+        )
         return [
             {
                 "id": "COMMAND-RESULT-JSON-LIMIT",
-                "detail": "OUTPUT-LIMIT-EXCEEDED for command-results.json",
+                "detail": bounded_detail,
             }
         ]
     expected = list(expected_plan or expected_command_authority(profile))
@@ -12153,6 +12217,61 @@ class _InotifyMutationWatcher(_MutationWatcher):
             self.callback("inotify watcher did not stop", True)
 
 
+_WINDOWS_DIRECTORY_CHANGE_ACTIONS = MappingProxyType(
+    {
+        1: "added",
+        2: "removed",
+        3: "modified",
+        4: "renamed-old-name",
+        5: "renamed-new-name",
+    }
+)
+
+
+def _windows_directory_change_events(data: bytes, root: str) -> list[dict[str, Any]]:
+    """Parse a bounded ReadDirectoryChangesW FILE_NOTIFY_INFORMATION buffer."""
+
+    events: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        if offset + 12 > len(data):
+            raise ValueError("FILE_NOTIFY_INFORMATION header is truncated")
+        next_offset, action_code, name_length = struct.unpack_from("<III", data, offset)
+        if name_length == 0 or name_length % 2:
+            raise ValueError("FILE_NOTIFY_INFORMATION name length is invalid")
+        name_start = offset + 12
+        name_end = name_start + name_length
+        if name_end > len(data):
+            raise ValueError("FILE_NOTIFY_INFORMATION name is truncated")
+        try:
+            relative_path = data[name_start:name_end].decode("utf-16-le", errors="strict")
+        except UnicodeError as exc:
+            raise ValueError("FILE_NOTIFY_INFORMATION name is not valid UTF-16LE") from exc
+        events.append(
+            {
+                "backend": "ReadDirectoryChangesW",
+                "kind": "filesystem-notification",
+                "action": _WINDOWS_DIRECTORY_CHANGE_ACTIONS.get(
+                    int(action_code), f"unknown-{int(action_code)}"
+                ),
+                "actionCode": int(action_code),
+                "root": root,
+                "relativePath": relative_path.replace("\\", "/"),
+            }
+        )
+        if next_offset == 0:
+            if name_end != len(data):
+                trailing = data[name_end:]
+                if any(trailing):
+                    raise ValueError("FILE_NOTIFY_INFORMATION has nonzero trailing bytes")
+            return events
+        if next_offset % 4 or next_offset < 12 + name_length:
+            raise ValueError("FILE_NOTIFY_INFORMATION next offset is invalid")
+        offset += next_offset
+        if offset >= len(data):
+            raise ValueError("FILE_NOTIFY_INFORMATION next offset leaves the buffer")
+
+
 class _WindowsDirectoryMutationWatcher(_MutationWatcher):
     def __init__(self, roots: Sequence[Path], callback: Any) -> None:
         from ctypes import wintypes
@@ -12250,7 +12369,20 @@ class _WindowsDirectoryMutationWatcher(_MutationWatcher):
             if returned.value == 0:
                 self.callback(f"ReadDirectoryChangesW queue overflow root={root}", True)
             else:
-                self.callback(f"ReadDirectoryChangesW mutation root={root}", False)
+                try:
+                    events = _windows_directory_change_events(
+                        bytes(buffer.raw[: returned.value]),
+                        root,
+                    )
+                except ValueError as exc:
+                    self.callback(
+                        "ReadDirectoryChangesW malformed notification "
+                        f"root={root} reason={type(exc).__name__}",
+                        False,
+                    )
+                    return
+                for event in events:
+                    self.callback(event, False)
 
     def close(self) -> None:
         if not hasattr(self, "stop_event"):
@@ -12335,6 +12467,62 @@ def _remeasure_dependency_semantics(
     return hashlib.sha256(_canonical_frame(semantic)).hexdigest(), member_count
 
 
+def _runtime_guard_path_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _runtime_guard_path_is_within(path_key: str, parent_key: str) -> bool:
+    try:
+        return os.path.commonpath((path_key, parent_key)) == parent_key
+    except ValueError:
+        return False
+
+
+def _runtime_guard_path_state(path: Path) -> dict[str, Any]:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return {"state": "absent"}
+    except OSError as exc:
+        return {"state": "unreadable", "errorClass": type(exc).__name__}
+    if stat.S_ISLNK(metadata.st_mode):
+        file_type = "symlink"
+    elif _is_reparse_point(metadata):
+        file_type = "reparse-point"
+    elif stat.S_ISDIR(metadata.st_mode):
+        file_type = "directory"
+    elif stat.S_ISREG(metadata.st_mode):
+        file_type = "regular-file"
+    else:
+        file_type = "other"
+    return {
+        "state": "present",
+        "fileType": file_type,
+        "mode": _portable_file_mode(metadata),
+        "size": int(metadata.st_size),
+        "objectIdentity": hashlib.sha256(
+            _canonical_frame(
+                {
+                    "deviceOrVolume": str(int(metadata.st_dev)),
+                    "inodeOrFileIndex": str(int(metadata.st_ino)),
+                }
+            )
+        ).hexdigest(),
+        "stableIdentityDigest": hashlib.sha256(
+            _canonical_frame(_stable_file_identity(metadata))
+        ).hexdigest(),
+    }
+
+
+def _runtime_guard_temporary_or_generated(relative_path: str) -> bool:
+    parts = [part.casefold() for part in relative_path.replace("\\", "/").split("/")]
+    leaf = parts[-1] if parts else ""
+    return bool(
+        any(part in {"tmp", "temp", "__pycache__", ".cache"} for part in parts)
+        or leaf.endswith((".tmp", ".temp", ".pyc", ".swp", "~"))
+    )
+
+
 class RuntimeDependencyClosureGuard:
     """Sticky native mutation guard for the verifier's fresh runtime closure."""
 
@@ -12349,10 +12537,67 @@ class RuntimeDependencyClosureGuard:
         self.repo_root = repo_root
         self.lock = threading.Lock()
         self.mutation_reasons: list[str] = []
+        self.mutation_events: list[dict[str, Any]] = []
+        self.ignored_events: list[dict[str, Any]] = []
+        self.ignored_event_count = 0
         self.queue_overflow = False
+        self.dependency_root_keys: dict[str, str] = {}
+        self.exact_protected_paths: dict[str, str] = {}
+        self.initial_authority: dict[str, dict[str, Any]] = {}
+        for index, dependency_root in enumerate(closure.dependency_roots):
+            resolved_root = dependency_root.resolve(strict=True)
+            root_key = _runtime_guard_path_key(resolved_root)
+            self.dependency_root_keys[root_key] = "dependency-tree"
+            self.initial_authority[root_key] = {
+                "state": "present",
+                "fileType": "directory",
+            }
+            dependency_documents = closure.document.get("dependencyRoots", [])
+            if index >= len(dependency_documents):
+                continue
+            root_document = dependency_documents[index]
+            if not isinstance(root_document, Mapping):
+                continue
+            members = root_document.get("members", [])
+            if not isinstance(members, list):
+                continue
+            for member in members:
+                if not isinstance(member, Mapping):
+                    continue
+                relative = member.get("relativePath")
+                if not isinstance(relative, str) or not relative:
+                    continue
+                member_path = resolved_root.joinpath(*relative.split("/"))
+                self.initial_authority[_runtime_guard_path_key(member_path)] = {
+                    key: copy.deepcopy(member.get(key))
+                    for key in ("fileType", "mode", "size", "sha256", "symlinkTarget")
+                }
+        self.exact_protected_object_identities: set[str] = set()
+        for role, lease in closure.leases.items():
+            lease_path = Path(lease.path).resolve(strict=True)
+            lease_key = _runtime_guard_path_key(lease_path)
+            self.exact_protected_paths[lease_key] = f"leased-executable:{role}"
+            initial_state = _runtime_guard_path_state(lease_path)
+            self.initial_authority[lease_key] = initial_state
+            object_identity = initial_state.get("objectIdentity")
+            if isinstance(object_identity, str):
+                self.exact_protected_object_identities.add(object_identity)
         roots = list(closure.dependency_roots)
         roots.extend(Path(lease.path).parent for lease in closure.leases.values())
         roots = sorted(set(roots), key=lambda value: str(value).casefold())
+        self.watched_root_classes: dict[str, str] = {}
+        for root in roots:
+            resolved_root = root.resolve(strict=True)
+            root_key = _runtime_guard_path_key(resolved_root)
+            classes: list[str] = []
+            if root_key in self.dependency_root_keys:
+                classes.append("dependency-root")
+            if any(
+                _runtime_guard_path_key(Path(lease.path).parent) == root_key
+                for lease in closure.leases.values()
+            ):
+                classes.append("leased-executable-parent")
+            self.watched_root_classes[root_key] = "+".join(classes) or "closure-watch-root"
         if watcher_factory is None:
             watcher_factory = (
                 _WindowsDirectoryMutationWatcher
@@ -12364,12 +12609,138 @@ class RuntimeDependencyClosureGuard:
         self.initial_dependency_digest = closure.dependency_digest
         self.initial_member_count = closure.member_count
 
-    def _record_event(self, reason: str, overflow: bool) -> None:
+    def _classify_event(self, event: Mapping[str, Any]) -> dict[str, Any]:
+        classified = {
+            "backend": event.get("backend"),
+            "kind": event.get("kind"),
+            "action": event.get("action"),
+            "actionCode": event.get("actionCode"),
+            "root": event.get("root"),
+            "relativePath": event.get("relativePath"),
+            "protected": True,
+            "protectedClass": "ambiguous-event",
+            "rootClass": "unknown",
+            "temporaryOrGenerated": False,
+            "directoryPathNotification": False,
+            "monitorSelfNoise": False,
+            "preIdentityState": "unknown",
+            "postIdentityState": "unknown",
+            "identityComparison": "unknown",
+            "failClosedReason": None,
+        }
+        if event.get("backend") != "ReadDirectoryChangesW" or event.get("kind") != "filesystem-notification":
+            classified["failClosedReason"] = "unknown watcher event kind"
+            return classified
+        action = event.get("action")
+        if action not in set(_WINDOWS_DIRECTORY_CHANGE_ACTIONS.values()):
+            classified["failClosedReason"] = "unknown watcher action"
+            return classified
+        root_text = event.get("root")
+        relative_text = event.get("relativePath")
+        if not isinstance(root_text, str) or not root_text or not isinstance(relative_text, str):
+            classified["failClosedReason"] = "watcher event path is unavailable"
+            return classified
+        normalized_relative = relative_text.replace("\\", "/")
+        relative_parts = normalized_relative.split("/")
+        relative_path = Path(normalized_relative.replace("/", os.sep))
+        if (
+            not normalized_relative
+            or relative_path.is_absolute()
+            or relative_path.drive
+            or any(part in {"", ".", ".."} for part in relative_parts)
+        ):
+            classified["failClosedReason"] = "watcher event relative path is unsafe"
+            return classified
+        root = Path(root_text)
+        root_key = _runtime_guard_path_key(root)
+        root_class = self.watched_root_classes.get(root_key)
+        if root_class is None:
+            classified["failClosedReason"] = "watcher event root is outside the armed set"
+            return classified
+        affected_path = Path(os.path.abspath(os.path.join(root_text, *relative_parts)))
+        affected_key = _runtime_guard_path_key(affected_path)
+        if not _runtime_guard_path_is_within(affected_key, root_key):
+            classified["failClosedReason"] = "watcher event escapes its root"
+            return classified
+        post_state = _runtime_guard_path_state(affected_path)
+        classified["rootClass"] = root_class
+        classified["temporaryOrGenerated"] = _runtime_guard_temporary_or_generated(
+            normalized_relative
+        )
+        classified["directoryPathNotification"] = bool(
+            action == "modified" and post_state.get("fileType") == "directory"
+        )
+        classified["postIdentityState"] = post_state.get("state", "unknown")
+        initial = self.initial_authority.get(affected_key)
+        classified["preIdentityState"] = "known" if initial is not None else "absent"
+        if initial is None:
+            classified["identityComparison"] = "initial-authority-absent"
+        elif post_state.get("state") != "present":
+            classified["identityComparison"] = "changed-or-unreadable"
+        else:
+            comparable = ("fileType", "mode", "size")
+            known_fields = [field for field in comparable if field in initial]
+            classified["identityComparison"] = (
+                "metadata-changed"
+                if any(initial.get(field) != post_state.get(field) for field in known_fields)
+                else "metadata-equal-content-unmeasured"
+            )
+        protected_class: str | None = self.exact_protected_paths.get(affected_key)
+        if protected_class is None:
+            for dependency_key, candidate_class in self.dependency_root_keys.items():
+                if _runtime_guard_path_is_within(affected_key, dependency_key):
+                    protected_class = candidate_class
+                    break
+        if protected_class is None and post_state.get("state") == "present":
+            object_identity = post_state.get("objectIdentity")
+            if object_identity in self.exact_protected_object_identities:
+                protected_class = "leased-executable-hardlink-alias"
+        if protected_class is None:
+            classified["protected"] = False
+            classified["protectedClass"] = "unprotected-watched-sibling"
+        else:
+            classified["protectedClass"] = protected_class
+        return classified
+
+    @staticmethod
+    def _event_reason(classified: Mapping[str, Any]) -> str:
+        reason = (
+            f"ReadDirectoryChangesW action={classified.get('action')} "
+            f"relativePath={classified.get('relativePath')} "
+            f"root={classified.get('root')} rootClass={classified.get('rootClass')} "
+            f"protectedClass={classified.get('protectedClass')} "
+            f"directoryPathNotification={str(bool(classified.get('directoryPathNotification'))).lower()} "
+            f"temporaryOrGenerated={str(bool(classified.get('temporaryOrGenerated'))).lower()} "
+            f"preIdentity={classified.get('preIdentityState')} "
+            f"postIdentity={classified.get('postIdentityState')} "
+            f"identityComparison={classified.get('identityComparison')}"
+        )
+        failure = classified.get("failClosedReason")
+        if failure:
+            reason += f" failClosed={failure}"
+        return _truncate_utf8(sanitize_text(reason), 2_048)
+
+    def _record_event(self, reason: Any, overflow: bool) -> None:
+        classified: dict[str, Any] | None = None
+        if isinstance(reason, Mapping):
+            classified = self._classify_event(reason)
         with self.lock:
             if overflow:
                 self.queue_overflow = True
+            if classified is not None and not overflow and not classified["protected"]:
+                self.ignored_event_count += 1
+                if len(self.ignored_events) < 256:
+                    self.ignored_events.append(copy.deepcopy(classified))
+                return
+            if classified is not None and len(self.mutation_events) < 256:
+                self.mutation_events.append(copy.deepcopy(classified))
             if len(self.mutation_reasons) < 256:
-                self.mutation_reasons.append(sanitize_text(reason))
+                event_reason = (
+                    self._event_reason(classified)
+                    if classified is not None
+                    else _truncate_utf8(sanitize_text(str(reason)), 2_048)
+                )
+                self.mutation_reasons.append(event_reason)
 
     @property
     def mutated(self) -> bool:
@@ -12418,7 +12789,7 @@ class RuntimeDependencyClosureGuard:
         errors = self.verify("verifier-completion")
         self.watcher.close()
         self.active = False
-        errors.extend(self.closure.verify_executables())
+        errors.extend(self.verify("watcher-closed"))
         return sorted(set(errors))
 
 
@@ -13791,6 +14162,145 @@ def _protected_snapshot_environment(
     return snapshot_environment
 
 
+def _write_exclusive_private_file(path: Path, data: bytes) -> None:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as output:
+            output.write(data)
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+
+
+def _materialize_protected_git_projection(
+    snapshot_root: Path,
+    bundle: ProtectedTargetBundle,
+) -> None:
+    """Create a read-only semantic Git projection from held target bytes.
+
+    The bundle-normalization suite asks Git only about tracked membership,
+    ignore rules, and attributes.  Copying live repository metadata into the
+    isolated snapshot would cross the protected-input boundary, so construct
+    the minimal index directly from the already-authorized target set.
+    """
+
+    evidence = bundle.evidence()
+    logical_paths = evidence.get("orderedLogicalTargetPaths")
+    if not isinstance(logical_paths, list) or not logical_paths:
+        raise OSError("protected Git projection target set is unavailable")
+    records: list[tuple[bytes, bytes, int]] = []
+    seen: set[bytes] = set()
+    for value in logical_paths:
+        if not isinstance(value, str) or not value:
+            raise OSError("protected Git projection path is invalid")
+        parts = value.split("/")
+        if (
+            value.startswith(("/", "\\"))
+            or "\\" in value
+            or any(part in {"", ".", "..", ".git"} for part in parts)
+        ):
+            raise OSError("protected Git projection path is unsafe")
+        encoded = value.encode("utf-8", errors="strict")
+        if b"\x00" in encoded or encoded in seen:
+            raise OSError("protected Git projection path is duplicated or malformed")
+        seen.add(encoded)
+        data = bundle.bytes_for(value)
+        object_header = b"blob " + str(len(data)).encode("ascii") + b"\x00"
+        object_id = hashlib.sha1(object_header + data).digest()
+        records.append((encoded, object_id, len(data)))
+    records.sort(key=lambda item: item[0])
+    index = bytearray(struct.pack(">4sII", b"DIRC", 2, len(records)))
+    for encoded, object_id, data_length in records:
+        flags = min(len(encoded), 0x0FFF)
+        entry = bytearray(
+            struct.pack(
+                ">10I20sH",
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0o100644,
+                0,
+                0,
+                data_length,
+                object_id,
+                flags,
+            )
+        )
+        entry.extend(encoded)
+        entry.append(0)
+        entry.extend(b"\x00" * ((8 - (len(entry) % 8)) % 8))
+        index.extend(entry)
+    index.extend(hashlib.sha1(index).digest())
+
+    git_directory = snapshot_root / ".git"
+    git_directory.mkdir(mode=0o700)
+    (git_directory / "objects").mkdir(mode=0o700)
+    (git_directory / "refs").mkdir(mode=0o700)
+    (git_directory / "refs" / "heads").mkdir(mode=0o700)
+    _write_exclusive_private_file(
+        git_directory / "HEAD",
+        b"ref: refs/heads/protected-snapshot\n",
+    )
+    _write_exclusive_private_file(
+        git_directory / "config",
+        (
+            b"[core]\n"
+            b"\trepositoryformatversion = 0\n"
+            b"\tfilemode = false\n"
+            b"\tbare = false\n"
+            b"\tlogallrefupdates = false\n"
+        ),
+    )
+    _write_exclusive_private_file(git_directory / "index", bytes(index))
+    runtime_home = git_directory / "runtime-home"
+    runtime_home.mkdir(mode=0o700)
+    (runtime_home / "xdg").mkdir(mode=0o700)
+    _write_exclusive_private_file(runtime_home / "global.gitconfig", b"")
+
+
+def _protected_snapshot_git_environment(
+    environment: Mapping[str, str],
+    snapshot_root: Path,
+) -> dict[str, str]:
+    isolated = dict(environment)
+    runtime_home = snapshot_root / ".git" / "runtime-home"
+    global_config = runtime_home / "global.gitconfig"
+    if not runtime_home.is_dir() or not global_config.is_file():
+        raise OSError("protected Git projection runtime home is unavailable")
+    isolated.update(
+        {
+            "HOME": str(runtime_home),
+            "USERPROFILE": str(runtime_home),
+            "XDG_CONFIG_HOME": str(runtime_home / "xdg"),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(global_config),
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CEILING_DIRECTORIES": str(snapshot_root.parent.resolve(strict=True)),
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "safe.directory",
+            "GIT_CONFIG_VALUE_0": str(snapshot_root.resolve(strict=True)),
+        }
+    )
+    return isolated
+
+
 def execute_planned_static_suite(
     plan_record: Mapping[str, Any],
     *,
@@ -13849,6 +14359,10 @@ def execute_planned_static_suite(
                     pass
                 raise
 
+        git_projection_enabled = plan_record.get("commandId") == "bundle-normalization"
+        if git_projection_enabled:
+            _materialize_protected_git_projection(snapshot_root, bundle)
+
         if phase_hook is not None:
             phase_hook("after-snapshot-before-process-launch", bundle)
         okay, error = bundle.verify()
@@ -13858,6 +14372,11 @@ def execute_planned_static_suite(
             env,
             repo_root=repo_root,
         )
+        if git_projection_enabled:
+            snapshot_environment = _protected_snapshot_git_environment(
+                snapshot_environment,
+                snapshot_root,
+            )
         capture = execute_command(
             str(plan_record.get("commandId", "static-suite")),
             str(plan_record.get("commandClass", "static-suite")),
@@ -17092,6 +17611,8 @@ def _validate_command_record(
                 errors.append(f"{target_label}: reparsePoint is invalid")
     execution_inputs = record.get("executionInputs")
     execution_input_digest = record.get("executionInputBundleDigest")
+    compact_execution_input_reference = False
+    validated_execution_inputs: list[Any] = []
     input_keys = {
         "logicalPath",
         "canonicalSourcePath",
@@ -17106,7 +17627,17 @@ def _validate_command_record(
         errors.append(f"{label}: executionInputs must be a bounded array")
         execution_inputs = []
     else:
-        for input_index, execution_input in enumerate(execution_inputs):
+        validated_execution_inputs = execution_inputs
+        if execution_input_mode == "PROTECTED-TARGET-BUNDLE" and execution_inputs == []:
+            reconstructed_inputs = _reconstructed_protected_execution_inputs(record)
+            if (
+                reconstructed_inputs
+                and execution_input_digest
+                == execution_input_bundle_digest(reconstructed_inputs)
+            ):
+                compact_execution_input_reference = True
+                validated_execution_inputs = reconstructed_inputs
+        for input_index, execution_input in enumerate(validated_execution_inputs):
             input_label = f"{label}.executionInputs[{input_index}]"
             if not isinstance(execution_input, dict) or set(execution_input) != input_keys:
                 errors.append(f"{input_label}: schema is not exact")
@@ -17133,7 +17664,9 @@ def _validate_command_record(
             ):
                 errors.append(f"{input_label}: actual input identity differs from planned bytes")
     expected_input_digest = (
-        execution_input_bundle_digest(execution_inputs) if execution_inputs else None
+        execution_input_bundle_digest(validated_execution_inputs)
+        if validated_execution_inputs
+        else None
     )
     if execution_input_digest != expected_input_digest:
         errors.append(f"{label}: executionInputBundleDigest is invalid")
@@ -17282,7 +17815,8 @@ def _validate_command_record(
                     common_invalid
                     or record.get("executed") is not True
                     or not targets
-                    or len(execution_inputs) != len(targets)
+                    or not compact_execution_input_reference
+                    or len(validated_execution_inputs) != len(targets)
                     or len(
                         {
                             target.get("path")
@@ -17317,7 +17851,7 @@ def _validate_command_record(
                         f"{label}: protectedTargetBundle does not bind the command plan"
                     )
                 if record.get("executed") is True and (
-                    len(execution_inputs) != len(targets)
+                    len(validated_execution_inputs) != len(targets)
                     or protected_bundle.get("mutationDetected") is not False
                     or len(pre_identities) != len(targets)
                     or len(post_identities) != len(targets)
@@ -17886,6 +18420,41 @@ def _validate_evidence_semantics(
         errors.append(
             "command-results.json: PASS transcript has missing, extra, or duplicate command IDs"
         )
+    reconstructed_command_observations: list[dict[str, Any]] = []
+    observation_context = {
+        "producerObservationUniverseDigest": universe_digest,
+        "producerTranscriptDigest": transcript_digest,
+        "profileCompletedCommandClassSetDigest": actual_class_digest,
+        "authorizationContextBindingDigest": (
+            authorization_context_binding_digest_value
+        ),
+    }
+    for record in valid_command_records:
+        producer_items = record.get("producerObservations")
+        if not isinstance(producer_items, list):
+            continue
+        for raw in producer_items:
+            if not isinstance(raw, Mapping):
+                continue
+            try:
+                reconstructed_command_observations.append(
+                    _rederive_observation_record(
+                        {"rawObservation": raw},
+                        record,
+                        profile_context=observation_context,
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                errors.append(
+                    "command-results.json: raw producer observation cannot be "
+                    f"independently reconstructed ({type(exc).__name__})"
+                )
+    if command_observations not in ([], reconstructed_command_observations):
+        errors.append(
+            "command-results.json: derived observation projection differs from "
+            "independently reconstructed raw producer authority"
+        )
+    command_observations = reconstructed_command_observations
     for index, item in enumerate(command_observations):
         if not isinstance(item, Mapping):
             continue
@@ -18271,7 +18840,7 @@ def compare_verification_replay_claims(
         "actualCompletedCommandClasses"
     ):
         errors.append("verification replay completedCommandClasses mismatch")
-    if commands.get("observations") != runner.observations:
+    if commands.get("observations") not in ([], runner.observations):
         errors.append("verification replay producer observations mismatch")
     if comparison is not None:
         replay_sets = {
@@ -18610,6 +19179,111 @@ def render_summary_markdown(summary: Mapping[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _bounded_json_contribution_units(value: Any, *, depth: int = 0) -> int:
+    """Count compact JSON units without materializing another large transcript."""
+
+    if depth > MAX_EVIDENCE_JSON_DEPTH + 4:
+        return 0
+    if isinstance(value, Mapping):
+        items = list(value.items())
+        return 2 + max(0, len(items) - 1) + sum(
+            _bounded_json_contribution_units(str(key), depth=depth + 1)
+            + 1
+            + _bounded_json_contribution_units(item, depth=depth + 1)
+            for key, item in items
+        )
+    if isinstance(value, (list, tuple)):
+        return 2 + max(0, len(value) - 1) + sum(
+            _bounded_json_contribution_units(item, depth=depth + 1)
+            for item in value
+        )
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    )
+
+
+def _command_result_size_limit_detail(
+    document: Mapping[str, Any],
+    *,
+    total_bytes: int,
+) -> str:
+    """Return fixed-category, path-free telemetry for a bounded sentinel."""
+
+    records = document.get("records")
+    record_list = records if isinstance(records, list) else []
+    record_families = {
+        "record-targets": ("targets",),
+        "record-execution-inputs": ("executionInputs",),
+        "record-protected-bundles": ("protectedTargetBundle",),
+        "record-producer-observations": ("producerObservations",),
+        "record-diagnostics": (
+            "error",
+            "limitReason",
+            "processTreeError",
+            "diagnosticPreview",
+            "parsedFailureSummary",
+        ),
+        "record-runtime-containment": (
+            "fileScans",
+            "runtimeClosureGuard",
+            "runtimeClosureDigest",
+            "dependencyClosureDigest",
+            "nodePath",
+        ),
+    }
+    contributions: dict[str, int] = {}
+    claimed_record_units = 0
+    for label, fields in record_families.items():
+        value = sum(
+            _bounded_json_contribution_units(record.get(field))
+            for record in record_list
+            if isinstance(record, Mapping)
+            for field in fields
+            if field in record
+        )
+        contributions[label] = value
+        claimed_record_units += value
+    total_record_units = _bounded_json_contribution_units(record_list)
+    contributions["record-other"] = max(
+        0, total_record_units - claimed_record_units
+    )
+    for label, fields in (
+        ("command-authority", ("commandAuthority",)),
+        ("observations", ("observations",)),
+        (
+            "runtime",
+            ("runtime", "runtimeDependencyClosure", "runtimeDependencyGuard"),
+        ),
+        (
+            "bindings",
+            (
+                "executionBinding",
+                "authorizationContextBinding",
+            ),
+        ),
+    ):
+        contributions[label] = sum(
+            _bounded_json_contribution_units(document.get(field))
+            for field in fields
+        )
+    ranked = sorted(
+        contributions.items(),
+        key=lambda item: (-item[1], item[0]),
+    )[:6]
+    rendered = ",".join(f"{label}:{value}" for label, value in ranked)
+    return (
+        "OUTPUT-LIMIT-EXCEEDED for command-results.json "
+        f"total_bytes={total_bytes} limit_bytes={MAX_COMMAND_RESULTS_JSON_BYTES} "
+        f"approx_contributions={rendered}"
+    )
+
+
 def write_evidence(
     runner: FoundationRunner,
     comparison: Mapping[str, Any],
@@ -18778,7 +19452,9 @@ def write_evidence(
         "profile": runner.profile,
         "platform": runner.platform,
         "records": evidence_records,
-        "observations": observations,
+        # Derived observation projections are rebuilt from the retained raw
+        # per-record producer observations by every verifier/replay.
+        "observations": [],
         "completedCommandClasses": completed_command_classes,
         "expectedCompletedCommandClasses": list(
             runner.expected_completed_command_classes
@@ -18805,10 +19481,14 @@ def write_evidence(
     }
     command_bytes = _json_bytes(command_document)
     if len(command_bytes) > MAX_COMMAND_RESULTS_JSON_BYTES:
+        size_limit_detail = _command_result_size_limit_detail(
+            command_document,
+            total_bytes=len(command_bytes),
+        )
         runner.violations.append(
             {
                 "id": "COMMAND-RESULT-JSON-LIMIT",
-                "detail": "OUTPUT-LIMIT-EXCEEDED for command-results.json",
+                "detail": size_limit_detail,
             }
         )
         runner_tools = getattr(runner, "tools", {})
@@ -18855,7 +19535,7 @@ def write_evidence(
                 "command-results-size-limit",
                 "evidence-size-limit",
                 False,
-                "command result evidence exceeded its fixed JSON limit",
+                size_limit_detail,
                 execution_authority=approved_python,
                 observed_execution_authority=observed_python,
             ),
