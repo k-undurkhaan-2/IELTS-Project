@@ -3918,6 +3918,7 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
                     tools=trusted_tools,
                     source_environment=os.environ,
                 )
+                self.addCleanup(runner.cleanup_task_resources)
                 runner.run_static_profile()
             return runner, report_path.exists()
 
