@@ -10913,6 +10913,11 @@ class CI8RuntimeDependencyClosureTest(unittest.TestCase):
     def local_tool_authority(self) -> tuple[ci.ToolAuthorityPolicy, dict[str, str]]:
         return _resolved_local_test_authority("python", "node", "git")
 
+    @staticmethod
+    def make_hostile_path_fixture_executable(path: Path) -> None:
+        if os.name != "nt":
+            path.chmod(stat.S_IMODE(path.stat().st_mode) | 0o111)
+
     def make_guard(
         self,
         root: Path,
@@ -11113,6 +11118,22 @@ class CI8RuntimeDependencyClosureTest(unittest.TestCase):
                 [str(workspace), str(Path(approved_node).parent)]
             )
             shadow_source["GITHUB_WORKSPACE"] = str(workspace)
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(fake_node.stat().st_mode) & 0o111, 0)
+                non_executable_tools, non_executable_errors = ci.resolve_trusted_tools(
+                    {"node"},
+                    source_environment=shadow_source,
+                    repo_root=workspace,
+                )
+                self.assertEqual(
+                    Path(non_executable_tools["node"]),
+                    Path(approved_node).resolve(strict=True),
+                )
+                self.assertFalse(
+                    any("tool=node" in error for error in non_executable_errors),
+                    non_executable_errors,
+                )
+            self.make_hostile_path_fixture_executable(fake_node)
             tools, errors = ci.resolve_trusted_tools(
                 {"node"},
                 source_environment=shadow_source,
@@ -11125,13 +11146,20 @@ class CI8RuntimeDependencyClosureTest(unittest.TestCase):
             )
             fake_npm = workspace / ("npm.cmd" if os.name == "nt" else "npm")
             fake_npm.write_bytes(b"fake-npm")
+            self.make_hostile_path_fixture_executable(fake_npm)
             npm_tools, npm_errors = ci.resolve_trusted_tools(
                 {"npm"},
                 source_environment=shadow_source,
                 repo_root=workspace,
             )
             self.assertNotIn("npm", npm_tools)
-            self.assertTrue(npm_errors)
+            self.assertTrue(
+                any(
+                    ci.PATH_WORKSPACE_OR_TEMP_AUTHORITY in error
+                    for error in npm_errors
+                ),
+                npm_errors,
+            )
 
     def test_runtime_node_shadow_matrix_rejects_workspace_temp_and_node_modules_bin(self) -> None:
         _policy, approved_tools = self.local_tool_authority()
@@ -11151,6 +11179,7 @@ class CI8RuntimeDependencyClosureTest(unittest.TestCase):
                 with self.subTest(label=label):
                     fake = directory / ("node.exe" if os.name == "nt" else "node")
                     fake.write_bytes(b"untrusted-node-shadow")
+                    self.make_hostile_path_fixture_executable(fake)
                     source = dict(os.environ)
                     source["PATH"] = os.pathsep.join(
                         [str(directory), str(Path(approved_node).parent)]
