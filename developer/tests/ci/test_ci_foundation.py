@@ -1384,6 +1384,145 @@ def contained_capture(
     )
 
 
+def r03_static_failure_detail(
+    logical_target: str,
+    physical_root: str,
+    executable: str,
+) -> str:
+    separator = "\\" if re.match(r"^[A-Za-z]:", physical_root) else "/"
+    physical_target = physical_root.rstrip("/\\") + separator + logical_target.replace(
+        "/",
+        separator,
+    )
+
+    def failed_command(arguments: list[str], exit_code: int) -> str:
+        return (
+            f"Command '{arguments!r}' returned non-zero exit status {exit_code}."
+        )
+
+    if logical_target.endswith(
+        (
+            "simulation_nb_drag_regression.py",
+            "simulation_roundtrip_restore_regression.py",
+            "unified_submit_readonly_regression.py",
+        )
+    ):
+        return (
+            '执行失败: {"status": "fail", "detail": "playwright_python_missing"}\n'
+            + failed_command([executable, physical_target], 1)
+        )
+    if logical_target.endswith("reading_question_audit.py"):
+        return (
+            "执行失败: Playwright Python 未安装且无法切换到 .venv，审计无法执行。\n"
+            + failed_command(
+                [executable, physical_target, "--mode", "quick"],
+                2,
+            )
+        )
+    if logical_target.endswith("practiceCustomCard.test.js"):
+        payload = {
+            "status": "fail",
+            "detail": "背面组件选择区应使用单列 grid，避免横向挤压",
+            "checks": [{"name": "自定义卡片 DOM 结构守卫", "detail": {}}],
+        }
+    elif logical_target.endswith("onDemandEntrypoints.test.js"):
+        payload = {
+            "status": "fail",
+            "detail": "document.querySelectorAll is not a function",
+            "results": [
+                {
+                    "name": "on-demand 入口测试执行失败",
+                    "passed": False,
+                    "detail": {"error": "document.querySelectorAll is not a function"},
+                    "timestamp": "2026-08-12T11:05:12.899Z",
+                }
+            ],
+        }
+    else:  # pragma: no cover - closed fixture inventory
+        raise AssertionError(logical_target)
+    return (
+        "执行失败: "
+        + json.dumps(payload, ensure_ascii=False, indent=2)
+        + "\n"
+        + failed_command(["node", physical_target], 1)
+    )
+
+
+def r03_node_failure_output(logical_target: str, physical_root: str) -> str:
+    root = physical_root.rstrip("/\\").replace("\\", "/")
+    physical_uri = "file:///" + root.lstrip("/") + "/" + logical_target
+    if logical_target.endswith("adminFrontendGuard.test.js"):
+        return f"""backend/admin/admin.js:83
+        exportButtons: Array.from(document.querySelectorAll('[data-export-dataset]')),
+                                           ^
+
+TypeError: document.querySelectorAll is not a function
+    at backend/admin/admin.js:83:44
+    at backend/admin/admin.js:874:3
+    at Script.runInContext (node:vm:149:12)
+    at Object.runInContext (node:vm:301:6)
+    at {physical_uri}:113:4
+    at ModuleJob.run (node:internal/modules/esm/module_job:430:25)
+
+Node.js v24.14.0
+✖ developer\\tests\\js\\adminFrontendGuard.test.js (258.6937ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 273.5459
+
+✖ failing tests:
+
+test at developer\\tests\\js\\adminFrontendGuard.test.js:1:1
+✖ developer\\tests\\js\\adminFrontendGuard.test.js (258.6937ms)
+  'test failed'
+"""
+    if logical_target.endswith("localDataRenderingGuard.test.js"):
+        message = (
+            "vocab store must cap stored list size, normalize long imported word "
+            "fields, and return defensive clones"
+        )
+        return f"""node:internal/modules/run_main:107
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: {message}
+    at {physical_uri}:566:1
+    at ModuleJob.run (node:internal/modules/esm/module_job:430:25)
+    at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:661:26)
+    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5) {{
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: false,
+  expected: true,
+  operator: '==',
+  diff: 'simple'
+}}
+
+Node.js v24.14.0
+✖ developer\\tests\\js\\localDataRenderingGuard.test.js (151.5622ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 159.7374
+
+✖ failing tests:
+
+test at developer\\tests\\js\\localDataRenderingGuard.test.js:1:1
+✖ developer\\tests\\js\\localDataRenderingGuard.test.js (151.5622ms)
+  'test failed'
+"""
+    raise AssertionError(logical_target)  # pragma: no cover - closed fixture inventory
+
+
 class BaselineSchemaTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -1830,15 +1969,498 @@ class ComparisonPolicyTest(unittest.TestCase):
         self.assertIn("UNKNOWN-NONPASS", [item["id"] for item in result["violations"]])
 
     def test_exact_complete_node_failure_identity_is_accepted(self) -> None:
-        baseline, entry = self.baseline_with_known_id("E-ADMIN-FRONTEND-DOM-STUB")
-        identity = ci._known_identity_expected(entry["testOrPathScope"])
-        observed = ci.observation(
-            entry["commandClass"], entry["testOrPathScope"], "fail",
-            entry["allowedNormalizedSignature"][0], source_command_id(entry), failure_identity=identity,
+        entry_ids = {
+            "B-STATIC-PY-PLAYWRIGHT-READING-QUICK-AUDIT",
+            "B-STATIC-PY-PLAYWRIGHT-NB-DRAG",
+            "B-STATIC-PY-PLAYWRIGHT-ROUNDTRIP",
+            "B-STATIC-PY-PLAYWRIGHT-UNIFIED-SUBMIT",
+            "B-STATIC-PRACTICE-CUSTOM-CARD-LAYOUT",
+            "B-STATIC-ON-DEMAND-HARNESS-DOM-STUB",
+            "E-ADMIN-FRONTEND-DOM-STUB",
+            "E-WINDOWS-LOCAL-DATA-CRLF-ASSERTION",
+        }
+        entries = {
+            entry["id"]: entry
+            for entry in self.full_baseline["knownDebts"]
+            if entry["id"] in entry_ids
+        }
+        self.assertEqual(set(entries), entry_ids)
+
+        def baseline_for(entry: Mapping) -> dict:
+            baseline = copy.deepcopy(self.full_baseline)
+            baseline["knownDebts"] = [copy.deepcopy(entry)]
+            baseline["expectedOmissions"] = []
+            baseline["releaseOnlySkips"] = []
+            return baseline
+
+        def source_record(
+            entry: Mapping,
+            targets: list[str],
+            *,
+            tool_role: str,
+            platform_name: str,
+        ) -> dict:
+            authorities = [ci._target_authority(ci.REPO_ROOT, target) for target in targets]
+            specification = synthetic_command_spec(
+                source_command_id(entry),
+                str(entry["commandClass"]),
+                0,
+                command_role="observation-producing",
+                allowed_exits=[0, 1, 2],
+                targets=authorities,
+                execution_input_mode="PROTECTED-TARGET-BUNDLE",
+            )
+            specification["toolRole"] = tool_role
+            specification["profile"] = (
+                "static" if entry["commandClass"] == "static-suite" else "frontend"
+            )
+            specification["platform"] = platform_name
+            return synthetic_record_from_spec(specification, passed=False)
+
+        def derived_observation(
+            entry: Mapping,
+            record: dict,
+            raw_fields: Mapping,
+            binding: Mapping,
+            *,
+            source_path: str,
+            occurrences: int = 1,
+        ) -> tuple[dict, dict]:
+            scope = str(entry["testOrPathScope"])
+            source_result = scope.removeprefix("result:")
+            raw = ci.make_raw_observation(
+                str(record["commandId"]),
+                int(record["ordinal"]),
+                0,
+                (
+                    "static-producer-v1"
+                    if entry["commandClass"] == "static-suite"
+                    else "process-output-v1"
+                ),
+                source_result,
+                source_path,
+                raw_fields,
+                ci.command_output_digest(record),
+                occurrences,
+                failure_path_authority=binding,
+            )
+            self.assertEqual(
+                ci._validate_raw_observation(raw, label="r03-fixture", source=record),
+                [],
+            )
+            record = copy.deepcopy(record)
+            record["producerObservations"] = [raw]
+            record["producerObservationSetDigest"] = ci.producer_observation_set_digest(
+                record["producerObservations"]
+            )
+            observed = ci._rederive_observation_record(
+                {"rawObservation": raw},
+                record,
+            )
+            return observed, record
+
+        def assert_classification(
+            entry: Mapping,
+            observed: Mapping,
+            record: Mapping,
+            *,
+            platform_name: str,
+            known: bool,
+        ) -> dict:
+            result = ci.compare_observations(
+                baseline_for(entry),
+                [observed],
+                {str(entry["commandClass"])},
+                platform_name,
+                command_records=[record],
+            )
+            violation_ids = [item["id"] for item in result["violations"]]
+            if known:
+                self.assertEqual(violation_ids, [])
+                self.assertEqual(result["observedDebts"][0]["id"], entry["id"])
+            else:
+                self.assertIn("UNKNOWN-NONPASS", violation_ids)
+            return result
+
+        ubuntu_repository = "/home/runner/work/IELTS-practice/IELTS-practice"
+        ubuntu_snapshot = "/tmp/cs-r03"
+        ubuntu_python = "/opt/hostedtoolcache/Python/3.14.0/x64/python"
+        static_entries = [
+            entries[entry_id]
+            for entry_id in (
+                "B-STATIC-PY-PLAYWRIGHT-READING-QUICK-AUDIT",
+                "B-STATIC-PY-PLAYWRIGHT-NB-DRAG",
+                "B-STATIC-PY-PLAYWRIGHT-ROUNDTRIP",
+                "B-STATIC-PY-PLAYWRIGHT-UNIFIED-SUBMIT",
+                "B-STATIC-PRACTICE-CUSTOM-CARD-LAYOUT",
+                "B-STATIC-ON-DEMAND-HARNESS-DOM-STUB",
+            )
+        ]
+        for entry in static_entries:
+            scope = str(entry["testOrPathScope"])
+            logical_target = ci.R03_FAILURE_TARGETS[scope]
+            authority = ci._coerce_failure_path_authority(
+                ubuntu_repository,
+                ubuntu_snapshot,
+                [logical_target],
+                trusted_executables=[("python-static-producer", ubuntu_python)],
+            )
+            canonical_variants: list[tuple[dict, dict]] = []
+            for representation, physical_root in (
+                ("ubuntu-live", ubuntu_repository),
+                ("ubuntu-snapshot", ubuntu_snapshot),
+            ):
+                with self.subTest(entry=entry["id"], representation=representation):
+                    result_fields = {
+                        "name": scope.removeprefix("result:"),
+                        "status": "fail",
+                        "detail": r03_static_failure_detail(
+                            logical_target,
+                            physical_root,
+                            ubuntu_python,
+                        ),
+                    }
+                    canonical_result, binding = ci.canonicalize_failure_identity_value(
+                        result_fields,
+                        authority,
+                    )
+                    canonical_variants.append((canonical_result, binding))
+                    identity = ci.structured_failure_identity(
+                        scope,
+                        canonical_result["detail"],
+                        path_authority=binding,
+                    )
+                    self.assertEqual(
+                        ci.static_failure_signature(
+                            scope,
+                            canonical_result["detail"],
+                            identity,
+                        ),
+                        entry["allowedNormalizedSignature"][0],
+                    )
+                    record = source_record(
+                        entry,
+                        [logical_target],
+                        tool_role="python-static-producer",
+                        platform_name="ubuntu",
+                    )
+                    observed, bound_record = derived_observation(
+                        entry,
+                        record,
+                        canonical_result,
+                        binding,
+                        source_path=ci.STATIC_SUITE_RELATIVE_PATH,
+                    )
+                    assert_classification(
+                        entry,
+                        observed,
+                        bound_record,
+                        platform_name="ubuntu",
+                        known=True,
+                    )
+            self.assertEqual(canonical_variants[0], canonical_variants[1])
+
+            mutated_result = copy.deepcopy(canonical_variants[0][0])
+            mutated_result["detail"] += "\nR03 non-path mutation"
+            mutation_record = source_record(
+                entry,
+                [logical_target],
+                tool_role="python-static-producer",
+                platform_name="ubuntu",
+            )
+            mutated, mutated_record = derived_observation(
+                entry,
+                mutation_record,
+                mutated_result,
+                canonical_variants[0][1],
+                source_path=ci.STATIC_SUITE_RELATIVE_PATH,
+            )
+            with self.subTest(entry=entry["id"], mutation="non-path-message"):
+                assert_classification(
+                    entry,
+                    mutated,
+                    mutated_record,
+                    platform_name="ubuntu",
+                    known=False,
+                )
+
+        windows_repository = r"D:\a\IELTS-practice\IELTS-practice"
+        windows_snapshot = r"C:\Users\RUNNER~1\AppData\Local\Temp\cs-r03"
+        node_entries = [
+            entries["E-ADMIN-FRONTEND-DOM-STUB"],
+            entries["E-WINDOWS-LOCAL-DATA-CRLF-ASSERTION"],
+        ]
+        for entry in node_entries:
+            scope = str(entry["testOrPathScope"])
+            logical_target = ci.R03_FAILURE_TARGETS[scope]
+            source_targets = [logical_target]
+            if logical_target.endswith("adminFrontendGuard.test.js"):
+                source_targets.append("backend/admin/admin.js")
+            authority = ci._coerce_failure_path_authority(
+                windows_repository,
+                windows_snapshot,
+                source_targets,
+            )
+            canonical_variants = []
+            for representation, physical_root in (
+                ("windows-live", windows_repository),
+                ("windows-snapshot", windows_snapshot),
+            ):
+                with self.subTest(entry=entry["id"], representation=representation):
+                    fields = {
+                        "executed": True,
+                        "exitCode": 1,
+                        "stdout": r03_node_failure_output(
+                            logical_target,
+                            physical_root,
+                        ),
+                        "stderr": "",
+                        "error": None,
+                    }
+                    canonical_fields, binding = ci.canonicalize_failure_identity_value(
+                        fields,
+                        authority,
+                    )
+                    canonical_variants.append((canonical_fields, binding))
+                    self.assertEqual(
+                        ci.node_failure_signature(
+                            scope,
+                            canonical_fields["stdout"],
+                            path_authority=binding,
+                        ),
+                        entry["allowedNormalizedSignature"][0],
+                    )
+                    record = source_record(
+                        entry,
+                        source_targets,
+                        tool_role="node-security-test",
+                        platform_name="windows",
+                    )
+                    observed, bound_record = derived_observation(
+                        entry,
+                        record,
+                        canonical_fields,
+                        binding,
+                        source_path=logical_target,
+                    )
+                    assert_classification(
+                        entry,
+                        observed,
+                        bound_record,
+                        platform_name="windows",
+                        known=True,
+                    )
+            self.assertEqual(canonical_variants[0], canonical_variants[1])
+
+            mutated_fields = copy.deepcopy(canonical_variants[0][0])
+            mutated_fields["stdout"] = mutated_fields["stdout"].replace(
+                next(iter(ci.KNOWN_NODE_FAILURES[scope]["errorMessages"])),
+                "R03 non-path mutation",
+            )
+            mutation_record = source_record(
+                entry,
+                source_targets,
+                tool_role="node-security-test",
+                platform_name="windows",
+            )
+            mutated, mutated_record = derived_observation(
+                entry,
+                mutation_record,
+                mutated_fields,
+                canonical_variants[0][1],
+                source_path=logical_target,
+            )
+            with self.subTest(entry=entry["id"], mutation="non-path-message"):
+                assert_classification(
+                    entry,
+                    mutated,
+                    mutated_record,
+                    platform_name="windows",
+                    known=False,
+                )
+
+        count_entry = static_entries[0]
+        count_scope = str(count_entry["testOrPathScope"])
+        count_target = ci.R03_FAILURE_TARGETS[count_scope]
+        count_authority = ci._coerce_failure_path_authority(
+            ubuntu_repository,
+            ubuntu_snapshot,
+            [count_target],
+            trusted_executables=[("python-static-producer", ubuntu_python)],
         )
-        result = ci.compare_observations(baseline, [observed], {entry["commandClass"]}, "windows")
-        self.assertEqual(result["violations"], [])
-        self.assertEqual(result["observedDebts"][0]["id"], entry["id"])
+        count_fields, count_binding = ci.canonicalize_failure_identity_value(
+            {
+                "name": count_scope.removeprefix("result:"),
+                "status": "fail",
+                "detail": r03_static_failure_detail(
+                    count_target,
+                    ubuntu_snapshot,
+                    ubuntu_python,
+                ),
+            },
+            count_authority,
+        )
+        count_record = source_record(
+            count_entry,
+            [count_target],
+            tool_role="python-static-producer",
+            platform_name="ubuntu",
+        )
+        counted, counted_record = derived_observation(
+            count_entry,
+            count_record,
+            count_fields,
+            count_binding,
+            source_path=ci.STATIC_SUITE_RELATIVE_PATH,
+            occurrences=2,
+        )
+        count_result = ci.compare_observations(
+            baseline_for(count_entry),
+            [counted],
+            {"static-suite"},
+            "ubuntu",
+            command_records=[counted_record],
+        )
+        self.assertIn(
+            "BASELINE-OCCURRENCE-LIMIT",
+            [item["id"] for item in count_result["violations"]],
+        )
+
+        wrong_static_target = ci.R03_FAILURE_TARGETS[
+            "result:模拟模式 NB 拖拽回灌回归测试"
+        ]
+        exact_static_detail = r03_static_failure_detail(
+            count_target,
+            ubuntu_snapshot,
+            ubuntu_python,
+        )
+        wrong_static_detail = exact_static_detail.replace(
+            count_target,
+            wrong_static_target,
+        )
+        self.assertNotEqual(exact_static_detail, wrong_static_detail)
+        wrong_static_fields, wrong_static_binding = (
+            ci.canonicalize_failure_identity_value(
+                {
+                    "name": count_scope.removeprefix("result:"),
+                    "status": "fail",
+                    "detail": wrong_static_detail,
+                },
+                count_authority,
+            )
+        )
+        self.assertEqual(wrong_static_binding["authorizedTargetPaths"], [])
+        self.assertTrue(wrong_static_binding["unmappedAbsolutePathDigests"])
+        wrong_static, wrong_static_record = derived_observation(
+            count_entry,
+            count_record,
+            wrong_static_fields,
+            wrong_static_binding,
+            source_path=ci.STATIC_SUITE_RELATIVE_PATH,
+        )
+        with self.subTest(family="static", mutation="path-target"):
+            assert_classification(
+                count_entry,
+                wrong_static,
+                wrong_static_record,
+                platform_name="ubuntu",
+                known=False,
+            )
+
+        node_count_entry = node_entries[0]
+        node_count_scope = str(node_count_entry["testOrPathScope"])
+        node_count_target = ci.R03_FAILURE_TARGETS[node_count_scope]
+        node_count_targets = [node_count_target, "backend/admin/admin.js"]
+        node_count_authority = ci._coerce_failure_path_authority(
+            windows_repository,
+            windows_snapshot,
+            node_count_targets,
+        )
+        exact_node_output = r03_node_failure_output(
+            node_count_target,
+            windows_snapshot,
+        )
+        node_count_fields, node_count_binding = (
+            ci.canonicalize_failure_identity_value(
+                {
+                    "executed": True,
+                    "exitCode": 1,
+                    "stdout": exact_node_output,
+                    "stderr": "",
+                    "error": None,
+                },
+                node_count_authority,
+            )
+        )
+        node_count_record = source_record(
+            node_count_entry,
+            node_count_targets,
+            tool_role="node-security-test",
+            platform_name="windows",
+        )
+        node_counted, node_counted_record = derived_observation(
+            node_count_entry,
+            node_count_record,
+            node_count_fields,
+            node_count_binding,
+            source_path=node_count_target,
+            occurrences=2,
+        )
+        node_count_result = ci.compare_observations(
+            baseline_for(node_count_entry),
+            [node_counted],
+            {"frontend"},
+            "windows",
+            command_records=[node_counted_record],
+        )
+        self.assertIn(
+            "BASELINE-OCCURRENCE-LIMIT",
+            [item["id"] for item in node_count_result["violations"]],
+        )
+
+        wrong_node_target = "developer/tests/js/localDataRenderingGuard.test.js"
+        exact_node_uri = (
+            "file:///"
+            + windows_snapshot.replace("\\", "/").lstrip("/")
+            + "/"
+            + node_count_target
+        )
+        wrong_node_uri = (
+            "file:///"
+            + windows_snapshot.replace("\\", "/").lstrip("/")
+            + "/"
+            + wrong_node_target
+        )
+        wrong_node_output = exact_node_output.replace(exact_node_uri, wrong_node_uri)
+        self.assertNotEqual(exact_node_output, wrong_node_output)
+        wrong_node_fields, wrong_node_binding = (
+            ci.canonicalize_failure_identity_value(
+                {
+                    "executed": True,
+                    "exitCode": 1,
+                    "stdout": wrong_node_output,
+                    "stderr": "",
+                    "error": None,
+                },
+                node_count_authority,
+            )
+        )
+        self.assertTrue(wrong_node_binding["unmappedAbsolutePathDigests"])
+        wrong_node, wrong_node_record = derived_observation(
+            node_count_entry,
+            node_count_record,
+            wrong_node_fields,
+            wrong_node_binding,
+            source_path=node_count_target,
+        )
+        with self.subTest(family="node", mutation="path-target"):
+            assert_classification(
+                node_count_entry,
+                wrong_node,
+                wrong_node_record,
+                platform_name="windows",
+                known=False,
+            )
 
     def static_session_detail(self, suffix: str = "") -> str:
         assertion = "sessionId 不一致时仍应路由模拟导航"
@@ -9600,19 +10222,31 @@ class CI6ProtectedPolicyInputTest(unittest.TestCase):
             timeout=30,
         )
         self.assertTrue(capture.execution_passed(), capture.error)
+        raw_lines = capture.stdout.splitlines()
+        identity_lines = capture.identity_stdout.splitlines()
+        self.assertEqual(raw_lines[:2], ["planned", "1"])
+        self.assertNotEqual(raw_lines[2], str(self.root.resolve()))
+        self.assertEqual(identity_lines[:2], ["planned", "1"])
+        self.assertEqual(identity_lines[2], str(self.root.resolve()))
         self.assertEqual(
-            capture.stdout.splitlines(),
-            [
-                "planned",
-                "1",
-                str(self.root.resolve()),
-                json.dumps({"root": str(self.root.resolve())}, sort_keys=True),
-            ],
+            identity_lines[3],
+            json.dumps({"root": str(self.root.resolve())}, sort_keys=True),
         )
         self.assertEqual(capture.stdout_raw, capture.stdout.encode("utf-8"))
         self.assertEqual(capture.stdout_bytes, len(capture.stdout.encode("utf-8")))
+        self.assertEqual(
+            capture.identity_stdout_raw,
+            capture.identity_stdout.encode("utf-8"),
+        )
+        self.assertNotEqual(capture.stdout_raw, capture.identity_stdout_raw)
         first_capture = contained_capture()
         second_capture = contained_capture()
+        first_capture.stdout = "raw-first"
+        first_capture.stdout_raw = b"raw-first"
+        first_capture.stdout_bytes = len(first_capture.stdout_raw)
+        second_capture.stdout = "raw-second"
+        second_capture.stdout_raw = b"raw-second"
+        second_capture.stdout_bytes = len(second_capture.stdout_raw)
         first_report = {
             "observations": [
                 {"detail": {"duration": 1.25, "outputTail": ["Ran 18 tests in 1.250s"]}}
@@ -9625,8 +10259,16 @@ class CI6ProtectedPolicyInputTest(unittest.TestCase):
         }
         ci._canonicalize_static_machine_capture(first_capture, first_report)
         ci._canonicalize_static_machine_capture(second_capture, second_report)
-        self.assertEqual(first_capture.stdout_raw, second_capture.stdout_raw)
-        self.assertIn("Ran 18 tests in <duration>s", first_capture.stdout)
+        self.assertEqual(first_capture.stdout_raw, b"raw-first")
+        self.assertEqual(second_capture.stdout_raw, b"raw-second")
+        self.assertEqual(
+            first_capture.identity_stdout_raw,
+            second_capture.identity_stdout_raw,
+        )
+        self.assertIn(
+            "Ran 18 tests in <duration>s",
+            first_capture.identity_stdout,
+        )
         self.assertEqual(evidence["cleanupState"], "closed")
         self.assertFalse(evidence["mutationDetected"])
         self.assertEqual(
@@ -11773,6 +12415,108 @@ class CI10PathAndAuthorizationContextTest(unittest.TestCase):
                     "<repo>/developer/tests/js/example.js:1:2",
                 )
 
+        logical = "developer/tests/js/adminFrontendGuard.test.js"
+        source_root = r"D:\CI-R03\Repo Root"
+        snapshot_root = r"C:\Temp\cs-r03"
+        authority = ci._coerce_failure_path_authority(
+            source_root,
+            snapshot_root,
+            [logical],
+        )
+
+        def canonical(value: str) -> tuple[tuple[str, ...], dict]:
+            translated, binding = ci.canonicalize_failure_identity_text(
+                value,
+                authority,
+            )
+            with mock.patch.object(ci, "REPO_ROOT", Path(source_root)):
+                identity = ci.extract_failure_identity(
+                    "fixture:r03-windows",
+                    stdout=translated,
+                    path_authority=binding,
+                )
+            return tuple(identity["fileLocations"]), binding
+
+        windows_equivalents = (
+            source_root + "\\" + logical.replace("/", "\\"),
+            snapshot_root + "\\" + logical.replace("/", "\\"),
+            snapshot_root.replace("C:", "c:") + "/" + logical,
+            (snapshot_root + "\\" + logical.replace("/", "\\")).replace(
+                "\\",
+                "\\\\",
+            ),
+        )
+        canonical_values: list[tuple[str, ...]] = []
+        for value in windows_equivalents:
+            with self.subTest(r03_windows_equivalent=value):
+                normalized, binding = canonical(value)
+                canonical_values.append(normalized)
+                self.assertEqual(
+                    binding["authorizedTargetPaths"],
+                    [logical],
+                )
+                self.assertEqual(binding["unmappedAbsolutePathDigests"], [])
+                self.assertEqual(binding["literalPlaceholderDigests"], [])
+        self.assertEqual(len(set(canonical_values)), 1)
+        self.assertEqual(canonical_values[0], (logical,))
+
+        translated = ci._translate_snapshot_output_paths(
+            snapshot_root + "\\" + logical.replace("/", "\\"),
+            snapshot_root,
+            source_root,
+            [logical],
+        )
+        self.assertEqual(
+            ci.normalize_authorized_path_text(
+                translated,
+                repository_root=source_root,
+                task_roots=[],
+            ),
+            f"<repo>/{logical}",
+        )
+        binary = (
+            b"\xff"
+            + (snapshot_root + "\\" + logical.replace("/", "\\")).encode("utf-8")
+            + b"\xfe"
+        )
+        translated_binary = ci._translate_snapshot_output_bytes(
+            binary,
+            snapshot_root,
+            source_root,
+            [logical],
+        )
+        self.assertTrue(translated_binary.startswith(b"\xff"))
+        self.assertTrue(translated_binary.endswith(b"\xfe"))
+        self.assertIn(source_root.encode("utf-8"), translated_binary)
+
+        negative_values = {
+            "near-prefix": snapshot_root + "-evil\\" + logical.replace("/", "\\"),
+            "same-basename-wrong-directory": (
+                snapshot_root + r"\other\adminFrontendGuard.test.js"
+            ),
+            "relative-case-drift": (
+                snapshot_root + r"\developer\tests\js\AdminFrontendGuard.test.js"
+            ),
+            "traversal": snapshot_root + r"\..\outside\adminFrontendGuard.test.js",
+            "literal-placeholder": f"<repo>/{logical}",
+        }
+        for label, value in negative_values.items():
+            with self.subTest(r03_windows_negative=label):
+                normalized, binding = canonical(value)
+                self.assertNotEqual(normalized, (logical,))
+                self.assertNotEqual(
+                    binding["unmappedAbsolutePathDigests"]
+                    or binding["literalPlaceholderDigests"],
+                    [],
+                )
+                self.assertEqual(binding["authorizedTargetPaths"], [])
+        unknown_a = canonical(r"E:\other\same\adminFrontendGuard.test.js")[1]
+        unknown_b = canonical(r"F:\other\same\adminFrontendGuard.test.js")[1]
+        self.assertNotEqual(
+            unknown_a["unmappedAbsolutePathDigests"],
+            unknown_b["unmappedAbsolutePathDigests"],
+        )
+
     def test_path_aware_posix_boundary_and_prose_matrix(self) -> None:
         self.assertEqual(
             ci.normalize_authorized_path_text(
@@ -11799,6 +12543,83 @@ class CI10PathAndAuthorizationContextTest(unittest.TestCase):
                 task_roots=[],
             ),
             "the repo remains ordinary prose",
+        )
+
+        logical = "developer/tests/e2e/reading_question_audit.py"
+        source_root = "/srv/IELTS/Repo"
+        snapshot_root = "/tmp/cs-r03"
+        authority = ci._coerce_failure_path_authority(
+            source_root,
+            snapshot_root,
+            [logical],
+        )
+
+        def canonical(value: str) -> tuple[tuple[str, ...], dict]:
+            translated, binding = ci.canonicalize_failure_identity_text(
+                value,
+                authority,
+            )
+            identity = ci.extract_failure_identity(
+                "fixture:r03-posix",
+                stdout=translated,
+                path_authority=binding,
+            )
+            return tuple(identity["fileLocations"]), binding
+
+        source_value, source_binding = canonical(f"{source_root}/{logical}")
+        snapshot_value, snapshot_binding = canonical(f"{snapshot_root}/{logical}")
+        self.assertEqual(source_value, snapshot_value)
+        self.assertTrue(source_value[0].endswith(logical))
+        self.assertEqual(source_binding, snapshot_binding)
+        self.assertEqual(source_binding["authorizedTargetPaths"], [logical])
+
+        translated = ci._translate_snapshot_output_paths(
+            f"{snapshot_root}/{logical}",
+            snapshot_root,
+            source_root,
+            [logical],
+        )
+        self.assertEqual(translated, f"{source_root}/{logical}")
+        binary = b"\xff" + f"{snapshot_root}/{logical}".encode("utf-8") + b"\xfe"
+        translated_binary = ci._translate_snapshot_output_bytes(
+            binary,
+            snapshot_root,
+            source_root,
+            [logical],
+        )
+        self.assertEqual(
+            translated_binary,
+            b"\xff" + f"{source_root}/{logical}".encode("utf-8") + b"\xfe",
+        )
+
+        negative_values = {
+            "near-prefix": f"{snapshot_root}-evil/{logical}",
+            "same-basename-wrong-directory": (
+                f"{snapshot_root}/other/reading_question_audit.py"
+            ),
+            "relative-case-drift": (
+                f"{snapshot_root}/developer/tests/e2e/Reading_question_audit.py"
+            ),
+            "traversal": f"{snapshot_root}/../outside/reading_question_audit.py",
+            "literal-repo": f"<repo>/{logical}",
+            "literal-task-root": f"<task-root>/{logical}",
+            "literal-abs-path": f"<abs-path>/{logical}",
+        }
+        for label, value in negative_values.items():
+            with self.subTest(r03_posix_negative=label):
+                normalized, binding = canonical(value)
+                self.assertNotEqual(normalized, source_value)
+                self.assertEqual(binding["authorizedTargetPaths"], [])
+                self.assertNotEqual(
+                    binding["unmappedAbsolutePathDigests"]
+                    or binding["literalPlaceholderDigests"],
+                    [],
+                )
+        unknown_a = canonical("/tmp/unrelated-a/reading_question_audit.py")[1]
+        unknown_b = canonical("/tmp/unrelated-b/reading_question_audit.py")[1]
+        self.assertNotEqual(
+            unknown_a["unmappedAbsolutePathDigests"],
+            unknown_b["unmappedAbsolutePathDigests"],
         )
 
     def test_escape_looking_segments_are_path_components(self) -> None:

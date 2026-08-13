@@ -64,7 +64,7 @@ STATIC_MACHINE_DOCUMENT_KIND = "ieltmps-static-suite-machine-report-v2"
 STATIC_MACHINE_SCHEMA_VERSION = 2
 CANONICAL_FAILURE_MATERIAL_VERSION = 4
 FROZEN_V1_RELEASE_SKIP_SIGNATURE_SCHEMA_VERSION = 1
-RAW_OBSERVATION_SCHEMA_VERSION = 1
+RAW_OBSERVATION_SCHEMA_VERSION = 2
 TARGET_EXECUTION_LEASE_VERSION = 1
 PROTECTED_TARGET_BUNDLE_VERSION = 1
 VERIFICATION_REPLAY_TRANSCRIPT_VERSION = 1
@@ -2118,6 +2118,7 @@ _DERIVED_FAILURE_FIELD_NAMES = frozenset(
         "failureIdentityHash",
         "legacyBaselineComparisonDigest",
         "normalizedSignature",
+        "pathAuthority",
         "signature",
         "structuredFailureSet",
         "currentFullContextDigest",
@@ -2153,6 +2154,7 @@ def make_raw_observation(
     raw_structured_fields: Any,
     source_output_digest: str,
     occurrences: int = 1,
+    failure_path_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create one baseline-blind producer observation with a self-checking frame."""
 
@@ -2165,6 +2167,11 @@ def make_raw_observation(
         "sourceResultId": source_result_id,
         "sourcePath": source_path,
         "rawStructuredFields": raw_observation_json_value(raw_structured_fields),
+        "failurePathAuthority": (
+            normalized_json_value(copy.deepcopy(failure_path_authority))
+            if failure_path_authority is not None
+            else None
+        ),
         "sourceOutputDigest": source_output_digest,
         "occurrences": occurrences,
     }
@@ -4559,6 +4566,15 @@ class CommandCapture:
     execution_input_sha256: str | None = None
     producer_observations: list[dict[str, Any]] = field(default_factory=list, repr=False)
     target_execution_lease: dict[str, Any] | None = None
+    # Physical command streams remain authoritative.  These parallel fields are
+    # derived, authority-bound inputs for failure parsing only and are never used
+    # to replace or hash the raw diagnostic bytes.
+    identity_stdout: str | None = field(default=None, repr=False)
+    identity_stderr: str | None = field(default=None, repr=False)
+    identity_error: str | None = field(default=None, repr=False)
+    identity_stdout_raw: bytes | None = field(default=None, repr=False)
+    identity_stderr_raw: bytes | None = field(default=None, repr=False)
+    failure_path_authority: Any | None = field(default=None, repr=False)
 
     def execution_passed(self) -> bool:
         return (
@@ -4656,8 +4672,8 @@ class CommandCapture:
         if failure_summary is None and self.executed and self.exit_code not in (0, None):
             failure_summary = extract_failure_identity(
                 f"command:{self.command_id}",
-                stdout=self.stdout,
-                stderr=self.stderr,
+                stdout=(self.identity_stdout if self.identity_stdout is not None else self.stdout),
+                stderr=(self.identity_stderr if self.identity_stderr is not None else self.stderr),
             )
         if failure_summary:
             record["parsedFailureSummary"] = normalized_json_value(failure_summary)
@@ -4667,6 +4683,13 @@ class CommandCapture:
         if self.stdout_raw is not None:
             return self.stdout_raw
         return self.stdout.encode("utf-8", errors="strict")
+
+    def failure_identity_stdout_bytes(self) -> bytes:
+        if self.identity_stdout_raw is not None:
+            return self.identity_stdout_raw
+        if self.identity_stdout is not None:
+            return self.identity_stdout.encode("utf-8", errors="strict")
+        return self.authoritative_stdout_bytes()
 
 
 _ACTIVE_CONTAINMENTS: set[str] = set()
@@ -9145,6 +9168,8 @@ def _normalize_failure_path(value: str) -> str:
     normalized = re.sub(r"(?i)^.*?\((?=(?:file:///)?(?:[A-Z]:/|/))", "", normalized)
     normalized = re.sub(r"(?i)^(?:test\s+at|at)\s+", "", normalized)
     normalized = re.sub(r"(?i)^file:///", "", normalized)
+    if normalized.startswith("<repo>/"):
+        normalized = normalized[len("<repo>/") :]
     normalized = re.sub(r"(?i)^([A-Z]):/+", r"\1:/", normalized)
     normalized = re.sub(r"/+", "/", normalized)
     repo = str(REPO_ROOT.resolve()).replace("\\", "/")
@@ -9176,12 +9201,16 @@ def extract_failure_identity(
     stdout: str = "",
     stderr: str = "",
     structured: Any | None = None,
+    path_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if structured is not None:
-        return {
+        identity = {
             "scope": scope,
             "structuredFailureSet": structured_signature(structured),
         }
+        if path_authority is not None:
+            identity["pathAuthority"] = copy.deepcopy(path_authority)
+        return identity
 
     source = strip_terminal_controls("\n".join(part for part in (stdout, stderr) if part))
     source = source.replace("\\", "/")
@@ -9244,6 +9273,8 @@ def extract_failure_identity(
         "errorClasses": sorted(error_classes),
         "errorMessages": sorted(error_messages),
     }
+    if path_authority is not None:
+        identity["pathAuthority"] = copy.deepcopy(path_authority)
     return identity
 
 
@@ -9277,10 +9308,16 @@ def _structured_failure_fragments(value: Any) -> list[str]:
     return [value]
 
 
-def structured_failure_identity(scope: str, detail: Any) -> dict[str, Any]:
+def structured_failure_identity(
+    scope: str,
+    detail: Any,
+    *,
+    path_authority: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     identity = extract_failure_identity(
         scope,
         stdout="\n".join(_structured_failure_fragments(detail)),
+        path_authority=path_authority,
     )
     test_ids = set(identity["testIds"])
     for location in identity["fileLocations"]:
@@ -9390,6 +9427,60 @@ KNOWN_NODE_FAILURES = MappingProxyType(
     }
 )
 
+# Run-6 R03 adjudication binds each affected frozen scope to one exact
+# repository-relative producer target.  This is deliberately separate from
+# the baseline signature: a privacy token or matching message cannot prove
+# that the observed path referred to this target.
+R03_FAILURE_TARGETS = MappingProxyType(
+    {
+        "result:Reading 逐题自动排查（quick）": (
+            "developer/tests/e2e/reading_question_audit.py"
+        ),
+        "result:模拟模式 NB 拖拽回灌回归测试": (
+            "developer/tests/e2e/simulation_nb_drag_regression.py"
+        ),
+        "result:模拟模式切题回灌回归测试": (
+            "developer/tests/e2e/simulation_roundtrip_restore_regression.py"
+        ),
+        "result:统一阅读提交只读高亮回归测试": (
+            "developer/tests/e2e/unified_submit_readonly_regression.py"
+        ),
+        "result:Practice 自定义卡片守卫": (
+            "developer/tests/js/practiceCustomCard.test.js"
+        ),
+        "result:按需入口回归测试": (
+            "developer/tests/js/onDemandEntrypoints.test.js"
+        ),
+        "file:developer/tests/js/adminFrontendGuard.test.js": (
+            "developer/tests/js/adminFrontendGuard.test.js"
+        ),
+        "file:developer/tests/js/localDataRenderingGuard.test.js": (
+            "developer/tests/js/localDataRenderingGuard.test.js"
+        ),
+    }
+)
+
+
+def _r03_legacy_static_signature_projection(value: Any, logical_target: str) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _r03_legacy_static_signature_projection(child, logical_target)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _r03_legacy_static_signature_projection(child, logical_target)
+            for child in value
+        ]
+    if not isinstance(value, str):
+        return value
+    token = f"<repo>/{logical_target}"
+    return re.sub(
+        re.escape(token) + r"(?![A-Za-z0-9_.%+@~/?#\\-])",
+        "<abs-path>",
+        value,
+    )
+
 
 def static_failure_signature(
     scope: str,
@@ -9398,19 +9489,45 @@ def static_failure_signature(
 ) -> str:
     known = KNOWN_STATIC_FAILURES.get(scope)
     if known is not None:
-        comparable = {key: value for key, value in identity.items() if key != "structuredFailureSet"}
+        comparable = {
+            key: value
+            for key, value in identity.items()
+            if key not in {"structuredFailureSet", "pathAuthority"}
+        }
         expected = {"scope": scope, **{key: value for key, value in known.items() if key != "signature"}}
         if comparable == expected:
             return str(known["signature"])
+    expected_target = R03_FAILURE_TARGETS.get(scope)
+    path_binding = identity.get("pathAuthority")
+    if (
+        expected_target is not None
+        and isinstance(path_binding, Mapping)
+        and path_binding.get("authorizedTargetPaths") == [expected_target]
+        and not path_binding.get("unmappedAbsolutePathDigests")
+        and not path_binding.get("literalPlaceholderDigests")
+    ):
+        return structured_signature(
+            _r03_legacy_static_signature_projection(detail, expected_target)
+        )
     return structured_signature(detail)
 
 
-def node_failure_signature(scope: str, output: str) -> str:
-    identity = extract_failure_identity(scope, stdout=output)
+def node_failure_signature(
+    scope: str,
+    output: str,
+    *,
+    path_authority: Mapping[str, Any] | None = None,
+) -> str:
+    identity = extract_failure_identity(
+        scope,
+        stdout=output,
+        path_authority=path_authority,
+    )
     known = KNOWN_NODE_FAILURES.get(scope)
     if known is not None and node_failure_count(output) == 1:
         expected_identity = {"scope": scope, **{key: value for key, value in known.items() if key != "signature"}}
-        if identity == expected_identity:
+        comparable = {key: value for key, value in identity.items() if key != "pathAuthority"}
+        if comparable == expected_identity:
             return str(known["signature"])
     return failure_identity_hash(identity)
 
@@ -9528,6 +9645,9 @@ def _raw_failure_outputs(
     fields = raw.get("rawStructuredFields")
     command_class = str(command_record.get("commandClass", ""))
     source_result_id = str(raw.get("sourceResultId", ""))
+    path_authority = raw.get("failurePathAuthority")
+    if not isinstance(path_authority, Mapping):
+        path_authority = None
     parser_semantics = ""
     identity: dict[str, Any] | None = None
 
@@ -9545,7 +9665,11 @@ def _raw_failure_outputs(
             identity = {"scope": scope, "resultStatus": "pass"}
             signature = "pass"
         else:
-            identity = structured_failure_identity(scope, detail)
+            identity = structured_failure_identity(
+                scope,
+                detail,
+                path_authority=path_authority,
+            )
             if outcome == "skip" and source_result_id in FROZEN_V1_RELEASE_SKIP_DETAIL_FIELDS:
                 signature = derive_frozen_v1_release_skip_signature(raw)
             else:
@@ -9578,7 +9702,11 @@ def _raw_failure_outputs(
                 signature = "pass"
             else:
                 outcome = "fail"
-                signature = node_failure_signature(scope, stdout + "\n" + stderr)
+                signature = node_failure_signature(
+                    scope,
+                    stdout + "\n" + stderr,
+                    path_authority=path_authority,
+                )
         elif command_class == "learner-focused":
             if not executed:
                 outcome = "unavailable"
@@ -9598,17 +9726,32 @@ def _raw_failure_outputs(
                 signature = "pass"
             else:
                 outcome = "fail"
-                identity = extract_failure_identity(scope, stdout=stdout, stderr=stderr)
+                identity = extract_failure_identity(
+                    scope,
+                    stdout=stdout,
+                    stderr=stderr,
+                    path_authority=path_authority,
+                )
                 signature = failure_identity_hash(identity)
         else:
             outcome = "pass" if executed and exit_code == 0 else "fail"
-            identity = extract_failure_identity(scope, stdout=stdout, stderr=stderr)
+            identity = extract_failure_identity(
+                scope,
+                stdout=stdout,
+                stderr=stderr,
+                path_authority=path_authority,
+            )
             signature = "pass" if outcome == "pass" else failure_identity_hash(identity)
         if identity is None:
             identity = (
                 {"scope": scope, "resultStatus": "pass"}
                 if outcome == "pass"
-                else extract_failure_identity(scope, stdout=stdout, stderr=stderr)
+                else extract_failure_identity(
+                    scope,
+                    stdout=stdout,
+                    stderr=stderr,
+                    path_authority=path_authority,
+                )
             )
     elif kind == "standalone-membership-v1" and isinstance(fields, Mapping):
         parser_semantics = "standalone-positive-membership-v1"
@@ -9635,12 +9778,14 @@ def _raw_failure_outputs(
                 if key not in {"outcome", "message"}
             }
             identity["scope"] = scope
+            if path_authority is not None:
+                identity["pathAuthority"] = copy.deepcopy(path_authority)
             known_static = KNOWN_STATIC_FAILURES.get(scope)
             known_expected = _known_identity_expected(scope)
             if known_static is not None:
                 comparable = {
                     key: value for key, value in identity.items()
-                    if key != "structuredFailureSet"
+                    if key not in {"structuredFailureSet", "pathAuthority"}
                 }
                 expected = {
                     "scope": scope,
@@ -9906,6 +10051,30 @@ def _known_identity_expected(scope: str) -> dict[str, Any] | None:
     return None
 
 
+def _r03_path_authority_matches(scope: str, identity: Mapping[str, Any]) -> bool:
+    expected_target = R03_FAILURE_TARGETS.get(scope)
+    if expected_target is None:
+        return True
+    binding = identity.get("pathAuthority")
+    if not isinstance(binding, dict) or set(binding) != FAILURE_PATH_AUTHORITY_KEYS:
+        return False
+    target_paths = binding.get("authorizedTargetPaths")
+    if not isinstance(target_paths, list) or expected_target not in target_paths:
+        return False
+    if binding.get("unmappedAbsolutePathDigests") or binding.get(
+        "literalPlaceholderDigests"
+    ):
+        return False
+    allowed_targets = {expected_target}
+    known_node = KNOWN_NODE_FAILURES.get(scope)
+    if known_node is not None:
+        for key in ("testIds", "fileLocations"):
+            for value in known_node.get(key, []):
+                if isinstance(value, str):
+                    allowed_targets.add(re.sub(r":\d+(?::\d+)?$", "", value))
+    return set(target_paths).issubset(allowed_targets)
+
+
 def _failure_identity_authorizes(
     entry: Mapping[str, Any],
     item: Mapping[str, Any],
@@ -9915,6 +10084,9 @@ def _failure_identity_authorizes(
 ) -> bool:
     raw = item.get("rawObservation")
     if not isinstance(raw, dict):
+        return False
+    baseline_scope = str(entry.get("testOrPathScope", ""))
+    if baseline_scope in R03_FAILURE_TARGETS and source_command is None:
         return False
     expected_source = _baseline_source_command_id(entry)
     if expected_source is not None and item.get("commandId") != expected_source:
@@ -9979,9 +10151,16 @@ def _failure_identity_authorizes(
     if item.get("signature") != item.get("legacyBaselineComparisonDigest"):
         return False
     identity = derived["failureIdentity"]
-    known_static = KNOWN_STATIC_FAILURES.get(str(entry.get("testOrPathScope", "")))
+    scope = baseline_scope
+    if not _r03_path_authority_matches(scope, identity):
+        return False
+    known_static = KNOWN_STATIC_FAILURES.get(scope)
     if known_static is not None:
-        comparable = {key: value for key, value in identity.items() if key != "structuredFailureSet"}
+        comparable = {
+            key: value
+            for key, value in identity.items()
+            if key not in {"structuredFailureSet", "pathAuthority"}
+        }
         expected = {
             "scope": entry.get("testOrPathScope"),
             **{key: value for key, value in known_static.items() if key != "signature"},
@@ -9990,9 +10169,10 @@ def _failure_identity_authorizes(
             derived.get("legacyBaselineComparisonDigest") == known_static["signature"]
             and comparable == expected
         )
-    expected = _known_identity_expected(str(entry.get("testOrPathScope", "")))
+    expected = _known_identity_expected(scope)
     if expected is not None:
-        return identity == expected
+        comparable = {key: value for key, value in identity.items() if key != "pathAuthority"}
+        return comparable == expected
     signature = str(item.get("legacyBaselineComparisonDigest", ""))
     if signature.startswith("sha256:"):
         return (
@@ -11087,6 +11267,97 @@ def _command_authority_violations(
     return violations
 
 
+def _canonical_target_occurs_in_raw_fields(value: Any, logical_target: str) -> bool:
+    if isinstance(value, Mapping):
+        return any(
+            _canonical_target_occurs_in_raw_fields(child, logical_target)
+            for child in value.values()
+        )
+    if isinstance(value, list):
+        return any(
+            _canonical_target_occurs_in_raw_fields(child, logical_target)
+            for child in value
+        )
+    if not isinstance(value, str):
+        return False
+    token = f"<repo>/{logical_target}"
+    return re.search(
+        re.escape(token) + r"(?![A-Za-z0-9_.%+@~/?#\\-])",
+        value,
+    ) is not None
+
+
+def _validate_failure_path_authority(
+    value: Any,
+    *,
+    label: str,
+    source: Mapping[str, Any] | None,
+    raw_fields: Any,
+) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, dict) or set(value) != FAILURE_PATH_AUTHORITY_KEYS:
+        return [f"{label}: failure-path authority schema is not exact"]
+    errors: list[str] = []
+    if value.get("schemaVersion") != 1:
+        errors.append(f"{label}: failure-path authority schema version is invalid")
+    if value.get("canonicalizationKind") != "SOURCE-SNAPSHOT-BOUND-FAILURE-PATHS-V1":
+        errors.append(f"{label}: failure-path authority kind is invalid")
+
+    sequence_keys = (
+        "authorizedTargetPaths",
+        "authorizedToolRoles",
+        "unmappedAbsolutePathDigests",
+        "literalPlaceholderDigests",
+    )
+    for key in sequence_keys:
+        items = value.get(key)
+        if (
+            not isinstance(items, list)
+            or any(not isinstance(item, str) or not item for item in items)
+            or items != sorted(set(items))
+        ):
+            errors.append(f"{label}: {key} must be a sorted unique string array")
+
+    target_paths = value.get("authorizedTargetPaths")
+    if isinstance(target_paths, list):
+        for target in target_paths:
+            if isinstance(target, str) and not _safe_failure_logical_target(target):
+                errors.append(f"{label}: authorized target path is unsafe")
+            elif isinstance(target, str) and not _canonical_target_occurs_in_raw_fields(
+                raw_fields,
+                target,
+            ):
+                errors.append(
+                    f"{label}: authorized target path is absent from canonical identity input"
+                )
+
+    for key in ("unmappedAbsolutePathDigests", "literalPlaceholderDigests"):
+        items = value.get(key)
+        if isinstance(items, list) and any(
+            re.fullmatch(r"sha256:[0-9a-f]{64}", item) is None
+            for item in items
+            if isinstance(item, str)
+        ):
+            errors.append(f"{label}: {key} contains an invalid digest")
+
+    if source is not None:
+        source_targets = {
+            str(target.get("path"))
+            for target in source.get("targets", [])
+            if isinstance(target, Mapping) and isinstance(target.get("path"), str)
+        }
+        if isinstance(target_paths, list) and any(
+            target not in source_targets for target in target_paths
+        ):
+            errors.append(f"{label}: target path is outside source command authority")
+        roles = value.get("authorizedToolRoles")
+        source_role = source.get("toolRole")
+        if isinstance(roles, list) and any(role != source_role for role in roles):
+            errors.append(f"{label}: tool role is outside source command authority")
+    return errors
+
+
 def _validate_raw_observation(
     raw: Any,
     *,
@@ -11102,6 +11373,7 @@ def _validate_raw_observation(
         "sourceResultId",
         "sourcePath",
         "rawStructuredFields",
+        "failurePathAuthority",
         "sourceOutputDigest",
         "occurrences",
         "producerRecordDigest",
@@ -11138,6 +11410,14 @@ def _validate_raw_observation(
     errors.extend(
         f"{label}: {error}"
         for error in _raw_observation_forbidden_fields(raw.get("rawStructuredFields"))
+    )
+    errors.extend(
+        _validate_failure_path_authority(
+            raw.get("failurePathAuthority"),
+            label=label,
+            source=source,
+            raw_fields=raw.get("rawStructuredFields"),
+        )
     )
     digest_source = {key: value for key, value in raw.items() if key != "producerRecordDigest"}
     try:
@@ -14095,36 +14375,599 @@ def _failed_protected_target_bundle(
     }
 
 
-def _translate_snapshot_output_paths(value: str, snapshot_root: Path, repo_root: Path) -> str:
-    """Map the task-owned physical snapshot root back to its logical repository root."""
+@dataclass(frozen=True)
+class FailurePathAuthority:
+    """Ephemeral source/snapshot authority used only for failure identity."""
 
-    snapshot = str(snapshot_root.resolve())
-    repository = str(repo_root.resolve())
-    replacements = (
-        (snapshot.replace("\\", "\\\\"), repository.replace("\\", "\\\\")),
-        (snapshot_root.resolve().as_uri(), repo_root.resolve().as_uri()),
-        (snapshot.replace("\\", "/"), repository.replace("\\", "/")),
-        (snapshot, repository),
+    repository_root: str
+    snapshot_root: str
+    targets: tuple[tuple[str, str], ...]
+    trusted_executables: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class _AuthorizedPathPattern:
+    pattern: str
+    logical_target: str | None
+    slash_replacement: str
+    backslash_replacement: str
+    escaped_replacement: str
+    uri_replacement: str | None = None
+
+    def replacement_for_text(self, observed: str) -> str:
+        if self.uri_replacement is not None:
+            return self.uri_replacement
+        if "\\\\" in observed:
+            return self.escaped_replacement
+        if "\\" in observed:
+            return self.backslash_replacement
+        return self.slash_replacement
+
+    def replacement_for_bytes(self, observed: bytes) -> bytes:
+        if self.uri_replacement is not None:
+            return self.uri_replacement.encode("utf-8")
+        if b"\\\\" in observed:
+            return self.escaped_replacement.encode("utf-8")
+        if b"\\" in observed:
+            return self.backslash_replacement.encode("utf-8")
+        return self.slash_replacement.encode("utf-8")
+
+
+def _safe_failure_logical_target(value: str) -> bool:
+    return bool(value) and not value.startswith(("/", "\\")) and "\\" not in value and all(
+        part not in {"", ".", ".."} for part in value.split("/")
     )
+
+
+def _coerce_failure_path_authority(
+    repository_root: str | Path,
+    snapshot_root: str | Path,
+    targets: Sequence[Mapping[str, Any] | str],
+    *,
+    trusted_executables: Sequence[tuple[str, str]] = (),
+) -> FailurePathAuthority:
+    repository = str(repository_root)
+    snapshot = str(snapshot_root)
+    authorized_targets: list[tuple[str, str]] = []
+    for target in targets:
+        logical = str(target.get("path", "")) if isinstance(target, Mapping) else str(target)
+        if not _safe_failure_logical_target(logical):
+            raise ValueError("failure path authority contains an unsafe logical target")
+        if isinstance(target, Mapping) and isinstance(target.get("canonicalSourcePath"), str):
+            canonical_source = str(target["canonicalSourcePath"])
+        else:
+            canonical_source = str(Path(repository).joinpath(*logical.split("/")))
+        authorized_targets.append((logical, canonical_source))
+    if len({logical for logical, _canonical in authorized_targets}) != len(authorized_targets):
+        raise ValueError("failure path authority contains duplicate logical targets")
+    return FailurePathAuthority(
+        repository_root=repository,
+        snapshot_root=snapshot,
+        targets=tuple(sorted(authorized_targets)),
+        trusted_executables=tuple(sorted(set(trusted_executables))),
+    )
+
+
+def _failure_path_authority_from_plan(
+    plan_record: Mapping[str, Any],
+    *,
+    snapshot_root: Path,
+    repo_root: Path,
+) -> FailurePathAuthority:
+    resolved_repository = repo_root.resolve(strict=True)
+    targets = plan_record.get("targets")
+    if not isinstance(targets, list) or not targets:
+        raise OSError("protected command has no failure-path target authority")
+    for target in targets:
+        if not isinstance(target, Mapping):
+            raise OSError("protected command target authority is malformed")
+        logical = str(target.get("path", ""))
+        if not _safe_failure_logical_target(logical):
+            raise OSError("protected command target path is unsafe")
+        expected = resolved_repository.joinpath(*logical.split("/")).resolve(strict=True)
+        if str(target.get("canonicalSourcePath", "")) != str(expected):
+            raise OSError("protected command target canonical source is inconsistent")
+    trusted_executables: list[tuple[str, str]] = []
+    executable = plan_record.get("resolvedExecutablePath")
+    role = str(plan_record.get("toolRole", ""))
+    if isinstance(executable, str) and executable and Path(executable).is_absolute() and role:
+        trusted_executables.append((role, executable))
+    return _coerce_failure_path_authority(
+        str(resolved_repository),
+        str(snapshot_root.resolve(strict=True)),
+        targets,
+        trusted_executables=trusted_executables,
+    )
+
+
+def _authority_literal_pattern(
+    value: str,
+    *,
+    ascii_fold: bool,
+    flexible_separators: bool,
+) -> str:
+    pattern: list[str] = []
+    for character in value:
+        if flexible_separators and character in "/\\":
+            pattern.append(r"(?:/|\\{1,2})")
+        elif ascii_fold and ("A" <= character <= "Z" or "a" <= character <= "z"):
+            lower = chr(ord(character) + 32) if "A" <= character <= "Z" else character
+            upper = chr(ord(lower) - 32)
+            pattern.append(f"[{re.escape(lower)}{re.escape(upper)}]")
+        else:
+            pattern.append(re.escape(character))
+    return "".join(pattern)
+
+
+def _failure_root_uri_spellings(value: str) -> list[str]:
+    return [
+        root
+        for root, _token, _windows in _normalization_root_records(value, "<unused>")
+        if root.startswith("file:")
+    ]
+
+
+def _failure_path_patterns(
+    candidate_root: str,
+    repository_root: str,
+    logical_target: str | None,
+) -> list[_AuthorizedPathPattern]:
+    candidate_reference = classify_windows_absolute_reference(candidate_root)
+    repository_reference = classify_windows_absolute_reference(repository_root)
+    windows = (
+        candidate_reference.authorizable
+        and candidate_reference.authority_path is not None
+        and repository_reference.authorizable
+        and repository_reference.authority_path is not None
+    )
+    logical_suffix = "" if logical_target is None else "/" + logical_target
+    before = r"(?<![A-Za-z0-9_.:/\\-])"
+    after = r"(?![A-Za-z0-9_.%+@~/?#\\-])"
+    patterns: list[_AuthorizedPathPattern] = []
+
+    if windows:
+        candidate_native = candidate_reference.authority_path.replace("\\", "/").rstrip("/")
+        repository_native = repository_reference.authority_path.replace("\\", "/").rstrip("/")
+        native_pattern = (
+            before
+            + _authority_literal_pattern(
+                candidate_native,
+                ascii_fold=True,
+                flexible_separators=True,
+            )
+            + _authority_literal_pattern(
+                logical_suffix,
+                ascii_fold=False,
+                flexible_separators=True,
+            )
+            + after
+        )
+        slash_replacement = repository_native + logical_suffix
+        backslash_replacement = slash_replacement.replace("/", "\\")
+        patterns.append(
+            _AuthorizedPathPattern(
+                native_pattern,
+                logical_target,
+                slash_replacement,
+                backslash_replacement,
+                backslash_replacement.replace("\\", "\\\\"),
+            )
+        )
+        candidate_uris = _failure_root_uri_spellings(candidate_root)
+        repository_uris = _failure_root_uri_spellings(repository_root)
+        encoded_suffix = "" if logical_target is None else "/" + quote(
+            logical_target,
+            safe="/:@()+,;=-._~",
+            encoding="utf-8",
+            errors="strict",
+        )
+        for index, candidate_uri in enumerate(candidate_uris):
+            if not repository_uris:
+                break
+            repository_uri = repository_uris[min(index, len(repository_uris) - 1)]
+            uri_pattern = (
+                before
+                + _authority_literal_pattern(
+                    candidate_uri.rstrip("/"),
+                    ascii_fold=True,
+                    flexible_separators=False,
+                )
+                + _authority_literal_pattern(
+                    encoded_suffix,
+                    ascii_fold=False,
+                    flexible_separators=False,
+                )
+                + after
+            )
+            replacement = repository_uri.rstrip("/") + encoded_suffix
+            patterns.append(
+                _AuthorizedPathPattern(
+                    uri_pattern,
+                    logical_target,
+                    replacement,
+                    replacement,
+                    replacement,
+                    replacement,
+                )
+            )
+        return patterns
+
+    candidate = candidate_root.rstrip("/") or "/"
+    repository = repository_root.rstrip("/") or "/"
+    if candidate.startswith("/") and repository.startswith("/"):
+        separator = "" if candidate == "/" else "/"
+        repository_separator = "" if repository == "/" else "/"
+        source = candidate + separator + (logical_target or "")
+        replacement = repository + repository_separator + (logical_target or "")
+        patterns.append(
+            _AuthorizedPathPattern(
+                before + re.escape(source) + after,
+                logical_target,
+                replacement,
+                replacement,
+                replacement,
+            )
+        )
+    return patterns
+
+
+def _selected_failure_targets(
+    value: str | bytes,
+    authority: FailurePathAuthority,
+) -> list[tuple[str, str]]:
+    selected: list[tuple[str, str]] = []
+    for logical, canonical in authority.targets:
+        basename = logical.rsplit("/", 1)[-1]
+        needle = basename.encode("utf-8") if isinstance(value, bytes) else basename
+        if needle in value:
+            selected.append((logical, canonical))
+    return selected
+
+
+def _translate_authorized_paths_text(
+    value: str,
+    authority: FailurePathAuthority,
+    *,
+    include_repository_root: bool,
+) -> str:
     translated = value
-    for source, target in replacements:
-        translated = translated.replace(source, target)
+    roots = [authority.snapshot_root]
+    if include_repository_root:
+        roots.append(authority.repository_root)
+    for logical, _canonical in _selected_failure_targets(value, authority):
+        for candidate_root in roots:
+            for specification in _failure_path_patterns(
+                candidate_root,
+                authority.repository_root,
+                logical,
+            ):
+                pattern = re.compile(specification.pattern)
+                translated = pattern.sub(
+                    lambda match, item=specification: item.replacement_for_text(match.group(0)),
+                    translated,
+                )
+    for candidate_root in roots:
+        for specification in _failure_path_patterns(
+            candidate_root,
+            authority.repository_root,
+            None,
+        ):
+            pattern = re.compile(specification.pattern)
+            translated = pattern.sub(
+                lambda match, item=specification: item.replacement_for_text(match.group(0)),
+                translated,
+            )
     return translated
 
 
-def _translate_snapshot_output_bytes(value: bytes, snapshot_root: Path, repo_root: Path) -> bytes:
-    snapshot = str(snapshot_root.resolve())
-    repository = str(repo_root.resolve())
-    replacements = (
-        (snapshot.replace("\\", "\\\\"), repository.replace("\\", "\\\\")),
-        (snapshot_root.resolve().as_uri(), repo_root.resolve().as_uri()),
-        (snapshot.replace("\\", "/"), repository.replace("\\", "/")),
-        (snapshot, repository),
-    )
+def _translate_authorized_paths_bytes(
+    value: bytes,
+    authority: FailurePathAuthority,
+    *,
+    include_repository_root: bool,
+) -> bytes:
     translated = value
-    for source, target in replacements:
-        translated = translated.replace(source.encode("utf-8"), target.encode("utf-8"))
+    roots = [authority.snapshot_root]
+    if include_repository_root:
+        roots.append(authority.repository_root)
+    for logical, _canonical in _selected_failure_targets(value, authority):
+        for candidate_root in roots:
+            for specification in _failure_path_patterns(
+                candidate_root,
+                authority.repository_root,
+                logical,
+            ):
+                pattern = re.compile(specification.pattern.encode("utf-8"))
+                translated = pattern.sub(
+                    lambda match, item=specification: item.replacement_for_bytes(match.group(0)),
+                    translated,
+                )
+    for candidate_root in roots:
+        for specification in _failure_path_patterns(
+            candidate_root,
+            authority.repository_root,
+            None,
+        ):
+            pattern = re.compile(specification.pattern.encode("utf-8"))
+            translated = pattern.sub(
+                lambda match, item=specification: item.replacement_for_bytes(match.group(0)),
+                translated,
+            )
     return translated
+
+
+def _translate_snapshot_output_paths(
+    value: str,
+    snapshot_root: str | Path,
+    repo_root: str | Path,
+    authorized_targets: Sequence[Mapping[str, Any] | str] = (),
+) -> str:
+    """Translate only exact snapshot roots and exact authority-bound targets."""
+
+    authority = _coerce_failure_path_authority(repo_root, snapshot_root, authorized_targets)
+    return _translate_authorized_paths_text(
+        value,
+        authority,
+        include_repository_root=False,
+    )
+
+
+def _translate_snapshot_output_bytes(
+    value: bytes,
+    snapshot_root: str | Path,
+    repo_root: str | Path,
+    authorized_targets: Sequence[Mapping[str, Any] | str] = (),
+) -> bytes:
+    """Byte-preserving counterpart to ``_translate_snapshot_output_paths``."""
+
+    authority = _coerce_failure_path_authority(repo_root, snapshot_root, authorized_targets)
+    return _translate_authorized_paths_bytes(
+        value,
+        authority,
+        include_repository_root=False,
+    )
+
+
+FAILURE_PATH_AUTHORITY_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "canonicalizationKind",
+        "authorizedTargetPaths",
+        "authorizedToolRoles",
+        "unmappedAbsolutePathDigests",
+        "literalPlaceholderDigests",
+    }
+)
+
+
+def _failure_path_digest_token(value: str) -> tuple[str, str]:
+    digest = f"sha256:{sha256_text(value)}"
+    return f"<unmapped-abs-{digest}>", digest
+
+
+def _literal_path_token_pattern() -> re.Pattern[str]:
+    return re.compile(
+        r"<(?:repo|task-root|abs-path)>"
+        r"(?:[\\/][^\s\x00-\x1f\"'<>|]+)*"
+    )
+
+
+def _fingerprint_windows_absolute_references(
+    text: str,
+    digests: set[str],
+) -> str:
+    output: list[str] = []
+    cursor = 0
+    index = 0
+    while index < len(text):
+        if not _windows_reference_start(text, index):
+            index += 1
+            continue
+        end = _windows_reference_span_end(text, index)
+        if end <= index:
+            index += 1
+            continue
+        reference = classify_windows_absolute_reference(text[index:end])
+        if reference.kind in {"ordinary-prose", "relative-path"}:
+            index += 1
+            continue
+        token, digest = _failure_path_digest_token(text[index:end])
+        digests.add(digest)
+        output.append(text[cursor:index])
+        output.append(token)
+        cursor = end
+        index = end
+    output.append(text[cursor:])
+    return "".join(output)
+
+
+def _mask_authorized_failure_paths(
+    text: str,
+    authority: FailurePathAuthority,
+    *,
+    authorized_targets: set[str],
+    authorized_tools: set[str],
+) -> tuple[str, list[tuple[str, str]]]:
+    masked = text
+    restorations: list[tuple[str, str]] = []
+    sentinel_prefix = "__CI_AUTHORIZED_FAILURE_PATH__"
+    while sentinel_prefix in masked:
+        sentinel_prefix += "_"
+
+    def reserve(replacement: str) -> str:
+        sentinel = f"{sentinel_prefix}{len(restorations)}__"
+        restorations.append((sentinel, replacement))
+        return sentinel
+
+    roots = (authority.snapshot_root, authority.repository_root)
+    for logical, _canonical in _selected_failure_targets(masked, authority):
+        for candidate_root in roots:
+            for specification in _failure_path_patterns(
+                candidate_root,
+                authority.repository_root,
+                logical,
+            ):
+                pattern = re.compile(specification.pattern)
+
+                def replace_target(
+                    match: re.Match[str],
+                    *,
+                    item: _AuthorizedPathPattern = specification,
+                    target: str = logical,
+                ) -> str:
+                    authorized_targets.add(target)
+                    return reserve(f"<repo>/{target}")
+
+                masked = pattern.sub(replace_target, masked)
+
+    for role, executable in authority.trusted_executables:
+        basename = executable.replace("\\", "/").rsplit("/", 1)[-1]
+        if basename not in masked:
+            continue
+        parent_text = executable[: -len(basename)].rstrip("/\\")
+        if not parent_text:
+            continue
+        for specification in _failure_path_patterns(parent_text, parent_text, basename):
+            pattern = re.compile(specification.pattern)
+
+            def replace_tool(
+                match: re.Match[str],
+                *,
+                tool_role: str = role,
+            ) -> str:
+                authorized_tools.add(tool_role)
+                return reserve(match.group(0))
+
+            masked = pattern.sub(replace_tool, masked)
+
+    for candidate_root in roots:
+        for specification in _failure_path_patterns(
+            candidate_root,
+            authority.repository_root,
+            None,
+        ):
+            pattern = re.compile(specification.pattern)
+            masked = pattern.sub(
+                lambda match, item=specification: reserve(
+                    item.replacement_for_text(match.group(0))
+                ),
+                masked,
+            )
+    return masked, restorations
+
+
+def _fingerprint_authority_root_descendants(
+    text: str,
+    authority: FailurePathAuthority,
+    digests: set[str],
+) -> str:
+    fingerprinted = text
+    before = r"(?<![A-Za-z0-9_.:/\\-])"
+    for root in (authority.snapshot_root, authority.repository_root):
+        reference = classify_windows_absolute_reference(root)
+        if reference.authorizable and reference.authority_path is not None:
+            normalized = reference.authority_path.replace("\\", "/").rstrip("/")
+            root_pattern = _authority_literal_pattern(
+                normalized,
+                ascii_fold=True,
+                flexible_separators=True,
+            )
+            tail = r"(?:/|\\{1,2})[^\s\x00-\x1f\"'<>|]+"
+        else:
+            normalized = root.rstrip("/") or "/"
+            if not normalized.startswith("/"):
+                continue
+            separator = "" if normalized == "/" else "/"
+            root_pattern = re.escape(normalized) + re.escape(separator)
+            tail = r"[^\s\x00-\x1f\"'<>|]+"
+        pattern = re.compile(before + root_pattern + tail)
+
+        def replace(match: re.Match[str]) -> str:
+            token, digest = _failure_path_digest_token(match.group(0))
+            digests.add(digest)
+            return token
+
+        fingerprinted = pattern.sub(replace, fingerprinted)
+    return fingerprinted
+
+
+def canonicalize_failure_identity_text(
+    value: str,
+    authority: FailurePathAuthority,
+) -> tuple[str, dict[str, Any]]:
+    """Canonicalize only proven paths and fingerprint every other absolute origin."""
+
+    literal_digests: set[str] = set()
+
+    def replace_literal(match: re.Match[str]) -> str:
+        token, digest = _failure_path_digest_token("literal:" + match.group(0))
+        literal_digests.add(digest)
+        return token.replace("unmapped-abs", "literal-path-token")
+
+    text = _literal_path_token_pattern().sub(replace_literal, value)
+    authorized_targets: set[str] = set()
+    authorized_tools: set[str] = set()
+    text, restorations = _mask_authorized_failure_paths(
+        text,
+        authority,
+        authorized_targets=authorized_targets,
+        authorized_tools=authorized_tools,
+    )
+    unmapped_digests: set[str] = set()
+    text = _fingerprint_authority_root_descendants(text, authority, unmapped_digests)
+    text = _fingerprint_windows_absolute_references(text, unmapped_digests)
+
+    def replace_posix(match: re.Match[str]) -> str:
+        token, digest = _failure_path_digest_token(match.group(0))
+        unmapped_digests.add(digest)
+        return token
+
+    text = KNOWN_UNIX_ABSOLUTE_PATH.sub(replace_posix, text)
+    for sentinel, replacement in restorations:
+        text = text.replace(sentinel, replacement)
+    binding = {
+        "schemaVersion": 1,
+        "canonicalizationKind": "SOURCE-SNAPSHOT-BOUND-FAILURE-PATHS-V1",
+        "authorizedTargetPaths": sorted(authorized_targets),
+        "authorizedToolRoles": sorted(authorized_tools),
+        "unmappedAbsolutePathDigests": sorted(unmapped_digests),
+        "literalPlaceholderDigests": sorted(literal_digests),
+    }
+    return text, binding
+
+
+def canonicalize_failure_identity_value(
+    value: Any,
+    authority: FailurePathAuthority,
+) -> tuple[Any, dict[str, Any]]:
+    target_paths: set[str] = set()
+    tool_roles: set[str] = set()
+    unmapped: set[str] = set()
+    literals: set[str] = set()
+
+    def visit(item: Any) -> Any:
+        if isinstance(item, Mapping):
+            return {str(key): visit(child) for key, child in item.items()}
+        if isinstance(item, list):
+            return [visit(child) for child in item]
+        if not isinstance(item, str):
+            return item
+        canonical, binding = canonicalize_failure_identity_text(item, authority)
+        target_paths.update(binding["authorizedTargetPaths"])
+        tool_roles.update(binding["authorizedToolRoles"])
+        unmapped.update(binding["unmappedAbsolutePathDigests"])
+        literals.update(binding["literalPlaceholderDigests"])
+        return canonical
+
+    canonical_value = visit(value)
+    return canonical_value, {
+        "schemaVersion": 1,
+        "canonicalizationKind": "SOURCE-SNAPSHOT-BOUND-FAILURE-PATHS-V1",
+        "authorizedTargetPaths": sorted(target_paths),
+        "authorizedToolRoles": sorted(tool_roles),
+        "unmappedAbsolutePathDigests": sorted(unmapped),
+        "literalPlaceholderDigests": sorted(literals),
+    }
 
 
 def _canonicalize_static_machine_capture(
@@ -14134,9 +14977,8 @@ def _canonicalize_static_machine_capture(
     """Bind a validated machine document after removing only replay-volatile values."""
 
     canonical = _json_bytes(normalized_json_value(report))
-    capture.stdout_raw = canonical
-    capture.stdout = canonical.decode("utf-8", errors="strict")
-    capture.stdout_bytes = len(canonical)
+    capture.identity_stdout_raw = canonical
+    capture.identity_stdout = canonical.decode("utf-8", errors="strict")
 
 
 def _protected_snapshot_environment(
@@ -14339,6 +15181,11 @@ def execute_planned_static_suite(
 
         temporary = tempfile.TemporaryDirectory(prefix="cs-")
         snapshot_root = Path(temporary.name)
+        failure_path_authority = _failure_path_authority_from_plan(
+            plan_record,
+            snapshot_root=snapshot_root,
+            repo_root=repo_root,
+        )
         for relative in bundle.evidence()["orderedLogicalTargetPaths"]:
             if not isinstance(relative, str):
                 raise OSError("protected static target path is invalid")
@@ -14393,39 +15240,49 @@ def execute_planned_static_suite(
             execution_input_mode=adapter,
             executable_lease=executable_lease,
         )
+        capture.failure_path_authority = failure_path_authority
         if capture.stdout_raw is not None:
-            capture.stdout_raw = _translate_snapshot_output_bytes(
+            capture.identity_stdout_raw = _translate_snapshot_output_bytes(
                 capture.stdout_raw,
                 snapshot_root,
                 repo_root,
+                targets,
             )
-            capture.stdout = capture.stdout_raw.decode("utf-8", errors="replace")
-            capture.stdout_bytes = len(capture.stdout_raw)
+            capture.identity_stdout = capture.identity_stdout_raw.decode(
+                "utf-8",
+                errors="replace",
+            )
         else:
-            capture.stdout = _translate_snapshot_output_paths(
+            capture.identity_stdout = _translate_snapshot_output_paths(
                 capture.stdout,
                 snapshot_root,
                 repo_root,
+                targets,
             )
         if capture.stderr_raw is not None:
-            capture.stderr_raw = _translate_snapshot_output_bytes(
+            capture.identity_stderr_raw = _translate_snapshot_output_bytes(
                 capture.stderr_raw,
                 snapshot_root,
                 repo_root,
+                targets,
             )
-            capture.stderr = capture.stderr_raw.decode("utf-8", errors="replace")
-            capture.stderr_bytes = len(capture.stderr_raw)
+            capture.identity_stderr = capture.identity_stderr_raw.decode(
+                "utf-8",
+                errors="replace",
+            )
         else:
-            capture.stderr = _translate_snapshot_output_paths(
+            capture.identity_stderr = _translate_snapshot_output_paths(
                 capture.stderr,
                 snapshot_root,
                 repo_root,
+                targets,
             )
         if capture.error is not None:
-            capture.error = _translate_snapshot_output_paths(
+            capture.identity_error = _translate_snapshot_output_paths(
                 capture.error,
                 snapshot_root,
                 repo_root,
+                targets,
             )
         if phase_hook is not None:
             phase_hook("after-process-before-evidence", bundle)
@@ -15372,6 +16229,34 @@ class FoundationRunner:
     ) -> dict[str, Any]:
         """Bind one process result to its command's raw output identity."""
 
+        raw_fields: Any = {
+            "executed": capture.executed,
+            "exitCode": capture.exit_code,
+            "stdout": (
+                capture.identity_stdout
+                if capture.identity_stdout is not None
+                else capture.stdout
+            ),
+            "stderr": (
+                capture.identity_stderr
+                if capture.identity_stderr is not None
+                else capture.stderr
+            ),
+            "error": (
+                capture.identity_error
+                if capture.identity_error is not None
+                else capture.error
+            ),
+        }
+        path_binding: Mapping[str, Any] | None = None
+        if (
+            source_result_id in R03_FAILURE_TARGETS
+            and isinstance(capture.failure_path_authority, FailurePathAuthority)
+        ):
+            raw_fields, path_binding = canonicalize_failure_identity_value(
+                raw_fields,
+                capture.failure_path_authority,
+            )
         raw = make_raw_observation(
             capture.command_id,
             int(command_record["ordinal"]),
@@ -15379,14 +16264,9 @@ class FoundationRunner:
             "process-output-v1",
             source_result_id,
             source_path,
-            {
-                "executed": capture.executed,
-                "exitCode": capture.exit_code,
-                "stdout": capture.stdout,
-                "stderr": capture.stderr,
-                "error": capture.error,
-            },
+            raw_fields,
             command_output_digest(command_record),
+            failure_path_authority=path_binding,
         )
         return self.add_observation(
             {"commandId": capture.command_id, "rawObservation": raw}
@@ -15921,7 +16801,7 @@ class FoundationRunner:
         if not capture.output_limited:
             try:
                 report, parse_errors = parse_static_machine_report(
-                    capture.authoritative_stdout_bytes(),
+                    capture.failure_identity_stdout_bytes(),
                     expected_invocation_id=invocation_id,
                 )
                 report_errors.extend(parse_errors)
@@ -15944,8 +16824,28 @@ class FoundationRunner:
         invocation_exact = capture.argv == argv
         if not invocation_exact:
             report_errors.append("static machine invocation argv identity is not exact")
+        canonical_report: dict[str, Any] | None = None
+        canonical_observation_bindings: list[Mapping[str, Any] | None] = []
         if report is not None and not report_errors:
-            _canonicalize_static_machine_capture(capture, report)
+            canonical_report = copy.deepcopy(report)
+            canonical_results: list[Any] = []
+            for result in report["observations"]:
+                scope = f"result:{result.get('name', '')}"
+                if (
+                    scope in R03_FAILURE_TARGETS
+                    and isinstance(capture.failure_path_authority, FailurePathAuthority)
+                ):
+                    canonical_result, binding = canonicalize_failure_identity_value(
+                        result,
+                        capture.failure_path_authority,
+                    )
+                else:
+                    canonical_result = copy.deepcopy(result)
+                    binding = None
+                canonical_results.append(canonical_result)
+                canonical_observation_bindings.append(binding)
+            canonical_report["observations"] = canonical_results
+            _canonicalize_static_machine_capture(capture, canonical_report)
         static_command_record = self.add_command(capture)
         static_command_record["executionInputs"] = copy.deepcopy(
             protected_bundle["executionInputs"]
@@ -15973,11 +16873,14 @@ class FoundationRunner:
             detail_parts.extend(report_errors)
             self.add_hard_gate("STATIC-SUITE-RESULT", False, "; ".join(detail_parts))
         else:
-            assert report is not None
+            assert canonical_report is not None
             release_scopes = {
                 entry["testOrPathScope"] for entry in self.baseline.get("releaseOnlySkips", [])
             }
-            for observation_ordinal, result in enumerate(report["observations"]):
+            for observation_ordinal, result in enumerate(
+                canonical_report["observations"]
+            ):
+                path_binding = canonical_observation_bindings[observation_ordinal]
                 scope = f"result:{result['name']}"
                 status = result.get("status")
                 detail = result.get("detail")
@@ -15989,7 +16892,11 @@ class FoundationRunner:
                     signature = "pass"
                     identity: Mapping[str, Any] = {"scope": scope, "normalizedSignature": "pass"}
                 else:
-                    identity = structured_failure_identity(scope, detail)
+                    identity = structured_failure_identity(
+                        scope,
+                        detail,
+                        path_authority=path_binding,
+                    )
                     signature = static_failure_signature(scope, detail, identity)
                 raw = make_raw_observation(
                     "static-suite",
@@ -16000,6 +16907,7 @@ class FoundationRunner:
                     STATIC_SUITE_RELATIVE_PATH,
                     result,
                     command_output_digest(static_command_record),
+                    failure_path_authority=path_binding,
                 )
                 self.add_observation(
                     observation(
@@ -16014,7 +16922,7 @@ class FoundationRunner:
                     )
                 )
             self.completed_classes.add("static-suite")
-            self.static_machine_report = report
+            self.static_machine_report = canonical_report
         self.run_direct_syntax()
 
     def run_direct_syntax(self) -> None:
