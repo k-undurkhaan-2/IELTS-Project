@@ -496,12 +496,11 @@ SECURITY_GUARD_FILES = (
     "developer/tests/js/vocabSessionExportGuard.test.js",
 )
 
-VITEST_SECURITY_GUARD = "developer/tests/js/messageOriginGuard.test.js"
+MESSAGE_ORIGIN_SECURITY_GUARD = "developer/tests/js/messageOriginGuard.test.js"
 DEPENDENCY_BACKED_TOOL_ROLES = frozenset(
     {
         "node-test",
         "node-security-test",
-        "node-vitest-security-test",
         "npm-backend-test",
     }
 )
@@ -10992,10 +10991,9 @@ def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
     canonical["resolvedExecutableFileIdentity"] = None
     if canonical.get("dependencyBacked"):
         canonical["runtimeClosureDigest"] = "<FRESH-RUNTIME-CLOSURE>"
-        if tool_role != "node-vitest-security-test":
-            canonical["resolvedTestRunnerEntrypoint"] = (
-                f"<TRUSTED-TOOL:{tool_role}>"
-            )
+        canonical["resolvedTestRunnerEntrypoint"] = (
+            f"<TRUSTED-TOOL:{tool_role}>"
+        )
     for target in canonical.get("targets", []):
         if isinstance(target, dict):
             target["canonicalSourcePath"] = None
@@ -12279,25 +12277,10 @@ class RuntimeDependencyClosure:
             git_value = tools.get("git")
             if git_value:
                 leases["git"] = ExecutableIdentityLease(git_value, "git-authority")
-            vitest_record: dict[str, Any] | None = None
-            if profile in {"frontend", "all"}:
-                vitest_path = repo_root / "developer" / "node_modules" / "vitest" / "vitest.mjs"
-                package_path = repo_root / "developer" / "node_modules" / "vitest" / "package.json"
-                if not vitest_path.is_file() or not package_path.is_file():
-                    raise ValueError("fresh Vitest entrypoint/package metadata is unavailable")
-                package = strict_json_load_file(package_path)
-                if package.get("name") != "vitest" or not isinstance(package.get("version"), str):
-                    raise ValueError("Vitest package identity is invalid")
-                leases["vitest"] = ExecutableIdentityLease(
-                    vitest_path,
-                    "vitest-entrypoint",
-                    allow_dependency_root=True,
-                )
-                vitest_record = {
-                    "resolvedEntrypoint": "developer/node_modules/vitest/vitest.mjs",
-                    "packageVersion": package["version"],
-                    "entrypointSha256": leases["vitest"].expected_sha256,
-                }
+            # Keep the schema-v1 field as an explicit null sentinel.  No
+            # production profile resolves or leases Vitest after the
+            # message-origin guard moved to Node's built-in test runner.
+            vitest_record = None
             python_record = {
                 **leases["python"].evidence(),
                 "version": platform.python_version(),
@@ -12728,16 +12711,9 @@ def _remeasure_dependency_semantics(
                 "sha256": _sha256_file(path),
             }
         )
-    vitest = closure.document.get("vitest")
-    if isinstance(vitest, dict):
-        vitest_path = repo_root.joinpath(*str(vitest["resolvedEntrypoint"]).split("/"))
-        package_path = vitest_path.parent / "package.json"
-        package = strict_json_load_file(package_path)
-        vitest = {
-            "resolvedEntrypoint": str(vitest["resolvedEntrypoint"]),
-            "packageVersion": package.get("version"),
-            "entrypointSha256": _sha256_file(vitest_path),
-        }
+    if "vitest" not in closure.document or closure.document["vitest"] is not None:
+        raise ValueError("Vitest identity is not authorized")
+    vitest = None
     semantic = {
         "lockfiles": lockfiles,
         "dependencyRoots": root_records,
@@ -13560,12 +13536,11 @@ def build_profile_command_plan(
                 result_semantics="exit-zero-pass-exit-one-classified-observation",
                 execution_input_mode="PROTECTED-TARGET-BUNDLE",
             )
-        vitest = "developer/node_modules/vitest/vitest.mjs"
         add(
             "frontend-security:messageOriginGuard.test.js",
             "frontend-security",
-            [node, str((repo_root / vitest).resolve()), "run", "--root", "developer", "tests/js/messageOriginGuard.test.js"],
-            tool_role="node-vitest-security-test",
+            [node, "--test", MESSAGE_ORIGIN_SECURITY_GUARD],
+            tool_role="node-builtin-security-test",
             targets=candidate_paths,
             command_role="observation-producing",
             allowed_exits=(0, 1),
@@ -14985,9 +14960,14 @@ def _protected_snapshot_environment(
     env: Mapping[str, str],
     *,
     repo_root: Path,
+    include_dependency_roots: bool = True,
 ) -> dict[str, str]:
     snapshot_environment = dict(env)
     snapshot_environment["CI_PROTECTED_TARGET_SNAPSHOT"] = "1"
+    if not include_dependency_roots:
+        snapshot_environment.pop("NODE_PATH", None)
+        snapshot_environment.pop("NODE_OPTIONS", None)
+        return snapshot_environment
     dependency_roots: list[str] = []
     for relative in ("developer/node_modules", "backend/node_modules"):
         candidate = repo_root.joinpath(*relative.split("/"))
@@ -15218,6 +15198,9 @@ def execute_planned_static_suite(
         snapshot_environment = _protected_snapshot_environment(
             env,
             repo_root=repo_root,
+            include_dependency_roots=(
+                plan_record.get("toolRole") != "node-builtin-security-test"
+            ),
         )
         if git_projection_enabled:
             snapshot_environment = _protected_snapshot_git_environment(
@@ -15976,23 +15959,10 @@ class FoundationRunner:
             bound["runtimeClosureDigest"] = self.runtime_closure_digest
             bound["dependencyClosureDigest"] = self.dependency_closure_digest
             bound["nodePath"] = []
-            if bound.get("toolRole") == "node-vitest-security-test":
-                vitest_lease = (
-                    self.runtime_dependency_closure.leases.get("vitest")
-                    if self.runtime_dependency_closure is not None
-                    else None
-                )
-                bound["resolvedTestRunnerEntrypoint"] = (
-                    "developer/node_modules/vitest/vitest.mjs"
-                )
-                bound["resolvedTestRunnerSha256"] = (
-                    vitest_lease.expected_sha256 if vitest_lease is not None else None
-                )
-            else:
-                bound["resolvedTestRunnerEntrypoint"] = str(
-                    bound.get("resolvedExecutablePath")
-                )
-                bound["resolvedTestRunnerSha256"] = bound.get("resolvedExecutableSha256")
+            bound["resolvedTestRunnerEntrypoint"] = str(
+                bound.get("resolvedExecutablePath")
+            )
+            bound["resolvedTestRunnerSha256"] = bound.get("resolvedExecutableSha256")
             guard_evidence = (
                 self.runtime_dependency_guard.evidence()
                 if self.runtime_dependency_guard is not None
@@ -17101,44 +17071,47 @@ class FoundationRunner:
                 source_path=relative,
             )
 
-        vitest_command_id = "frontend-security:messageOriginGuard.test.js"
-        vitest_capture, vitest_record = self.execute_protected_external(
-            vitest_command_id,
+        message_origin_command_id = "frontend-security:messageOriginGuard.test.js"
+        message_origin_capture, message_origin_record = self.execute_protected_external(
+            message_origin_command_id,
             timeout=180,
         )
-        vitest_scope = f"file:{VITEST_SECURITY_GUARD}"
-        if not vitest_capture.executed:
-            vitest_outcome = "unavailable"
-            vitest_signature = "required-command-unavailable:vitest"
+        message_origin_scope = f"file:{MESSAGE_ORIGIN_SECURITY_GUARD}"
+        if not message_origin_capture.executed:
+            message_origin_outcome = "unavailable"
+            message_origin_signature = "required-executable-unavailable:node"
             self.add_hard_gate(
                 "FRONTEND-SECURITY-GUARD-EXECUTION",
                 False,
-                "canonical message-origin Vitest command did not execute",
+                "canonical message-origin Node built-in test command did not execute",
             )
-        elif vitest_capture.exit_code == 0:
-            vitest_outcome = "pass"
-            vitest_signature = "pass"
+        elif message_origin_capture.exit_code == 0:
+            message_origin_outcome = "pass"
+            message_origin_signature = "pass"
         else:
-            vitest_outcome = "fail"
-            vitest_identity = extract_failure_identity(
-                vitest_scope,
-                stdout=vitest_capture.stdout,
-                stderr=vitest_capture.stderr,
+            message_origin_outcome = "fail"
+            message_origin_identity = extract_failure_identity(
+                message_origin_scope,
+                stdout=message_origin_capture.stdout,
+                stderr=message_origin_capture.stderr,
             )
-            vitest_signature = failure_identity_hash(vitest_identity)
-        if vitest_outcome == "pass":
-            vitest_identity = {"scope": vitest_scope, "normalizedSignature": "pass"}
-        elif not isinstance(locals().get("vitest_identity"), dict):
-            vitest_identity = extract_failure_identity(
-                vitest_scope,
-                stdout=vitest_capture.stdout,
-                stderr=vitest_capture.stderr,
+            message_origin_signature = failure_identity_hash(message_origin_identity)
+        if message_origin_outcome == "pass":
+            message_origin_identity = {
+                "scope": message_origin_scope,
+                "normalizedSignature": "pass",
+            }
+        elif not isinstance(locals().get("message_origin_identity"), dict):
+            message_origin_identity = extract_failure_identity(
+                message_origin_scope,
+                stdout=message_origin_capture.stdout,
+                stderr=message_origin_capture.stderr,
             )
         self.add_process_observation(
-            vitest_record,
-            vitest_capture,
-            source_result_id=vitest_scope,
-            source_path=VITEST_SECURITY_GUARD,
+            message_origin_record,
+            message_origin_capture,
+            source_result_id=message_origin_scope,
+            source_path=MESSAGE_ORIGIN_SECURITY_GUARD,
         )
         self.completed_classes.add("frontend-security")
         self.add_hard_gate(
@@ -18033,15 +18006,8 @@ def _validate_runtime_dependency_closure(
             errors.append(f"{label}: dependency root set/order is not exact for profile")
         if closure.get("dependencyMemberCount") != total_members:
             errors.append(f"{label}: dependencyMemberCount is invalid")
-        if profile in {"frontend", "all"}:
-            if not isinstance(vitest, dict) or set(vitest) != {
-                "resolvedEntrypoint",
-                "packageVersion",
-                "entrypointSha256",
-            }:
-                errors.append(f"{label}: Vitest identity is missing or invalid")
-        elif vitest is not None:
-            errors.append(f"{label}: Vitest identity is unexpected for profile")
+        if vitest is not None:
+            errors.append(f"{label}: Vitest identity is unexpected")
         semantic = {
             "lockfiles": lockfiles,
             "dependencyRoots": roots,
@@ -18355,7 +18321,7 @@ def _validate_command_record(
         entrypoint = record.get("resolvedTestRunnerEntrypoint")
         if not isinstance(entrypoint, str) or not entrypoint:
             errors.append(f"{label}: resolved test-runner entrypoint is invalid")
-        elif record.get("toolRole") != "node-vitest-security-test" and not Path(entrypoint).is_absolute():
+        elif not Path(entrypoint).is_absolute():
             errors.append(f"{label}: resolved test-runner entrypoint is not absolute")
         guard = record.get("runtimeClosureGuard")
         guard_keys = {

@@ -4055,6 +4055,11 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
             role: str(Path(sys.executable).resolve(strict=True))
             for role in ci.required_tool_names("all")
         }
+        tools["node"] = _explicit_local_test_tool_map("node")["node"]
+        self.assertNotEqual(
+            Path(tools["node"]).resolve(strict=True),
+            Path(sys.executable).resolve(strict=True),
+        )
         plan = ci.build_profile_command_plan(
             "all",
             tools=tools,
@@ -4068,13 +4073,144 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
         target_universe = {
             target["path"] for spec in plan for target in spec["targets"]
         }
+        target_reference_count = sum(len(spec["targets"]) for spec in plan)
         self.assertEqual(len(plan), 705)
         self.assertEqual(len(command_classes), 16)
         self.assertEqual(len(target_universe), 904)
+        self.assertEqual(target_reference_count, 19725)
+        self.assertNotIn(
+            "node-vitest-security-test",
+            {spec["toolRole"] for spec in plan},
+        )
+        message_origin_commands = [
+            spec
+            for spec in plan
+            if spec["commandId"]
+            == "frontend-security:messageOriginGuard.test.js"
+        ]
+        self.assertEqual(len(message_origin_commands), 1)
+        message_origin_command = message_origin_commands[0]
+        trusted_node = tools["node"]
+        expected_message_origin_argv = [
+            trusted_node,
+            "--test",
+            ci.MESSAGE_ORIGIN_SECURITY_GUARD,
+        ]
+        self.assertEqual(message_origin_command["ordinal"], 700)
+        self.assertEqual(message_origin_command["commandClass"], "frontend-security")
+        self.assertEqual(message_origin_command["commandRole"], "observation-producing")
+        self.assertTrue(message_origin_command["required"])
+        self.assertEqual(message_origin_command["cwd"], ".")
+        self.assertEqual(
+            message_origin_command["toolRole"], "node-builtin-security-test"
+        )
+        self.assertNotIn(
+            message_origin_command["toolRole"], ci.DEPENDENCY_BACKED_TOOL_ROLES
+        )
+        for argv_field in ("argv", "logicalArgv", "executionArgv"):
+            self.assertEqual(
+                message_origin_command[argv_field],
+                expected_message_origin_argv,
+            )
+        self.assertEqual(
+            message_origin_command["executionInputMode"],
+            "PROTECTED-TARGET-BUNDLE",
+        )
+        self.assertEqual(message_origin_command["allowedExecutionExits"], [0, 1])
+        self.assertEqual(
+            message_origin_command["resultSemantics"],
+            "exit-zero-pass-exit-one-classified-observation",
+        )
+        message_origin_targets = [
+            target["path"] for target in message_origin_command["targets"]
+        ]
+        self.assertEqual(message_origin_targets, candidate_paths)
+        self.assertIn(ci.MESSAGE_ORIGIN_SECURITY_GUARD, message_origin_targets)
+        self.assertIn("developer/package.json", message_origin_targets)
+        self.assertFalse(
+            any("node_modules" in Path(target).parts for target in message_origin_targets)
+        )
+        forbidden_route_tokens = (
+            "vitest",
+            "node_modules",
+            "npm",
+            "npx",
+            "pnpm",
+            "yarn",
+            ".bin",
+            "cmd.exe",
+            "powershell",
+        )
+        message_origin_route = " ".join(expected_message_origin_argv[1:]).casefold()
+        for token in forbidden_route_tokens:
+            self.assertNotIn(token, message_origin_route)
+        self.assertEqual(plan[699]["commandId"], "frontend-security:vocabSessionExportGuard.test.js")
+        self.assertEqual(plan[701]["commandId"], "backend-canonical")
         records = [synthetic_record_from_spec(spec) for spec in plan]
+        message_origin_template = records[message_origin_command["ordinal"]]
+        message_origin_stdout = (
+            "TAP version 13\n"
+            "# Subtest: postMessage origin guard tests pass\n"
+            "ok 1 - postMessage origin guard tests pass\n"
+            "1..1\n"
+        )
+        message_origin_stdout_raw = message_origin_stdout.encode("utf-8")
+        message_origin_capture = ci.CommandCapture(
+            command_id=message_origin_command["commandId"],
+            command_class=message_origin_command["commandClass"],
+            argv=list(expected_message_origin_argv),
+            executed=True,
+            exit_code=0,
+            duration_seconds=0.01,
+            stdout=message_origin_stdout,
+            stderr="",
+            required=True,
+            cwd=".",
+            stdout_raw=message_origin_stdout_raw,
+            stderr_raw=b"",
+            stdout_byte_limit=ci.MAX_STATIC_MACHINE_STDOUT_BYTES,
+            stderr_byte_limit=ci.MAX_STATIC_MACHINE_STDERR_BYTES,
+            stdout_bytes=len(message_origin_stdout_raw),
+            stderr_bytes=0,
+            include_preview=False,
+            containment=(
+                "windows-job-object"
+                if os.name == "nt"
+                else "linux-subreaper-pidfd-proc-supervisor"
+            ),
+            process_tree_status="contained-clean",
+            containment_disposition="no-descendants",
+            logical_argv=list(expected_message_origin_argv),
+            execution_input_mode="PROTECTED-TARGET-BUNDLE",
+        )
+        message_origin_binder = object.__new__(ci.FoundationRunner)
+        message_origin_binder.command_plan_by_id = {
+            message_origin_command["commandId"]: message_origin_command
+        }
+        message_origin_record = ci.FoundationRunner._bind_command_record(
+            message_origin_binder,
+            message_origin_capture.evidence(),
+            actual_argv=expected_message_origin_argv,
+        )
+        for field_name in (
+            "executionInputs",
+            "executionInputBundleDigest",
+            "protectedTargetBundle",
+        ):
+            message_origin_record[field_name] = copy.deepcopy(
+                message_origin_template[field_name]
+            )
+        records[message_origin_command["ordinal"]] = message_origin_record
+        message_origin_binder.command_results = [message_origin_record]
+        message_origin_binder.observations = []
+        message_origin_binder.add_process_observation(
+            message_origin_record,
+            message_origin_capture,
+            source_result_id=f"file:{ci.MESSAGE_ORIGIN_SECURITY_GUARD}",
+            source_path=ci.MESSAGE_ORIGIN_SECURITY_GUARD,
+        )
+        message_origin_observation = message_origin_binder.observations[0]
         observations: list[dict] = []
-        executable = Path(sys.executable).resolve(strict=True)
-        executable_hash = ci._sha256_file(executable)
         closure_guard = {
             "guardSchemaVersion": ci.RUNTIME_DEPENDENCY_GUARD_SCHEMA_VERSION,
             "watcherBackend": "live-shaped-fixture",
@@ -4113,21 +4249,34 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                         "runtimeClosureDigest": "4" * 64,
                         "dependencyClosureDigest": "5" * 64,
                         "nodePath": [],
-                        "resolvedTestRunnerEntrypoint": str(executable),
-                        "resolvedTestRunnerSha256": executable_hash,
+                        "resolvedTestRunnerEntrypoint": record[
+                            "resolvedExecutablePath"
+                        ],
+                        "resolvedTestRunnerSha256": record[
+                            "resolvedExecutableSha256"
+                        ],
                         "closureWatcherActive": True,
                         "closureMutationState": "clean",
                         "runtimeClosureGuard": copy.deepcopy(closure_guard),
                     }
                 )
+            elif (
+                spec["commandId"]
+                == "frontend-security:messageOriginGuard.test.js"
+            ):
+                record["dependencyBacked"] = False
             observation_count = (
                 1 if spec["commandRole"] == "observation-producing" else 0
             )
-            if observation_count:
+            if observation_count and record is not message_origin_record:
                 record["diagnosticPreview"] = "live-shaped bounded diagnostic" * 8
             for observation_ordinal in range(observation_count):
-                scope = (
-                    f"live-shaped:{spec['commandId']}:{observation_ordinal:03d}"
+                if record is message_origin_record:
+                    observations.append(copy.deepcopy(message_origin_observation))
+                    continue
+                scope = f"live-shaped:{spec['commandId']}:{observation_ordinal:03d}"
+                source_path = (
+                    spec["targets"][0]["path"] if spec["targets"] else None
                 )
                 raw = ci.make_raw_observation(
                     spec["commandId"],
@@ -4135,7 +4284,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                     observation_ordinal,
                     "normalized-fields-v1",
                     scope,
-                    spec["targets"][0]["path"] if spec["targets"] else None,
+                    source_path,
                     {"scope": scope, "outcome": "pass"},
                     ci.command_output_digest(record),
                 )
@@ -4166,15 +4315,10 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 "backend/node_modules",
             )
         ]
-        vitest = {
-            "resolvedEntrypoint": str(executable),
-            "packageVersion": "live-shaped-fixture",
-            "entrypointSha256": executable_hash,
-        }
         dependency_semantic = {
             "lockfiles": runner.runtime_closure_document["lockfiles"],
             "dependencyRoots": dependency_roots,
-            "vitest": vitest,
+            "vitest": None,
             "nodePath": [],
         }
         dependency_digest = hashlib.sha256(
@@ -4184,8 +4328,20 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
             {
                 "profile": "all",
                 "runnerOS": "Linux",
+                "nodeExecutable": {
+                    "role": "node-runtime",
+                    "canonicalPath": str(Path(trusted_node).resolve(strict=True)),
+                    "size": message_origin_command["resolvedExecutableSize"],
+                    "sha256": message_origin_command[
+                        "resolvedExecutableSha256"
+                    ],
+                    "stableIdentity": message_origin_command[
+                        "resolvedExecutableFileIdentity"
+                    ],
+                    "leaseHeld": True,
+                },
                 "dependencyRoots": dependency_roots,
-                "vitest": vitest,
+                "vitest": None,
                 "nodePath": [],
                 "dependencyClosureDigest": dependency_digest,
                 "dependencyMemberCount": 0,
@@ -4255,7 +4411,112 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 [record["commandId"] for record in document["records"]],
                 [spec["commandId"] for spec in plan],
             )
+            self.assertIsNone(document["runtimeDependencyClosure"]["vitest"])
             self.assertEqual(len(document["records"]), 705)
+            persisted_message_origin = next(
+                record
+                for record in document["records"]
+                if record["commandId"]
+                == "frontend-security:messageOriginGuard.test.js"
+            )
+            self.assertEqual(
+                persisted_message_origin["actualExecutionArgv"],
+                expected_message_origin_argv,
+            )
+            self.assertEqual(
+                persisted_message_origin["resolvedExecutablePath"],
+                str(Path(trusted_node).resolve(strict=True)),
+            )
+            self.assertEqual(
+                persisted_message_origin["executable"], Path(trusted_node).name
+            )
+            self.assertNotEqual(persisted_message_origin["executable"], "internal")
+            for field_name in (
+                "resolvedExecutableSize",
+                "resolvedExecutableSha256",
+                "resolvedExecutableFileIdentity",
+            ):
+                self.assertEqual(
+                    persisted_message_origin[field_name],
+                    message_origin_command[field_name],
+                )
+            self.assertEqual(
+                persisted_message_origin["containment"],
+                (
+                    "windows-job-object"
+                    if os.name == "nt"
+                    else "linux-subreaper-pidfd-proc-supervisor"
+                ),
+            )
+            self.assertEqual(
+                persisted_message_origin["processTreeStatus"], "contained-clean"
+            )
+            self.assertEqual(
+                persisted_message_origin["containmentDisposition"], "no-descendants"
+            )
+            self.assertEqual(
+                persisted_message_origin["stdoutBytesObserved"],
+                len(message_origin_stdout_raw),
+            )
+            self.assertIs(persisted_message_origin["dependencyBacked"], False)
+            for field_name in (
+                "runtimeClosureDigest",
+                "dependencyClosureDigest",
+                "nodePath",
+                "resolvedTestRunnerEntrypoint",
+                "resolvedTestRunnerSha256",
+                "closureWatcherActive",
+                "closureMutationState",
+                "runtimeClosureGuard",
+            ):
+                self.assertNotIn(field_name, persisted_message_origin)
+            self.assertEqual(
+                len(persisted_message_origin["producerObservations"]), 1
+            )
+            self.assertEqual(
+                persisted_message_origin["producerObservations"][0]["commandId"],
+                persisted_message_origin["commandId"],
+            )
+            persisted_message_origin_observation = (
+                persisted_message_origin["producerObservations"][0]
+            )
+            self.assertEqual(
+                persisted_message_origin_observation["observationKind"],
+                "process-output-v1",
+            )
+            self.assertEqual(
+                persisted_message_origin_observation["sourceResultId"],
+                f"file:{ci.MESSAGE_ORIGIN_SECURITY_GUARD}",
+            )
+            self.assertEqual(
+                persisted_message_origin_observation["sourcePath"],
+                ci.MESSAGE_ORIGIN_SECURITY_GUARD,
+            )
+            self.assertEqual(
+                persisted_message_origin_observation["sourceOutputDigest"],
+                ci.command_output_digest(persisted_message_origin),
+            )
+            self.assertEqual(
+                persisted_message_origin_observation["rawStructuredFields"],
+                {
+                    "executed": True,
+                    "exitCode": 0,
+                    "stdout": message_origin_stdout.rstrip("\n"),
+                    "stderr": "",
+                    "error": None,
+                },
+            )
+            record_errors: list[str] = []
+            self.assertFalse(
+                ci._validate_command_record(
+                    persisted_message_origin,
+                    message_origin_command["ordinal"],
+                    record_errors,
+                    expected_record=message_origin_command,
+                ),
+                record_errors,
+            )
+            self.assertEqual(record_errors, [])
             self.assertEqual(
                 document["completedCommandClasses"], sorted(command_classes)
             )
@@ -4323,6 +4584,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 f"RECORDS={len(document['records'])} "
                 f"CLASSES={len(document['completedCommandClasses'])} "
                 f"TARGETS={len(target_universe)} "
+                f"TARGET_REFERENCES={target_reference_count} "
                 f"LARGEST_RECORD_BYTES={largest_record[0]} "
                 f"LARGEST_RECORD_ID={largest_record[1]} "
                 f"LARGEST_FIELD={largest_field} "
@@ -10123,6 +10385,7 @@ class CI6ProtectedPolicyInputTest(unittest.TestCase):
         candidates = [
             "developer/tests/ci/run_static_suite.py",
             "developer/tests/ci/test_standalone_packaging.py",
+            ci.MESSAGE_ORIGIN_SECURITY_GUARD,
         ]
         expected_external = {
             "policy": {
@@ -10179,6 +10442,38 @@ class CI6ProtectedPolicyInputTest(unittest.TestCase):
                             candidates,
                             command_id,
                         )
+                    if command_id == "frontend-security:messageOriginGuard.test.js":
+                        trusted_node = tools["node"]
+                        expected_argv = [
+                            trusted_node,
+                            "--test",
+                            ci.MESSAGE_ORIGIN_SECURITY_GUARD,
+                        ]
+                        self.assertEqual(command["argv"], expected_argv)
+                        self.assertEqual(command["logicalArgv"], expected_argv)
+                        self.assertEqual(command["executionArgv"], expected_argv)
+                        self.assertEqual(
+                            command["toolRole"], "node-builtin-security-test"
+                        )
+                        self.assertNotIn(
+                            command["toolRole"], ci.DEPENDENCY_BACKED_TOOL_ROLES
+                        )
+                        self.assertTrue(command["required"])
+                        self.assertEqual(command["commandRole"], "observation-producing")
+                        self.assertEqual(
+                            [
+                                target["path"]
+                                for target in command["targets"]
+                                if target["path"] == ci.MESSAGE_ORIGIN_SECURITY_GUARD
+                            ],
+                            [ci.MESSAGE_ORIGIN_SECURITY_GUARD],
+                        )
+                        self.assertFalse(
+                            any(
+                                "node_modules" in Path(target["path"]).parts
+                                for target in command["targets"]
+                            )
+                        )
                 for command in plan:
                     if command["targets"]:
                         self.assertIn(
@@ -10186,6 +10481,13 @@ class CI6ProtectedPolicyInputTest(unittest.TestCase):
                             {"PROTECTED-TARGET-BUNDLE", "TARGET-BYTES-STDIN"},
                             command["commandId"],
                         )
+        guard_source = ci.REPO_ROOT.joinpath(
+            *ci.MESSAGE_ORIGIN_SECURITY_GUARD.split("/")
+        ).read_text(encoding="utf-8")
+        self.assertIn("from 'node:test'", guard_source)
+        self.assertIn("from 'node:assert/strict'", guard_source)
+        self.assertNotIn("vitest", guard_source.casefold())
+        self.assertNotRegex(guard_source, r"\.(?:skip|todo|only)\b")
 
     def test_protected_snapshot_process_consumes_only_materialized_planned_bytes(self) -> None:
         script = self.root / "check.py"
@@ -10275,6 +10577,103 @@ class CI6ProtectedPolicyInputTest(unittest.TestCase):
             [item["actualSha256"] for item in evidence["executionInputs"]],
             [item["plannedSha256"] for item in evidence["executionInputs"]],
         )
+
+        with self.subTest(command="message-origin-node-builtin"):
+            policy, tools = _resolved_local_test_authority("python", "git", "node")
+            source_environment = _explicit_local_test_environment()
+            source_environment.pop("NODE_PATH", None)
+            source_environment.pop("NODE_OPTIONS", None)
+            candidate_paths, candidate_errors = ci.deterministic_candidate_paths(
+                ci.REPO_ROOT
+            )
+            self.assertEqual(candidate_errors, [])
+            protected_root = self.root / "message-origin-projection"
+            protected_root.mkdir()
+            for relative in candidate_paths:
+                source = ci.REPO_ROOT.joinpath(*relative.split("/"))
+                destination = protected_root.joinpath(*relative.split("/"))
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+            self.assertFalse((protected_root / "developer" / "node_modules").exists())
+            self.assertFalse(
+                (
+                    protected_root
+                    / "developer"
+                    / "node_modules"
+                    / "vitest"
+                    / "vitest.mjs"
+                ).exists()
+            )
+            plan = ci.build_profile_command_plan(
+                "frontend",
+                tools=tools,
+                candidate_paths=candidate_paths,
+                baseline=ci.strict_json_load_file(ci.BASELINE_PATH),
+                current_platform=ci.platform_key(),
+                static_invocation_id=ci.deterministic_static_invocation_id(
+                    protected_root
+                ),
+                repo_root=protected_root,
+            )
+            command = next(
+                item
+                for item in plan
+                if item["commandId"]
+                == "frontend-security:messageOriginGuard.test.js"
+            )
+            child_environment = ci.child_process_environment(
+                tools,
+                source_environment=source_environment,
+                repo_root=protected_root,
+                policy=policy,
+            )
+            child_environment["NODE_PATH"] = str(
+                protected_root / "unauthorized-node-path"
+            )
+            child_environment["NODE_OPTIONS"] = (
+                "--require=./unauthorized-node-loader.cjs"
+            )
+            observed_environment: dict[str, str] = {}
+            original_execute_command = ci.execute_command
+
+            def observe_execute_command(*args, **kwargs):
+                observed_environment.update(kwargs.get("env") or {})
+                return original_execute_command(*args, **kwargs)
+
+            node_lease = ci.ExecutableIdentityLease(
+                tools["node"], "r04-trusted-node"
+            )
+            try:
+                with mock.patch.object(
+                    ci,
+                    "execute_command",
+                    side_effect=observe_execute_command,
+                ):
+                    capture, bundle = ci.execute_planned_static_suite(
+                        command,
+                        repo_root=protected_root,
+                        env=child_environment,
+                        timeout=180,
+                        executable_lease=node_lease,
+                    )
+            finally:
+                node_lease.close()
+            self.assertTrue(
+                capture.execution_passed(), capture.stdout + capture.stderr
+            )
+            self.assertEqual(
+                capture.argv,
+                [tools["node"], "--test", ci.MESSAGE_ORIGIN_SECURITY_GUARD],
+            )
+            self.assertNotIn("NODE_PATH", observed_environment)
+            self.assertNotIn("NODE_OPTIONS", observed_environment)
+            self.assertEqual(bundle["cleanupState"], "closed")
+            self.assertFalse(bundle["mutationDetected"])
+            self.assertEqual(
+                [item["actualSha256"] for item in bundle["executionInputs"]],
+                [item["plannedSha256"] for item in bundle["executionInputs"]],
+            )
+            self.assertFalse((protected_root / "developer" / "node_modules").exists())
 
     def test_bundle_snapshot_gets_only_derived_git_membership_ignore_and_attribute_authority(
         self,
@@ -11587,18 +11986,13 @@ class CI8RuntimeDependencyClosureTest(unittest.TestCase):
         tool = root / "trusted-node" if lease_path is None else lease_path
         if lease_path is None:
             tool.write_bytes(b"trusted-tool")
-        vitest_record = {
-            "resolvedEntrypoint": "developer/node_modules/vitest/vitest.mjs",
-            "packageVersion": "1.0.0",
-            "entrypointSha256": hashlib.sha256((vitest / "vitest.mjs").read_bytes()).hexdigest(),
-        }
         document = {
             "dependencyRoots": [{"logicalRoot": "developer/node_modules"}],
             "lockfiles": [
                 {"relativePath": "developer/package-lock.json"},
                 {"relativePath": "backend/package-lock.json"},
             ],
-            "vitest": vitest_record,
+            "vitest": None,
         }
         placeholder = SimpleNamespace(document=document)
         digest, count = ci._remeasure_dependency_semantics(placeholder, repo_root=root)
@@ -11645,6 +12039,9 @@ class CI8RuntimeDependencyClosureTest(unittest.TestCase):
             self.assertEqual(document["closureSchemaVersion"], ci.RUNTIME_DEPENDENCY_CLOSURE_SCHEMA_VERSION)
             self.assertEqual(document["profile"], "policy")
             self.assertEqual(document["nodePath"], [])
+            self.assertIsNone(document["vitest"])
+            self.assertIsNotNone(runner.runtime_dependency_closure)
+            self.assertNotIn("vitest", runner.runtime_dependency_closure.leases)
             self.assertEqual(document["dependencyMemberCount"], 0)
             self.assertEqual(
                 document["closureDigest"],
@@ -11710,14 +12107,16 @@ class CI8RuntimeDependencyClosureTest(unittest.TestCase):
                 npm_entry.write_text(
                     "console.log('11.0.0');\n", encoding="utf-8"
                 )
+                measured_tools = {**tools, "npm": str(npm_entry)}
+                measurement_environment = ci.child_process_environment(
+                    measured_tools,
+                    source_environment=local_source,
+                    policy=policy,
+                )
                 closure = ci.RuntimeDependencyClosure.build(
                     "policy",
-                    {**tools, "npm": str(npm_entry)},
-                    ci.child_process_environment(
-                        {**tools, "npm": str(npm_entry)},
-                        source_environment=local_source,
-                        policy=policy,
-                    ),
+                    measured_tools,
+                    measurement_environment,
                     repo_root=ci.REPO_ROOT,
                     source_environment={},
                 )
@@ -11726,8 +12125,144 @@ class CI8RuntimeDependencyClosureTest(unittest.TestCase):
                         closure.document["measurementStatus"],
                         "measured-complete",
                     )
+                    self.assertIsNone(closure.document["vitest"])
+                    self.assertNotIn("vitest", closure.leases)
+                    forged_closure = SimpleNamespace(
+                        document={
+                            **copy.deepcopy(closure.document),
+                            "vitest": {
+                                "resolvedEntrypoint": (
+                                    "developer/node_modules/vitest/vitest.mjs"
+                                )
+                            },
+                        }
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "Vitest identity is not authorized"
+                    ):
+                        ci._remeasure_dependency_semantics(
+                            forged_closure,
+                            repo_root=ci.REPO_ROOT,
+                        )
+                    missing_sentinel = SimpleNamespace(
+                        document={
+                            key: copy.deepcopy(value)
+                            for key, value in closure.document.items()
+                            if key != "vitest"
+                        }
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "Vitest identity is not authorized"
+                    ):
+                        ci._remeasure_dependency_semantics(
+                            missing_sentinel,
+                            repo_root=ci.REPO_ROOT,
+                        )
+                    forged_document = copy.deepcopy(closure.document)
+                    forged_document["vitest"] = {
+                        "resolvedEntrypoint": (
+                            "developer/node_modules/vitest/vitest.mjs"
+                        )
+                    }
+                    forged_document_without_digest = {
+                        key: value
+                        for key, value in forged_document.items()
+                        if key != "closureDigest"
+                    }
+                    forged_document["closureDigest"] = hashlib.sha256(
+                        ci._canonical_frame(forged_document_without_digest)
+                    ).hexdigest()
+                    forged_errors: list[str] = []
+                    ci._validate_runtime_dependency_closure(
+                        forged_document,
+                        local_runner.runtime_closure_guard_evidence,
+                        local_runner.runtime,
+                        profile="policy",
+                        status="FAIL",
+                        errors=forged_errors,
+                    )
+                    self.assertTrue(
+                        any(
+                            "Vitest identity is unexpected" in error
+                            for error in forged_errors
+                        ),
+                        forged_errors,
+                    )
                 finally:
                     closure.close()
+
+                dependency_repo = Path(temp_dir) / "dependency-repo"
+                developer_modules = dependency_repo / "developer" / "node_modules"
+                backend_modules = dependency_repo / "backend" / "node_modules"
+                (developer_modules / "playwright").mkdir(parents=True)
+                (backend_modules / "backend-fixture").mkdir(parents=True)
+                (developer_modules / "playwright" / "package.json").write_text(
+                    '{"name":"playwright","version":"fixture"}\n',
+                    encoding="utf-8",
+                )
+                (backend_modules / "backend-fixture" / "package.json").write_text(
+                    '{"name":"backend-fixture","version":"fixture"}\n',
+                    encoding="utf-8",
+                )
+                for relative in (
+                    "developer/package-lock.json",
+                    "backend/package-lock.json",
+                ):
+                    lockfile = dependency_repo.joinpath(*relative.split("/"))
+                    lockfile.parent.mkdir(parents=True, exist_ok=True)
+                    lockfile.write_text('{"lockfileVersion":3}\n', encoding="utf-8")
+                self.assertFalse(
+                    (developer_modules / "vitest" / "vitest.mjs").exists()
+                )
+                for profile, expected_roots in (
+                    ("frontend", ["developer/node_modules"]),
+                    (
+                        "all",
+                        ["developer/node_modules", "backend/node_modules"],
+                    ),
+                ):
+                    with self.subTest(profile=profile, dependency="vitest-absent"):
+                        profile_closure = ci.RuntimeDependencyClosure.build(
+                            profile,
+                            measured_tools,
+                            measurement_environment,
+                            repo_root=dependency_repo,
+                            source_environment={},
+                        )
+                        try:
+                            self.assertEqual(
+                                profile_closure.document["measurementStatus"],
+                                "measured-complete",
+                            )
+                            self.assertEqual(
+                                [
+                                    item["logicalRoot"]
+                                    for item in profile_closure.document[
+                                        "dependencyRoots"
+                                    ]
+                                ],
+                                expected_roots,
+                            )
+                            self.assertIsNone(
+                                profile_closure.document["vitest"]
+                            )
+                            self.assertNotIn("vitest", profile_closure.leases)
+                            dependency_digest, dependency_members = (
+                                ci._remeasure_dependency_semantics(
+                                    profile_closure,
+                                    repo_root=dependency_repo,
+                                )
+                            )
+                            self.assertEqual(
+                                dependency_digest,
+                                profile_closure.dependency_digest,
+                            )
+                            self.assertEqual(
+                                dependency_members,
+                                profile_closure.member_count,
+                            )
+                        finally:
+                            profile_closure.close()
         finally:
             local_runner.cleanup_task_resources()
 
@@ -11846,12 +12381,16 @@ class CI8RuntimeDependencyClosureTest(unittest.TestCase):
 
     def test_vitest_change_and_restore_is_sticky(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ci8-closure-restore-") as temp_dir:
-            closure, guard, helper = self.make_guard(Path(temp_dir))
-            original = helper.read_bytes()
+            root = Path(temp_dir)
+            closure, guard, _helper = self.make_guard(root)
+            vitest_entrypoint = (
+                root / "developer" / "node_modules" / "vitest" / "vitest.mjs"
+            )
+            original = vitest_entrypoint.read_bytes()
             try:
-                helper.write_bytes(b"BBBB")
-                helper.write_bytes(original)
-                guard.watcher.emit("Vitest/node_modules helper write and restore")
+                vitest_entrypoint.write_bytes(b"export default 2;\n")
+                vitest_entrypoint.write_bytes(original)
+                guard.watcher.emit("Vitest file write and restore under generic manifest")
                 errors = guard.verify("change-and-restore")
                 self.assertTrue(guard.mutated)
                 self.assertTrue(any("sticky" in error for error in errors), errors)
