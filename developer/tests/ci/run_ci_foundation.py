@@ -65,6 +65,14 @@ STATIC_MACHINE_SCHEMA_VERSION = 2
 CANONICAL_FAILURE_MATERIAL_VERSION = 4
 FROZEN_V1_RELEASE_SKIP_SIGNATURE_SCHEMA_VERSION = 1
 RAW_OBSERVATION_SCHEMA_VERSION = 2
+RAW_OBSERVATION_KINDS = frozenset(
+    {
+        "static-producer-v1",
+        "process-output-v1",
+        "standalone-membership-v1",
+        "normalized-fields-v1",
+    }
+)
 TARGET_EXECUTION_LEASE_VERSION = 1
 PROTECTED_TARGET_BUNDLE_VERSION = 1
 VERIFICATION_REPLAY_TRANSCRIPT_VERSION = 1
@@ -11356,6 +11364,39 @@ def _validate_failure_path_authority(
     return errors
 
 
+def _source_observation_kinds(source: Mapping[str, Any]) -> frozenset[str]:
+    """Return parser roles authorized by immutable source-command identity."""
+
+    command_id = str(source.get("commandId", ""))
+    command_class = str(source.get("commandClass", ""))
+    if source.get("resultSemantics") == "synthetic-replay-fixture":
+        return RAW_OBSERVATION_KINDS
+    if command_id == "static-suite" and command_class == "static-suite":
+        return frozenset({"static-producer-v1"})
+    if (
+        command_class == "direct-syntax"
+        and command_id.startswith("node-check:")
+        and command_id != "node-check:"
+    ):
+        return frozenset({"process-output-v1"})
+    if command_id == "learner-focused" and command_class == "learner-focused":
+        return frozenset({"process-output-v1"})
+    if (
+        command_class == "frontend-security"
+        and command_id.startswith("frontend-security:")
+        and command_id != "frontend-security:"
+    ):
+        return frozenset({"process-output-v1"})
+    if command_id == "backend-canonical" and command_class == "backend-canonical":
+        return frozenset({"process-output-v1"})
+    if (
+        command_id == "standalone-membership-audit"
+        and command_class == "standalone-membership"
+    ):
+        return frozenset({"standalone-membership-v1"})
+    return frozenset()
+
+
 def _validate_raw_observation(
     raw: Any,
     *,
@@ -11384,13 +11425,15 @@ def _validate_raw_observation(
     for key in ("commandId", "observationKind", "sourceResultId", "sourceOutputDigest", "producerRecordDigest"):
         if not isinstance(raw.get(key), str) or not raw.get(key):
             errors.append(f"{label}: {key} must be a non-empty string")
-    if raw.get("observationKind") not in {
-        "static-producer-v1",
-        "process-output-v1",
-        "standalone-membership-v1",
-        "normalized-fields-v1",
-    }:
+    if raw.get("observationKind") not in RAW_OBSERVATION_KINDS:
         errors.append(f"{label}: observationKind is not authorized")
+    if (
+        source is not None
+        and raw.get("observationKind") not in _source_observation_kinds(source)
+    ):
+        errors.append(
+            f"{label}: observationKind is outside source command observation authority"
+        )
     for key in ("commandOrdinal", "observationOrdinal"):
         if type(raw.get(key)) is not int or not 0 <= raw.get(key, -1) < MAX_EVIDENCE_COLLECTION_ITEMS:
             errors.append(f"{label}: {key} must be a bounded non-negative integer")
@@ -11742,7 +11785,7 @@ def derive_authoritative_evidence(
             derivation_violations.append(
                 {"id": "PRODUCER-OBSERVATION-ORDINAL-GAP", "commandId": command_id}
             )
-        if record.get("commandRole") != "observation-producing" and records:
+        if not _source_observation_kinds(record) and records:
             derivation_violations.append(
                 {"id": "UNAUTHORIZED-PRODUCER-OBSERVATION", "commandId": command_id}
             )

@@ -4147,6 +4147,199 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
         self.assertEqual(plan[699]["commandId"], "frontend-security:vocabSessionExportGuard.test.js")
         self.assertEqual(plan[701]["commandId"], "backend-canonical")
         records = [synthetic_record_from_spec(spec) for spec in plan]
+        backend_command = plan[701]
+        self.assertEqual(backend_command["commandClass"], "backend-canonical")
+        self.assertEqual(backend_command["profile"], "all")
+        self.assertEqual(backend_command["platform"], "ubuntu")
+        self.assertEqual(backend_command["commandRole"], "required-execution")
+        self.assertEqual(backend_command["allowedExecutionExits"], [0])
+        self.assertEqual(backend_command["toolRole"], "npm-backend-test")
+        self.assertEqual(
+            ci._source_observation_kinds(backend_command),
+            frozenset({"process-output-v1"}),
+        )
+
+        backend_record = copy.deepcopy(records[backend_command["ordinal"]])
+        backend_scope = "command:npm --prefix backend test"
+        backend_raw_fields = {
+            "executed": True,
+            "exitCode": 0,
+            "stdout": "backend canonical observation passed",
+            "stderr": "",
+            "error": None,
+        }
+        backend_raw = ci.make_raw_observation(
+            backend_command["commandId"],
+            backend_command["ordinal"],
+            0,
+            "process-output-v1",
+            backend_scope,
+            "backend/package.json",
+            backend_raw_fields,
+            ci.command_output_digest(backend_record),
+        )
+        backend_record["producerObservations"] = [backend_raw]
+        backend_record["producerObservationSetDigest"] = (
+            ci.producer_observation_set_digest([backend_raw])
+        )
+        backend_runner = SimpleNamespace(
+            command_plan=[backend_command],
+            command_results=[backend_record],
+            observations=[
+                {
+                    "commandId": backend_command["commandId"],
+                    "rawObservation": backend_raw,
+                }
+            ],
+            completed_classes=set(),
+        )
+        ci.finalize_evidence_transcript(backend_runner)
+        backend_baseline = copy.deepcopy(baseline)
+        backend_baseline["knownDebts"] = []
+        backend_baseline["expectedOmissions"] = []
+        backend_baseline["releaseOnlySkips"] = []
+
+        def backend_result(
+            *,
+            record_change=None,
+            raw_change=None,
+            expected_plan=None,
+            duplicate_record: bool = False,
+        ):
+            selected_record = copy.deepcopy(backend_runner.command_results[0])
+            selected_observation = copy.deepcopy(backend_runner.observations[0])
+            selected_raw = copy.deepcopy(selected_observation["rawObservation"])
+            if record_change is not None:
+                record_change(selected_record)
+            if raw_change is not None:
+                raw_change(selected_raw)
+                selected_raw["producerRecordDigest"] = ci._producer_record_digest(
+                    {
+                        key: value
+                        for key, value in selected_raw.items()
+                        if key != "producerRecordDigest"
+                    }
+                )
+            selected_record["producerObservations"] = [selected_raw]
+            selected_record["producerObservationSetDigest"] = (
+                ci.producer_observation_set_digest([selected_raw])
+            )
+            selected_observation["rawObservation"] = selected_raw
+            selected_records = [selected_record]
+            if duplicate_record:
+                selected_records.append(copy.deepcopy(selected_record))
+            return ci.derive_authoritative_evidence(
+                "all",
+                [selected_observation],
+                backend_runner.completed_classes,
+                selected_records,
+                backend_baseline,
+                "ubuntu",
+                [copy.deepcopy(expected_plan or backend_command)],
+            )
+
+        legitimate_backend = backend_result()
+        self.assertEqual(legitimate_backend["violations"], [])
+        self.assertEqual(
+            backend_runner.observations[0]["rawObservation"]["rawStructuredFields"],
+            backend_raw_fields,
+        )
+
+        plan_role_forgery = backend_result(
+            record_change=lambda record: record.__setitem__(
+                "commandRole", "observation-producing"
+            )
+        )
+        self.assertIn(
+            "COMMAND-AUTHORITY-MISMATCH",
+            {item["id"] for item in plan_role_forgery["violations"]},
+        )
+
+        raw_role_cases = {
+            "forged-observation-role": "normalized-fields-v1",
+            "cross-domain-command-role": backend_command["commandRole"],
+            "unknown-observation-role": "unknown-observation-role",
+            "malformed-observation-role": 7,
+        }
+        for name, value in raw_role_cases.items():
+            with self.subTest(r05=name):
+                result = backend_result(
+                    raw_change=lambda raw, selected=value: raw.__setitem__(
+                        "observationKind", selected
+                    )
+                )
+                self.assertTrue(result["violations"], name)
+                details = " ".join(
+                    str(item.get("detail", "")) for item in result["violations"]
+                )
+                self.assertIn("observation", details.casefold())
+
+        missing_role = backend_result(
+            raw_change=lambda raw: raw.pop("observationKind")
+        )
+        self.assertTrue(missing_role["violations"])
+        swapped_roles = backend_result(
+            record_change=lambda record: record.__setitem__(
+                "commandRole", "process-output-v1"
+            ),
+            raw_change=lambda raw: raw.__setitem__(
+                "observationKind", "required-execution"
+            ),
+        )
+        self.assertTrue(swapped_roles["violations"])
+
+        binding_cases = {
+            "wrong-command-id": (
+                None,
+                lambda raw: raw.__setitem__("commandId", "static-suite"),
+            ),
+            "wrong-target": (
+                lambda record: record["targets"][0].__setitem__("sha256", "0" * 64),
+                None,
+            ),
+            "wrong-command-class": (
+                lambda record: record.__setitem__("commandClass", "frontend-security"),
+                None,
+            ),
+            "wrong-profile": (
+                lambda record: record.__setitem__("profile", "backend"),
+                None,
+            ),
+        }
+        for name, (record_change, raw_change) in binding_cases.items():
+            with self.subTest(r05=name):
+                result = backend_result(
+                    record_change=record_change,
+                    raw_change=raw_change,
+                )
+                self.assertTrue(result["violations"], name)
+        duplicate_backend = backend_result(duplicate_record=True)
+        self.assertTrue(duplicate_backend["violations"])
+        wrong_plan = copy.deepcopy(backend_command)
+        wrong_plan["profile"] = "backend"
+        wrong_plan_instance = backend_result(expected_plan=wrong_plan)
+        self.assertTrue(wrong_plan_instance["violations"])
+
+        windows_backend = copy.deepcopy(backend_command)
+        windows_backend["platform"] = "windows"
+        windows_backend["commandRole"] = "observation-producing"
+        windows_backend["allowedExecutionExits"] = [0, 1]
+        self.assertEqual(
+            ci._source_observation_kinds(windows_backend),
+            frozenset({"process-output-v1"}),
+        )
+        self.assertEqual(
+            ci._source_observation_kinds(message_origin_command),
+            frozenset({"process-output-v1"}),
+        )
+        self.assertEqual(
+            ci._source_observation_kinds(
+                next(item for item in plan if item["commandId"] == "static-suite")
+            ),
+            frozenset({"static-producer-v1"}),
+        )
+        self.assertEqual(ci._source_observation_kinds(plan[0]), frozenset())
+
         message_origin_template = records[message_origin_command["ordinal"]]
         message_origin_stdout = (
             "TAP version 13\n"
@@ -4265,33 +4458,77 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 == "frontend-security:messageOriginGuard.test.js"
             ):
                 record["dependencyBacked"] = False
-            observation_count = (
-                1 if spec["commandRole"] == "observation-producing" else 0
-            )
-            if observation_count and record is not message_origin_record:
+            observation_kinds = ci._source_observation_kinds(spec)
+            self.assertLessEqual(len(observation_kinds), 1)
+            if observation_kinds and record is not message_origin_record:
                 record["diagnosticPreview"] = "live-shaped bounded diagnostic" * 8
-            for observation_ordinal in range(observation_count):
-                if record is message_origin_record:
-                    observations.append(copy.deepcopy(message_origin_observation))
-                    continue
-                scope = f"live-shaped:{spec['commandId']}:{observation_ordinal:03d}"
-                source_path = (
-                    spec["targets"][0]["path"] if spec["targets"] else None
-                )
-                raw = ci.make_raw_observation(
-                    spec["commandId"],
-                    spec["ordinal"],
-                    observation_ordinal,
-                    "normalized-fields-v1",
-                    scope,
-                    source_path,
-                    {"scope": scope, "outcome": "pass"},
-                    ci.command_output_digest(record),
-                )
-                record["producerObservations"].append(raw)
-                observations.append(
-                    {"commandId": spec["commandId"], "rawObservation": raw}
-                )
+            if not observation_kinds:
+                continue
+            if record is message_origin_record:
+                observations.append(copy.deepcopy(message_origin_observation))
+                continue
+            observation_kind = next(iter(observation_kinds))
+            if observation_kind == "static-producer-v1":
+                result_name = "live-shaped-static-suite"
+                source_result_id = result_name
+                source_path = ci.STATIC_SUITE_RELATIVE_PATH
+                raw_fields = {
+                    "name": result_name,
+                    "status": "pass",
+                    "detail": {"fixture": "live-shaped"},
+                }
+            elif observation_kind == "process-output-v1":
+                if spec["commandClass"] == "direct-syntax":
+                    source_result_id = spec["commandId"].removeprefix("node-check:")
+                    source_path = source_result_id
+                elif spec["commandClass"] == "learner-focused":
+                    source_result_id = "command:learner-focused-runtime"
+                    source_path = "developer/tests/js/learnerPalette.test.js"
+                elif spec["commandClass"] == "frontend-security":
+                    source_path = next(
+                        relative
+                        for relative in (
+                            *ci.SECURITY_GUARD_FILES,
+                            ci.MESSAGE_ORIGIN_SECURITY_GUARD,
+                        )
+                        if Path(relative).name
+                        == spec["commandId"].removeprefix("frontend-security:")
+                    )
+                    source_result_id = f"file:{source_path}"
+                elif spec["commandClass"] == "backend-canonical":
+                    source_result_id = backend_scope
+                    source_path = "backend/package.json"
+                else:
+                    self.fail(
+                        f"unexpected process observation class: {spec['commandClass']}"
+                    )
+                raw_fields = {
+                    "executed": True,
+                    "exitCode": 0,
+                    "stdout": "live-shaped process observation",
+                    "stderr": "",
+                    "error": None,
+                }
+            elif observation_kind == "standalone-membership-v1":
+                source_path = "js/siteContent.js"
+                source_result_id = f"membership:index.html::{source_path}"
+                raw_fields = {"relative": source_path, "missing": False}
+            else:
+                self.fail(f"unexpected observation kind: {observation_kind}")
+            raw = ci.make_raw_observation(
+                spec["commandId"],
+                spec["ordinal"],
+                0,
+                observation_kind,
+                source_result_id,
+                source_path,
+                raw_fields,
+                ci.command_output_digest(record),
+            )
+            record["producerObservations"].append(raw)
+            observations.append(
+                {"commandId": spec["commandId"], "rawObservation": raw}
+            )
         runner = fake_runner(baseline)
         runner.profile = "all"
         runner.platform = "ubuntu"
