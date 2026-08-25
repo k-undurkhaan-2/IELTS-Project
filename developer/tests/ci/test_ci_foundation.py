@@ -231,6 +231,7 @@ def _ci12_local_binding(repository: str) -> dict[str, object]:
         "bindingKind": "AuthorizationContextBinding",
         "bindingMode": "local",
         "expectedProfile": "static",
+        "releaseGateRequired": False,
         "producerJobId": "local-producer",
         "expectedVerifierJobId": "local-verifier",
         "runnerOS": "Windows" if os.name == "nt" else "Linux",
@@ -275,6 +276,7 @@ CI11_AUTHORIZATION_FIELDS = frozenset(
         "bindingKind",
         "bindingMode",
         "expectedProfile",
+        "releaseGateRequired",
         "producerJobId",
         "expectedVerifierJobId",
         "runnerOS",
@@ -370,15 +372,24 @@ def _ci11_reference_schema(
     fields: frozenset[str],
     version_field: str,
     kind: str,
+    *,
+    schema_version: int = 1,
+    boolean_fields: frozenset[str] = frozenset(),
 ) -> dict:
     if not isinstance(value, dict) or set(value) != fields:
         raise ValueError("reference schema field set is not exact")
-    if type(value.get(version_field)) is not int or value[version_field] != 1:
+    if (
+        type(value.get(version_field)) is not int
+        or value[version_field] != schema_version
+    ):
         raise ValueError("reference schema version is invalid")
     if value.get("bindingKind") != kind:
         raise ValueError("reference schema kind is invalid")
     for field_name, field_value in value.items():
-        if field_name != version_field and not isinstance(field_value, str):
+        if field_name in boolean_fields:
+            if type(field_value) is not bool:
+                raise ValueError(f"reference schema {field_name} is not boolean")
+        elif field_name != version_field and not isinstance(field_value, str):
             raise ValueError(f"reference schema {field_name} is not text")
     return copy.deepcopy(value)
 
@@ -389,10 +400,12 @@ def ci11_reference_authorization_preimage(binding: object) -> bytes:
         CI11_AUTHORIZATION_FIELDS,
         "bindingSchemaVersion",
         "AuthorizationContextBinding",
+        schema_version=2,
+        boolean_fields=frozenset({"releaseGateRequired"}),
     )
     return ci11_reference_frame(
         {
-            "digestDomain": "ieltmps-authorization-context-binding-v1",
+            "digestDomain": "ieltmps-authorization-context-binding-v2",
             "binding": value,
         }
     )
@@ -805,7 +818,10 @@ def synthetic_execution_binding(
     plan_digest: str,
     *,
     platform_name: str = "windows",
+    release_gate_required: bool | None = None,
 ) -> dict:
+    if release_gate_required is None:
+        release_gate_required = ci.resolve_release_gate_required(profile)
     return {
         "bindingSchemaVersion": ci.EVIDENCE_EXECUTION_BINDING_SCHEMA_VERSION,
         "bindingKind": "ProducerExecutionBinding",
@@ -813,6 +829,7 @@ def synthetic_execution_binding(
         "producerJobId": "local-producer",
         "producerRunnerOS": "Windows" if platform_name == "windows" else "Linux",
         "producerProfile": profile,
+        "releaseGateRequired": release_gate_required,
         "runId": "local",
         "runAttempt": "1",
         "eventName": "local",
@@ -837,6 +854,7 @@ def synthetic_external_context(binding: dict) -> ci.ExternallyExpectedVerificati
     return ci.ExternallyExpectedVerificationContext(
         binding_mode=binding["bindingMode"],
         expected_profile=binding["producerProfile"],
+        release_gate_required=binding["releaseGateRequired"],
         producer_job_id=binding["producerJobId"],
         verifier_job_id=verifier_job_id,
         runner_os=binding["producerRunnerOS"],
@@ -907,6 +925,7 @@ def fake_runner(baseline: dict) -> SimpleNamespace:
     runtime_closure_document["closureDigest"] = runtime_digest
     runner = SimpleNamespace(
         profile="policy",
+        release_gate_required=False,
         platform="windows",
         violations=[],
         hard_gate_results=[],
@@ -1080,6 +1099,7 @@ def sixth_review_replay_fixture() -> tuple[SimpleNamespace, dict, dict]:
         observations.append({"commandId": command_id, "rawObservation": raw})
     runner = SimpleNamespace(
         profile="static",
+        release_gate_required=False,
         command_plan=specs,
         command_results=records,
         observations=observations,
@@ -1243,6 +1263,7 @@ def p52_compact_replay_fixture() -> tuple[SimpleNamespace, dict, dict]:
     records = [synthetic_record_from_spec(spec) for spec in specs]
     runner = SimpleNamespace(
         profile="static",
+        release_gate_required=False,
         platform=ci.platform_key(),
         command_plan=specs,
         command_results=records,
@@ -2623,6 +2644,7 @@ class AuthoritativeEvidenceDerivationTest(unittest.TestCase):
     def build_runner(self, observations: list[dict], *, completed: set[str] | None = None) -> SimpleNamespace:
         runner = SimpleNamespace(
             profile="static",
+            release_gate_required=False,
             platform="windows",
             violations=[],
             hard_gate_results=[],
@@ -4236,6 +4258,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 backend_baseline,
                 "ubuntu",
                 [copy.deepcopy(expected_plan or backend_command)],
+                release_gate_required=False,
             )
 
         legitimate_backend = backend_result()
@@ -8138,6 +8161,7 @@ class WindowsGitInstallationAuthorityRegressionTest(unittest.TestCase):
             bash_position="bin/bash.exe",
         )
         all_runner: ci.FoundationRunner | None = None
+        release_all_runner: ci.FoundationRunner | None = None
         static_runner: ci.FoundationRunner | None = None
         try:
             tools, errors = fixture.resolve(self.REQUIRED)
@@ -8155,6 +8179,14 @@ class WindowsGitInstallationAuthorityRegressionTest(unittest.TestCase):
                     tool_policy=fixture.policy,
                     source_environment=fixture.source,
                 )
+                release_all_runner = ci.FoundationRunner(
+                    "all",
+                    baseline,
+                    release_authoritative=True,
+                    tools=all_tools,
+                    tool_policy=fixture.policy,
+                    source_environment=fixture.source,
+                )
                 static_runner = ci.FoundationRunner(
                     "static",
                     baseline,
@@ -8163,6 +8195,16 @@ class WindowsGitInstallationAuthorityRegressionTest(unittest.TestCase):
                     source_environment=fixture.source,
                 )
             self.assertTrue(all_runner.tool_authority_frozen)
+            self.assertFalse(all_runner.release_gate_required)
+            self.assertTrue(release_all_runner.release_gate_required)
+            self.assertEqual(
+                release_all_runner.command_plan_digest,
+                all_runner.command_plan_digest,
+            )
+            self.assertEqual(
+                release_all_runner.command_plan,
+                all_runner.command_plan,
+            )
             self.assertEqual(
                 set(all_runner.require_all_tools(phase="EXECUTION_BINDING")),
                 {"bash", "git", "node", "npm", "powershell", "python"},
@@ -8204,6 +8246,8 @@ class WindowsGitInstallationAuthorityRegressionTest(unittest.TestCase):
         finally:
             if all_runner is not None:
                 all_runner.cleanup_task_resources()
+            if release_all_runner is not None:
+                release_all_runner.cleanup_task_resources()
             if static_runner is not None:
                 static_runner.cleanup_task_resources()
             fixture.cleanup()
@@ -8762,6 +8806,7 @@ class CI5DerivedFailureIdentityTest(unittest.TestCase):
             baseline,
             platform_name,
             [spec],
+            release_gate_required=False,
         )
         return [item["id"] for item in result["violations"]]
 
@@ -9026,6 +9071,7 @@ class CI5DerivedFailureIdentityTest(unittest.TestCase):
             one_entry_baseline(self.baseline, "expectedOmissions", self.omission),
             "ubuntu",
             [spec, copy.deepcopy(spec)],
+            release_gate_required=False,
         )
         ids = [value["id"] for value in result["violations"]]
         self.assertIn("DUPLICATE-PRODUCER-OBSERVATION", ids)
@@ -9288,6 +9334,7 @@ class CI9FrozenReleaseSkipDualSignatureTest(unittest.TestCase):
                 one_entry_baseline(self.baseline, "releaseOnlySkips", entry),
                 "windows",
                 [spec],
+                release_gate_required=False,
             )
             return result["violations"]
 
@@ -11189,8 +11236,13 @@ class CI7ExternalAuthorityBindingTest(unittest.TestCase):
         checkout_tree: str = ci.BASELINE_TREE,
         trust_digest: str = "4" * 64,
         command_plan_digest: str = "5" * 64,
+        release_gate_required: bool | None = None,
     ) -> dict:
         authority = ci.WORKFLOW_JOB_PROFILE_AUTHORITY[job_id]
+        if release_gate_required is None:
+            release_gate_required = ci.resolve_release_gate_required(
+                str(authority["verificationProfile"])
+            )
         binding = {
             "bindingSchemaVersion": ci.EVIDENCE_EXECUTION_BINDING_SCHEMA_VERSION,
             "bindingKind": "ProducerExecutionBinding",
@@ -11198,6 +11250,7 @@ class CI7ExternalAuthorityBindingTest(unittest.TestCase):
             "producerJobId": authority["producerJobId"],
             "producerRunnerOS": authority["runnerOS"],
             "producerProfile": authority["verificationProfile"],
+            "releaseGateRequired": release_gate_required,
             "runId": run_id,
             "runAttempt": run_attempt,
             "eventName": event_name,
@@ -11215,6 +11268,7 @@ class CI7ExternalAuthorityBindingTest(unittest.TestCase):
     def binding_runner(self, profile: str) -> SimpleNamespace:
         return SimpleNamespace(
             profile=profile,
+            release_gate_required=ci.resolve_release_gate_required(profile),
             baseline={
                 "baselineCommit": ci.BASELINE_COMMIT,
                 "baselineTree": ci.BASELINE_TREE,
@@ -11339,6 +11393,7 @@ class CI7ExternalAuthorityBindingTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "external invocation identity"):
                 ci.build_externally_expected_verification_context(
                     expected_profile="policy",
+                    release_gate_required=False,
                     expected_producer_job=None,
                     expected_verifier_job=None,
                     expected_runner_os=None,
@@ -11432,6 +11487,9 @@ class CI7ExternalAuthorityBindingTest(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         ci.build_externally_expected_verification_context(
                             expected_profile=expected_profile,
+                            release_gate_required=ci.resolve_release_gate_required(
+                                expected_profile
+                            ),
                             expected_producer_job=ci.WORKFLOW_JOB_PROFILE_AUTHORITY[
                                 expected_job
                             ]["producerJobId"],
@@ -11541,6 +11599,7 @@ class CI7ExternalAuthorityBindingTest(unittest.TestCase):
 
         runner = SimpleNamespace(
             profile="all",
+            release_gate_required=False,
             command_plan=[],
             command_plan_digest=ubuntu_expected["commandPlanDigest"],
         )
@@ -14735,6 +14794,464 @@ class CI11AuthorityAndCanonicalSpecificationTest(unittest.TestCase):
             ci11_reference_frame(duplicate_normalized_key)
         with self.assertRaises(ValueError):
             ci._canonical_frame(duplicate_normalized_key)
+
+
+class R08OptionBReleaseAuthorityTest(unittest.TestCase):
+    RELEASE_IDS = (
+        "B-SKIP-RELEASE-ZIP",
+        "B-SKIP-PDF-RECONCILIATION",
+        "B-SKIP-CHECKLIST-CONSISTENCY",
+    )
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
+        cls.entries = {
+            entry["id"]: entry for entry in cls.baseline["releaseOnlySkips"]
+        }
+
+    def assert_cli_rejected(self, argv: list[str]) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises((ValueError, SystemExit)):
+                ci.parse_args(argv)
+
+    def test_release_authority_selector_requires_exact_long_option(self) -> None:
+        rejected_argv = (
+            ["--profile", "all", "--release-auth"],
+            ["--profile", "all", "--release-author"],
+            [
+                "--profile",
+                "all",
+                "--release-authoritative",
+                "--release-auth",
+            ],
+            [
+                "--profile",
+                "all",
+                "--release-auth",
+                "--release-authoritative",
+            ],
+            [
+                "--profile",
+                "all",
+                "--release-authoritative",
+                "--release-authoritative",
+            ],
+            ["--profile", "all", "--release-authoritative=true"],
+        )
+        for argv in rejected_argv:
+            with self.subTest(argv=argv):
+                self.assert_cli_rejected(argv)
+
+        exact_release = ci.parse_args(
+            ["--profile", "all", "--release-authoritative"]
+        )
+        engineering_all = ci.parse_args(["--profile", "all"])
+        self.assertTrue(exact_release.release_authoritative)
+        self.assertFalse(engineering_all.release_authoritative)
+
+    def test_security_relevant_long_options_require_exact_spelling(self) -> None:
+        rejected_argv = {
+            "profile": ["--prof", "all"],
+            "verify-evidence": [
+                "--verify-evid",
+                "--expected-profile",
+                "policy",
+            ],
+            "verify-only": ["--profile", "policy", "--verify-onl"],
+            "require-install-tools": [
+                "--profile",
+                "policy",
+                "--verify-only",
+                "--require-install",
+            ],
+            "expected-profile": [
+                "--verify-evidence",
+                "--expected-prof",
+                "policy",
+            ],
+            "expected-producer-job": [
+                "--verify-evidence",
+                "--expected-profile",
+                "policy",
+                "--expected-producer",
+                "repository-policy-producer",
+            ],
+            "expected-verifier-job": [
+                "--verify-evidence",
+                "--expected-profile",
+                "policy",
+                "--expected-verifier",
+                "repository-policy",
+            ],
+            "expected-runner-os": [
+                "--verify-evidence",
+                "--expected-profile",
+                "policy",
+                "--expected-runner",
+                "Linux",
+            ],
+            "expected-invocation-id": [
+                "--verify-evidence",
+                "--expected-profile",
+                "policy",
+                "--expected-invocation",
+                "r08-probe",
+            ],
+            "untrusted-evidence-root": [
+                "--verify-evidence",
+                "--expected-profile",
+                "policy",
+                "--untrusted-evidence",
+                "r08-probe",
+            ],
+            "require-linux-containment-self-test": [
+                "--verify-evidence",
+                "--expected-profile",
+                "policy",
+                "--require-linux-containment",
+            ],
+            "require-fresh-runtime-closure": [
+                "--verify-evidence",
+                "--expected-profile",
+                "policy",
+                "--require-fresh-runtime",
+            ],
+        }
+        for option, argv in rejected_argv.items():
+            with self.subTest(option=option):
+                self.assert_cli_rejected(argv)
+
+        exact_context = ci.parse_args(
+            [
+                "--verify-evidence",
+                "--expected-profile",
+                "policy",
+                "--expected-producer-job",
+                "repository-policy-producer",
+                "--expected-verifier-job",
+                "repository-policy",
+                "--expected-runner-os",
+                "Linux",
+                "--expected-invocation-id",
+                "r08-probe",
+                "--untrusted-evidence-root",
+                "r08-probe",
+                "--require-linux-containment-self-test",
+                "--require-fresh-runtime-closure",
+            ]
+        )
+        self.assertTrue(exact_context.verify_evidence)
+        self.assertEqual(exact_context.expected_profile, "policy")
+        self.assertEqual(
+            exact_context.expected_producer_job,
+            "repository-policy-producer",
+        )
+        self.assertEqual(exact_context.expected_verifier_job, "repository-policy")
+        self.assertEqual(exact_context.expected_runner_os, "Linux")
+        self.assertEqual(exact_context.expected_invocation_id, "r08-probe")
+        self.assertEqual(exact_context.untrusted_evidence_root, "r08-probe")
+        self.assertTrue(exact_context.require_linux_containment_self_test)
+        self.assertTrue(exact_context.require_fresh_runtime_closure)
+
+    def three_release_skips(self) -> tuple[dict, dict, list[dict]]:
+        items = []
+        for index, entry_id in enumerate(self.RELEASE_IDS):
+            entry = self.entries[entry_id]
+            raw = frozen_v1_release_skip_raw_observation(
+                entry,
+                observation_ordinal=index,
+            )
+            items.append(
+                ci.observation(
+                    entry["commandClass"],
+                    entry["testOrPathScope"],
+                    entry["expectedOutcome"],
+                    entry["allowedNormalizedSignature"][0],
+                    "static-suite",
+                    raw_observation=raw,
+                )
+            )
+        _spec, record, observations = ci9_static_evidence_fixture(items)
+        baseline = copy.deepcopy(self.baseline)
+        baseline["knownDebts"] = []
+        baseline["expectedOmissions"] = []
+        return baseline, record, observations
+
+    def compare_three_skips(self, *, release_gate_required: bool) -> dict:
+        baseline, record, observations = self.three_release_skips()
+        return ci.compare_observations(
+            baseline,
+            observations,
+            {"static-suite"},
+            "windows",
+            release_gate_required=release_gate_required,
+            command_records=[record],
+        )
+
+    def test_resolved_requiredness_matrix_separates_all_breadth_from_authority(self) -> None:
+        expected = {
+            "policy": False,
+            "static": False,
+            "frontend": False,
+            "backend": False,
+            "standalone": True,
+            "all": False,
+        }
+        self.assertEqual(
+            {
+                profile: ci.resolve_release_gate_required(profile)
+                for profile in ci.PROFILES
+            },
+            expected,
+        )
+        self.assertTrue(
+            ci.resolve_release_gate_required(
+                "all",
+                release_authoritative=True,
+            )
+        )
+        for invalid in (None, 0, 1, "true"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                ci.resolve_release_gate_required(
+                    "all",
+                    release_authoritative=invalid,
+                )
+        for profile in ("policy", "static", "frontend", "backend", "standalone"):
+            with self.subTest(profile=profile), self.assertRaises(ValueError):
+                ci.resolve_release_gate_required(
+                    profile,
+                    release_authoritative=True,
+                )
+
+    def test_engineering_and_explicit_release_all_have_exact_three_skip_exit_contract(self) -> None:
+        engineering = self.compare_three_skips(release_gate_required=False)
+        explicit_release = self.compare_three_skips(release_gate_required=True)
+
+        self.assertEqual(len(engineering["releaseOnlySkips"]), 3)
+        self.assertEqual(engineering["violations"], [])
+        engineering_status = "PASS" if not engineering["violations"] else "FAIL"
+        self.assertEqual(engineering_status, "PASS")
+        self.assertEqual(ci.policy_status_exit_code(engineering_status), 0)
+
+        self.assertEqual(len(explicit_release["releaseOnlySkips"]), 3)
+        self.assertEqual(len(explicit_release["violations"]), 3)
+        self.assertEqual(
+            {item["id"] for item in explicit_release["violations"]},
+            {"RELEASE-ONLY-SKIP-IN-REQUIRED-GATE"},
+        )
+        release_status = "PASS" if not explicit_release["violations"] else "FAIL"
+        self.assertEqual(release_status, "FAIL")
+        self.assertEqual(ci.policy_status_exit_code(release_status), 2)
+
+    def test_static_and_standalone_release_skip_semantics_are_preserved(self) -> None:
+        static = self.compare_three_skips(
+            release_gate_required=ci.resolve_release_gate_required("static")
+        )
+        standalone = self.compare_three_skips(
+            release_gate_required=ci.resolve_release_gate_required("standalone")
+        )
+        self.assertEqual(len(static["releaseOnlySkips"]), 3)
+        self.assertEqual(static["violations"], [])
+        self.assertEqual(len(standalone["releaseOnlySkips"]), 3)
+        self.assertEqual(len(standalone["violations"]), 3)
+
+    def test_release_authority_is_bound_in_producer_verifier_and_digest_context(self) -> None:
+        engineering = synthetic_execution_binding(
+            "all",
+            "a" * 64,
+            release_gate_required=False,
+        )
+        release = synthetic_execution_binding(
+            "all",
+            "a" * 64,
+            release_gate_required=True,
+        )
+        engineering_context = ci.authorization_context_binding_from_execution_binding(
+            engineering
+        )
+        release_context = ci.authorization_context_binding_from_execution_binding(
+            release
+        )
+        self.assertFalse(engineering_context["releaseGateRequired"])
+        self.assertTrue(release_context["releaseGateRequired"])
+        self.assertEqual(
+            {
+                key: value
+                for key, value in engineering_context.items()
+                if key != "releaseGateRequired"
+            },
+            {
+                key: value
+                for key, value in release_context.items()
+                if key != "releaseGateRequired"
+            },
+        )
+        self.assertNotEqual(
+            ci.authorization_context_binding_digest(engineering_context),
+            ci.authorization_context_binding_digest(release_context),
+        )
+        self.assertFalse(
+            synthetic_external_context(engineering)
+            .verifier_binding()["releaseGateRequired"]
+        )
+        self.assertTrue(
+            synthetic_external_context(release)
+            .verifier_binding()["releaseGateRequired"]
+        )
+
+    def test_producer_verifier_release_authority_match_and_mismatch_matrix(self) -> None:
+        bindings = {
+            required: synthetic_execution_binding(
+                "all",
+                "b" * 64,
+                release_gate_required=required,
+            )
+            for required in (False, True)
+        }
+        for required, binding in bindings.items():
+            with self.subTest(match=required):
+                authorization = ci.authorization_context_binding_from_execution_binding(
+                    binding
+                )
+                self.assertEqual(
+                    ci.authorization_context_binding_errors(
+                        authorization,
+                        ci.authorization_context_binding_digest(authorization),
+                        execution_binding=binding,
+                        expected_context=synthetic_external_context(binding),
+                    ),
+                    [],
+                )
+        for producer_required, verifier_required in ((False, True), (True, False)):
+            with self.subTest(
+                producer=producer_required,
+                verifier=verifier_required,
+            ):
+                producer = bindings[producer_required]
+                authorization = ci.authorization_context_binding_from_execution_binding(
+                    producer
+                )
+                errors = ci.authorization_context_binding_errors(
+                    authorization,
+                    ci.authorization_context_binding_digest(authorization),
+                    execution_binding=producer,
+                    expected_context=synthetic_external_context(
+                        bindings[verifier_required]
+                    ),
+                )
+                self.assertTrue(any("external" in error for error in errors), errors)
+                self.assertTrue(
+                    ci.execution_binding_external_context_errors(
+                        producer,
+                        ci.execution_binding_digest(producer),
+                        synthetic_external_context(bindings[verifier_required]),
+                    )
+                )
+
+    def test_missing_invalid_duplicate_and_substituted_release_context_fails_closed(self) -> None:
+        binding = synthetic_execution_binding(
+            "all",
+            "c" * 64,
+            release_gate_required=True,
+        )
+        authorization = ci.authorization_context_binding_from_execution_binding(binding)
+
+        missing_authorization = copy.deepcopy(authorization)
+        missing_authorization.pop("releaseGateRequired")
+        with self.assertRaises(ValueError):
+            ci.authorization_context_binding_digest(missing_authorization)
+
+        missing_execution = copy.deepcopy(binding)
+        missing_execution.pop("releaseGateRequired")
+        with self.assertRaises(ValueError):
+            ci.authorization_context_binding_from_execution_binding(missing_execution)
+        execution_errors: list[str] = []
+        ci._validate_execution_binding(
+            missing_execution,
+            ci.execution_binding_digest(missing_execution),
+            label="r08-missing",
+            errors=execution_errors,
+        )
+        self.assertTrue(execution_errors)
+
+        for invalid in (None, 0, 1, "true", [], {}):
+            with self.subTest(invalid=invalid):
+                invalid_authorization = copy.deepcopy(authorization)
+                invalid_authorization["releaseGateRequired"] = invalid
+                with self.assertRaises(ValueError):
+                    ci.authorization_context_binding_digest(invalid_authorization)
+                invalid_execution = copy.deepcopy(binding)
+                invalid_execution["releaseGateRequired"] = invalid
+                errors: list[str] = []
+                ci._validate_execution_binding(
+                    invalid_execution,
+                    ci.execution_binding_digest(invalid_execution),
+                    label="r08-invalid",
+                    errors=errors,
+                )
+                self.assertTrue(errors)
+
+        with self.assertRaises(ci.DuplicateJsonKeyError):
+            ci.strict_json_loads(
+                '{"releaseGateRequired":false,"releaseGateRequired":true}',
+                label="r08-duplicate-release-authority",
+            )
+
+        substituted = copy.deepcopy(binding)
+        substituted["releaseGateRequired"] = False
+        substituted_authorization = (
+            ci.authorization_context_binding_from_execution_binding(substituted)
+        )
+        self.assertTrue(
+            ci.authorization_context_binding_errors(
+                substituted_authorization,
+                ci.authorization_context_binding_digest(substituted_authorization),
+                execution_binding=substituted,
+                expected_context=synthetic_external_context(binding),
+            )
+        )
+
+    def test_cli_and_unchanged_hosted_all_resolve_engineering_by_default(self) -> None:
+        engineering = ci.parse_args(["--profile", "all"])
+        explicit_release = ci.parse_args(
+            ["--profile", "all", "--release-authoritative"]
+        )
+        verifier_release = ci.parse_args(
+            [
+                "--verify-evidence",
+                "--expected-profile",
+                "all",
+                "--release-authoritative",
+            ]
+        )
+        self.assertFalse(engineering.release_authoritative)
+        self.assertTrue(explicit_release.release_authoritative)
+        self.assertTrue(verifier_release.release_authoritative)
+        for argv in (
+            ["--profile", "static", "--release-authoritative"],
+            ["--profile", "standalone", "--release-authoritative"],
+            [
+                "--profile",
+                "all",
+                "--release-authoritative",
+                "--release-authoritative",
+            ],
+            ["--profile", "all", "--release-authoritative=true"],
+        ):
+            with self.subTest(argv=argv), self.assertRaises((ValueError, SystemExit)):
+                ci.parse_args(argv)
+
+        workflow_text = ci.WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertEqual(ci.check_workflow_text(workflow_text), [])
+        self.assertNotIn("--release-authoritative", workflow_text)
+        self.assertGreaterEqual(
+            workflow_text.count(
+                "developer/tests/ci/run_ci_foundation.py --profile all"
+            ),
+            2,
+        )
+        self.assertFalse(ci.resolve_release_gate_required("all"))
 
 
 def _flatten_test_suite(test: unittest.TestSuite | unittest.TestCase) -> list[unittest.TestCase]:

@@ -56,6 +56,47 @@ EXIT_POLICY_VIOLATION = 2
 EXIT_CONFIGURATION_ERROR = 3
 EXIT_RUNNER_ERROR = 4
 
+
+def _require_resolved_release_gate_required(
+    profile: str,
+    value: Any,
+) -> bool:
+    if profile not in PROFILES:
+        raise ValueError("release-gate profile is outside the fixed profile registry")
+    if type(value) is not bool:
+        raise ValueError("resolved release-gate authority must be a boolean")
+    if profile == "standalone" and value is not True:
+        raise ValueError("standalone requires release-gate authority")
+    if profile not in {"standalone", "all"} and value is not False:
+        raise ValueError("release-gate authority is unsupported for this profile")
+    return value
+
+
+def resolve_release_gate_required(
+    profile: str,
+    *,
+    release_authoritative: bool = False,
+) -> bool:
+    """Resolve suite breadth separately from release authorization."""
+
+    if type(release_authoritative) is not bool:
+        raise ValueError("explicit release authority must be a boolean")
+    if release_authoritative and profile != "all":
+        raise ValueError("explicit release authority is supported only with profile all")
+    return _require_resolved_release_gate_required(
+        profile,
+        profile == "standalone" or release_authoritative,
+    )
+
+
+def policy_status_exit_code(status: str) -> int:
+    if status == "PASS":
+        return EXIT_SUCCESS
+    if status == "FAIL":
+        return EXIT_POLICY_VIOLATION
+    raise ValueError("CI policy status is invalid")
+
+
 BASELINE_COMMIT = "db743cc625daded38442834731cbf35db024e10f"
 BASELINE_TREE = "c3f3825ecc4523a6e39da1164df41d6d59e3527a"
 CHECKPOINT_TAG = "checkpoint-phase1-20260730"
@@ -76,9 +117,9 @@ RAW_OBSERVATION_KINDS = frozenset(
 TARGET_EXECUTION_LEASE_VERSION = 1
 PROTECTED_TARGET_BUNDLE_VERSION = 1
 VERIFICATION_REPLAY_TRANSCRIPT_VERSION = 1
-EVIDENCE_EXECUTION_BINDING_SCHEMA_VERSION = 2
-EXTERNALLY_EXPECTED_VERIFICATION_CONTEXT_SCHEMA_VERSION = 2
-AUTHORIZATION_CONTEXT_BINDING_SCHEMA_VERSION = 1
+EVIDENCE_EXECUTION_BINDING_SCHEMA_VERSION = 3
+EXTERNALLY_EXPECTED_VERIFICATION_CONTEXT_SCHEMA_VERSION = 3
+AUTHORIZATION_CONTEXT_BINDING_SCHEMA_VERSION = 2
 VERIFIER_REPLAY_CONTEXT_BINDING_SCHEMA_VERSION = 1
 REPLAY_AUTHORIZATION_ENVELOPE_SCHEMA_VERSION = 1
 CI_TRUST_FILE_SET_SCHEMA_VERSION = 1
@@ -121,7 +162,7 @@ CANONICAL_FRAME_TAGS = MappingProxyType(
     }
 )
 AUTHORIZATION_CONTEXT_BINDING_DIGEST_DOMAIN = (
-    "ieltmps-authorization-context-binding-v1"
+    "ieltmps-authorization-context-binding-v2"
 )
 VERIFIER_REPLAY_CONTEXT_BINDING_DIGEST_DOMAIN = (
     "ieltmps-verifier-replay-context-binding-v1"
@@ -309,6 +350,7 @@ class ExternallyExpectedVerificationContext:
 
     binding_mode: str
     expected_profile: str
+    release_gate_required: bool
     producer_job_id: str
     verifier_job_id: str
     runner_os: str
@@ -326,6 +368,12 @@ class ExternallyExpectedVerificationContext:
     fresh_runtime_closure_digest: str
     verifier_invocation_id: str
 
+    def __post_init__(self) -> None:
+        _require_resolved_release_gate_required(
+            self.expected_profile,
+            self.release_gate_required,
+        )
+
     def evidence_binding(self) -> dict[str, Any]:
         return {
             "bindingSchemaVersion": EVIDENCE_EXECUTION_BINDING_SCHEMA_VERSION,
@@ -334,6 +382,7 @@ class ExternallyExpectedVerificationContext:
             "producerJobId": self.producer_job_id,
             "producerRunnerOS": self.runner_os,
             "producerProfile": self.expected_profile,
+            "releaseGateRequired": self.release_gate_required,
             "runId": self.run_id,
             "runAttempt": self.run_attempt,
             "eventName": self.event_name,
@@ -355,6 +404,7 @@ class ExternallyExpectedVerificationContext:
             "bindingKind": "AuthorizationContextBinding",
             "bindingMode": self.binding_mode,
             "expectedProfile": self.expected_profile,
+            "releaseGateRequired": self.release_gate_required,
             "producerJobId": self.producer_job_id,
             "expectedVerifierJobId": self.verifier_job_id,
             "runnerOS": self.runner_os,
@@ -379,6 +429,7 @@ class ExternallyExpectedVerificationContext:
             "verifierJobId": self.verifier_job_id,
             "verifierRunnerOS": self.runner_os,
             "expectedProfile": self.expected_profile,
+            "releaseGateRequired": self.release_gate_required,
             "expectedProducerJobId": self.producer_job_id,
             "runId": self.run_id,
             "runAttempt": self.run_attempt,
@@ -8078,6 +8129,7 @@ AUTHORIZATION_CONTEXT_BINDING_KEYS = frozenset(
         "bindingKind",
         "bindingMode",
         "expectedProfile",
+        "releaseGateRequired",
         "producerJobId",
         "expectedVerifierJobId",
         "runnerOS",
@@ -8125,6 +8177,10 @@ def _require_authorization_context_binding(
         raise ValueError("AuthorizationContextBinding mode is invalid")
     if value.get("expectedProfile") not in PROFILES:
         raise ValueError("AuthorizationContextBinding profile is invalid")
+    _require_resolved_release_gate_required(
+        str(value.get("expectedProfile", "")),
+        value.get("releaseGateRequired"),
+    )
     if value.get("runnerOS") not in {"Linux", "Windows"}:
         raise ValueError("AuthorizationContextBinding runner OS is invalid")
     for key in (
@@ -8188,6 +8244,7 @@ def authorization_context_binding_from_execution_binding(
         "bindingKind": "AuthorizationContextBinding",
         "bindingMode": binding_mode,
         "expectedProfile": execution_binding.get("producerProfile"),
+        "releaseGateRequired": execution_binding.get("releaseGateRequired"),
         "producerJobId": producer_job_id,
         "expectedVerifierJobId": expected_verifier_job_id,
         "runnerOS": execution_binding.get("producerRunnerOS"),
@@ -8638,7 +8695,7 @@ def _github_binding_invocation_id(
     return hashlib.sha256(
         _canonical_frame(
             {
-                "purpose": f"github-actions-{role}-execution-binding-v2",
+                "purpose": f"github-actions-{role}-execution-binding-v3",
                 "binding": binding_without_invocation,
             }
         )
@@ -8662,6 +8719,7 @@ def _producer_binding_without_invocation(
     producer_job_id: str,
     runner_os: str,
     profile: str,
+    release_gate_required: bool,
     run_id: str,
     run_attempt: str,
     event_name: str,
@@ -8673,6 +8731,10 @@ def _producer_binding_without_invocation(
     trust_file_digest: str,
     command_plan_digest_value: str,
 ) -> dict[str, Any]:
+    release_gate_required = _require_resolved_release_gate_required(
+        profile,
+        release_gate_required,
+    )
     return {
         "bindingSchemaVersion": EVIDENCE_EXECUTION_BINDING_SCHEMA_VERSION,
         "bindingKind": "ProducerExecutionBinding",
@@ -8680,6 +8742,7 @@ def _producer_binding_without_invocation(
         "producerJobId": producer_job_id,
         "producerRunnerOS": runner_os,
         "producerProfile": profile,
+        "releaseGateRequired": release_gate_required,
         "runId": run_id,
         "runAttempt": run_attempt,
         "eventName": event_name,
@@ -8696,6 +8759,7 @@ def _producer_binding_without_invocation(
 def build_externally_expected_verification_context(
     *,
     expected_profile: str,
+    release_gate_required: bool,
     expected_producer_job: str | None,
     expected_verifier_job: str | None,
     expected_runner_os: str | None,
@@ -8714,6 +8778,10 @@ def build_externally_expected_verification_context(
         raise ValueError("explicit external authority is required")
     if expected_profile not in PROFILES:
         raise ValueError("expected profile is not in the fixed profile registry")
+    release_gate_required = _require_resolved_release_gate_required(
+        expected_profile,
+        release_gate_required,
+    )
     if not re.fullmatch(r"[0-9a-f]{64}", command_plan_digest_value):
         raise ValueError("expected command-plan digest is invalid")
     if not re.fullmatch(r"[0-9a-f]{64}", fresh_runtime_closure_digest):
@@ -8789,6 +8857,7 @@ def build_externally_expected_verification_context(
             producer_job_id=expected_producer_job,
             runner_os=expected_runner_os,
             profile=expected_profile,
+            release_gate_required=release_gate_required,
             run_id=values["GITHUB_RUN_ID"],
             run_attempt=values["GITHUB_RUN_ATTEMPT"],
             event_name=values["GITHUB_EVENT_NAME"],
@@ -8808,6 +8877,7 @@ def build_externally_expected_verification_context(
             "verifierJobId": expected_verifier_job,
             "verifierRunnerOS": expected_runner_os,
             "expectedProfile": expected_profile,
+            "releaseGateRequired": release_gate_required,
             "expectedProducerJobId": expected_producer_job,
             "runId": values["GITHUB_RUN_ID"],
             "runAttempt": values["GITHUB_RUN_ATTEMPT"],
@@ -8859,6 +8929,7 @@ def build_externally_expected_verification_context(
             {
                 "bindingMode": "local",
                 "expectedProfile": expected_profile,
+                "releaseGateRequired": release_gate_required,
                 "producerInvocationId": producer_invocation_id,
                 "commandPlanDigest": command_plan_digest_value,
                 "freshRuntimeClosureDigest": fresh_runtime_closure_digest,
@@ -8869,6 +8940,7 @@ def build_externally_expected_verification_context(
     return ExternallyExpectedVerificationContext(
         binding_mode=binding_mode,
         expected_profile=expected_profile,
+        release_gate_required=release_gate_required,
         producer_job_id=producer_job_id,
         verifier_job_id=verifier_job_id,
         runner_os=runner_os,
@@ -8953,6 +9025,7 @@ def _build_generation_execution_binding(
         producer_job_id=producer_job_id,
         runner_os=runner_os,
         profile=str(runner.profile),
+        release_gate_required=getattr(runner, "release_gate_required", None),
         run_id=run_id,
         run_attempt=run_attempt,
         event_name=event_name,
@@ -9017,6 +9090,7 @@ def rebuild_external_verification_context(
         raise ValueError("verification runner lacks frozen external authority")
     return build_externally_expected_verification_context(
         expected_profile=context.expected_profile,
+        release_gate_required=context.release_gate_required,
         expected_producer_job=(
             context.producer_job_id if context.binding_mode == "github-actions" else None
         ),
@@ -11079,6 +11153,15 @@ def _ensure_runner_authorization_context_binding(
         execution_binding,
         expected_verifier_job_id=expected_verifier_job_id,
     )
+    runner_release_gate_required = getattr(
+        runner,
+        "release_gate_required",
+        None,
+    )
+    if derived["releaseGateRequired"] is not runner_release_gate_required:
+        raise ValueError(
+            "runner release authority differs from producer execution binding"
+        )
     existing = getattr(runner, "authorization_context_binding", None)
     if existing is not None and existing != derived:
         raise ValueError(
@@ -11706,8 +11789,15 @@ def derive_authoritative_evidence(
     current_platform: str,
     command_plan: Sequence[Mapping[str, Any]] | None = None,
     authorization_context_binding_digest_value: str | None = None,
+    *,
+    release_gate_required: bool,
 ) -> dict[str, Any]:
     """Recompute all semantic evidence from commands and the frozen baseline map."""
+
+    release_gate_required = _require_resolved_release_gate_required(
+        profile,
+        release_gate_required,
+    )
 
     command_by_id: dict[str, Mapping[str, Any]] = {}
     derivation_violations: list[dict[str, Any]] = []
@@ -11815,7 +11905,7 @@ def derive_authoritative_evidence(
         valid_observations,
         completed,
         current_platform,
-        release_gate_required=profile in {"standalone", "all"},
+        release_gate_required=release_gate_required,
         command_records=command_records,
         authorization_context_binding_digest_value=(
             authorization_context_binding_digest_value
@@ -15486,9 +15576,14 @@ class FoundationRunner:
         target_phase_hook: Any | None = None,
         enable_runtime_closure: bool = False,
         require_fresh_runtime_closure: bool = False,
+        release_authoritative: bool = False,
         execution_external_authority: ExecutionExternalAuthority | None = None,
     ) -> None:
         self.profile = profile
+        self.release_gate_required = resolve_release_gate_required(
+            profile,
+            release_authoritative=release_authoritative,
+        )
         self.baseline = baseline
         self.platform = platform_key()
         self.command_results: list[dict[str, Any]] = []
@@ -17513,6 +17608,7 @@ class FoundationRunner:
             self.platform,
             self.command_plan,
             getattr(self, "authorization_context_binding_digest", None),
+            release_gate_required=self.release_gate_required,
         )
         self.violations.extend(comparison["violations"])
         if self.profile in {"static", "all"}:
@@ -18145,6 +18241,7 @@ def _validate_execution_binding(
         "producerJobId",
         "producerRunnerOS",
         "producerProfile",
+        "releaseGateRequired",
         "runId",
         "runAttempt",
         "eventName",
@@ -18169,6 +18266,13 @@ def _validate_execution_binding(
         errors.append(f"{label}: execution-binding mode is invalid")
     if binding.get("producerProfile") not in PROFILES:
         errors.append(f"{label}: producer profile is invalid")
+    try:
+        _require_resolved_release_gate_required(
+            str(binding.get("producerProfile", "")),
+            binding.get("releaseGateRequired"),
+        )
+    except ValueError as exc:
+        errors.append(f"{label}: execution-binding release authority is invalid: {exc}")
     if binding.get("producerRunnerOS") not in {"Linux", "Windows"}:
         errors.append(f"{label}: execution-binding runner OS is invalid")
     for key in (
@@ -19150,6 +19254,17 @@ def _validate_evidence_semantics(
     authorization_context_binding_digest_value = summary.get(
         "authorizationContextBindingDigest"
     )
+    bound_release_gate_required = (
+        authorization_context_binding.get("releaseGateRequired")
+        if isinstance(authorization_context_binding, Mapping)
+        and type(authorization_context_binding.get("releaseGateRequired")) is bool
+        else True
+    )
+    authoritative_release_gate_required = (
+        expected_context.release_gate_required
+        if expected_context is not None
+        else bound_release_gate_required
+    )
     for name, document in documents.items():
         if document.get("invocation") != invocation:
             errors.append(f"{name}: invocation identity is inconsistent")
@@ -19497,6 +19612,7 @@ def _validate_evidence_semantics(
                 str(summary.get("platform", "")),
                 expected_authority,
                 authorization_context_binding_digest_value,
+                release_gate_required=authoritative_release_gate_required,
             )
             derived_sets = {
                 "knownDebtsObserved": derived["observedDebts"],
@@ -19832,6 +19948,11 @@ def run_verification_replay(
     runner = verification_runner
     if runner.profile != expected_context.expected_profile:
         return None, ["verification replay runner profile differs from external authority"]
+    if (
+        runner.release_gate_required
+        is not expected_context.release_gate_required
+    ):
+        return None, ["verification replay release authority differs from external authority"]
     if runner.command_plan_digest != expected_context.command_plan_digest:
         return None, ["verification replay command plan differs from external authority"]
     if getattr(runner, "execution_binding", None) != expected_context.evidence_binding():
@@ -19921,6 +20042,11 @@ def verify_evidence_with_replay(
 ) -> tuple[list[str], dict[str, Any] | None]:
     if verification_runner.profile != expected_context.expected_profile:
         return ["verification runner profile differs from external expected profile"], None
+    if (
+        verification_runner.release_gate_required
+        is not expected_context.release_gate_required
+    ):
+        return ["verification runner release authority differs from external expected context"], None
     if verification_runner.command_plan_digest != expected_context.command_plan_digest:
         return ["verification runner command plan differs from external expected context"], None
     errors = verify_evidence_file_set(
@@ -20024,6 +20150,7 @@ def render_summary_markdown(summary: Mapping[str, Any]) -> str:
         "",
         f"- Binding kind: {render_markdown_text(authorization_binding['bindingKind'])}",
         f"- Expected profile: {render_markdown_text(authorization_binding['expectedProfile'])}",
+        f"- Release gates required: {str(authorization_binding['releaseGateRequired']).lower()}",
         f"- Producer job: {render_markdown_text(authorization_binding['producerJobId'])}",
         f"- Expected verifier job: {render_markdown_text(authorization_binding['expectedVerifierJobId'])}",
         f"- Runner OS: {render_markdown_text(authorization_binding['runnerOS'])}",
@@ -20252,6 +20379,13 @@ def write_evidence(
     if isinstance(execution_binding, Mapping):
         if execution_binding.get("producerProfile") != runner.profile:
             binding_errors.append("generation execution binding profile differs from runner profile")
+        if (
+            execution_binding.get("releaseGateRequired")
+            is not getattr(runner, "release_gate_required", None)
+        ):
+            binding_errors.append(
+                "generation execution binding release authority differs from runner"
+            )
         if execution_binding.get("commandPlanDigest") != runner.command_plan_digest:
             binding_errors.append("generation execution binding command plan differs from runner plan")
         if execution_binding.get("baselineCommit") != runner.baseline.get("baselineCommit"):
@@ -20271,6 +20405,7 @@ def write_evidence(
         runner.platform,
         runner.command_plan,
         getattr(runner, "authorization_context_binding_digest", None),
+        release_gate_required=runner.release_gate_required,
     )
     existing_violation_keys = {
         json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -20777,6 +20912,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--expected-runner-os",
         "--expected-invocation-id",
         "--untrusted-evidence-root",
+        "--release-authoritative",
     ):
         occurrences = sum(
             token == option or token.startswith(option + "=")
@@ -20785,6 +20921,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         if occurrences > 1:
             raise ValueError(f"{option} may be supplied at most once")
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         description="Run the baseline-aware Phase 1 CI foundation policy.",
         exit_on_error=False,
     )
@@ -20795,6 +20932,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     group.add_argument("--verify-evidence", action="store_true")
     parser.add_argument("--verify-only", action="store_true")
     parser.add_argument("--require-install-tools", action="store_true")
+    parser.add_argument("--release-authoritative", action="store_true")
     parser.add_argument("--expected-profile", choices=PROFILES)
     parser.add_argument(
         "--expected-producer-job",
@@ -20820,6 +20958,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         raise ValueError("--verify-only is supported only with --profile policy")
     if args.require_install_tools and not (args.verify_only and args.profile == "policy"):
         raise ValueError("--require-install-tools requires the policy verify-only pre-install profile")
+    selected_profile = args.expected_profile if args.verify_evidence else args.profile
+    if args.release_authoritative and selected_profile != "all":
+        raise ValueError("--release-authoritative requires profile all")
     expected_options = (
         args.expected_profile,
         args.expected_producer_job,
@@ -20890,6 +21031,7 @@ def prepare_verification_authority(
         source_environment=source_environment,
         enable_runtime_closure=True,
         require_fresh_runtime_closure=bool(args.require_fresh_runtime_closure),
+        release_authoritative=bool(args.release_authoritative),
         execution_external_authority=external_authority,
     )
     runner.require_all_tools(phase="VERIFICATION_PREPARATION")
@@ -20915,6 +21057,7 @@ def prepare_verification_authority(
     try:
         context = build_externally_expected_verification_context(
             expected_profile=str(args.expected_profile),
+            release_gate_required=runner.release_gate_required,
             expected_producer_job=args.expected_producer_job,
             expected_verifier_job=args.expected_verifier_job,
             expected_runner_os=args.expected_runner_os,
@@ -21087,6 +21230,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_install_tools=args.require_install_tools,
         source_environment=source_environment,
         enable_runtime_closure=True,
+        release_authoritative=bool(args.release_authoritative),
         execution_external_authority=external_authority,
     )
     try:
@@ -21150,7 +21294,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         hard_failures = [item for item in runner.hard_gate_results if item["status"] != "pass"]
         status = "PASS" if not runner.violations and not hard_failures else "FAIL"
         print(f"CI foundation profile={args.profile} verify-only status={status}")
-        return EXIT_SUCCESS if status == "PASS" else EXIT_POLICY_VIOLATION
+        return policy_status_exit_code(status)
     try:
         summary = write_evidence(
             runner,
@@ -21178,7 +21322,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             else "task-authorized-external/summary.md"
         )
     )
-    return EXIT_SUCCESS if summary["status"] == "PASS" else EXIT_POLICY_VIOLATION
+    return policy_status_exit_code(str(summary["status"]))
 
 
 if __name__ == "__main__":

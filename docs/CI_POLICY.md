@@ -193,10 +193,16 @@ Expected private-resource omissions remain separately labelled intentional
 public-clone omissions and never weaken the tracked-resource hard gate.
 Release-only ZIP, PDF, and checklist checks remain explicit skips because this
 CI has no release input or publication authority. They are visible and
-nonblocking in `static`; the same observation is blocking when `standalone` or
-`all` makes a release gate required. If an observation could match both frozen
-debt and hard-gate authority, the hard-gate result wins. No gate is
-observational.
+nonblocking in `static` and in an ordinary engineering `all` invocation.
+Profile breadth and release authority are separate: `all` schedules the full
+engineering suite but resolves `releaseGateRequired=false` unless the
+invocation separately requests explicit release authority. `standalone`
+intentionally retains its release-shaped profile semantic and always resolves
+`releaseGateRequired=true`. An explicit release-authoritative `all` invocation
+also resolves `true`; the same three unresolved skips then remain visible and
+each is a blocking `RELEASE-ONLY-SKIP-IN-REQUIRED-GATE` violation. If an
+observation could match both frozen debt and hard-gate authority, the hard-gate
+result wins. No gate is observational.
 
 The static profile exposes two distinct hard gates. `STATIC-SUITE-EXECUTION`
 requires a started child, zero exit, no timeout or output overflow, clean
@@ -263,16 +269,28 @@ The runner uses only Python standard-library code before installation:
 
 ```text
 python -B developer/tests/ci/run_ci_foundation.py --profile PROFILE
+python -B developer/tests/ci/run_ci_foundation.py --profile all --release-authoritative
 python -B developer/tests/ci/run_ci_foundation.py --profile policy --verify-only
 python -B developer/tests/ci/run_ci_foundation.py --profile policy --verify-only --require-install-tools
 python -B developer/tests/ci/run_ci_foundation.py --prepare-developer-esbuild
 python -B developer/tests/ci/run_ci_foundation.py --verify-evidence --expected-profile PROFILE --expected-invocation-id LOCAL_INVOCATION_ID
+python -B developer/tests/ci/run_ci_foundation.py --verify-evidence --expected-profile all --release-authoritative --expected-invocation-id LOCAL_INVOCATION_ID
 <ABSOLUTE_PYTHON> -B developer/tests/ci/run_ci_foundation.py --verify-evidence --expected-profile PROFILE --expected-producer-job PRODUCER --expected-verifier-job VERIFIER --expected-runner-os OS --untrusted-evidence-root ROOT
 python -B developer/tests/ci/run_ci_foundation.py --list-profiles
 ```
 
 `PROFILE` is exactly one of `policy`, `static`, `frontend`, `backend`,
 `standalone`, or `all`.
+
+`--release-authoritative` is a single-use boolean invocation selector accepted
+only with producer `--profile all` or verifier `--expected-profile all`.
+Omission is valid and means that `all` is engineering/non-release. The selector
+does not change command-plan breadth. A release producer and every verifier of
+its evidence must deliberately supply it; the resolved boolean is then bound
+as `releaseGateRequired=true`. `standalone` needs no selector because its
+retained profile semantic resolves the same field to `true`. Supplying the
+selector for any other profile, duplicating it, or giving it a value is a
+configuration error.
 
 `--verify-evidence` without `--expected-profile` is a configuration error and
 exits before a replay runner is constructed or any evidence byte is read. The
@@ -292,7 +310,17 @@ explicit untrusted artifact root. Linux verifier jobs additionally require
 - `frontend` runs bundle normalization and byte parity, focused learner tests, and the authoritative frontend security/export guards.
 - `backend` runs `npm --prefix backend test` as the full canonical suite.
 - `standalone` runs the canonical packaging security suite and exact index-to-positive-manifest membership audit.
-- `all` executes every profile responsibility in one evidence set.
+- `all` executes every profile responsibility in one evidence set; this is
+  engineering breadth and is not release authorization by itself.
+
+The current hosted Ubuntu and Windows `all` producers and verifiers do not use
+`--release-authoritative`; they therefore remain valid engineering runs with
+`releaseGateRequired=false`, without a workflow change. No release workflow
+currently exists. A future release workflow must add the selector deliberately
+to both sides of its producer/verifier invocation contract. It must not infer
+release intent from profile `all`. Once `releaseGateRequired=true` is bound,
+missing release inputs, unresolved release-only skips, malformed authority, or
+producer/verifier disagreement remain fail-closed.
 
 Exit codes are `0` for success, `2` for a test or policy violation, `3` for a
 CLI or baseline configuration error, and `4` when safe evidence cannot be
@@ -835,31 +863,36 @@ the canonical rendering of `summary.json` byte for byte.
 
 ### External replay and execution-binding authority
 
-Evidence may describe its profile and execution context. Evidence never
-selects the expected profile, workflow job, runner operating system, run
-identity, checkout identity, or command plan that verification replays.
+Evidence may describe its profile, resolved release authority, and execution
+context. Evidence never selects the expected profile, resolved release
+authority, workflow job, runner operating system, run identity, checkout
+identity, or command plan that verification replays.
 
 After CLI parsing and before opening `.ci-results`, verification constructs one
 `ExternallyExpectedVerificationContext`. It loads the frozen baseline,
-constructs `FoundationRunner` from the externally supplied expected profile,
-independently freezes that profile's command plan, measures the current
-checkout and CI trust files, and binds the current execution context. Only
-then may evidence parsing begin. A profile or binding mismatch fails before
+constructs `FoundationRunner` from the externally supplied expected profile
+and explicit-release selector, resolves `release_gate_required`, independently
+freezes that profile's command plan, measures the current checkout and CI trust
+files, and binds the current execution context. Only then may evidence parsing
+begin. A profile, release-authority, or binding mismatch fails before
 `runner.run()`; replay always uses
-`ExternallyExpectedVerificationContext.expected_profile`.
+`ExternallyExpectedVerificationContext.expected_profile` and
+`ExternallyExpectedVerificationContext.release_gate_required`.
 
 Every structured evidence document contains the same strict
 `ProducerExecutionBinding` and `executionBindingDigest`. Evidence is allowed to
 claim only producer facts: binding kind/mode, `producerJobId`,
-`producerRunnerOS`, `producerProfile`, run/attempt/event/repository,
+`producerRunnerOS`, `producerProfile`, the strict boolean
+`releaseGateRequired`, run/attempt/event/repository,
 checkout/baseline commit and tree, `trustFileDigest`, `commandPlanDigest`, and
 `producerInvocationId`.
 
 Generation also records one strict, versioned `AuthorizationContextBinding` and
 its domain-separated, type-aware, length-framed, NFC-normalized
 `authorizationContextBindingDigest`. Its exact stable projection is: binding
-schema and kind, binding mode, expected profile, producer job ID, expected
-verifier job ID, runner OS, run ID and attempt, event, repository, checkout
+schema and kind, binding mode, expected profile, resolved strict boolean
+`releaseGateRequired`, producer job ID, expected verifier job ID, runner OS,
+run ID and attempt, event, repository, checkout
 commit and tree, baseline commit and tree, CI trust-file digest, independently
 rebuilt command-plan digest, and producer invocation ID. Local mode fixes the
 roles to `local-producer` and `local-verifier`. The authoritative projection is
@@ -867,6 +900,16 @@ constructed from the fixed workflow mapping, GitHub-controlled or explicit
 local verifier context, current checkout/baseline/trust bytes, the independently
 rebuilt plan, and the caller-owned generation receipt. Artifact fields are
 comparison claims only.
+
+The producer execution binding, stable authorization binding, externally
+constructed expected context, verifier execution binding, fresh replay runner,
+and replay transcript all carry or reconstruct the same resolved release
+authority. The producer and authorization digests cover the field through the
+existing canonical framing; no second release digest or parallel trust channel
+exists. Missing fields, non-boolean values, duplicate JSON keys, digest drift,
+or `false`/`true` substitution are invalid. A verifier cannot downgrade a
+release-authoritative producer by removing or rewriting the field, even if it
+coherently rewrites other evidence claims.
 
 The authorization projection cannot contain `currentFullContextDigest`,
 `derivedFailureDigest`, any evidence or summary/manifest digest, or its own
@@ -904,12 +947,12 @@ reconstruct the three vectors below without consulting Python source.
     "map-key": "6b"
   },
   "domains": {
-    "AuthorizationContextBindingDigest": "ieltmps-authorization-context-binding-v1",
+    "AuthorizationContextBindingDigest": "ieltmps-authorization-context-binding-v2",
     "VerifierReplayContextDigest": "ieltmps-verifier-replay-context-binding-v1",
     "ReplayAuthorizationEnvelopeDigest": "ieltmps-replay-authorization-envelope-v1"
   },
   "schemaVersions": {
-    "AuthorizationContextBinding": 1,
+    "AuthorizationContextBinding": 2,
     "VerifierReplayContextBinding": 1,
     "ReplayAuthorizationEnvelope": 1
   }
@@ -967,18 +1010,19 @@ with no `sha256:` prefix.
 
 #### AuthorizationContextBindingDigest schema
 
-The exact domain text is `ieltmps-authorization-context-binding-v1`; its UTF-8
+The exact domain text is `ieltmps-authorization-context-binding-v2`; its UTF-8
 hex is
-`69656c746d70732d617574686f72697a6174696f6e2d636f6e746578742d62696e64696e672d7631`.
+`69656c746d70732d617574686f72697a6174696f6e2d636f6e746578742d62696e64696e672d7632`.
 The complete preimage projection is the map
 `{"digestDomain": domain_text, "binding": AuthorizationContextBinding}`.
 
 | Field | Canonical type and constraint | Required |
 | --- | --- | --- |
-| `bindingSchemaVersion` | integer, exactly `1` | yes |
+| `bindingSchemaVersion` | integer, exactly `2` | yes |
 | `bindingKind` | text, exactly `AuthorizationContextBinding` | yes |
 | `bindingMode` | text, `github-actions` or `local` | yes |
 | `expectedProfile` | text, one of `policy`, `static`, `frontend`, `backend`, `standalone`, `all` | yes |
+| `releaseGateRequired` | boolean; `true` for `standalone`, either value for `all`, and `false` for every other profile | yes |
 | `producerJobId`, `expectedVerifierJobId` | nonempty trimmed text, at most 512 UTF-8 octets | yes |
 | `runnerOS` | text, `Linux` or `Windows` | yes |
 | `runId`, `runAttempt`, `eventName`, `repository` | nonempty trimmed text, at most 512 UTF-8 octets | yes |
@@ -1041,10 +1085,11 @@ projection, `canonicalPreimageByteLength` counts the complete framed outer map,
   "vector": "A",
   "name": "AuthorizationContextBinding",
   "structuredInput": {
-    "bindingSchemaVersion": 1,
+    "bindingSchemaVersion": 2,
     "bindingKind": "AuthorizationContextBinding",
     "bindingMode": "local",
     "expectedProfile": "policy",
+    "releaseGateRequired": false,
     "producerJobId": "local-producer",
     "expectedVerifierJobId": "local-verifier",
     "runnerOS": "Windows",
@@ -1061,12 +1106,13 @@ projection, `canonicalPreimageByteLength` counts the complete framed outer map,
     "producerInvocationId": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
   },
   "canonicalNormalizedProjection": {
-    "digestDomain": "ieltmps-authorization-context-binding-v1",
+    "digestDomain": "ieltmps-authorization-context-binding-v2",
     "binding": {
-      "bindingSchemaVersion": 1,
+      "bindingSchemaVersion": 2,
       "bindingKind": "AuthorizationContextBinding",
       "bindingMode": "local",
       "expectedProfile": "policy",
+      "releaseGateRequired": false,
       "producerJobId": "local-producer",
       "expectedVerifierJobId": "local-verifier",
       "runnerOS": "Windows",
@@ -1083,10 +1129,10 @@ projection, `canonicalPreimageByteLength` counts the complete framed outer map,
       "producerInvocationId": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
     }
   },
-  "canonicalPreimageByteLength": 1150,
-  "canonicalPreimageHex": "6d000000000000047500000000000000026b000000000000000762696e64696e676d000000000000040e00000000000000126b000000000000000e626173656c696e65436f6d6d6974730000000000000028343534353435343534353435343534353435343534353435343534353435343534353435343534356b000000000000000c626173656c696e6554726565730000000000000028363736373637363736373637363736373637363736373637363736373637363736373637363736376b000000000000000b62696e64696e674b696e6473000000000000001b417574686f72697a6174696f6e436f6e7465787442696e64696e676b000000000000000b62696e64696e674d6f64657300000000000000056c6f63616c6b000000000000001462696e64696e67536368656d6156657273696f6e690000000000000001316b000000000000000e636865636b6f7574436f6d6d6974730000000000000028303130313031303130313031303130313031303130313031303130313031303130313031303130316b000000000000000c636865636b6f757454726565730000000000000028323332333233323332333233323332333233323332333233323332333233323332333233323332336b0000000000000011636f6d6d616e64506c616e446967657374730000000000000040616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626b00000000000000096576656e744e616d65730000000000000011776f726b666c6f775f64697370617463686b000000000000000f657870656374656450726f66696c65730000000000000006706f6c6963796b0000000000000015657870656374656456657269666965724a6f62496473000000000000000e6c6f63616c2d76657269666965726b000000000000001470726f6475636572496e766f636174696f6e4964730000000000000040636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646b000000000000000d70726f64756365724a6f62496473000000000000000e6c6f63616c2d70726f64756365726b000000000000000a7265706f7369746f727973000000000000000f6578616d706c652f69656c746d70736b000000000000000a72756e417474656d7074730000000000000001316b000000000000000572756e496473000000000000000a766563746f722d72756e6b000000000000000872756e6e65724f5373000000000000000757696e646f77736b000000000000000f747275737446696c65446967657374730000000000000040383938393839383938393839383938393839383938393839383938393839383938393839383938393839383938393839383938393839383938393839383938396b000000000000000c646967657374446f6d61696e73000000000000002869656c746d70732d617574686f72697a6174696f6e2d636f6e746578742d62696e64696e672d7631",
-  "sha256": "ddf4607eecbd29b2d42225427a7e1f7c18b7747db51d8a685156479e6b75f88f",
-  "expectedTextualDigest": "ddf4607eecbd29b2d42225427a7e1f7c18b7747db51d8a685156479e6b75f88f"
+  "canonicalPreimageByteLength": 1188,
+  "canonicalPreimageHex": "6d000000000000049b00000000000000026b000000000000000762696e64696e676d000000000000043400000000000000136b000000000000000e626173656c696e65436f6d6d6974730000000000000028343534353435343534353435343534353435343534353435343534353435343534353435343534356b000000000000000c626173656c696e6554726565730000000000000028363736373637363736373637363736373637363736373637363736373637363736373637363736376b000000000000000b62696e64696e674b696e6473000000000000001b417574686f72697a6174696f6e436f6e7465787442696e64696e676b000000000000000b62696e64696e674d6f64657300000000000000056c6f63616c6b000000000000001462696e64696e67536368656d6156657273696f6e690000000000000001326b000000000000000e636865636b6f7574436f6d6d6974730000000000000028303130313031303130313031303130313031303130313031303130313031303130313031303130316b000000000000000c636865636b6f757454726565730000000000000028323332333233323332333233323332333233323332333233323332333233323332333233323332336b0000000000000011636f6d6d616e64506c616e446967657374730000000000000040616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626b00000000000000096576656e744e616d65730000000000000011776f726b666c6f775f64697370617463686b000000000000000f657870656374656450726f66696c65730000000000000006706f6c6963796b0000000000000015657870656374656456657269666965724a6f62496473000000000000000e6c6f63616c2d76657269666965726b000000000000001470726f6475636572496e766f636174696f6e4964730000000000000040636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646b000000000000000d70726f64756365724a6f62496473000000000000000e6c6f63616c2d70726f64756365726b000000000000001372656c65617365476174655265717569726564620000000000000001306b000000000000000a7265706f7369746f727973000000000000000f6578616d706c652f69656c746d70736b000000000000000a72756e417474656d7074730000000000000001316b000000000000000572756e496473000000000000000a766563746f722d72756e6b000000000000000872756e6e65724f5373000000000000000757696e646f77736b000000000000000f747275737446696c65446967657374730000000000000040383938393839383938393839383938393839383938393839383938393839383938393839383938393839383938393839383938393839383938393839383938396b000000000000000c646967657374446f6d61696e73000000000000002869656c746d70732d617574686f72697a6174696f6e2d636f6e746578742d62696e64696e672d7632",
+  "sha256": "a04cd2fc5119910f80fa1a06a97500074ed0983ba248c71b197c5d6cd63c86f5",
+  "expectedTextualDigest": "a04cd2fc5119910f80fa1a06a97500074ed0983ba248c71b197c5d6cd63c86f5"
 }
 ```
 
@@ -1249,8 +1295,9 @@ movement, and unresolved or unexecuted "resolved" candidates are rejected.
 
 Structural agreement is still only an evidence claim. Whenever `summary.json`
 claims `PASS`, `--verify-evidence` executes the runner already constructed from
-the external expected profile and frozen baseline, independently rebuilds its command plan,
-and re-executes every required, observation-producing, and hard-gate command.
+the external expected profile, resolved release authority, and frozen baseline,
+independently rebuilds its command plan, and re-executes every required,
+observation-producing, and hard-gate command.
 Historical command records, exits, producer sets, summary counts, manifest
 hashes, and replay-shaped fields are never execution inputs. Missing tools or
 dependencies make replay unavailable and the PASS claim is rejected.
@@ -1276,8 +1323,9 @@ exactly once. Policy and static completed-class sets must be nonempty and must
 equal the classes independently derived from the plan and clean replay facts.
 The transcript also carries both the exact producer binding being compared and
 the externally constructed verifier binding, plus the fresh runtime/dependency
-closure and guard state. This binds expected profile, producer/verifier jobs,
-OS, run/attempt/event/repository, checkout commit/tree, baseline commit/tree,
+closure and guard state. This binds expected profile, resolved
+`releaseGateRequired`, producer/verifier jobs, OS,
+run/attempt/event/repository, checkout commit/tree, baseline commit/tree,
 current trust-file digest, independently rebuilt command plan, fresh closure,
 and both invocation identities to the replay.
 
@@ -1377,6 +1425,11 @@ ubuntu-canonical:
 windows-compatibility:
 <ABSOLUTE_PYTHON> -B developer/tests/ci/run_ci_foundation.py --verify-evidence --expected-profile all --expected-producer-job windows-compatibility-producer --expected-verifier-job windows-compatibility --expected-runner-os Windows --untrusted-evidence-root .ci-untrusted/windows-compatibility --require-fresh-runtime-closure
 ```
+
+The two shown hosted `all` verifier commands intentionally omit
+`--release-authoritative`; they reconstruct engineering authority
+`releaseGateRequired=false` and must stay paired with their unchanged producer
+commands. These commands are not a release workflow.
 
 This mode re-executes only the externally selected profile through protected
 command authority and modifies no artifact byte. All-profile dependencies were
