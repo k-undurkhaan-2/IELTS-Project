@@ -6465,8 +6465,12 @@ print(json.dumps({
                     / "3.12.13"
                     / "x64"
                     / "bin"
-                    / "python3.12",
+                    / "python",
                 )
+            )
+            self.assertEqual(
+                Path(ci.require_tool(tools, "python", phase="CAPTURE")).name,
+                "python3.12",
             )
         finally:
             fixture.cleanup()
@@ -7028,6 +7032,30 @@ print(json.dumps({
                     self.assertNotIn("GITHUB_PATH", child)
                 finally:
                     fixture.cleanup()
+
+    def test_python_wildcard_spelling_does_not_gain_executable_authority(self) -> None:
+        fixture = _HostedToolFixture("Ubuntu")
+        try:
+            wildcard_dir = fixture.root / "wildcard-python-name"
+            wildcard = fixture._write(
+                wildcard_dir / "python3.999",
+                b"different-python-file",
+            )
+            source = dict(fixture.source)
+            source["PATH"] = fixture.policy.path_separator.join(
+                (str(wildcard_dir), source["PATH"])
+            )
+            tools, errors = ci.resolve_trusted_tools(
+                self.REQUIRED,
+                source_environment=source,
+                policy=fixture.policy,
+            )
+            self.assertEqual(errors, [])
+            captured = Path(ci.require_tool(tools, "python", phase="CAPTURE"))
+            self.assertEqual(captured, fixture.paths["python"])
+            self.assertFalse(ci._same_file_identity(wildcard, captured))
+        finally:
+            fixture.cleanup()
 
     def test_missing_tool_and_partial_map_failures_are_typed_and_keyerror_free(self) -> None:
         for role in ("git", "bash", "node", "python"):
@@ -10658,13 +10686,28 @@ class CI6ProtectedPolicyInputTest(unittest.TestCase):
 
     def test_all_target_bound_plans_use_protected_execution_inputs(self) -> None:
         baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
+        canonical_fixture_executable = ci.require_tool(
+            {"python": sys.executable},
+            "python",
+            phase="SELF_TEST_PLAN_FIXTURE",
+        )
+        self.assertEqual(
+            Path(canonical_fixture_executable),
+            Path(sys.executable).resolve(strict=True),
+        )
+        self.assertTrue(
+            ci._same_file_identity(
+                Path(canonical_fixture_executable),
+                Path(sys.executable),
+            )
+        )
         tools = {
-            "python": sys.executable,
-            "node": sys.executable,
-            "npm": sys.executable,
-            "git": sys.executable,
-            "bash": sys.executable,
-            "powershell": sys.executable,
+            "python": canonical_fixture_executable,
+            "node": canonical_fixture_executable,
+            "npm": canonical_fixture_executable,
+            "git": canonical_fixture_executable,
+            "bash": canonical_fixture_executable,
+            "powershell": canonical_fixture_executable,
         }
         candidates = [
             "developer/tests/ci/run_static_suite.py",
@@ -10727,7 +10770,11 @@ class CI6ProtectedPolicyInputTest(unittest.TestCase):
                             command_id,
                         )
                     if command_id == "frontend-security:messageOriginGuard.test.js":
-                        trusted_node = tools["node"]
+                        trusted_node = ci.require_tool(
+                            tools,
+                            "node",
+                            phase="SELF_TEST_PLAN_EXPECTATION",
+                        )
                         expected_argv = [
                             trusted_node,
                             "--test",
@@ -10772,6 +10819,66 @@ class CI6ProtectedPolicyInputTest(unittest.TestCase):
         self.assertIn("from 'node:assert/strict'", guard_source)
         self.assertNotIn("vitest", guard_source.casefold())
         self.assertNotRegex(guard_source, r"\.(?:skip|todo|only)\b")
+
+    def test_posix_snapshot_root_and_descendant_translation_is_exactly_bounded(
+        self,
+    ) -> None:
+        snapshot_root = "/tmp/cs-abc"
+        repository_root = "/srv/IELTS/Repo"
+        positive_cases = {
+            "bare-root": (snapshot_root, repository_root),
+            "direct-child": (
+                f"{snapshot_root}/result.json",
+                f"{repository_root}/result.json",
+            ),
+            "deeper-descendant": (
+                f"{snapshot_root}/reports/static/result.json",
+                f"{repository_root}/reports/static/result.json",
+            ),
+        }
+        for label, (observed, expected) in positive_cases.items():
+            with self.subTest(positive=label):
+                self.assertEqual(
+                    ci._translate_snapshot_output_paths(
+                        observed,
+                        snapshot_root,
+                        repository_root,
+                    ),
+                    expected,
+                )
+                self.assertEqual(
+                    ci._translate_snapshot_output_bytes(
+                        observed.encode("utf-8"),
+                        snapshot_root,
+                        repository_root,
+                    ),
+                    expected.encode("utf-8"),
+                )
+
+        negative_cases = {
+            "near-prefix": f"{snapshot_root}d/result.json",
+            "unrelated-root": "/tmp/cs-unrelated/result.json",
+            "parent-directory": "/tmp",
+            "generic-temp-descendant": "/tmp/arbitrary/result.json",
+        }
+        for label, observed in negative_cases.items():
+            with self.subTest(negative=label):
+                self.assertEqual(
+                    ci._translate_snapshot_output_paths(
+                        observed,
+                        snapshot_root,
+                        repository_root,
+                    ),
+                    observed,
+                )
+                self.assertEqual(
+                    ci._translate_snapshot_output_bytes(
+                        observed.encode("utf-8"),
+                        snapshot_root,
+                        repository_root,
+                    ),
+                    observed.encode("utf-8"),
+                )
 
     def test_protected_snapshot_process_consumes_only_materialized_planned_bytes(self) -> None:
         script = self.root / "check.py"

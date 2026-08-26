@@ -14619,6 +14619,8 @@ def _failure_path_patterns(
     candidate_root: str,
     repository_root: str,
     logical_target: str | None,
+    *,
+    include_root_descendants: bool = False,
 ) -> list[_AuthorizedPathPattern]:
     candidate_reference = classify_windows_absolute_reference(candidate_root)
     repository_reference = classify_windows_absolute_reference(repository_root)
@@ -14707,9 +14709,15 @@ def _failure_path_patterns(
         repository_separator = "" if repository == "/" else "/"
         source = candidate + separator + (logical_target or "")
         replacement = repository + repository_separator + (logical_target or "")
+        path_boundary = after
+        if logical_target is None and candidate != "/":
+            source = candidate
+            replacement = repository
+            if include_root_descendants:
+                path_boundary = r"(?=/|(?![A-Za-z0-9_.%+@~/?#\\-]))"
         patterns.append(
             _AuthorizedPathPattern(
-                before + re.escape(source) + after,
+                before + re.escape(source) + path_boundary,
                 logical_target,
                 replacement,
                 replacement,
@@ -14759,6 +14767,7 @@ def _translate_authorized_paths_text(
             candidate_root,
             authority.repository_root,
             None,
+            include_root_descendants=True,
         ):
             pattern = re.compile(specification.pattern)
             translated = pattern.sub(
@@ -14795,6 +14804,7 @@ def _translate_authorized_paths_bytes(
             candidate_root,
             authority.repository_root,
             None,
+            include_root_descendants=True,
         ):
             pattern = re.compile(specification.pattern.encode("utf-8"))
             translated = pattern.sub(
@@ -14810,7 +14820,7 @@ def _translate_snapshot_output_paths(
     repo_root: str | Path,
     authorized_targets: Sequence[Mapping[str, Any] | str] = (),
 ) -> str:
-    """Translate only exact snapshot roots and exact authority-bound targets."""
+    """Translate only exact snapshot-root boundaries and authority-bound targets."""
 
     authority = _coerce_failure_path_authority(repo_root, snapshot_root, authorized_targets)
     return _translate_authorized_paths_text(
