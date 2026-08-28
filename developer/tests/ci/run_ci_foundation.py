@@ -9541,6 +9541,18 @@ R03_FAILURE_TARGETS = MappingProxyType(
     }
 )
 
+# Release-only producers report an absent repository-root checklist by its
+# physical snapshot path.  The missing path is intentionally not part of the
+# materialized target bundle, so it needs a separate, exact scope-to-path
+# authority before frozen-v1 signature derivation.  This must remain a closed
+# map: it is not authority to translate arbitrary snapshot descendants.
+RELEASE_ONLY_SKIP_FAILURE_TARGETS = MappingProxyType(
+    {
+        "result:PDF 对账与回归审计": "checklist.md",
+        "result:Checklist 对账一致性校验": "checklist.md",
+    }
+)
+
 
 def _r03_legacy_static_signature_projection(value: Any, logical_target: str) -> Any:
     if isinstance(value, Mapping):
@@ -10132,20 +10144,42 @@ def _known_identity_expected(scope: str) -> dict[str, Any] | None:
     return None
 
 
-def _r03_path_authority_matches(scope: str, identity: Mapping[str, Any]) -> bool:
+def _failure_path_authority_matches(
+    scope: str,
+    identity: Mapping[str, Any],
+    *,
+    raw_fields: Any,
+    source: Mapping[str, Any] | None,
+) -> bool:
     expected_target = R03_FAILURE_TARGETS.get(scope)
-    if expected_target is None:
+    release_target = RELEASE_ONLY_SKIP_FAILURE_TARGETS.get(scope)
+    if expected_target is None and release_target is None:
         return True
     binding = identity.get("pathAuthority")
     if not isinstance(binding, dict) or set(binding) != FAILURE_PATH_AUTHORITY_KEYS:
         return False
     target_paths = binding.get("authorizedTargetPaths")
-    if not isinstance(target_paths, list) or expected_target not in target_paths:
+    required_target = expected_target or release_target
+    if not isinstance(target_paths, list) or required_target not in target_paths:
         return False
     if binding.get("unmappedAbsolutePathDigests") or binding.get(
         "literalPlaceholderDigests"
     ):
         return False
+    if release_target is not None:
+        return (
+            target_paths == [release_target]
+            and binding.get("authorizedToolRoles") == []
+            and (
+                source is None
+                or _release_skip_missing_target_is_authorized(
+                    source,
+                    raw_fields,
+                    release_target,
+                )
+            )
+        )
+    assert expected_target is not None
     allowed_targets = {expected_target}
     known_node = KNOWN_NODE_FAILURES.get(scope)
     if known_node is not None:
@@ -10233,7 +10267,12 @@ def _failure_identity_authorizes(
         return False
     identity = derived["failureIdentity"]
     scope = baseline_scope
-    if not _r03_path_authority_matches(scope, identity):
+    if not _failure_path_authority_matches(
+        scope,
+        identity,
+        raw_fields=raw.get("rawStructuredFields"),
+        source=source_command,
+    ):
         return False
     known_static = KNOWN_STATIC_FAILURES.get(scope)
     if known_static is not None:
@@ -11376,6 +11415,40 @@ def _canonical_target_occurs_in_raw_fields(value: Any, logical_target: str) -> b
     ) is not None
 
 
+def _release_skip_missing_target_is_authorized(
+    source: Mapping[str, Any],
+    raw_fields: Any,
+    logical_target: str,
+) -> bool:
+    """Authorize one exact absent release input from a protected static snapshot."""
+
+    if not isinstance(raw_fields, Mapping):
+        return False
+    scope = f"result:{raw_fields.get('name', '')}"
+    if RELEASE_ONLY_SKIP_FAILURE_TARGETS.get(scope) != logical_target:
+        return False
+    detail = raw_fields.get("detail")
+    if not isinstance(detail, Mapping):
+        return False
+    source_targets = {
+        str(target.get("path"))
+        for target in source.get("targets", [])
+        if isinstance(target, Mapping) and isinstance(target.get("path"), str)
+    }
+    return (
+        source.get("commandId") == "static-suite"
+        and source.get("commandClass") == "static-suite"
+        and source.get("toolRole") == "python-static-producer"
+        and source.get("resultSemantics") == "machine-v2-complete-execution"
+        and source.get("actualExecutionInputMode") == "PROTECTED-TARGET-BUNDLE"
+        and raw_fields.get("status") == "pass"
+        and nested_skip(detail)
+        and detail.get("reason")
+        == f"missing_checklist:<repo>/{logical_target}"
+        and logical_target not in source_targets
+    )
+
+
 def _validate_failure_path_authority(
     value: Any,
     *,
@@ -11437,7 +11510,13 @@ def _validate_failure_path_authority(
             if isinstance(target, Mapping) and isinstance(target.get("path"), str)
         }
         if isinstance(target_paths, list) and any(
-            target not in source_targets for target in target_paths
+            target not in source_targets
+            and not _release_skip_missing_target_is_authorized(
+                source,
+                raw_fields,
+                target,
+            )
+            for target in target_paths
         ):
             errors.append(f"{label}: target path is outside source command authority")
         roles = value.get("authorizedToolRoles")
@@ -15088,6 +15167,86 @@ def canonicalize_failure_identity_value(
     }
 
 
+def _canonicalize_static_result_failure_paths(
+    result: Mapping[str, Any],
+    authority: FailurePathAuthority,
+) -> tuple[Any, dict[str, Any] | None]:
+    """Bind only approved static failure paths, including exact missing release input."""
+
+    scope = f"result:{result.get('name', '')}"
+    selected_authority = authority
+    if scope in RELEASE_ONLY_SKIP_FAILURE_TARGETS:
+        detail = result.get("detail")
+        if (
+            result.get("status") != "pass"
+            or not nested_skip(detail)
+            or not isinstance(detail, Mapping)
+        ):
+            return copy.deepcopy(result), None
+        logical_target = RELEASE_ONLY_SKIP_FAILURE_TARGETS[scope]
+        if logical_target not in {logical for logical, _canonical in authority.targets}:
+            canonical_target = str(
+                Path(authority.repository_root).joinpath(
+                    *logical_target.split("/")
+                )
+            )
+            selected_authority = FailurePathAuthority(
+                repository_root=authority.repository_root,
+                snapshot_root=authority.snapshot_root,
+                targets=tuple(
+                    sorted(
+                        (*authority.targets, (logical_target, canonical_target))
+                    )
+                ),
+                trusted_executables=authority.trusted_executables,
+            )
+        reason = detail.get("reason")
+        if not isinstance(reason, str):
+            return canonicalize_failure_identity_value(result, selected_authority)
+        release_prefix = "missing_checklist:"
+        result_without_reason = copy.deepcopy(result)
+        del result_without_reason["detail"]["reason"]
+        canonical_result, outer_binding = canonicalize_failure_identity_value(
+            result_without_reason,
+            selected_authority,
+        )
+        if reason.startswith(release_prefix):
+            canonical_reason_path, reason_binding = canonicalize_failure_identity_text(
+                reason[len(release_prefix) :],
+                selected_authority,
+            )
+            canonical_reason = release_prefix + canonical_reason_path
+        else:
+            canonical_reason, reason_binding = canonicalize_failure_identity_text(
+                reason,
+                selected_authority,
+            )
+        canonical_result["detail"]["reason"] = canonical_reason
+        return canonical_result, {
+            "schemaVersion": 1,
+            "canonicalizationKind": "SOURCE-SNAPSHOT-BOUND-FAILURE-PATHS-V1",
+            "authorizedTargetPaths": sorted(
+                set(outer_binding["authorizedTargetPaths"])
+                | set(reason_binding["authorizedTargetPaths"])
+            ),
+            "authorizedToolRoles": sorted(
+                set(outer_binding["authorizedToolRoles"])
+                | set(reason_binding["authorizedToolRoles"])
+            ),
+            "unmappedAbsolutePathDigests": sorted(
+                set(outer_binding["unmappedAbsolutePathDigests"])
+                | set(reason_binding["unmappedAbsolutePathDigests"])
+            ),
+            "literalPlaceholderDigests": sorted(
+                set(outer_binding["literalPlaceholderDigests"])
+                | set(reason_binding["literalPlaceholderDigests"])
+            ),
+        }
+    elif scope not in R03_FAILURE_TARGETS:
+        return copy.deepcopy(result), None
+    return canonicalize_failure_identity_value(result, selected_authority)
+
+
 def _canonicalize_static_machine_capture(
     capture: CommandCapture,
     report: Mapping[str, Any],
@@ -16948,12 +17107,11 @@ class FoundationRunner:
             canonical_report = copy.deepcopy(report)
             canonical_results: list[Any] = []
             for result in report["observations"]:
-                scope = f"result:{result.get('name', '')}"
-                if (
-                    scope in R03_FAILURE_TARGETS
-                    and isinstance(capture.failure_path_authority, FailurePathAuthority)
+                if isinstance(
+                    capture.failure_path_authority,
+                    FailurePathAuthority,
                 ):
-                    canonical_result, binding = canonicalize_failure_identity_value(
+                    canonical_result, binding = _canonicalize_static_result_failure_paths(
                         result,
                         capture.failure_path_authority,
                     )

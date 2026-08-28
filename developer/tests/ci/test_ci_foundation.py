@@ -643,6 +643,20 @@ FROZEN_V1_RELEASE_SKIP_DETAILS = {
 }
 
 
+def frozen_release_skip_path_binding(entry: dict) -> dict | None:
+    target = ci.RELEASE_ONLY_SKIP_FAILURE_TARGETS.get(entry["testOrPathScope"])
+    if target is None:
+        return None
+    return {
+        "schemaVersion": 1,
+        "canonicalizationKind": "SOURCE-SNAPSHOT-BOUND-FAILURE-PATHS-V1",
+        "authorizedTargetPaths": [target],
+        "authorizedToolRoles": [],
+        "unmappedAbsolutePathDigests": [],
+        "literalPlaceholderDigests": [],
+    }
+
+
 def frozen_v1_release_skip_raw_observation(
     entry: dict,
     *,
@@ -661,6 +675,7 @@ def frozen_v1_release_skip_raw_observation(
         ci.STATIC_SUITE_RELATIVE_PATH,
         result,
         ci.canonical_failure_digest(result),
+        failure_path_authority=frozen_release_skip_path_binding(entry),
     )
 
 
@@ -695,6 +710,7 @@ def exact_static_observation(entry: dict) -> dict:
         ci.STATIC_SUITE_RELATIVE_PATH,
         result,
         ci.canonical_failure_digest(result),
+        failure_path_authority=frozen_release_skip_path_binding(entry),
     )
     return ci.observation(
         entry["commandClass"],
@@ -13257,6 +13273,7 @@ class CI10PathAndAuthorizationContextTest(unittest.TestCase):
                 ci.STATIC_SUITE_RELATIVE_PATH,
                 result,
                 ci.canonical_failure_digest(result),
+                failure_path_authority=frozen_release_skip_path_binding(entry),
             )
 
     def full_context_digest(self, authorization_digest: str) -> str:
@@ -15359,6 +15376,496 @@ class R08OptionBReleaseAuthorityTest(unittest.TestCase):
             2,
         )
         self.assertFalse(ci.resolve_release_gate_required("all"))
+
+
+class R10ReleaseSkipSignatureBindingTest(unittest.TestCase):
+    PATH_IDS = (
+        "B-SKIP-PDF-RECONCILIATION",
+        "B-SKIP-CHECKLIST-CONSISTENCY",
+    )
+    RELEASE_IDS = (
+        "B-SKIP-RELEASE-ZIP",
+        *PATH_IDS,
+    )
+    FROZEN_SIGNATURES = {
+        "B-SKIP-RELEASE-ZIP": (
+            "sha256:8ae895e21db520d968113c11eac0e2df73ed14d70521c5ac5957bb3f92f0da7f"
+        ),
+        "B-SKIP-PDF-RECONCILIATION": (
+            "sha256:33bc9b849164b41e15815b3b0db644c6b5bb44620715cd08b26852dda0a22a2d"
+        ),
+        "B-SKIP-CHECKLIST-CONSISTENCY": (
+            "sha256:6817f608de514acb77d92038f93328ef15d0c8da44cf377126984efb1d2cee07"
+        ),
+    }
+    POSIX_ROOT = "/srv/IELTS-practice"
+    POSIX_SNAPSHOT = "/tmp/cs-r10-release"
+    WINDOWS_ROOT = r"D:\a\IELTS-practice\IELTS-practice"
+    WINDOWS_SNAPSHOT = r"C:\Users\RUNNER~1\AppData\Local\Temp\cs-r10-release"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
+        cls.entries = {
+            entry["id"]: entry for entry in cls.baseline["releaseOnlySkips"]
+        }
+
+    @staticmethod
+    def joined(root: str, relative: str) -> str:
+        reference = ci.classify_windows_absolute_reference(root)
+        separator = "\\" if reference.authorizable else "/"
+        return root.rstrip("/\\") + separator + relative.replace("/", separator)
+
+    def physical_item(
+        self,
+        entry_id: str,
+        repository_root: str,
+        snapshot_root: str,
+        *,
+        observed_path: str | None = None,
+        reason_prefix: str = "missing_checklist:",
+        result_name: str | None = None,
+        observation_ordinal: int = 0,
+    ) -> tuple[dict, dict | None, dict]:
+        entry = self.entries[entry_id]
+        expected_name = entry["testOrPathScope"].removeprefix("result:")
+        detail = copy.deepcopy(FROZEN_V1_RELEASE_SKIP_DETAILS[expected_name])
+        detail["reason"] = reason_prefix + (
+            observed_path or self.joined(snapshot_root, "checklist.md")
+        )
+        result = {
+            "name": result_name or expected_name,
+            "status": "pass",
+            "detail": detail,
+        }
+        authority = ci._coerce_failure_path_authority(
+            repository_root,
+            snapshot_root,
+            [ci.STATIC_SUITE_RELATIVE_PATH],
+        )
+        canonical, binding = ci._canonicalize_static_result_failure_paths(
+            result,
+            authority,
+        )
+        raw = ci.make_raw_observation(
+            "static-suite",
+            4,
+            observation_ordinal,
+            "static-producer-v1",
+            str(canonical["name"]),
+            ci.STATIC_SUITE_RELATIVE_PATH,
+            canonical,
+            ci.canonical_failure_digest(canonical),
+            failure_path_authority=binding,
+        )
+        item = ci.observation(
+            "static-suite",
+            entry["testOrPathScope"],
+            "skip",
+            entry["allowedNormalizedSignature"][0],
+            "static-suite",
+            raw_observation=raw,
+        )
+        return canonical, binding, item
+
+    def selected_baseline(self, *entry_ids: str) -> dict:
+        selected = copy.deepcopy(self.baseline)
+        selected["knownDebts"] = []
+        selected["expectedOmissions"] = []
+        selected["releaseOnlySkips"] = [
+            copy.deepcopy(self.entries[entry_id]) for entry_id in entry_ids
+        ]
+        return selected
+
+    def compare_bound(
+        self,
+        entry_ids: tuple[str, ...],
+        items: list[dict],
+        *,
+        release_gate_required: bool = False,
+        platform_name: str = "windows",
+    ) -> tuple[dict, dict, list[dict]]:
+        _spec, record, observations = ci9_static_evidence_fixture(
+            items,
+            platform_name=platform_name,
+        )
+        result = ci.compare_observations(
+            self.selected_baseline(*entry_ids),
+            observations,
+            {"static-suite"},
+            platform_name,
+            release_gate_required=release_gate_required,
+            command_records=[record],
+        )
+        return result, record, observations
+
+    def assert_path_positive(
+        self,
+        entry_id: str,
+        repository_root: str,
+        snapshot_root: str,
+        *,
+        platform_name: str,
+    ) -> tuple[dict, dict, dict]:
+        canonical, binding, item = self.physical_item(
+            entry_id,
+            repository_root,
+            snapshot_root,
+        )
+        self.assertEqual(
+            canonical["detail"]["reason"],
+            "missing_checklist:<repo>/checklist.md",
+        )
+        self.assertIsNotNone(binding)
+        assert binding is not None
+        self.assertEqual(binding["authorizedTargetPaths"], ["checklist.md"])
+        self.assertEqual(binding["unmappedAbsolutePathDigests"], [])
+        self.assertEqual(binding["literalPlaceholderDigests"], [])
+        self.assertEqual(
+            ci.derive_frozen_v1_release_skip_signature(item["rawObservation"]),
+            self.FROZEN_SIGNATURES[entry_id],
+        )
+        result, record, observations = self.compare_bound(
+            (entry_id,),
+            [item],
+            platform_name=platform_name,
+        )
+        self.assertEqual(
+            ci._validate_raw_observation(
+                observations[0]["rawObservation"],
+                label="r10-positive",
+                source=record,
+            ),
+            [],
+        )
+        self.assertEqual(result["violations"], [])
+        self.assertEqual(
+            [release["baselineId"] for release in result["releaseOnlySkips"]],
+            [entry_id],
+        )
+        self.assertEqual(
+            result["releaseOnlySkips"][0]["legacyBaselineComparisonDigest"],
+            self.FROZEN_SIGNATURES[entry_id],
+        )
+        return canonical, binding, observations[0]
+
+    def assert_path_negative(
+        self,
+        entry_id: str,
+        repository_root: str,
+        snapshot_root: str,
+        *,
+        observed_path: str | None = None,
+        reason_prefix: str = "missing_checklist:",
+        result_name: str | None = None,
+    ) -> tuple[dict, dict | None, dict]:
+        canonical, binding, item = self.physical_item(
+            entry_id,
+            repository_root,
+            snapshot_root,
+            observed_path=observed_path,
+            reason_prefix=reason_prefix,
+            result_name=result_name,
+        )
+        result, _record, observations = self.compare_bound(
+            (entry_id,),
+            [item],
+            platform_name="windows",
+        )
+        self.assertEqual(result["releaseOnlySkips"], [])
+        self.assertIn(
+            "UNKNOWN-NONPASS",
+            {violation["id"] for violation in result["violations"]},
+        )
+        return canonical, binding, observations[0]
+
+    def three_physical_items(self) -> list[dict]:
+        zip_entry = self.entries["B-SKIP-RELEASE-ZIP"]
+        zip_raw = frozen_v1_release_skip_raw_observation(
+            zip_entry,
+            observation_ordinal=0,
+        )
+        items = [
+            ci.observation(
+                "static-suite",
+                zip_entry["testOrPathScope"],
+                "skip",
+                self.FROZEN_SIGNATURES[zip_entry["id"]],
+                "static-suite",
+                raw_observation=zip_raw,
+            )
+        ]
+        for ordinal, entry_id in enumerate(self.PATH_IDS, start=1):
+            _canonical, _binding, item = self.physical_item(
+                entry_id,
+                self.WINDOWS_ROOT,
+                self.WINDOWS_SNAPSHOT,
+                observation_ordinal=ordinal,
+            )
+            items.append(item)
+        return items
+
+    def test_pdf_posix_physical_snapshot_binds_exactly(self) -> None:
+        self.assert_path_positive(
+            "B-SKIP-PDF-RECONCILIATION",
+            self.POSIX_ROOT,
+            self.POSIX_SNAPSHOT,
+            platform_name="linux",
+        )
+
+    def test_checklist_posix_physical_snapshot_binds_exactly(self) -> None:
+        self.assert_path_positive(
+            "B-SKIP-CHECKLIST-CONSISTENCY",
+            self.POSIX_ROOT,
+            self.POSIX_SNAPSHOT,
+            platform_name="linux",
+        )
+
+    def test_pdf_windows_physical_snapshot_binds_exactly(self) -> None:
+        self.assert_path_positive(
+            "B-SKIP-PDF-RECONCILIATION",
+            self.WINDOWS_ROOT,
+            self.WINDOWS_SNAPSHOT,
+            platform_name="windows",
+        )
+
+    def test_checklist_windows_physical_snapshot_binds_exactly(self) -> None:
+        self.assert_path_positive(
+            "B-SKIP-CHECKLIST-CONSISTENCY",
+            self.WINDOWS_ROOT,
+            self.WINDOWS_SNAPSHOT,
+            platform_name="windows",
+        )
+
+    def test_release_zip_exact_binding_is_unchanged(self) -> None:
+        entry_id = "B-SKIP-RELEASE-ZIP"
+        entry = self.entries[entry_id]
+        raw = frozen_v1_release_skip_raw_observation(entry)
+        self.assertIsNone(raw["failurePathAuthority"])
+        self.assertEqual(
+            raw["rawStructuredFields"]["detail"],
+            FROZEN_V1_RELEASE_SKIP_DETAILS["Release ZIP 运行时内容守卫"],
+        )
+        item = ci.observation(
+            "static-suite",
+            entry["testOrPathScope"],
+            "skip",
+            self.FROZEN_SIGNATURES[entry_id],
+            "static-suite",
+            raw_observation=raw,
+        )
+        result, _record, observations = self.compare_bound((entry_id,), [item])
+        self.assertEqual(result["violations"], [])
+        self.assertEqual(result["releaseOnlySkips"][0]["baselineId"], entry_id)
+        self.assertEqual(
+            observations[0]["legacyBaselineComparisonDigest"],
+            self.FROZEN_SIGNATURES[entry_id],
+        )
+
+    def test_physical_snapshot_root_variation_preserves_frozen_identity(self) -> None:
+        cases = (
+            (self.POSIX_ROOT, "/tmp/cs-r10-a"),
+            (self.POSIX_ROOT, "/private/tmp/cs-r10-b"),
+            (self.WINDOWS_ROOT, r"C:\Temp\cs-r10-a"),
+            (self.WINDOWS_ROOT, r"E:\Build Temp\cs-r10-b"),
+        )
+        for entry_id in self.PATH_IDS:
+            signatures = set()
+            canonical_reasons = set()
+            for repository_root, snapshot_root in cases:
+                canonical, binding, item = self.physical_item(
+                    entry_id,
+                    repository_root,
+                    snapshot_root,
+                )
+                canonical_reasons.add(canonical["detail"]["reason"])
+                signatures.add(
+                    ci.derive_frozen_v1_release_skip_signature(
+                        item["rawObservation"]
+                    )
+                )
+                self.assertEqual(binding["authorizedTargetPaths"], ["checklist.md"])
+            self.assertEqual(
+                canonical_reasons,
+                {"missing_checklist:<repo>/checklist.md"},
+            )
+            self.assertEqual(signatures, {self.FROZEN_SIGNATURES[entry_id]})
+
+    def test_exact_repository_reason_and_all_three_frozen_digests_are_reproduced(self) -> None:
+        expected_scopes = {
+            "B-SKIP-RELEASE-ZIP": "result:Release ZIP 运行时内容守卫",
+            "B-SKIP-PDF-RECONCILIATION": "result:PDF 对账与回归审计",
+            "B-SKIP-CHECKLIST-CONSISTENCY": "result:Checklist 对账一致性校验",
+        }
+        for entry_id in self.RELEASE_IDS:
+            entry = self.entries[entry_id]
+            self.assertEqual(entry["testOrPathScope"], expected_scopes[entry_id])
+            self.assertEqual(
+                entry["allowedNormalizedSignature"],
+                [self.FROZEN_SIGNATURES[entry_id]],
+            )
+            self.assertEqual(entry["category"], "release-only-skip")
+            self.assertEqual(entry["expectedOutcome"], "skip")
+            raw = frozen_v1_release_skip_raw_observation(entry)
+            if entry_id in self.PATH_IDS:
+                self.assertEqual(
+                    raw["rawStructuredFields"]["detail"]["reason"],
+                    "missing_checklist:<repo>/checklist.md",
+                )
+            self.assertEqual(
+                ci.derive_frozen_v1_release_skip_signature(raw),
+                self.FROZEN_SIGNATURES[entry_id],
+            )
+
+    def test_near_prefix_physical_root_does_not_bind(self) -> None:
+        canonical, binding, _item = self.assert_path_negative(
+            "B-SKIP-PDF-RECONCILIATION",
+            self.WINDOWS_ROOT,
+            self.WINDOWS_SNAPSHOT,
+            observed_path=self.WINDOWS_SNAPSHOT + r"-evil\checklist.md",
+        )
+        self.assertNotEqual(
+            canonical["detail"]["reason"],
+            "missing_checklist:<repo>/checklist.md",
+        )
+        self.assertTrue(binding["unmappedAbsolutePathDigests"])
+
+    def test_unrelated_physical_root_does_not_bind(self) -> None:
+        _canonical, binding, _item = self.assert_path_negative(
+            "B-SKIP-CHECKLIST-CONSISTENCY",
+            self.WINDOWS_ROOT,
+            self.WINDOWS_SNAPSHOT,
+            observed_path=r"E:\unrelated\checklist.md",
+        )
+        self.assertEqual(binding["authorizedTargetPaths"], [])
+
+    def test_path_traversal_does_not_bind(self) -> None:
+        _canonical, binding, _item = self.assert_path_negative(
+            "B-SKIP-PDF-RECONCILIATION",
+            self.POSIX_ROOT,
+            self.POSIX_SNAPSHOT,
+            observed_path=self.POSIX_SNAPSHOT + "/../outside/checklist.md",
+        )
+        self.assertEqual(binding["authorizedTargetPaths"], [])
+        self.assertTrue(binding["unmappedAbsolutePathDigests"])
+
+    def test_wrong_checklist_filename_does_not_bind(self) -> None:
+        _canonical, binding, _item = self.assert_path_negative(
+            "B-SKIP-CHECKLIST-CONSISTENCY",
+            self.POSIX_ROOT,
+            self.POSIX_SNAPSHOT,
+            observed_path=self.POSIX_SNAPSHOT + "/release-checklist.md",
+        )
+        self.assertEqual(binding["authorizedTargetPaths"], [])
+
+    def test_wrong_repository_relative_target_does_not_bind(self) -> None:
+        _canonical, binding, _item = self.assert_path_negative(
+            "B-SKIP-PDF-RECONCILIATION",
+            self.WINDOWS_ROOT,
+            self.WINDOWS_SNAPSHOT,
+            observed_path=self.WINDOWS_SNAPSHOT + r"\artifact\checklist.md",
+        )
+        self.assertEqual(binding["authorizedTargetPaths"], [])
+        self.assertTrue(binding["unmappedAbsolutePathDigests"])
+
+    def test_altered_reason_text_does_not_bind(self) -> None:
+        _canonical, binding, _item = self.assert_path_negative(
+            "B-SKIP-CHECKLIST-CONSISTENCY",
+            self.POSIX_ROOT,
+            self.POSIX_SNAPSHOT,
+            reason_prefix="missing_checklist_extra:",
+        )
+        self.assertEqual(binding["authorizedTargetPaths"], [])
+
+    def test_generic_absolute_or_literal_path_stripping_is_not_accepted(self) -> None:
+        cases = (
+            r"F:\outside\checklist.md",
+            "<abs-path>/checklist.md",
+            "<task-root>/checklist.md",
+            "<repo>/checklist.md",
+        )
+        for observed_path in cases:
+            with self.subTest(observed_path=observed_path):
+                canonical, binding, _item = self.assert_path_negative(
+                    "B-SKIP-PDF-RECONCILIATION",
+                    self.WINDOWS_ROOT,
+                    self.WINDOWS_SNAPSHOT,
+                    observed_path=observed_path,
+                )
+                self.assertNotEqual(
+                    canonical["detail"]["reason"],
+                    "missing_checklist:<repo>/checklist.md",
+                )
+                self.assertEqual(binding["authorizedTargetPaths"], [])
+                self.assertTrue(
+                    binding["unmappedAbsolutePathDigests"]
+                    or binding["literalPlaceholderDigests"]
+                )
+
+    def test_arbitrary_unknown_nonpass_remains_blocking(self) -> None:
+        _canonical, binding, observation = self.assert_path_negative(
+            "B-SKIP-CHECKLIST-CONSISTENCY",
+            self.POSIX_ROOT,
+            self.POSIX_SNAPSHOT,
+            observed_path="producer_failure_without_authorized_path",
+            reason_prefix="",
+        )
+        self.assertEqual(binding["authorizedTargetPaths"], [])
+        self.assertNotEqual(
+            observation["legacyBaselineComparisonDigest"],
+            self.FROZEN_SIGNATURES["B-SKIP-CHECKLIST-CONSISTENCY"],
+        )
+
+    def test_unrelated_nonpass_cannot_be_absorbed_by_release_classification(self) -> None:
+        _canonical, binding, observation = self.assert_path_negative(
+            "B-SKIP-PDF-RECONCILIATION",
+            self.POSIX_ROOT,
+            self.POSIX_SNAPSHOT,
+            result_name="Unrelated producer failure",
+        )
+        self.assertIsNone(binding)
+        self.assertEqual(
+            observation["testOrPathScope"],
+            "result:Unrelated producer failure",
+        )
+
+    def test_engineering_all_keeps_three_exact_release_skips_visible_nonblocking(self) -> None:
+        result, _record, observations = self.compare_bound(
+            self.RELEASE_IDS,
+            self.three_physical_items(),
+            release_gate_required=ci.resolve_release_gate_required("all"),
+        )
+        self.assertFalse(ci.resolve_release_gate_required("all"))
+        self.assertEqual(result["violations"], [])
+        self.assertEqual(
+            {release["baselineId"] for release in result["releaseOnlySkips"]},
+            set(self.RELEASE_IDS),
+        )
+        self.assertEqual(
+            {item["legacyBaselineComparisonDigest"] for item in observations},
+            set(self.FROZEN_SIGNATURES.values()),
+        )
+
+    def test_explicit_release_all_keeps_same_skips_and_fails_closed(self) -> None:
+        required = ci.resolve_release_gate_required(
+            "all",
+            release_authoritative=True,
+        )
+        result, _record, _observations = self.compare_bound(
+            self.RELEASE_IDS,
+            self.three_physical_items(),
+            release_gate_required=required,
+        )
+        self.assertTrue(required)
+        self.assertEqual(
+            {release["baselineId"] for release in result["releaseOnlySkips"]},
+            set(self.RELEASE_IDS),
+        )
+        self.assertEqual(len(result["violations"]), 3)
+        self.assertEqual(
+            {violation["id"] for violation in result["violations"]},
+            {"RELEASE-ONLY-SKIP-IN-REQUIRED-GATE"},
+        )
 
 
 def _flatten_test_suite(test: unittest.TestSuite | unittest.TestCase) -> list[unittest.TestCase]:
