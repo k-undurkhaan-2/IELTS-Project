@@ -9553,6 +9553,35 @@ RELEASE_ONLY_SKIP_FAILURE_TARGETS = MappingProxyType(
     }
 )
 
+# Run-7 R11 binds only the three P144 known-debt manifestations to their
+# already-frozen targets.  These entries do not authorize a new debt or a
+# basename/root heuristic: every path canonicalization below still requires
+# the complete authority root plus the complete repository-relative target.
+R11_KNOWN_DEBT_FAILURE_TARGETS = MappingProxyType(
+    {
+        "result:套题模式状态机回归测试": (
+            "developer/tests/js/suiteModeRegression.test.js"
+        ),
+        "file:developer/tests/js/adminFrontendGuard.test.js": (
+            "developer/tests/js/adminFrontendGuard.test.js"
+        ),
+        "file:developer/tests/js/localDataRenderingGuard.test.js": (
+            "developer/tests/js/localDataRenderingGuard.test.js"
+        ),
+    }
+)
+
+R11_POSIX_FILE_URI_TARGETS = frozenset(
+    {
+        "developer/tests/js/adminFrontendGuard.test.js",
+        "developer/tests/js/suiteModeRegression.test.js",
+    }
+)
+
+R11_WINDOWS_ENCODED_SHORT_NAME_URI_TARGETS = frozenset(
+    {"developer/tests/js/localDataRenderingGuard.test.js"}
+)
+
 
 def _r03_legacy_static_signature_projection(value: Any, logical_target: str) -> Any:
     if isinstance(value, Mapping):
@@ -10190,6 +10219,34 @@ def _failure_path_authority_matches(
     return set(target_paths).issubset(allowed_targets)
 
 
+def _r11_known_debt_path_authority_matches(
+    scope: str,
+    identity: Mapping[str, Any],
+) -> bool:
+    expected_target = R11_KNOWN_DEBT_FAILURE_TARGETS.get(scope)
+    if expected_target is None:
+        return True
+    binding = identity.get("pathAuthority")
+    if not isinstance(binding, dict) or set(binding) != FAILURE_PATH_AUTHORITY_KEYS:
+        return False
+    target_paths = binding.get("authorizedTargetPaths")
+    if not isinstance(target_paths, list) or expected_target not in target_paths:
+        return False
+    if binding.get("unmappedAbsolutePathDigests") or binding.get(
+        "literalPlaceholderDigests"
+    ):
+        return False
+
+    allowed_targets = {expected_target}
+    known = KNOWN_NODE_FAILURES.get(scope) or KNOWN_STATIC_FAILURES.get(scope)
+    if known is not None:
+        for key in ("testIds", "fileLocations"):
+            for value in known.get(key, []):
+                if isinstance(value, str):
+                    allowed_targets.add(re.sub(r":\d+(?::\d+)?$", "", value))
+    return set(target_paths).issubset(allowed_targets)
+
+
 def _failure_identity_authorizes(
     entry: Mapping[str, Any],
     item: Mapping[str, Any],
@@ -10201,7 +10258,10 @@ def _failure_identity_authorizes(
     if not isinstance(raw, dict):
         return False
     baseline_scope = str(entry.get("testOrPathScope", ""))
-    if baseline_scope in R03_FAILURE_TARGETS and source_command is None:
+    if (
+        baseline_scope in R03_FAILURE_TARGETS
+        or baseline_scope in R11_KNOWN_DEBT_FAILURE_TARGETS
+    ) and source_command is None:
         return False
     expected_source = _baseline_source_command_id(entry)
     if expected_source is not None and item.get("commandId") != expected_source:
@@ -10274,6 +10334,17 @@ def _failure_identity_authorizes(
         source=source_command,
     ):
         return False
+    expected_r11_target = R11_KNOWN_DEBT_FAILURE_TARGETS.get(scope)
+    if expected_r11_target is not None:
+        source_targets = {
+            str(target.get("path"))
+            for target in source_command.get("targets", [])
+            if isinstance(target, Mapping) and isinstance(target.get("path"), str)
+        }
+        if expected_r11_target not in source_targets:
+            return False
+        if not _r11_known_debt_path_authority_matches(scope, identity):
+            return False
     known_static = KNOWN_STATIC_FAILURES.get(scope)
     if known_static is not None:
         comparable = {
@@ -14694,6 +14765,44 @@ def _failure_root_uri_spellings(value: str) -> list[str]:
     ]
 
 
+def _r11_posix_file_uri_spelling(value: str) -> str | None:
+    """Return one canonical URI for an exact absolute POSIX authority root."""
+
+    root = value.rstrip("/") or "/"
+    if not root.startswith("/") or "\\" in root:
+        return None
+    try:
+        encoded = quote(
+            root,
+            safe="/:@()+,;=-._~",
+            encoding="utf-8",
+            errors="strict",
+        )
+    except UnicodeEncodeError:
+        return None
+    return "file://" + encoded
+
+
+def _r11_windows_encoded_short_name_uri_spellings(value: str) -> list[str]:
+    """Derive only the hosted ``NAME%7E1`` spelling of an exact root."""
+
+    spellings: list[str] = []
+    for uri in _failure_root_uri_spellings(value):
+        components = uri.split("/")
+        short_name_indexes = [
+            index
+            for index, component in enumerate(components)
+            if re.fullmatch(r"[A-Za-z0-9]{1,6}~1", component)
+        ]
+        if len(short_name_indexes) != 1:
+            continue
+        index = short_name_indexes[0]
+        encoded_components = list(components)
+        encoded_components[index] = components[index].replace("~", "%7E")
+        spellings.append("/".join(encoded_components))
+    return sorted(set(spellings))
+
+
 def _failure_path_patterns(
     candidate_root: str,
     repository_root: str,
@@ -14779,6 +14888,41 @@ def _failure_path_patterns(
                     replacement,
                 )
             )
+        if logical_target in R11_WINDOWS_ENCODED_SHORT_NAME_URI_TARGETS:
+            encoded_candidate_uris = (
+                _r11_windows_encoded_short_name_uri_spellings(candidate_root)
+            )
+            for index, candidate_uri in enumerate(encoded_candidate_uris):
+                if not repository_uris:
+                    break
+                repository_uri = repository_uris[
+                    min(index, len(repository_uris) - 1)
+                ]
+                uri_pattern = (
+                    before
+                    + _authority_literal_pattern(
+                        candidate_uri.rstrip("/"),
+                        ascii_fold=True,
+                        flexible_separators=False,
+                    )
+                    + _authority_literal_pattern(
+                        encoded_suffix,
+                        ascii_fold=False,
+                        flexible_separators=False,
+                    )
+                    + after
+                )
+                replacement = repository_uri.rstrip("/") + encoded_suffix
+                patterns.append(
+                    _AuthorizedPathPattern(
+                        uri_pattern,
+                        logical_target,
+                        replacement,
+                        replacement,
+                        replacement,
+                        replacement,
+                    )
+                )
         return patterns
 
     candidate = candidate_root.rstrip("/") or "/"
@@ -14803,6 +14947,38 @@ def _failure_path_patterns(
                 replacement,
             )
         )
+        if logical_target in R11_POSIX_FILE_URI_TARGETS:
+            candidate_uri = _r11_posix_file_uri_spelling(candidate)
+            repository_uri = _r11_posix_file_uri_spelling(repository)
+            if candidate_uri is not None and repository_uri is not None:
+                encoded_suffix = "/" + quote(
+                    logical_target,
+                    safe="/:@()+,;=-._~",
+                    encoding="utf-8",
+                    errors="strict",
+                )
+                uri_pattern = (
+                    before
+                    + _authority_literal_pattern(
+                        "file://",
+                        ascii_fold=True,
+                        flexible_separators=False,
+                    )
+                    + re.escape(candidate_uri[len("file://") :].rstrip("/"))
+                    + re.escape(encoded_suffix)
+                    + after
+                )
+                uri_replacement = repository_uri.rstrip("/") + encoded_suffix
+                patterns.append(
+                    _AuthorizedPathPattern(
+                        uri_pattern,
+                        logical_target,
+                        uri_replacement,
+                        uri_replacement,
+                        uri_replacement,
+                        uri_replacement,
+                    )
+                )
     return patterns
 
 
@@ -16527,7 +16703,10 @@ class FoundationRunner:
         }
         path_binding: Mapping[str, Any] | None = None
         if (
-            source_result_id in R03_FAILURE_TARGETS
+            (
+                source_result_id in R03_FAILURE_TARGETS
+                or source_result_id in R11_KNOWN_DEBT_FAILURE_TARGETS
+            )
             and isinstance(capture.failure_path_authority, FailurePathAuthority)
         ):
             raw_fields, path_binding = canonicalize_failure_identity_value(
@@ -17107,14 +17286,24 @@ class FoundationRunner:
             canonical_report = copy.deepcopy(report)
             canonical_results: list[Any] = []
             for result in report["observations"]:
+                scope = f"result:{result.get('name', '')}"
                 if isinstance(
                     capture.failure_path_authority,
                     FailurePathAuthority,
                 ):
-                    canonical_result, binding = _canonicalize_static_result_failure_paths(
-                        result,
-                        capture.failure_path_authority,
-                    )
+                    if (
+                        scope in R11_KNOWN_DEBT_FAILURE_TARGETS
+                        and scope not in R03_FAILURE_TARGETS
+                    ):
+                        canonical_result, binding = canonicalize_failure_identity_value(
+                            result,
+                            capture.failure_path_authority,
+                        )
+                    else:
+                        canonical_result, binding = _canonicalize_static_result_failure_paths(
+                            result,
+                            capture.failure_path_authority,
+                        )
                 else:
                     canonical_result = copy.deepcopy(result)
                     binding = None

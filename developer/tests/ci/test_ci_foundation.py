@@ -2516,7 +2516,7 @@ class ComparisonPolicyTest(unittest.TestCase):
             + suffix
         )
 
-    def test_exact_static_session_failure_identity_is_accepted(self) -> None:
+    def test_static_session_failure_without_path_authority_fails_closed(self) -> None:
         baseline, entry = self.baseline_with_known_id("B-STATIC-SUITE-SESSION-ROUTING")
         detail = self.static_session_detail()
         identity = ci.structured_failure_identity(entry["testOrPathScope"], detail)
@@ -2526,8 +2526,10 @@ class ComparisonPolicyTest(unittest.TestCase):
             signature, source_command_id(entry), failure_identity=identity,
         )
         result = ci.compare_observations(baseline, [observed], {entry["commandClass"]}, "windows")
-        self.assertEqual(result["violations"], [])
-        self.assertEqual(result["observedDebts"][0]["id"], entry["id"])
+        self.assertIn(
+            "UNKNOWN-NONPASS",
+            [item["id"] for item in result["violations"]],
+        )
 
     def test_static_session_failure_plus_extra_assertion_fails_closed(self) -> None:
         baseline, entry = self.baseline_with_known_id("B-STATIC-SUITE-SESSION-ROUTING")
@@ -2549,6 +2551,697 @@ class ComparisonPolicyTest(unittest.TestCase):
         )
         result = ci.compare_observations(baseline, [observed], {"unapproved-command"}, "windows")
         self.assertIn("UNKNOWN-NONPASS", [item["id"] for item in result["violations"]])
+
+
+class R11KnownDebtSignatureBindingTest(unittest.TestCase):
+    ADMIN_ID = "E-ADMIN-FRONTEND-DOM-STUB"
+    ADMIN_SCOPE = "file:developer/tests/js/adminFrontendGuard.test.js"
+    ADMIN_TARGET = "developer/tests/js/adminFrontendGuard.test.js"
+    ADMIN_PRODUCT_TARGET = "backend/admin/admin.js"
+
+    SUITE_ID = "B-STATIC-SUITE-SESSION-ROUTING"
+    SUITE_SCOPE = "result:套题模式状态机回归测试"
+    SUITE_TARGET = "developer/tests/js/suiteModeRegression.test.js"
+
+    LOCAL_ID = "E-WINDOWS-LOCAL-DATA-CRLF-ASSERTION"
+    LOCAL_SCOPE = "file:developer/tests/js/localDataRenderingGuard.test.js"
+    LOCAL_TARGET = "developer/tests/js/localDataRenderingGuard.test.js"
+
+    POSIX_REPOSITORY = "/home/runner/work/IELTS-practice/IELTS-practice"
+    POSIX_SNAPSHOT = "/tmp/cs-r11-known-debt"
+    WINDOWS_REPOSITORY = r"D:\a\IELTS-practice\IELTS-practice"
+    WINDOWS_SNAPSHOT = (
+        r"C:\Users\RUNNER~1\AppData\Local\Temp\cs-r11-known-debt"
+    )
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.full_baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
+        requested = {cls.ADMIN_ID, cls.SUITE_ID, cls.LOCAL_ID}
+        cls.entries = {
+            entry["id"]: entry
+            for entry in cls.full_baseline["knownDebts"]
+            if entry["id"] in requested
+        }
+        if set(cls.entries) != requested:
+            raise AssertionError("R11 known-debt fixture inventory is incomplete")
+
+    @classmethod
+    def targets_for(cls, entry: Mapping) -> list[str]:
+        target = ci.R11_KNOWN_DEBT_FAILURE_TARGETS[
+            str(entry["testOrPathScope"])
+        ]
+        if entry["id"] == cls.ADMIN_ID:
+            return [target, cls.ADMIN_PRODUCT_TARGET]
+        return [target]
+
+    @classmethod
+    def baseline_for(cls, entry: Mapping) -> dict:
+        baseline = copy.deepcopy(cls.full_baseline)
+        baseline["knownDebts"] = [copy.deepcopy(entry)]
+        baseline["expectedOmissions"] = []
+        baseline["releaseOnlySkips"] = []
+        return baseline
+
+    @staticmethod
+    def physical_uri(root: str, logical_target: str) -> str:
+        normalized = root.rstrip("/\\").replace("\\", "/")
+        return "file:///" + normalized.lstrip("/") + "/" + logical_target
+
+    @staticmethod
+    def physical_native(root: str, logical_target: str) -> str:
+        if re.match(r"^[A-Za-z]:", root):
+            return root.rstrip("/\\") + "\\" + logical_target.replace("/", "\\")
+        return root.rstrip("/") + "/" + logical_target
+
+    @classmethod
+    def node_fields(
+        cls,
+        entry: Mapping,
+        physical_root: str,
+        representation: str,
+    ) -> dict:
+        target = ci.R11_KNOWN_DEBT_FAILURE_TARGETS[
+            str(entry["testOrPathScope"])
+        ]
+        output = r03_node_failure_output(target, physical_root)
+        uri = cls.physical_uri(physical_root, target)
+        if representation == "native":
+            output = output.replace(
+                uri,
+                cls.physical_native(physical_root, target),
+            )
+        elif representation == "encoded-short-uri":
+            output = output.replace(uri, uri.replace("RUNNER~1", "RUNNER%7E1"))
+        elif representation != "file-uri":
+            raise AssertionError(f"unsupported node representation: {representation}")
+        return {
+            "executed": True,
+            "exitCode": 1,
+            "stdout": output,
+            "stderr": "",
+            "error": None,
+        }
+
+    @classmethod
+    def suite_fields(cls, physical_root: str, representation: str) -> dict:
+        assertion = "sessionId 不一致时仍应路由模拟导航"
+        native_target = cls.physical_native(physical_root, cls.SUITE_TARGET)
+        if representation == "native":
+            location = native_target
+        elif representation == "file-uri":
+            location = cls.physical_uri(physical_root, cls.SUITE_TARGET)
+        else:
+            raise AssertionError(f"unsupported suite representation: {representation}")
+        inner = {
+            "status": "fail",
+            "detail": (
+                f"AssertionError [ERR_ASSERTION]: {assertion}\n\n"
+                f"0 !== 1\n\n    at run ({location}:667:16)"
+            ),
+        }
+        detail = (
+            "执行失败: "
+            + json.dumps(inner, ensure_ascii=False, separators=(",", ":"))
+            + f"Command ['node', {native_target!r}] returned non-zero exit status 1."
+        )
+        return {
+            "name": cls.SUITE_SCOPE.removeprefix("result:"),
+            "status": "fail",
+            "detail": detail,
+        }
+
+    @classmethod
+    def canonical_fields(
+        cls,
+        entry: Mapping,
+        fields: Mapping,
+        repository_root: str,
+        snapshot_root: str,
+    ) -> tuple[dict, dict]:
+        authority = ci._coerce_failure_path_authority(
+            repository_root,
+            snapshot_root,
+            cls.targets_for(entry),
+        )
+        canonical, binding = ci.canonicalize_failure_identity_value(
+            fields,
+            authority,
+        )
+        return canonical, binding
+
+    @classmethod
+    def source_record(cls, entry: Mapping, platform_name: str) -> dict:
+        authorities = [
+            ci._target_authority(ci.REPO_ROOT, target)
+            for target in cls.targets_for(entry)
+        ]
+        specification = synthetic_command_spec(
+            source_command_id(entry),
+            str(entry["commandClass"]),
+            0,
+            command_role="observation-producing",
+            allowed_exits=[0, 1],
+            targets=authorities,
+            execution_input_mode="PROTECTED-TARGET-BUNDLE",
+        )
+        specification["toolRole"] = (
+            "python-static-producer"
+            if entry["commandClass"] == "static-suite"
+            else "node-security-test"
+        )
+        specification["profile"] = (
+            "static" if entry["commandClass"] == "static-suite" else "frontend"
+        )
+        specification["platform"] = platform_name
+        return synthetic_record_from_spec(specification, passed=False)
+
+    @classmethod
+    def observed_record(
+        cls,
+        entry: Mapping,
+        fields: Mapping,
+        binding: Mapping,
+        platform_name: str,
+        *,
+        occurrences: int = 1,
+    ) -> tuple[dict, dict]:
+        record = cls.source_record(entry, platform_name)
+        scope = str(entry["testOrPathScope"])
+        raw = ci.make_raw_observation(
+            str(record["commandId"]),
+            int(record["ordinal"]),
+            0,
+            (
+                "static-producer-v1"
+                if entry["commandClass"] == "static-suite"
+                else "process-output-v1"
+            ),
+            scope.removeprefix("result:"),
+            (
+                ci.STATIC_SUITE_RELATIVE_PATH
+                if entry["commandClass"] == "static-suite"
+                else ci.R11_KNOWN_DEBT_FAILURE_TARGETS[scope]
+            ),
+            fields,
+            ci.command_output_digest(record),
+            occurrences,
+            failure_path_authority=binding,
+        )
+        validation_errors = ci._validate_raw_observation(
+            raw,
+            label="r11-known-debt-fixture",
+            source=record,
+        )
+        if validation_errors:
+            raise AssertionError(validation_errors)
+        record = copy.deepcopy(record)
+        record["producerObservations"] = [raw]
+        record["producerObservationSetDigest"] = ci.producer_observation_set_digest(
+            record["producerObservations"]
+        )
+        observed = ci._rederive_observation_record(
+            {"rawObservation": raw},
+            record,
+        )
+        return observed, record
+
+    def classify(
+        self,
+        entry: Mapping,
+        fields: Mapping,
+        binding: Mapping,
+        platform_name: str,
+        *,
+        occurrences: int = 1,
+    ) -> tuple[dict, dict, dict]:
+        observed, record = self.observed_record(
+            entry,
+            fields,
+            binding,
+            platform_name,
+            occurrences=occurrences,
+        )
+        result = ci.compare_observations(
+            self.baseline_for(entry),
+            [observed],
+            {str(entry["commandClass"])},
+            platform_name,
+            command_records=[record],
+        )
+        return result, observed, record
+
+    def assert_known(self, result: Mapping, entry: Mapping) -> None:
+        self.assertEqual(result["violations"], [])
+        self.assertEqual(
+            [item["id"] for item in result["observedDebts"]],
+            [entry["id"]],
+        )
+
+    def assert_blocking(self, result: Mapping) -> None:
+        self.assertTrue(result["violations"], result)
+        self.assertEqual(result["observedDebts"], [])
+
+    def test_exact_r11_authority_inventory_is_three_existing_debts(self) -> None:
+        self.assertEqual(
+            dict(ci.R11_KNOWN_DEBT_FAILURE_TARGETS),
+            {
+                self.SUITE_SCOPE: self.SUITE_TARGET,
+                self.ADMIN_SCOPE: self.ADMIN_TARGET,
+                self.LOCAL_SCOPE: self.LOCAL_TARGET,
+            },
+        )
+        self.assertEqual(len(ci.R11_KNOWN_DEBT_FAILURE_TARGETS), 3)
+        self.assertEqual(
+            ci.R11_POSIX_FILE_URI_TARGETS,
+            frozenset({self.ADMIN_TARGET, self.SUITE_TARGET}),
+        )
+        self.assertEqual(
+            ci.R11_WINDOWS_ENCODED_SHORT_NAME_URI_TARGETS,
+            frozenset({self.LOCAL_TARGET}),
+        )
+
+    def test_admin_native_and_exact_posix_file_uri_bind_existing_debt(self) -> None:
+        entry = self.entries[self.ADMIN_ID]
+        canonical_variants = []
+        for root, representation in (
+            (self.POSIX_REPOSITORY, "native"),
+            (self.POSIX_SNAPSHOT, "native"),
+            (self.POSIX_REPOSITORY, "file-uri"),
+            (self.POSIX_SNAPSHOT, "file-uri"),
+        ):
+            with self.subTest(root=root, representation=representation):
+                fields, binding = self.canonical_fields(
+                    entry,
+                    self.node_fields(entry, root, representation),
+                    self.POSIX_REPOSITORY,
+                    self.POSIX_SNAPSHOT,
+                )
+                self.assertEqual(binding["authorizedTargetPaths"], [self.ADMIN_TARGET])
+                self.assertEqual(binding["unmappedAbsolutePathDigests"], [])
+                result, observed, _record = self.classify(
+                    entry,
+                    fields,
+                    binding,
+                    "ubuntu",
+                )
+                self.assertEqual(
+                    observed["legacyBaselineComparisonDigest"],
+                    entry["allowedNormalizedSignature"][0],
+                )
+                self.assert_known(result, entry)
+                canonical_variants.append((fields, binding))
+        self.assertEqual(len({ci.canonical_failure_digest(item) for item in canonical_variants}), 1)
+
+    def test_suite_native_root_descendant_and_posix_file_uri_bind_existing_debt(self) -> None:
+        entry = self.entries[self.SUITE_ID]
+        canonical_variants = []
+        for root, representation in (
+            (self.POSIX_REPOSITORY, "native"),
+            (self.POSIX_SNAPSHOT, "native"),
+            (self.POSIX_REPOSITORY, "file-uri"),
+            (self.POSIX_SNAPSHOT, "file-uri"),
+        ):
+            with self.subTest(root=root, representation=representation):
+                fields, binding = self.canonical_fields(
+                    entry,
+                    self.suite_fields(root, representation),
+                    self.POSIX_REPOSITORY,
+                    self.POSIX_SNAPSHOT,
+                )
+                self.assertEqual(binding["authorizedTargetPaths"], [self.SUITE_TARGET])
+                self.assertEqual(binding["unmappedAbsolutePathDigests"], [])
+                result, observed, _record = self.classify(
+                    entry,
+                    fields,
+                    binding,
+                    "ubuntu",
+                )
+                self.assertEqual(
+                    observed["legacyBaselineComparisonDigest"],
+                    entry["allowedNormalizedSignature"][0],
+                )
+                self.assert_known(result, entry)
+                canonical_variants.append((fields, binding))
+        self.assertEqual(len({ci.canonical_failure_digest(item) for item in canonical_variants}), 1)
+
+    def test_local_data_native_uri_and_encoded_short_name_bind_on_windows(self) -> None:
+        entry = self.entries[self.LOCAL_ID]
+        canonical_variants = []
+        for root, representation in (
+            (self.WINDOWS_REPOSITORY, "native"),
+            (self.WINDOWS_SNAPSHOT, "native"),
+            (self.WINDOWS_SNAPSHOT, "file-uri"),
+            (self.WINDOWS_SNAPSHOT, "encoded-short-uri"),
+        ):
+            with self.subTest(root=root, representation=representation):
+                fields, binding = self.canonical_fields(
+                    entry,
+                    self.node_fields(entry, root, representation),
+                    self.WINDOWS_REPOSITORY,
+                    self.WINDOWS_SNAPSHOT,
+                )
+                self.assertEqual(binding["authorizedTargetPaths"], [self.LOCAL_TARGET])
+                self.assertEqual(binding["unmappedAbsolutePathDigests"], [])
+                result, observed, _record = self.classify(
+                    entry,
+                    fields,
+                    binding,
+                    "windows",
+                )
+                self.assertEqual(
+                    observed["legacyBaselineComparisonDigest"],
+                    entry["allowedNormalizedSignature"][0],
+                )
+                self.assert_known(result, entry)
+                canonical_variants.append((fields, binding))
+        self.assertEqual(len({ci.canonical_failure_digest(item) for item in canonical_variants}), 1)
+
+    def test_admin_wrong_location_message_and_extra_failure_block(self) -> None:
+        entry = self.entries[self.ADMIN_ID]
+        exact = self.node_fields(entry, self.POSIX_SNAPSHOT, "file-uri")
+        exact_uri = self.physical_uri(self.POSIX_SNAPSHOT, self.ADMIN_TARGET)
+        variants = {
+            "wrong-location": exact["stdout"].replace(
+                exact_uri,
+                self.physical_uri(
+                    self.POSIX_SNAPSHOT,
+                    "other/adminFrontendGuard.test.js",
+                ),
+            ),
+            "altered-type-error": exact["stdout"].replace(
+                "document.querySelectorAll is not a function",
+                "document.querySelector is not a function",
+            ),
+            "extra-failure": (
+                exact["stdout"].replace("ℹ fail 1", "ℹ fail 2")
+                + "\nAssertionError: unrelated authorization failure"
+            ),
+        }
+        for label, stdout in variants.items():
+            with self.subTest(label=label):
+                candidate = {**exact, "stdout": stdout}
+                fields, binding = self.canonical_fields(
+                    entry,
+                    candidate,
+                    self.POSIX_REPOSITORY,
+                    self.POSIX_SNAPSHOT,
+                )
+                result, _observed, _record = self.classify(
+                    entry,
+                    fields,
+                    binding,
+                    "ubuntu",
+                )
+                self.assert_blocking(result)
+
+    def test_suite_wrong_location_near_prefix_message_values_and_count_block(self) -> None:
+        entry = self.entries[self.SUITE_ID]
+        exact = self.suite_fields(self.POSIX_SNAPSHOT, "file-uri")
+        exact_target = f"{self.POSIX_SNAPSHOT}/{self.SUITE_TARGET}"
+        wrong_location = copy.deepcopy(exact)
+        wrong_location["detail"] = wrong_location["detail"].replace(
+            exact_target,
+            f"{self.POSIX_SNAPSHOT}/other/suiteModeRegression.test.js",
+        )
+        near_prefix = self.suite_fields(
+            self.POSIX_SNAPSHOT + "-evil",
+            "file-uri",
+        )
+        altered_message = copy.deepcopy(exact)
+        altered_message["detail"] = altered_message["detail"].replace(
+            "sessionId 不一致时仍应路由模拟导航",
+            "sessionId 不一致时应拒绝导航",
+        )
+        altered_values = copy.deepcopy(exact)
+        altered_values["detail"] = altered_values["detail"].replace(
+            "0 !== 1",
+            "1 !== 2",
+        )
+        for label, candidate in (
+            ("wrong-location", wrong_location),
+            ("near-prefix", near_prefix),
+            ("altered-message", altered_message),
+            ("altered-values", altered_values),
+        ):
+            with self.subTest(label=label):
+                fields, binding = self.canonical_fields(
+                    entry,
+                    candidate,
+                    self.POSIX_REPOSITORY,
+                    self.POSIX_SNAPSHOT,
+                )
+                result, _observed, _record = self.classify(
+                    entry,
+                    fields,
+                    binding,
+                    "ubuntu",
+                )
+                self.assert_blocking(result)
+
+        fields, binding = self.canonical_fields(
+            entry,
+            exact,
+            self.POSIX_REPOSITORY,
+            self.POSIX_SNAPSHOT,
+        )
+        counted, _observed, _record = self.classify(
+            entry,
+            fields,
+            binding,
+            "ubuntu",
+            occurrences=2,
+        )
+        self.assertIn(
+            "BASELINE-OCCURRENCE-LIMIT",
+            [item["id"] for item in counted["violations"]],
+        )
+        self.assertEqual(counted["observedDebts"], [])
+
+    def test_local_data_wrong_file_unrelated_7e_values_and_count_block(self) -> None:
+        entry = self.entries[self.LOCAL_ID]
+        exact = self.node_fields(
+            entry,
+            self.WINDOWS_SNAPSHOT,
+            "encoded-short-uri",
+        )
+        encoded_uri = self.physical_uri(
+            self.WINDOWS_SNAPSHOT,
+            self.LOCAL_TARGET,
+        ).replace("RUNNER~1", "RUNNER%7E1")
+        wrong_file = exact["stdout"].replace(
+            encoded_uri,
+            encoded_uri.replace(
+                "/developer/tests/js/localDataRenderingGuard.test.js",
+                "/other/localDataRenderingGuard.test.js",
+            ),
+        )
+        unrelated_7e = exact["stdout"].replace(
+            encoded_uri,
+            "file:///C:/Unrelated/RUNNER%7E1/"
+            + self.LOCAL_TARGET,
+        )
+        changed_values = exact["stdout"].replace(
+            "actual: false",
+            "actual: true",
+        )
+        reversed_values = (
+            exact["stdout"]
+            .replace("actual: false", "actual: true")
+            .replace("expected: true", "expected: false")
+        )
+        for label, stdout in (
+            ("wrong-file", wrong_file),
+            ("unrelated-7e", unrelated_7e),
+            ("changed-values", changed_values),
+            ("reversed-values", reversed_values),
+        ):
+            with self.subTest(label=label):
+                fields, binding = self.canonical_fields(
+                    entry,
+                    {**exact, "stdout": stdout},
+                    self.WINDOWS_REPOSITORY,
+                    self.WINDOWS_SNAPSHOT,
+                )
+                result, _observed, _record = self.classify(
+                    entry,
+                    fields,
+                    binding,
+                    "windows",
+                )
+                self.assert_blocking(result)
+
+        fields, binding = self.canonical_fields(
+            entry,
+            exact,
+            self.WINDOWS_REPOSITORY,
+            self.WINDOWS_SNAPSHOT,
+        )
+        counted, _observed, _record = self.classify(
+            entry,
+            fields,
+            binding,
+            "windows",
+            occurrences=2,
+        )
+        self.assertIn(
+            "BASELINE-OCCURRENCE-LIMIT",
+            [item["id"] for item in counted["violations"]],
+        )
+        self.assertEqual(counted["observedDebts"], [])
+
+    def test_local_data_exact_identity_does_not_bind_on_posix(self) -> None:
+        entry = self.entries[self.LOCAL_ID]
+        fields, binding = self.canonical_fields(
+            entry,
+            self.node_fields(entry, self.POSIX_SNAPSHOT, "native"),
+            self.POSIX_REPOSITORY,
+            self.POSIX_SNAPSHOT,
+        )
+        self.assertEqual(binding["authorizedTargetPaths"], [self.LOCAL_TARGET])
+        result, observed, _record = self.classify(
+            entry,
+            fields,
+            binding,
+            "ubuntu",
+        )
+        self.assertEqual(
+            observed["legacyBaselineComparisonDigest"],
+            entry["allowedNormalizedSignature"][0],
+        )
+        self.assert_blocking(result)
+
+    def test_arbitrary_file_uri_traversal_malformed_and_unmapped_target_block(self) -> None:
+        entry = self.entries[self.ADMIN_ID]
+        exact = self.node_fields(entry, self.POSIX_SNAPSHOT, "file-uri")
+        exact_uri = self.physical_uri(self.POSIX_SNAPSHOT, self.ADMIN_TARGET)
+        replacements = {
+            "arbitrary-uri": "file:///opt/unrelated/" + self.ADMIN_TARGET,
+            "traversal": (
+                "file:///tmp/cs-r11-known-debt/../outside/"
+                "adminFrontendGuard.test.js"
+            ),
+            "malformed-uri": (
+                "file:///tmp/cs-r11-known-debt/%GG/"
+                "adminFrontendGuard.test.js"
+            ),
+            "unrelated-unmapped-target": (
+                "file:///tmp/cs-r11-known-debt/developer/tests/js/"
+                "unrelatedSecurity.test.js"
+            ),
+        }
+        for label, replacement in replacements.items():
+            with self.subTest(label=label):
+                candidate = {
+                    **exact,
+                    "stdout": exact["stdout"].replace(exact_uri, replacement),
+                }
+                fields, binding = self.canonical_fields(
+                    entry,
+                    candidate,
+                    self.POSIX_REPOSITORY,
+                    self.POSIX_SNAPSHOT,
+                )
+                self.assertEqual(binding["authorizedTargetPaths"], [])
+                self.assertTrue(binding["unmappedAbsolutePathDigests"])
+                result, _observed, _record = self.classify(
+                    entry,
+                    fields,
+                    binding,
+                    "ubuntu",
+                )
+                self.assert_blocking(result)
+
+    def test_exact_debt_plus_one_novel_failure_remains_blocking(self) -> None:
+        entry = self.entries[self.ADMIN_ID]
+        fields, binding = self.canonical_fields(
+            entry,
+            self.node_fields(entry, self.POSIX_SNAPSHOT, "file-uri"),
+            self.POSIX_REPOSITORY,
+            self.POSIX_SNAPSHOT,
+        )
+        exact, record = self.observed_record(
+            entry,
+            fields,
+            binding,
+            "ubuntu",
+        )
+        novel = ci.observation(
+            "frontend-security",
+            "file:developer/tests/js/unrelatedSecurity.test.js",
+            "fail",
+            "sha256:" + "9" * 64,
+            "frontend-security:unrelatedSecurity.test.js",
+            failure_identity={
+                "scope": "file:developer/tests/js/unrelatedSecurity.test.js",
+                "structuredFailureSet": "sha256:" + "8" * 64,
+            },
+        )
+        result = ci.compare_observations(
+            self.baseline_for(entry),
+            [exact, novel],
+            {"frontend-security"},
+            "ubuntu",
+            command_records=[record],
+        )
+        self.assertIn(
+            "UNKNOWN-NONPASS",
+            [item["id"] for item in result["violations"]],
+        )
+        self.assertEqual(
+            [item["id"] for item in result["observedDebts"]],
+            [entry["id"]],
+        )
+
+    def test_same_basename_outside_each_authorized_root_never_binds(self) -> None:
+        cases = (
+            (
+                self.entries[self.ADMIN_ID],
+                self.node_fields(
+                    self.entries[self.ADMIN_ID],
+                    "/tmp/unrelated-r11",
+                    "file-uri",
+                ),
+                self.POSIX_REPOSITORY,
+                self.POSIX_SNAPSHOT,
+                "ubuntu",
+            ),
+            (
+                self.entries[self.SUITE_ID],
+                self.suite_fields("/tmp/unrelated-r11", "file-uri"),
+                self.POSIX_REPOSITORY,
+                self.POSIX_SNAPSHOT,
+                "ubuntu",
+            ),
+            (
+                self.entries[self.LOCAL_ID],
+                self.node_fields(
+                    self.entries[self.LOCAL_ID],
+                    r"C:\Unrelated\RUNNER~1\cs-r11",
+                    "encoded-short-uri",
+                ),
+                self.WINDOWS_REPOSITORY,
+                self.WINDOWS_SNAPSHOT,
+                "windows",
+            ),
+        )
+        for entry, candidate, repository, snapshot, platform_name in cases:
+            with self.subTest(entry=entry["id"]):
+                fields, binding = self.canonical_fields(
+                    entry,
+                    candidate,
+                    repository,
+                    snapshot,
+                )
+                self.assertEqual(binding["authorizedTargetPaths"], [])
+                self.assertTrue(binding["unmappedAbsolutePathDigests"])
+                result, _observed, _record = self.classify(
+                    entry,
+                    fields,
+                    binding,
+                    platform_name,
+                )
+                self.assert_blocking(result)
 
 
 class AuthoritativeEvidenceDerivationTest(unittest.TestCase):
