@@ -9579,7 +9579,10 @@ R11_POSIX_FILE_URI_TARGETS = frozenset(
 )
 
 R11_WINDOWS_ENCODED_SHORT_NAME_URI_TARGETS = frozenset(
-    {"developer/tests/js/localDataRenderingGuard.test.js"}
+    {
+        "developer/tests/js/adminFrontendGuard.test.js",
+        "developer/tests/js/localDataRenderingGuard.test.js",
+    }
 )
 
 

@@ -2818,7 +2818,7 @@ class R11KnownDebtSignatureBindingTest(unittest.TestCase):
         )
         self.assertEqual(
             ci.R11_WINDOWS_ENCODED_SHORT_NAME_URI_TARGETS,
-            frozenset({self.LOCAL_TARGET}),
+            frozenset({self.ADMIN_TARGET, self.LOCAL_TARGET}),
         )
 
     def test_admin_native_and_exact_posix_file_uri_bind_existing_debt(self) -> None:
@@ -3242,6 +3242,374 @@ class R11KnownDebtSignatureBindingTest(unittest.TestCase):
                     platform_name,
                 )
                 self.assert_blocking(result)
+
+
+class R11WindowsKnownDebtRecurrenceTest(unittest.TestCase):
+    ADMIN_ID = R11KnownDebtSignatureBindingTest.ADMIN_ID
+    ADMIN_TARGET = R11KnownDebtSignatureBindingTest.ADMIN_TARGET
+    LOCAL_ID = R11KnownDebtSignatureBindingTest.LOCAL_ID
+    SUITE_ID = R11KnownDebtSignatureBindingTest.SUITE_ID
+    RUN8_WINDOWS_SNAPSHOT = (
+        r"C:\Users\RUNNER~1\AppData\Local\Temp\cs-ro3gvaro"
+    )
+    RUN8_ENCODED_URI = (
+        "file:///C:/Users/RUNNER%7E1/AppData/Local/Temp/cs-ro3gvaro/"
+        "developer/tests/js/adminFrontendGuard.test.js"
+    )
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        R11KnownDebtSignatureBindingTest.setUpClass()
+        cls.fixture = R11KnownDebtSignatureBindingTest(
+            "test_exact_r11_authority_inventory_is_three_existing_debts"
+        )
+        cls.entries = R11KnownDebtSignatureBindingTest.entries
+
+    def assert_known(self, result: Mapping, entry: Mapping) -> None:
+        self.assertEqual(result["violations"], [])
+        self.assertEqual(
+            [item["id"] for item in result["observedDebts"]],
+            [entry["id"]],
+        )
+
+    def assert_blocking(self, result: Mapping) -> None:
+        self.assertTrue(result["violations"], result)
+        self.assertEqual(result["observedDebts"], [])
+
+    def exact_run8_fields(self) -> dict:
+        entry = self.entries[self.ADMIN_ID]
+        fields = R11KnownDebtSignatureBindingTest.node_fields(
+            entry,
+            self.RUN8_WINDOWS_SNAPSHOT,
+            "encoded-short-uri",
+        )
+        self.assertEqual(fields["stdout"].count(self.RUN8_ENCODED_URI), 1)
+        return fields
+
+    def canonical_admin(
+        self,
+        fields: Mapping,
+        repository_root: str | None = None,
+        snapshot_root: str | None = None,
+    ) -> tuple[dict, dict]:
+        fixture = R11KnownDebtSignatureBindingTest
+        return fixture.canonical_fields(
+            self.entries[self.ADMIN_ID],
+            fields,
+            repository_root or fixture.WINDOWS_REPOSITORY,
+            snapshot_root or self.RUN8_WINDOWS_SNAPSHOT,
+        )
+
+    def test_recurrence_authority_is_target_scoped_and_existing_debt_is_unchanged(
+        self,
+    ) -> None:
+        fixture = R11KnownDebtSignatureBindingTest
+        entry = self.entries[self.ADMIN_ID]
+        self.assertEqual(
+            ci.R11_WINDOWS_ENCODED_SHORT_NAME_URI_TARGETS,
+            frozenset({fixture.ADMIN_TARGET, fixture.LOCAL_TARGET}),
+        )
+        self.assertNotIn(
+            fixture.SUITE_TARGET,
+            ci.R11_WINDOWS_ENCODED_SHORT_NAME_URI_TARGETS,
+        )
+        self.assertEqual(entry["id"], "E-ADMIN-FRONTEND-DOM-STUB")
+        self.assertEqual(entry["testOrPathScope"], fixture.ADMIN_SCOPE)
+        self.assertEqual(entry["maximumOccurrences"], 1)
+        self.assertEqual(len(entry["allowedNormalizedSignature"]), 1)
+
+    def test_exact_run8_encoded_short_name_uri_binds_only_admin_debt(self) -> None:
+        entry = self.entries[self.ADMIN_ID]
+        fields, binding = self.canonical_admin(self.exact_run8_fields())
+        self.assertEqual(binding["authorizedTargetPaths"], [self.ADMIN_TARGET])
+        self.assertEqual(binding["unmappedAbsolutePathDigests"], [])
+        self.assertNotIn("cs-ro3gvaro", json.dumps(fields, sort_keys=True))
+        result, observed, _record = self.fixture.classify(
+            entry,
+            fields,
+            binding,
+            "windows",
+        )
+        self.assertEqual(
+            observed["legacyBaselineComparisonDigest"],
+            entry["allowedNormalizedSignature"][0],
+        )
+        self.assert_known(result, entry)
+
+    def test_ubuntu_native_and_posix_uri_behavior_remains_unchanged(self) -> None:
+        fixture = R11KnownDebtSignatureBindingTest
+        entry = self.entries[self.ADMIN_ID]
+        for root, representation in (
+            (fixture.POSIX_REPOSITORY, "native"),
+            (fixture.POSIX_SNAPSHOT, "file-uri"),
+        ):
+            with self.subTest(root=root, representation=representation):
+                fields, binding = fixture.canonical_fields(
+                    entry,
+                    fixture.node_fields(entry, root, representation),
+                    fixture.POSIX_REPOSITORY,
+                    fixture.POSIX_SNAPSHOT,
+                )
+                self.assertEqual(
+                    binding["authorizedTargetPaths"],
+                    [self.ADMIN_TARGET],
+                )
+                self.assertEqual(binding["unmappedAbsolutePathDigests"], [])
+                result, _observed, _record = self.fixture.classify(
+                    entry,
+                    fields,
+                    binding,
+                    "ubuntu",
+                )
+                self.assert_known(result, entry)
+
+    def test_existing_suite_and_local_data_bindings_are_preserved(self) -> None:
+        fixture = R11KnownDebtSignatureBindingTest
+        cases = (
+            (
+                self.entries[self.SUITE_ID],
+                fixture.suite_fields(fixture.POSIX_SNAPSHOT, "file-uri"),
+                fixture.POSIX_REPOSITORY,
+                fixture.POSIX_SNAPSHOT,
+                "ubuntu",
+                fixture.SUITE_TARGET,
+            ),
+            (
+                self.entries[self.LOCAL_ID],
+                fixture.node_fields(
+                    self.entries[self.LOCAL_ID],
+                    fixture.WINDOWS_SNAPSHOT,
+                    "encoded-short-uri",
+                ),
+                fixture.WINDOWS_REPOSITORY,
+                fixture.WINDOWS_SNAPSHOT,
+                "windows",
+                fixture.LOCAL_TARGET,
+            ),
+        )
+        for entry, raw, repository, snapshot, platform_name, target in cases:
+            with self.subTest(entry=entry["id"]):
+                fields, binding = fixture.canonical_fields(
+                    entry,
+                    raw,
+                    repository,
+                    snapshot,
+                )
+                self.assertEqual(binding["authorizedTargetPaths"], [target])
+                self.assertEqual(binding["unmappedAbsolutePathDigests"], [])
+                result, _observed, _record = self.fixture.classify(
+                    entry,
+                    fields,
+                    binding,
+                    platform_name,
+                )
+                self.assert_known(result, entry)
+
+    def test_run8_path_uri_and_short_name_near_misses_fail_closed(self) -> None:
+        entry = self.entries[self.ADMIN_ID]
+        exact = self.exact_run8_fields()
+        replacements = {
+            "wrong-test-target": self.RUN8_ENCODED_URI.replace(
+                "adminFrontendGuard.test.js",
+                "otherFrontendGuard.test.js",
+            ),
+            "same-basename-outside-root": (
+                "file:///C:/outside/adminFrontendGuard.test.js"
+            ),
+            "unrelated-absolute-root": (
+                "file:///D:/unrelated/developer/tests/js/"
+                "adminFrontendGuard.test.js"
+            ),
+            "arbitrary-file-uri": (
+                "file:///opt/unrelated/developer/tests/js/"
+                "adminFrontendGuard.test.js"
+            ),
+            "malformed-percent-escape": self.RUN8_ENCODED_URI.replace(
+                "RUNNER%7E1",
+                "RUNNER%GG1",
+            ),
+            "traversal": self.RUN8_ENCODED_URI.replace(
+                "cs-ro3gvaro/developer",
+                "cs-ro3gvaro/../outside/developer",
+            ),
+            "unrelated-user-short-name": self.RUN8_ENCODED_URI.replace(
+                "RUNNER%7E1",
+                "OTHER%7E1",
+            ),
+            "wrong-short-name-ordinal": self.RUN8_ENCODED_URI.replace(
+                "RUNNER%7E1",
+                "RUNNER%7E2",
+            ),
+            "unrelated-short-name-component": self.RUN8_ENCODED_URI.replace(
+                "Temp/cs-ro3gvaro",
+                "Temp/OTHER%7E1/cs-ro3gvaro",
+            ),
+            "unrelated-temp-root": self.RUN8_ENCODED_URI.replace(
+                "cs-ro3gvaro",
+                "cs-unrelated",
+            ),
+            "generic-suffix-match": self.RUN8_ENCODED_URI.replace(
+                "developer/tests/js/adminFrontendGuard.test.js",
+                "unrelated/adminFrontendGuard.test.js",
+            ),
+        }
+        for label, replacement in replacements.items():
+            with self.subTest(label=label):
+                candidate = {
+                    **exact,
+                    "stdout": exact["stdout"].replace(
+                        self.RUN8_ENCODED_URI,
+                        replacement,
+                    ),
+                }
+                fields, binding = self.canonical_admin(candidate)
+                self.assertEqual(binding["authorizedTargetPaths"], [])
+                self.assertTrue(binding["unmappedAbsolutePathDigests"])
+                result, _observed, _record = self.fixture.classify(
+                    entry,
+                    fields,
+                    binding,
+                    "windows",
+                )
+                self.assert_blocking(result)
+
+    def test_wrong_identity_count_source_target_and_platform_fail_closed(
+        self,
+    ) -> None:
+        fixture = R11KnownDebtSignatureBindingTest
+        entry = self.entries[self.ADMIN_ID]
+        exact = self.exact_run8_fields()
+        variants = {
+            "wrong-source-location": exact["stdout"].replace(
+                "backend/admin/admin.js:83:44",
+                "backend/admin/admin.js:84:44",
+            ),
+            "wrong-test-location": exact["stdout"].replace(
+                self.RUN8_ENCODED_URI + ":113:4",
+                self.RUN8_ENCODED_URI + ":114:4",
+            ),
+            "wrong-message": exact["stdout"].replace(
+                "document.querySelectorAll is not a function",
+                "document.querySelector is not a function",
+            ),
+            "wrong-exception-type": exact["stdout"].replace(
+                "TypeError: document.querySelectorAll is not a function",
+                "RangeError: document.querySelectorAll is not a function",
+            ),
+        }
+        for label, candidate in variants.items():
+            with self.subTest(label=label):
+                fields, binding = self.canonical_admin(
+                    {**exact, "stdout": candidate}
+                )
+                result, _observed, _record = self.fixture.classify(
+                    entry,
+                    fields,
+                    binding,
+                    "windows",
+                )
+                self.assert_blocking(result)
+
+        fields, binding = self.canonical_admin(exact)
+        result, _observed, _record = self.fixture.classify(
+            entry,
+            fields,
+            binding,
+            "windows",
+            occurrences=2,
+        )
+        self.assert_blocking(result)
+
+        posix_fields, posix_binding = fixture.canonical_fields(
+            entry,
+            exact,
+            fixture.POSIX_REPOSITORY,
+            fixture.POSIX_SNAPSHOT,
+        )
+        self.assertEqual(posix_binding["authorizedTargetPaths"], [])
+        self.assertTrue(posix_binding["unmappedAbsolutePathDigests"])
+        result, _observed, _record = self.fixture.classify(
+            entry,
+            posix_fields,
+            posix_binding,
+            "ubuntu",
+        )
+        self.assert_blocking(result)
+
+        record = fixture.source_record(entry, "windows")
+        wrong_source = ci.make_raw_observation(
+            str(record["commandId"]),
+            int(record["ordinal"]),
+            0,
+            "process-output-v1",
+            fixture.ADMIN_SCOPE.removeprefix("file:"),
+            "developer/tests/js/unrelatedSecurity.test.js",
+            fields,
+            ci.command_output_digest(record),
+            1,
+            failure_path_authority=binding,
+        )
+        source_errors = ci._validate_raw_observation(
+            wrong_source,
+            label="r11-windows-wrong-source-target",
+            source=record,
+        )
+        self.assertEqual(source_errors, [])
+        wrong_record = copy.deepcopy(record)
+        wrong_record["producerObservations"] = [wrong_source]
+        wrong_record["producerObservationSetDigest"] = (
+            ci.producer_observation_set_digest(
+                wrong_record["producerObservations"]
+            )
+        )
+        wrong_observed = ci._rederive_observation_record(
+            {"rawObservation": wrong_source},
+            wrong_record,
+        )
+        result = ci.compare_observations(
+            self.fixture.baseline_for(entry),
+            [wrong_observed],
+            {"frontend-security"},
+            "windows",
+            command_records=[wrong_record],
+        )
+        self.assert_blocking(result)
+
+    def test_exact_debt_plus_novel_failure_cannot_mask_blocker(self) -> None:
+        entry = self.entries[self.ADMIN_ID]
+        fields, binding = self.canonical_admin(self.exact_run8_fields())
+        exact, record = self.fixture.observed_record(
+            entry,
+            fields,
+            binding,
+            "windows",
+        )
+        novel = ci.observation(
+            "frontend-security",
+            "file:developer/tests/js/unrelatedSecurity.test.js",
+            "fail",
+            "sha256:" + "9" * 64,
+            "frontend-security:unrelatedSecurity.test.js",
+            failure_identity={
+                "scope": "file:developer/tests/js/unrelatedSecurity.test.js",
+                "structuredFailureSet": "sha256:" + "8" * 64,
+            },
+        )
+        result = ci.compare_observations(
+            self.fixture.baseline_for(entry),
+            [exact, novel],
+            {"frontend-security"},
+            "windows",
+            command_records=[record],
+        )
+        self.assertIn(
+            "UNKNOWN-NONPASS",
+            [item["id"] for item in result["violations"]],
+        )
+        self.assertEqual(
+            [item["id"] for item in result["observedDebts"]],
+            [entry["id"]],
+        )
 
 
 class AuthoritativeEvidenceDerivationTest(unittest.TestCase):
