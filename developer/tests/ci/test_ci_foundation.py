@@ -6406,6 +6406,36 @@ class _HostedToolFixture:
         path.write_bytes(content)
         return path
 
+    def npm_launcher(self, directory: Path, npm_entry: Path) -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
+        if self.platform_name == "Windows":
+            launcher = self._write(directory / "npm.cmd", b"synthetic-npm-launcher")
+            derived_entry = (
+                directory / "node_modules" / "npm" / "bin" / "npm-cli.js"
+            )
+            derived_entry.parent.mkdir(parents=True, exist_ok=True)
+            os.link(npm_entry, derived_entry)
+            return launcher
+        launcher = directory / "npm"
+        os.link(npm_entry, launcher)
+        return launcher
+
+    def authorize_npm_roots(self, *roots: Path) -> None:
+        role_roots = {
+            role: tuple(values) for role, values in self.policy.role_roots.items()
+        }
+        role_roots["npm"] = tuple(
+            (f"synthetic-npm-root-{index}", root)
+            for index, root in enumerate(roots)
+        )
+        self.policy = ci.synthetic_tool_authority_policy(
+            self.platform_name,
+            running_python=self.paths["python"],
+            role_roots=role_roots,
+            minimal_system_directories=self.policy.minimal_system_directories,
+            path_separator=self.policy.path_separator,
+        )
+
     def shadow(self, role: str, *, directory: Path | None = None) -> Path:
         names = {
             "Windows": {
@@ -6950,6 +6980,339 @@ class InternalPythonExecutionAuthorityTest(unittest.TestCase):
 
 class HostedRunnerToolResolutionTest(unittest.TestCase):
     REQUIRED = frozenset({"python", "node", "git", "bash", "powershell"})
+    ROOT_B_FAILURE_SIGNATURE = (
+        "CI_TOOL_AUTHORITY_UNAVAILABLE tool=npm phase=VERIFICATION_PREPARATION "
+        "reason=PATH_EXECUTABLE_SHADOW path_index=11 candidate=parent-path "
+        "root_category=other"
+    )
+
+    def _npm_path_topology(self, fixture: _HostedToolFixture) -> SimpleNamespace:
+        authority_root = (
+            fixture.root / "hostedtoolcache" / "node" / "24.19.0" / "x64"
+        )
+        canonical = fixture._write(
+            authority_root
+            / "lib"
+            / "node_modules"
+            / "npm"
+            / "bin"
+            / "npm-cli.js",
+            b"synthetic-canonical-npm-cli",
+        ).resolve(strict=True)
+        launcher = fixture.npm_launcher(authority_root / "bin", canonical)
+        inert = []
+        for index in range(1, 11):
+            entry = fixture.root / "inert-path" / f"{index:02d}"
+            entry.mkdir(parents=True)
+            inert.append(entry)
+        unrelated_root = fixture.root / "unrelated-npm-bin"
+        unrelated = fixture._write(
+            unrelated_root
+            / ("npm.cmd" if fixture.platform_name == "Windows" else "npm"),
+            b"unrelated-later-npm",
+        )
+        fixture.authorize_npm_roots(authority_root)
+        source = dict(fixture.source)
+        source["CI_TRUSTED_NPM_ENTRY"] = str(canonical)
+        source["PATH"] = fixture.policy.path_separator.join(
+            str(path)
+            for path in (launcher.parent, *inert, unrelated.parent)
+        )
+        return SimpleNamespace(
+            authority_root=authority_root,
+            canonical=canonical,
+            launcher=launcher,
+            inert=tuple(inert),
+            unrelated=unrelated,
+            source=source,
+        )
+
+    def _assert_npm_blocked(
+        self,
+        fixture: _HostedToolFixture,
+        source: Mapping[str, str],
+    ) -> list[str]:
+        tools, errors = ci.resolve_trusted_tools(
+            {"npm"},
+            source_environment=source,
+            policy=fixture.policy,
+        )
+        self.assertNotIn("npm", tools)
+        self.assertTrue(any("tool=npm" in error for error in errors), errors)
+        return errors
+
+    def test_npm_path_launcher_anchor_repairs_run8_topology_on_posix_and_windows(
+        self,
+    ) -> None:
+        for platform_name in ("Ubuntu", "Windows"):
+            with self.subTest(platform=platform_name):
+                fixture = _HostedToolFixture(platform_name)
+                try:
+                    topology = self._npm_path_topology(fixture)
+                    path_entries = topology.source["PATH"].split(
+                        fixture.policy.path_separator
+                    )
+                    self.assertEqual(len(path_entries), 12)
+                    self.assertEqual(Path(path_entries[0]), topology.launcher.parent)
+                    self.assertEqual(Path(path_entries[11]), topology.unrelated.parent)
+                    self.assertTrue(
+                        ci._same_file_identity(
+                            ci._npm_entry_from_launcher(topology.launcher),
+                            topology.canonical,
+                        )
+                    )
+                    tools, errors = ci.resolve_trusted_tools(
+                        {"npm"},
+                        source_environment=topology.source,
+                        policy=fixture.policy,
+                    )
+                    self.assertEqual(errors, [])
+                    self.assertEqual(
+                        Path(
+                            ci.require_tool(
+                                tools,
+                                "npm",
+                                phase="VERIFICATION_PREPARATION",
+                            )
+                        ),
+                        topology.canonical,
+                    )
+                    self.assertNotIn(
+                        self.ROOT_B_FAILURE_SIGNATURE,
+                        "\n".join(errors),
+                    )
+
+                    duplicate_root = topology.authority_root / "duplicate-bin"
+                    duplicate = fixture.npm_launcher(
+                        duplicate_root, topology.canonical
+                    )
+                    duplicate_source = dict(topology.source)
+                    duplicate_source["PATH"] = fixture.policy.path_separator.join(
+                        (str(duplicate.parent), topology.source["PATH"])
+                    )
+                    duplicate_tools, duplicate_errors = ci.resolve_trusted_tools(
+                        {"npm"},
+                        source_environment=duplicate_source,
+                        policy=fixture.policy,
+                    )
+                    self.assertEqual(duplicate_errors, [])
+                    self.assertEqual(
+                        Path(duplicate_tools["npm"]), topology.canonical
+                    )
+                finally:
+                    fixture.cleanup()
+
+    def test_npm_path_launcher_anchor_negative_identity_and_order_matrix(
+        self,
+    ) -> None:
+        for label in (
+            "earlier-hostile",
+            "same-basename-outside-root",
+            "near-prefix-root",
+            "sibling-untrusted-root",
+            "ambiguous-non-equivalent",
+        ):
+            with self.subTest(case=label):
+                fixture = _HostedToolFixture("Ubuntu")
+                try:
+                    topology = self._npm_path_topology(fixture)
+                    if label == "near-prefix-root":
+                        hostile_root = Path(f"{topology.authority_root}-evil") / "bin"
+                    elif label == "sibling-untrusted-root":
+                        hostile_root = (
+                            topology.authority_root.parent / "24.19.0-sibling" / "bin"
+                        )
+                    elif label == "ambiguous-non-equivalent":
+                        hostile_root = topology.authority_root / "alternate-bin"
+                    else:
+                        hostile_root = fixture.root / label / "bin"
+                    fixture._write(hostile_root / "npm", label.encode("utf-8"))
+                    source = dict(topology.source)
+                    source["PATH"] = fixture.policy.path_separator.join(
+                        (str(hostile_root), topology.source["PATH"])
+                    )
+                    errors = self._assert_npm_blocked(fixture, source)
+                    self.assertTrue(
+                        any(
+                            reason in error
+                            for error in errors
+                            for reason in (
+                                ci.PATH_EXECUTABLE_SHADOW,
+                                ci.PATH_WORKSPACE_OR_TEMP_AUTHORITY,
+                            )
+                        ),
+                        errors,
+                    )
+                finally:
+                    fixture.cleanup()
+
+        for label in (
+            "missing-anchor",
+            "wrong-launcher-identity",
+            "wrong-npm-cli-identity",
+            "launcher-root-mismatch",
+            "missing-npm",
+        ):
+            with self.subTest(case=label):
+                fixture = _HostedToolFixture("Ubuntu")
+                try:
+                    topology = self._npm_path_topology(fixture)
+                    source = dict(topology.source)
+                    if label == "missing-anchor":
+                        source["PATH"] = fixture.policy.path_separator.join(
+                            str(path) for path in topology.inert
+                        )
+                    elif label == "wrong-launcher-identity":
+                        wrong_entry = fixture._write(
+                            topology.authority_root / "wrong-npm-cli.js",
+                            b"wrong-launcher-target",
+                        )
+                        wrong_launcher = fixture.npm_launcher(
+                            topology.authority_root / "wrong-bin", wrong_entry
+                        )
+                        source["PATH"] = str(wrong_launcher.parent)
+                    elif label == "wrong-npm-cli-identity":
+                        wrong_canonical = fixture._write(
+                            topology.authority_root / "wrong-canonical-npm-cli.js",
+                            b"wrong-canonical",
+                        ).resolve(strict=True)
+                        source["CI_TRUSTED_NPM_ENTRY"] = str(wrong_canonical)
+                        source["PATH"] = str(topology.launcher.parent)
+                    elif label == "launcher-root-mismatch":
+                        launcher_root = fixture.root / "approved-launcher-root"
+                        mismatch_launcher = fixture.npm_launcher(
+                            launcher_root / "bin", topology.canonical
+                        )
+                        fixture.authorize_npm_roots(
+                            topology.authority_root, launcher_root
+                        )
+                        source["PATH"] = str(mismatch_launcher.parent)
+                    else:
+                        source.pop("CI_TRUSTED_NPM_ENTRY")
+                        source["PATH"] = fixture.policy.path_separator.join(
+                            str(path) for path in topology.inert
+                        )
+                    self._assert_npm_blocked(fixture, source)
+                finally:
+                    fixture.cleanup()
+
+    def test_npm_path_launcher_anchor_malformed_unreadable_and_uninspectable_fail_closed(
+        self,
+    ) -> None:
+        fixture = _HostedToolFixture("Ubuntu")
+        try:
+            topology = self._npm_path_topology(fixture)
+            malformed = dict(topology.source)
+            malformed["CI_TRUSTED_NPM_ENTRY"] = "npm-cli.js"
+            self.assertTrue(
+                any(
+                    ci.TOOL_CANDIDATE_INVALID in error
+                    for error in self._assert_npm_blocked(fixture, malformed)
+                )
+            )
+
+            original_resolve = Path.resolve
+
+            def unreadable(path: Path, *args, **kwargs):
+                if path == topology.canonical:
+                    raise PermissionError("synthetic unreadable npm authority")
+                return original_resolve(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "resolve", unreadable):
+                unreadable_errors = self._assert_npm_blocked(
+                    fixture, topology.source
+                )
+            self.assertTrue(
+                any(ci.TOOL_CANDIDATE_UNREADABLE in error for error in unreadable_errors),
+                unreadable_errors,
+            )
+
+            blocked_entry = fixture.root / "uninspectable-predecessor"
+            blocked_entry.mkdir()
+            uninspectable_source = dict(topology.source)
+            uninspectable_source["PATH"] = fixture.policy.path_separator.join(
+                (str(blocked_entry), topology.source["PATH"])
+            )
+            original_lstat = Path.lstat
+
+            def uninspectable(path: Path, *args, **kwargs):
+                if path == blocked_entry:
+                    raise PermissionError("synthetic uninspectable PATH entry")
+                return original_lstat(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "lstat", uninspectable):
+                uninspectable_errors = self._assert_npm_blocked(
+                    fixture, uninspectable_source
+                )
+            self.assertTrue(
+                any(
+                    ci.PATH_PREDECESSOR_UNINSPECTABLE in error
+                    for error in uninspectable_errors
+                ),
+                uninspectable_errors,
+            )
+        finally:
+            fixture.cleanup()
+
+    def test_npm_path_launcher_anchor_rejects_novel_generic_authority(self) -> None:
+        controls = (
+            "basename-only",
+            "directory-prefix-only",
+            "ambient-path-winner",
+            "unverified-parent",
+            "arbitrary-npm-cli",
+            "generic-shell-launcher",
+            "wildcard-tool-root",
+        )
+        for label in controls:
+            with self.subTest(control=label):
+                fixture = _HostedToolFixture("Ubuntu")
+                try:
+                    topology = self._npm_path_topology(fixture)
+                    source = dict(topology.source)
+                    if label in {
+                        "basename-only",
+                        "directory-prefix-only",
+                        "wildcard-tool-root",
+                    }:
+                        if label == "basename-only":
+                            root = fixture.root / "basename-authority"
+                        else:
+                            root = Path(
+                                f"{topology.authority_root}-{label}"
+                            )
+                        arbitrary = fixture._write(
+                            root / "lib" / "npm-cli.js", b"arbitrary-npm-cli"
+                        ).resolve(strict=True)
+                        launcher = fixture.npm_launcher(root / "bin", arbitrary)
+                        source["CI_TRUSTED_NPM_ENTRY"] = str(arbitrary)
+                        source["PATH"] = str(launcher.parent)
+                    elif label == "ambient-path-winner":
+                        ambient = fixture.root / "ambient-bin"
+                        fixture._write(ambient / "npm", b"ambient-npm")
+                        source.pop("CI_TRUSTED_NPM_ENTRY")
+                        source["PATH"] = str(ambient)
+                    elif label == "unverified-parent":
+                        parent = fixture.root / "unverified-parent"
+                        launcher = fixture.npm_launcher(parent, topology.canonical)
+                        source["PATH"] = str(launcher.parent)
+                    elif label == "arbitrary-npm-cli":
+                        arbitrary = fixture._write(
+                            topology.authority_root / "arbitrary-npm-cli.js",
+                            b"arbitrary-npm-cli",
+                        ).resolve(strict=True)
+                        source["CI_TRUSTED_NPM_ENTRY"] = str(arbitrary)
+                        source["PATH"] = fixture.policy.path_separator.join(
+                            str(path) for path in topology.inert
+                        )
+                    else:
+                        shell_root = topology.authority_root / "generic-shell-bin"
+                        shell_root.mkdir(parents=True)
+                        os.link(topology.canonical, shell_root / "sh")
+                        source["PATH"] = str(shell_root)
+                    self._assert_npm_blocked(fixture, source)
+                finally:
+                    fixture.cleanup()
 
     def run5_repository_policy_helper(
         self,

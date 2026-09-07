@@ -3963,15 +3963,70 @@ def _preceding_shadow_issue(
             TOOL_CANDIDATE_UNREADABLE,
             candidate_class="tool-candidate",
         )
-    candidate_parent = canonical.parent
-    candidate_position = next(
-        (
-            offset
-            for offset, entry in enumerate(entries)
-            if entry.resolved == candidate_parent
-        ),
-        len(entries) if scan_all_if_absent else 0,
-    )
+    if role == "npm":
+        candidate_position = None
+        launcher_alias = None
+        launcher_entry = None
+        for offset, entry in enumerate(entries):
+            alias = entry.alias_for(role)
+            if alias is None or not _same_file_identity(
+                _npm_entry_from_launcher(alias), canonical
+            ):
+                continue
+            candidate_position = offset
+            launcher_alias = alias
+            launcher_entry = entry
+            break
+        if (
+            candidate_position is None
+            or launcher_alias is None
+            or launcher_entry is None
+        ):
+            return ToolAuthorityIssue(
+                role,
+                TOOL_CANDIDATE_INVALID,
+                candidate_class="tool-candidate",
+            )
+        launcher_root = _tool_root_classification_result(
+            launcher_alias, role, policy
+        )
+        candidate_root = _tool_root_classification_result(canonical, role, policy)
+        if launcher_root.inspection_failed or candidate_root.inspection_failed:
+            return ToolAuthorityIssue(
+                role,
+                PATH_PREDECESSOR_UNINSPECTABLE,
+                path_index=launcher_entry.index,
+                candidate_class="parent-path",
+                root_category=launcher_entry.root_category,
+            )
+        if (
+            launcher_root.root_label is None
+            or candidate_root.root_label is None
+            or launcher_root.root_label != candidate_root.root_label
+        ):
+            reason_code = {
+                UNSAFE_REPARSE_ESCAPE: PATH_REPARSE_ESCAPE,
+                UNSAFE_WORKSPACE_OR_TEMP_AUTHORITY: PATH_WORKSPACE_OR_TEMP_AUTHORITY,
+                UNSAFE_UNINSPECTABLE_SHADOW_CAPABLE_ENTRY: PATH_PREDECESSOR_UNINSPECTABLE,
+                UNKNOWN_FAIL_CLOSED: PATH_ENTRY_UNKNOWN,
+            }.get(launcher_entry.classification, PATH_EXECUTABLE_SHADOW)
+            return ToolAuthorityIssue(
+                role,
+                reason_code,
+                path_index=launcher_entry.index,
+                candidate_class="parent-path",
+                root_category=launcher_entry.root_category,
+            )
+    else:
+        candidate_parent = canonical.parent
+        candidate_position = next(
+            (
+                offset
+                for offset, entry in enumerate(entries)
+                if entry.resolved == candidate_parent
+            ),
+            len(entries) if scan_all_if_absent else 0,
+        )
     for entry in entries[:candidate_position]:
         if role in entry.uninspectable_roles:
             return ToolAuthorityIssue(
