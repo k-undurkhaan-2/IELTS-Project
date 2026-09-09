@@ -5175,8 +5175,9 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
         target_reference_count = sum(len(spec["targets"]) for spec in plan)
         self.assertEqual(len(plan), 705)
         self.assertEqual(len(command_classes), 16)
-        self.assertEqual(len(target_universe), 904)
-        self.assertEqual(target_reference_count, 19725)
+        # Four governance files add four targets and 86 plan references.
+        self.assertEqual(len(target_universe), 908)
+        self.assertEqual(target_reference_count, 19811)
         self.assertNotIn(
             "node-vitest-security-test",
             {spec["toolRole"] for spec in plan},
@@ -17449,5 +17450,78 @@ class TestInventoryAccountingTest(unittest.TestCase):
         self.assertIn("VERDICT=BLOCKING", stream.getvalue())
 
 
+def run_with_receipt(argv: list[str]) -> int:
+    """Opt-in local full-suite reuse; hosted and selected-test runs stay unchanged."""
+    import argparse
+    import governance_state as gs
+
+    parser = argparse.ArgumentParser(description=run_with_receipt.__doc__, allow_abbrev=False)
+    parser.add_argument("--reuse-receipt-dir", required=True)
+    parser.add_argument("--environment-contract", required=True)
+    parser.add_argument("--fixtures-digest", required=True, type=lambda value: None if value == "null" else value)
+    args = parser.parse_args(argv)
+    if any(key.upper() == "GITHUB_ACTIONS" and value.lower() not in {"", "false"}
+           for key, value in os.environ.items()):
+        parser.error("receipt reuse is local only")
+    try:
+        receipt_dir = gs.external_path(args.reuse_receipt_dir, ci.REPO_ROOT)
+        environment = gs.external_path(args.environment_contract, ci.REPO_ROOT)
+        receipt_dir.mkdir(parents=True, exist_ok=True)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        parser.error(str(exc))
+
+    before = None
+    decision = {"decision": "REVALIDATE", "reason": "RECEIPT_MISSING", "candidate_tree": None}
+    try:
+        before = gs.frozen_context(ci.REPO_ROOT, environment, args.fixtures_digest)
+        decision["candidate_tree"] = before["candidate_tree"]
+        for path in sorted(receipt_dir.glob(gs.digest(before) + "-*.json")):
+            try:
+                decision = gs.check_evidence(gs.read_document(path), before)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                decision["reason"] = "RECEIPT_INVALID"
+                continue
+            if decision["decision"] == "REUSE_ALLOWED":
+                if gs.frozen_context(ci.REPO_ROOT, environment, args.fixtures_digest) == before:
+                    print(json.dumps(decision, sort_keys=True))
+                    return 0
+                before = None
+                decision = {"decision": "REVALIDATE", "reason": "STATE_CHANGED",
+                            "candidate_tree": decision["candidate_tree"]}
+                break
+    except (OSError, ValueError, subprocess.SubprocessError):
+        before = None
+        decision = {"decision": "REVALIDATE", "reason": "STATE_UNKNOWN", "candidate_tree": None}
+    print(json.dumps(decision, sort_keys=True))
+
+    result = unittest.main(module=__name__, argv=[sys.argv[0]], verbosity=2,
+                           testRunner=InventoryTextTestRunner, exit=False).result
+    complete = (result.wasSuccessful() and result.testsRun == 476
+                and len(result.inventory_ids) == 476
+                and set(result.inventory_ids) == result.executed_test_ids == result.successful_test_ids)
+    if before is not None and complete:
+        try:
+            if gs.frozen_context(ci.REPO_ROOT, environment, args.fixtures_digest) != before:
+                print(json.dumps({"decision": "REVALIDATE", "reason": "STATE_CHANGED",
+                                  "candidate_tree": before["candidate_tree"]}, sort_keys=True))
+            else:
+                receipt = gs.make_receipt(before)
+                path = receipt_dir / (gs.digest(before) + "-" + uuid.uuid4().hex + ".json")
+                with path.open("xb") as output:
+                    output.write(gs.canonical(receipt))
+                print(json.dumps({"decision": "EVIDENCE_RECORDED", "reason": "FULL_VALIDATION_PASS",
+                                  "candidate_tree": before["candidate_tree"],
+                                  "receipt_id": receipt["receipt_id"],
+                                  "validation_fingerprint": receipt["validation_fingerprint"]},
+                                 sort_keys=True))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            print(json.dumps({"decision": "REVALIDATE", "reason": "RECEIPT_NOT_RECORDED",
+                              "candidate_tree": before["candidate_tree"]}, sort_keys=True))
+    return 0 if result.wasSuccessful() else 1
+
+
 if __name__ == "__main__":
+    if any(arg.split("=", 1)[0] in {"--reuse-receipt-dir", "--environment-contract", "--fixtures-digest"}
+           for arg in sys.argv[1:]):
+        sys.exit(run_with_receipt(sys.argv[1:]))
     unittest.main(verbosity=2, testRunner=InventoryTextTestRunner)
