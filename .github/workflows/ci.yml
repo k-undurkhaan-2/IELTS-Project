@@ -287,9 +287,28 @@ jobs:
         shell: pwsh
         run: |
           $pythonPath = (Resolve-Path -LiteralPath (Join-Path $env:pythonLocation 'python.exe')).Path
-          $nodePath = (Get-Command node.exe -CommandType Application).Source
-          $npmEntry = (Resolve-Path -LiteralPath (Join-Path (Split-Path $nodePath -Parent) 'node_modules\npm\bin\npm-cli.js')).Path
           if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) { throw 'trusted Python is unavailable' }
+          $runtimeCapture = @'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'developer/tests/ci')
+          import run_ci_foundation as ci
+          source = dict(os.environ)
+          tools, errors = ci.resolve_trusted_tools({'node'}, source_environment=source)
+          if errors:
+              raise SystemExit('trusted Node capture rejected by tool authority')
+          source['CI_TRUSTED_NODE'] = tools['node']
+          source['CI_TRUSTED_NPM_ENTRY'] = str(Path(tools['node']).parent / 'node_modules' / 'npm' / 'bin' / 'npm-cli.js')
+          tools, errors = ci.resolve_trusted_tools({'node', 'npm'}, source_environment=source)
+          if errors:
+              raise SystemExit('trusted Node/npm capture rejected by tool authority')
+          print(json.dumps({'node': tools['node'], 'npmEntry': tools['npm']}))
+          '@
+          $runtimeJson = & $pythonPath -B -c $runtimeCapture
+          if ($LASTEXITCODE -ne 0) { throw 'trusted Node/npm capture failed' }
+          $runtimePaths = $runtimeJson | ConvertFrom-Json
+          $nodePath = [string]$runtimePaths.node
+          $npmEntry = [string]$runtimePaths.npmEntry
           if (-not (Test-Path -LiteralPath $nodePath -PathType Leaf)) { throw 'trusted Node is unavailable' }
           if (-not (Test-Path -LiteralPath $npmEntry -PathType Leaf)) { throw 'trusted npm entry is unavailable' }
           "CI_TRUSTED_PYTHON=$pythonPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8

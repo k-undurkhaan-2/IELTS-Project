@@ -4120,6 +4120,113 @@ class AuthoritativeEvidenceDerivationTest(unittest.TestCase):
                     )
 
 
+def _assert_windows_runtime_capture(test: unittest.TestCase, fixture_factory) -> None:
+    """Keep these regression subtests in the existing focused CI test inventory."""
+
+    capture = ci.WINDOWS_RUNTIME_CAPTURE
+    script = capture.split("$runtimeCapture = @'\n", 1)[1].split("\n'@", 1)[0]
+    original_resolver = ci.resolve_trusted_tools
+
+    def execute(fixture):
+        def resolve(required, **kwargs):
+            return original_resolver(
+                required, **kwargs, policy=fixture.policy, repo_root=fixture.workspace
+            )
+
+        output = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, fixture.source, clear=True),
+            mock.patch.object(sys, "path", list(sys.path)),
+            mock.patch.object(ci, "resolve_trusted_tools", side_effect=resolve),
+            contextlib.redirect_stdout(output),
+        ):
+            try:
+                exec(compile(script, "<workflow-runtime-capture>", "exec"), {})
+            except SystemExit:
+                test.assertEqual(output.getvalue(), "")
+                raise
+        return ci.strict_json_loads(output.getvalue())
+
+    for scenario in (
+        "duplicate-lower-priority-node",
+        "higher-priority-workspace-node",
+        "higher-priority-unknown-node",
+        "higher-priority-npm-shadow",
+        "missing-exact-root-npm",
+    ):
+        with test.subTest(windows_runtime_capture=scenario):
+            fixture = fixture_factory("Windows")
+            try:
+                node = fixture.paths["node"]
+                node_root = node.parent
+                npm = fixture._write(
+                    node_root / "node_modules" / "npm" / "bin" / "npm-cli.js",
+                    b"synthetic-npm-entry",
+                )
+                fixture._write(node_root / "npm.cmd", b"synthetic-npm-launcher")
+                fixture.policy = ci.synthetic_tool_authority_policy(
+                    "Windows",
+                    running_python=fixture.paths["python"],
+                    role_roots={
+                        **dict(fixture.policy.role_roots),
+                        "npm": (("github-hosted-node-toolcache", node_root),),
+                    },
+                    minimal_system_directories=(fixture.paths["system"],),
+                )
+                secondary = fixture._write(
+                    fixture.root / "Program Files" / "nodejs" / "node.exe",
+                    b"synthetic-lower-priority-node",
+                )
+                fixture.source["PATH"] += os.pathsep + str(secondary.parent)
+
+                if scenario == "duplicate-lower-priority-node":
+                    if os.name == "nt":
+                        shell = shutil.which("pwsh") or shutil.which("powershell")
+                        test.assertIsNotNone(shell, "Windows regression requires PowerShell")
+                        discovery = subprocess.run(
+                            [shell, "-NoProfile", "-NonInteractive", "-Command",
+                             "$items = @(Get-Command node.exe -CommandType Application); "
+                             "ConvertTo-Json -Compress -InputObject @($items.Source)"],
+                            env={**os.environ, "PATH": fixture.source["PATH"]},
+                            capture_output=True, text=True, timeout=30, check=True,
+                        )
+                        # Native discovery reproduces the original array-valued Source.
+                        test.assertEqual(
+                            ci.strict_json_loads(discovery.stdout), [str(node), str(secondary)]
+                        )
+                    first = execute(fixture)
+                    second = execute(fixture)
+                    test.assertEqual(first, second)
+                    test.assertEqual(first, {"node": str(node), "npmEntry": str(npm)})
+                    test.assertIs(type(first["node"]), str)
+                    test.assertEqual(Path(first["npmEntry"]).parents[3], Path(first["node"]).parent)
+                    continue
+
+                if scenario == "higher-priority-workspace-node":
+                    fixture._write(fixture.workspace / "node.exe", b"workspace-shadow")
+                elif scenario == "higher-priority-unknown-node":
+                    fixture.source["PATH"] = (
+                        str(secondary.parent) + os.pathsep + fixture.source["PATH"]
+                    )
+                elif scenario == "higher-priority-npm-shadow":
+                    fixture._write(fixture.workspace / "npm.cmd", b"npm-shadow")
+                    fixture._write(
+                        fixture.workspace / "node_modules" / "npm" / "bin" / "npm-cli.js",
+                        b"workspace-npm-entry",
+                    )
+                elif scenario == "missing-exact-root-npm":
+                    npm.unlink()
+                    fixture._write(
+                        secondary.parent / "node_modules" / "npm" / "bin" / "npm-cli.js",
+                        b"unrelated-npm-entry",
+                    )
+                with test.assertRaisesRegex(SystemExit, "rejected by tool authority"):
+                    execute(fixture)
+            finally:
+                fixture.temporary.cleanup()
+
+
+
 class WorkflowPolicyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -4128,6 +4235,7 @@ class WorkflowPolicyTest(unittest.TestCase):
 
     def test_current_workflow_passes_narrow_policy(self) -> None:
         self.assertEqual(ci.check_workflow_text(self.workflow), [])
+        _assert_windows_runtime_capture(self, _HostedToolFixture)
 
     def test_write_permission_is_rejected(self) -> None:
         candidate = self.workflow.replace("contents: read", "contents: write", 1)
@@ -4516,6 +4624,81 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
         self.assertNotIn("C:/private", sanitized)
         self.assertNotIn("\r", sanitized)
 
+        violation = {
+            "id": "EXECUTION-ARGV-MISMATCH",
+            "commandId": "npm-version",
+            "detail": source,
+            "observation": {"privatePath": "/private/runner/secret", "output": source},
+        }
+        rendered = ci.missing_derived_violation_diagnostic(violation)
+        diagnostic = ci.strict_json_loads(rendered)
+        self.assertEqual(set(diagnostic), {"commandId", "violationType", "violationDigest"})
+        self.assertEqual(diagnostic["commandId"], "npm-version")
+        self.assertEqual(diagnostic["violationType"], "EXECUTION-ARGV-MISMATCH")
+        canonical = json.dumps(violation, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        self.assertEqual(
+            diagnostic["violationDigest"],
+            "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        )
+        self.assertEqual(
+            rendered,
+            ci.missing_derived_violation_diagnostic(dict(reversed(list(violation.items())))),
+        )
+        self.assertNotEqual(
+            diagnostic["violationDigest"],
+            ci.strict_json_loads(ci.missing_derived_violation_diagnostic(violation | {"detail": "changed"}))["violationDigest"],
+        )
+        for hostile_identity in (
+            source, "/private/runner/secret", "node-check:/private/runner/secret",
+            "npm-version\n" + source, "x" * 100_000, "\ud800", {"output": source}, None,
+        ):
+            with self.subTest(identityType=type(hostile_identity).__name__):
+                projected = ci.missing_derived_violation_diagnostic(
+                    violation | {"id": hostile_identity, "commandId": hostile_identity}
+                )
+                bounded = ci.strict_json_loads(projected)
+                self.assertLessEqual(len(projected), 300)
+                self.assertEqual(bounded["violationType"], "OTHER")
+                if isinstance(hostile_identity, str):
+                    self.assertRegex(bounded["commandId"], r"^sha256:[0-9a-f]{64}$")
+                else:
+                    self.assertIsNone(bounded["commandId"])
+                self.assertRegex(bounded["violationDigest"], r"^sha256:[0-9a-f]{64}$")
+                for forbidden in (synthetic_token, "/private/", "C:\\private", "\r", "\n"):
+                    self.assertNotIn(forbidden, projected)
+        for forbidden in (synthetic_token, "/private/", "C:\\private", "output", "\r", "\n"):
+            self.assertNotIn(forbidden, rendered)
+
+        aggregate = {"id": "COMMAND-AUTHORITY-MISMATCH", "expectedCommandIds": [source], "observedCommandIds": [source]}
+        expected = {field: 0 for field in ci._DIAGNOSTIC_AUTHORITY_FIELDS}
+        expected["commandId"] = source
+        actual = {field: source for field in expected}
+        projected = ci.missing_derived_violation_diagnostic(
+            aggregate, command_records=[actual], expected_authority=[expected]
+        )
+        bounded = ci.strict_json_loads(projected)
+        self.assertEqual(len(bounded["authorityFields"]), ci._MAX_DIAGNOSTIC_AUTHORITY_FIELDS)
+        self.assertEqual(bounded["authorityFields"][-1], "additional-fields")
+        self.assertRegex(bounded["commandId"], r"^sha256:[0-9a-f]{64}$")
+        self.assertLessEqual(len(projected), 500)
+        self.assertNotIn(synthetic_token, projected)
+        self.assertEqual(
+            bounded["violationDigest"],
+            ci.strict_json_loads(ci.missing_derived_violation_diagnostic(aggregate))["violationDigest"],
+        )
+        for observed_plan, expected_plan, categories in (
+            ([{"commandId": source, source: 1}], [{"commandId": source, source: 0}], ["OTHER"]),
+            ([], [{"commandId": source}], ["command-membership"]),
+            ([{"commandId": source}], [], ["command-membership"]),
+            ([{"commandId": source}], [{"commandId": source}], ["OTHER"]),
+        ):
+            with self.subTest(categories=categories):
+                projected = ci.missing_derived_violation_diagnostic(
+                    aggregate, command_records=observed_plan, expected_authority=expected_plan
+                )
+                self.assertEqual(ci.strict_json_loads(projected)["authorityFields"], categories)
+                self.assertNotIn(synthetic_token, projected)
+
     def test_private_path_policy_is_exact(self) -> None:
         self.assertIsNotNone(ci.private_or_operational_path_reason("ListeningPractice/P1/private.html"))
         self.assertIsNone(
@@ -4606,6 +4789,150 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
             self.rewrite_manifested_json(output, "command-results.json", document)
             errors = ci.verify_evidence_file_set(output, repo_root=repo)
         self.assertTrue(any("reports PASS" in error for error in errors), errors)
+        prefix = "summary.json: derived command/baseline violation is missing: "
+        diagnostics = [ci.strict_json_loads(error[len(prefix):]) for error in errors if error.startswith(prefix)]
+        expected_violation = {
+            "id": "REQUIRED-COMMAND-EXECUTION",
+            "commandId": record["commandId"],
+            "exitCode": None,
+        }
+        self.assertIn(
+            ci.strict_json_loads(ci.missing_derived_violation_diagnostic(expected_violation)),
+            diagnostics,
+        )
+
+        # Producer and verifier independently retain their local identities;
+        # cross-job evidence authority binds their portable execution semantics.
+        plan = [synthetic_command_spec(
+            "baseline-schema", "baseline-policy", 0,
+            targets=[ci._target_authority(ci.REPO_ROOT, "developer/tests/ci/phase1-ci-baseline.json")],
+        ), synthetic_command_spec("fixture-boundary", "repository-boundary", 1)]
+        for spec in plan:
+            spec["profile"] = "policy"
+        with tempfile.TemporaryDirectory(prefix="ci-evidence-fresh-identity-") as temp_dir:
+            repo = Path(temp_dir)
+            with mock.patch.object(ci, "expected_command_authority", return_value=plan):
+                output, summary = self.create_valid_evidence(repo)
+                self.assertEqual(summary["policyViolations"], [])
+                self.assertEqual(ci.verify_evidence_file_set(output, repo_root=repo), [])
+                fresh_plan = copy.deepcopy(plan)
+                identity = fresh_plan[0]["targets"][0]["fileIdentity"]
+                self.assertIsInstance(identity, dict)
+                identity["inodeOrFileIndex"] = str(int(identity["inodeOrFileIndex"]) + 1)
+                self.assertEqual(
+                    ci._portable_command_plan_value(plan),
+                    ci._portable_command_plan_value(fresh_plan),
+                )
+                self.assertEqual(ci.verify_evidence_file_set(
+                    output, repo_root=repo, expected_command_plan=fresh_plan
+                ), [])
+                document = ci.strict_json_load_file(output / "command-results.json")
+                records = document["records"]
+                raw_violations = ci._command_authority_violations(
+                    "policy", records, [], expected_plan=fresh_plan
+                )
+                self.assertEqual([v["id"] for v in raw_violations], ["COMMAND-AUTHORITY-MISMATCH"])
+                diagnostic = ci.strict_json_loads(ci.missing_derived_violation_diagnostic(
+                    raw_violations[0], command_records=records, expected_authority=fresh_plan
+                ))
+                self.assertEqual(diagnostic["authorityFields"], ["targets.fileIdentity"])
+
+                executable_plan = copy.deepcopy(plan)
+                executable_plan[0]["resolvedExecutableFileIdentity"]["inodeOrFileIndex"] = "fresh-verifier"
+                self.assertEqual(ci._portable_command_plan_value(plan), ci._portable_command_plan_value(executable_plan))
+                self.assertEqual(ci.verify_evidence_file_set(
+                    output, repo_root=repo, expected_command_plan=executable_plan
+                ), [])
+                # Tool installation paths are explicitly portable too. Actual
+                # producer execution argv must still equal its own local plan.
+                for field in ("argv", "logicalArgv", "executionArgv"):
+                    executable_plan[0][field] = ["/verifier/python", *plan[0][field][1:]]
+                executable_plan[0]["resolvedExecutablePath"] = "/verifier/python"
+                self.assertEqual(ci.verify_evidence_file_set(
+                    output, repo_root=repo, expected_command_plan=executable_plan
+                ), [])
+                forged_records = copy.deepcopy(records)
+                forged_records[0]["actualExecutionArgv"][0] = "/unplanned/python"
+                self.assertIn("EXECUTION-ARGV-MISMATCH", [v["id"] for v in ci._command_authority_violations(
+                    "policy", forged_records, [], expected_plan=executable_plan, cross_job=True
+                )])
+
+                mutations = (
+                    ("target-sha256", "targets", "sha256", "0" * 64),
+                    ("target-mode", "targets", "modeType", "other"),
+                    ("target-path", "targets", "path", "unrelated.json"),
+                    ("target-size", "targets", "size", 0),
+                    ("target-reparse", "targets", "reparsePoint", True),
+                    ("command-id", None, "commandId", "unrelated-command"),
+                    ("command-ordinal", None, "ordinal", 7),
+                    ("command-class", None, "commandClass", "unrelated-class"),
+                    ("command-role", None, "commandRole", "observation-producing"),
+                    ("requiredness", None, "required", False),
+                    ("allowed-exits", None, "allowedExecutionExits", [0, 1]),
+                    ("logical-argv", None, "logicalArgv", [sys.executable, "changed"]),
+                    ("execution-argv", None, "executionArgv", [sys.executable, "changed"]),
+                    ("input-mode", None, "executionInputMode", "TARGET-BYTES-STDIN"),
+                    ("input-size", None, "executionInputSize", 1),
+                    ("input-digest", None, "executionInputSha256", "0" * 64),
+                    ("tool-role", None, "toolRole", "unrelated-tool"),
+                )
+                for scenario, nested, field, value in mutations:
+                    with self.subTest(cross_job_semantic_mutation=scenario):
+                        changed = copy.deepcopy(fresh_plan)
+                        destination = changed[0][nested][0] if nested else changed[1]
+                        destination[field] = value
+                        errors = ci.verify_evidence_file_set(
+                            output, repo_root=repo, expected_command_plan=changed
+                        )
+                        diagnostics = [ci.strict_json_loads(error[len(prefix):]) for error in errors if error.startswith(prefix)]
+                        mismatch = next(d for d in diagnostics if d["violationType"] == "COMMAND-AUTHORITY-MISMATCH")
+                        expected_fields = (
+                            ["argv", "executionArgv", "logicalArgv", "additional-fields"]
+                            if field == "toolRole" else [nested or field]
+                        )
+                        self.assertEqual(mismatch["authorityFields"], expected_fields)
+
+                for scenario in ("order", "missing-command", "extra-command"):
+                    with self.subTest(cross_job_semantic_mutation=scenario):
+                        changed = copy.deepcopy(fresh_plan)
+                        if scenario == "order":
+                            changed.reverse()
+                        elif scenario == "missing-command":
+                            changed.pop()
+                        else:
+                            extra = copy.deepcopy(changed[-1])
+                            extra.update(commandId="extra-command", ordinal=len(changed))
+                            changed.append(extra)
+                        self.assertIn("COMMAND-AUTHORITY-MISMATCH", [v["id"] for v in ci._command_authority_violations(
+                            "policy", records, [], expected_plan=changed, cross_job=True
+                        )])
+
+                # Literal Git mode, where present in authority (such as static
+                # target inventory), must survive the existing projection.
+                git_plan = copy.deepcopy(plan)
+                git_records = copy.deepcopy(records)
+                git_plan[0]["targets"][0]["gitMode"] = "100644"
+                git_records[0]["targets"][0]["gitMode"] = "100644"
+                self.assertEqual(ci._command_authority_violations(
+                    "policy", git_records, [], expected_plan=git_plan, cross_job=True
+                ), [])
+                git_plan[0]["targets"][0]["gitMode"] = "100755"
+                self.assertIn("COMMAND-AUTHORITY-MISMATCH", [v["id"] for v in ci._command_authority_violations(
+                    "policy", git_records, [], expected_plan=git_plan, cross_job=True
+                )])
+
+                # A coherent raw producer transcript cannot authorize a forged
+                # artifact plan, even if it has a self-consistent portable form.
+                for field, value in (("required", False), ("resolvedExecutableFileIdentity", {"inodeOrFileIndex": "forged"})):
+                    with self.subTest(artifact_command_authority=field):
+                        forged = copy.deepcopy(document)
+                        forged["commandAuthority"][0][field] = value
+                        self.assertEqual(forged["records"], records)
+                        self.rewrite_manifested_json(output, "command-results.json", forged)
+                        errors = ci.verify_evidence_file_set(
+                            output, repo_root=repo, expected_command_plan=fresh_plan
+                        )
+                        self.assertEqual(errors, ["command-results.json: command authority does not match the immutable profile plan"])
 
     def test_required_command_nonzero_and_invalid_exit_matrix_is_rejected(self) -> None:
         exit_values = [1, 2, 7, 124, 125, 255, -1, 1.5, None]
@@ -11412,6 +11739,49 @@ class CI5TargetExecutionLeaseTest(unittest.TestCase):
             lease_evidence["executedInputSha256"],
             lease_evidence["plannedSha256"],
         )
+        for identity_field in ("target", "executable", "both"):
+            with self.subTest(identity_field=identity_field):
+                verifier_plan = copy.deepcopy(self.plan())
+                if identity_field in {"target", "both"}:
+                    identity = verifier_plan["targets"][0]["fileIdentity"]
+                    identity["inodeOrFileIndex"] = str(int(identity["inodeOrFileIndex"]) + 1)
+                if identity_field in {"executable", "both"}:
+                    identity = verifier_plan["resolvedExecutableFileIdentity"]
+                    identity["inodeOrFileIndex"] = str(int(identity["inodeOrFileIndex"]) + 1)
+                self.assertEqual(
+                    ci._portable_command_plan_value([plan]),
+                    ci._portable_command_plan_value([verifier_plan]),
+                )
+                self.assertIn(
+                    "COMMAND-AUTHORITY-MISMATCH",
+                    [
+                        value["id"]
+                        for value in ci._command_authority_violations(
+                            "static", [record], [], expected_plan=[verifier_plan]
+                        )
+                    ],
+                )
+                self.assertEqual(
+                    ci._command_authority_violations(
+                        "static", [record], [], expected_plan=[verifier_plan],
+                        cross_job=True,
+                    ),
+                    [],
+                )
+        for mutation in ("target-identity", "lease-identity", "detected-mutation"):
+            with self.subTest(local_mutation=mutation):
+                forged = copy.deepcopy(record)
+                if mutation == "target-identity":
+                    identity = forged["targets"][0]["fileIdentity"]
+                    identity["inodeOrFileIndex"] = str(int(identity["inodeOrFileIndex"]) + 1)
+                elif mutation == "lease-identity":
+                    identity = forged["targetExecutionLease"]["plannedStableFileIdentity"]
+                    identity["inodeOrFileIndex"] = str(int(identity["inodeOrFileIndex"]) + 1)
+                else:
+                    forged["targetExecutionLease"]["mutationDetected"] = True
+                errors = []
+                ci._validate_command_record(forged, 0, errors)
+                self.assertTrue(errors)
 
     def test_execution_input_omission_and_forgery_are_rejected(self) -> None:
         plan = self.plan()
@@ -11422,6 +11792,7 @@ class CI5TargetExecutionLeaseTest(unittest.TestCase):
             ("actualExecutionInputSha256", "0" * 64),
             ("actualExecutionInputSha256", None),
             ("actualExecutionInputSize", None),
+            ("executionInputSha256", "0" * 64),
         ):
             with self.subTest(field=field, value=value):
                 forged = copy.deepcopy(record)
@@ -11429,28 +11800,53 @@ class CI5TargetExecutionLeaseTest(unittest.TestCase):
                 errors: list[str] = []
                 ci._validate_command_record(forged, 0, errors)
                 self.assertTrue(errors)
+                for cross_job in (False, True):
+                    with self.subTest(cross_job=cross_job):
+                        ids = [
+                            value["id"]
+                            for value in ci._command_authority_violations(
+                                "static", [forged], [], expected_plan=[plan],
+                                cross_job=cross_job,
+                            )
+                        ]
+                        self.assertIn(
+                            "COMMAND-AUTHORITY-MISMATCH"
+                            if field == "executionInputSha256"
+                            else "EXECUTION-INPUT-IDENTITY-MISMATCH",
+                            ids,
+                        )
 
     def test_logical_or_execution_argv_forgery_is_rejected_by_rebuilt_plan(self) -> None:
         plan = self.plan()
         capture, lease = self.execute(plan)
         assert lease is not None
         record = self.final_record(plan, capture, lease)
-        for mode in ("logical", "execution-live-path"):
+        for mode in ("logical", "execution-live-path", "actual-only"):
             with self.subTest(mode=mode):
                 forged = copy.deepcopy(record)
                 if mode == "logical":
                     forged["logicalArgv"][-1] = "js/unrelated.js"
                     forged["argv"] = list(forged["logicalArgv"])
-                else:
+                elif mode == "execution-live-path":
                     forged["executionArgv"] = [self.node, "--check", self.relative]
                     forged["actualExecutionArgv"] = list(forged["executionArgv"])
-                ids = [
-                    value["id"]
-                    for value in ci._command_authority_violations(
-                        "static", [forged], [], expected_plan=[plan]
-                    )
-                ]
-                self.assertIn("COMMAND-AUTHORITY-MISMATCH", ids)
+                else:
+                    forged["actualExecutionArgv"] = [self.node, "--check", self.relative]
+                for cross_job in (False, True):
+                    with self.subTest(cross_job=cross_job):
+                        ids = [
+                            value["id"]
+                            for value in ci._command_authority_violations(
+                                "static", [forged], [], expected_plan=[plan],
+                                cross_job=cross_job,
+                            )
+                        ]
+                        self.assertIn(
+                            "EXECUTION-ARGV-MISMATCH"
+                            if mode == "actual-only"
+                            else "COMMAND-AUTHORITY-MISMATCH",
+                            ids,
+                        )
 
     def test_post_evidence_target_change_is_caught_by_independent_plan_rebuild(self) -> None:
         plan = self.plan()
@@ -11459,13 +11855,16 @@ class CI5TargetExecutionLeaseTest(unittest.TestCase):
         record = self.final_record(plan, capture, lease)
         self.target.write_bytes(self.invalid_bytes)
         rebuilt = self.plan()
-        ids = [
-            value["id"]
-            for value in ci._command_authority_violations(
-                "static", [record], [], expected_plan=[rebuilt]
-            )
-        ]
-        self.assertIn("COMMAND-AUTHORITY-MISMATCH", ids)
+        for cross_job in (False, True):
+            with self.subTest(cross_job=cross_job):
+                ids = [
+                    value["id"]
+                    for value in ci._command_authority_violations(
+                        "static", [record], [], expected_plan=[rebuilt],
+                        cross_job=cross_job,
+                    )
+                ]
+                self.assertIn("COMMAND-AUTHORITY-MISMATCH", ids)
 
     def test_plan_records_logical_and_execution_argv_without_live_target_execution(self) -> None:
         plan = self.plan()

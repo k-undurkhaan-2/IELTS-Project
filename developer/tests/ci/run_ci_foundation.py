@@ -7154,9 +7154,28 @@ printf 'CI_TRUSTED_NPM_ENTRY=%s\\n' "$(realpath "$npm_path")" >> "$GITHUB_ENV"''
 LINUX_RUNTIME_CAPTURE_FRESH = LINUX_RUNTIME_CAPTURE + '''
 printf 'CI_FRESH_DEPENDENCY_INSTALL=1\\n' >> "$GITHUB_ENV"'''
 WINDOWS_RUNTIME_CAPTURE = '''$pythonPath = (Resolve-Path -LiteralPath (Join-Path $env:pythonLocation 'python.exe')).Path
-$nodePath = (Get-Command node.exe -CommandType Application).Source
-$npmEntry = (Resolve-Path -LiteralPath (Join-Path (Split-Path $nodePath -Parent) 'node_modules\\npm\\bin\\npm-cli.js')).Path
 if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) { throw 'trusted Python is unavailable' }
+$runtimeCapture = @'
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, 'developer/tests/ci')
+import run_ci_foundation as ci
+source = dict(os.environ)
+tools, errors = ci.resolve_trusted_tools({'node'}, source_environment=source)
+if errors:
+    raise SystemExit('trusted Node capture rejected by tool authority')
+source['CI_TRUSTED_NODE'] = tools['node']
+source['CI_TRUSTED_NPM_ENTRY'] = str(Path(tools['node']).parent / 'node_modules' / 'npm' / 'bin' / 'npm-cli.js')
+tools, errors = ci.resolve_trusted_tools({'node', 'npm'}, source_environment=source)
+if errors:
+    raise SystemExit('trusted Node/npm capture rejected by tool authority')
+print(json.dumps({'node': tools['node'], 'npmEntry': tools['npm']}))
+'@
+$runtimeJson = & $pythonPath -B -c $runtimeCapture
+if ($LASTEXITCODE -ne 0) { throw 'trusted Node/npm capture failed' }
+$runtimePaths = $runtimeJson | ConvertFrom-Json
+$nodePath = [string]$runtimePaths.node
+$npmEntry = [string]$runtimePaths.npmEntry
 if (-not (Test-Path -LiteralPath $nodePath -PathType Leaf)) { throw 'trusted Node is unavailable' }
 if (-not (Test-Path -LiteralPath $npmEntry -PathType Leaf)) { throw 'trusted npm entry is unavailable' }
 "CI_TRUSTED_PYTHON=$pythonPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -11418,6 +11437,7 @@ def _command_authority_violations(
     observations: Sequence[Mapping[str, Any]],
     *,
     expected_plan: Sequence[Mapping[str, Any]] | None = None,
+    cross_job: bool = False,
 ) -> list[dict[str, Any]]:
     if (
         len(command_records) == 1
@@ -11446,7 +11466,14 @@ def _command_authority_violations(
         for record in command_records
     ]
     violations: list[dict[str, Any]] = []
-    if actual != expected:
+    # Physical identities are exact within an execution domain. Across jobs,
+    # bind producer records to the independently rebuilt verifier plan through
+    # the same portable projection used for commandAuthority and plan digests.
+    authority_matches = (
+        _portable_command_plan_value(actual) == _portable_command_plan_value(expected)
+        if cross_job else actual == expected
+    )
+    if not authority_matches:
         violations.append(
             {
                 "id": "COMMAND-AUTHORITY-MISMATCH",
@@ -11466,7 +11493,12 @@ def _command_authority_violations(
         authority = expected_by_id.get(command_id)
         if authority is None:
             continue
-        if record.get("actualExecutionArgv") != authority.get("executionArgv"):
+        # Cross-job semantic equality above binds executionArgv to the verifier.
+        # Actual argv must still exactly match the producer's own local argv.
+        execution_argv = (
+            record.get("executionArgv") if cross_job else authority.get("executionArgv")
+        )
+        if record.get("actualExecutionArgv") != execution_argv:
             violations.append(
                 {"id": "EXECUTION-ARGV-MISMATCH", "commandId": command_id}
             )
@@ -11999,6 +12031,7 @@ def derive_authoritative_evidence(
     authorization_context_binding_digest_value: str | None = None,
     *,
     release_gate_required: bool,
+    cross_job: bool = False,
 ) -> dict[str, Any]:
     """Recompute all semantic evidence from commands and the frozen baseline map."""
 
@@ -12125,6 +12158,7 @@ def derive_authoritative_evidence(
             command_records,
             valid_observations,
             expected_plan=command_plan,
+            cross_job=cross_job,
         )
     )
     comparison["violations"].extend(derivation_violations)
@@ -18150,6 +18184,145 @@ def write_json(path: Path, value: Any, *, repo_root: Path = REPO_ROOT) -> None:
     _exclusive_write(path, _json_bytes(value), repo_root=repo_root)
 
 
+_DIAGNOSTIC_COMMAND_IDS = frozenset({
+    "baseline-schema", "node-version", "npm-version", "git-bash-version",
+    "git-candidate-paths", "git-tracked-paths", "git-diff-check",
+    "git-cached-diff-check", "git-stage-modes", "git-dir",
+    "tracked-private-resource-scan", "tracked-secret-scan",
+    "license-governance-consistency", "workflow-self-policy", "static-suite",
+    "python-source-syntax", "bundle-normalization", "learner-focused",
+    "backend-canonical", "standalone-packaging", "standalone-membership-audit",
+    "lockfile-integrity", "command-results-size-limit",
+})
+_DIAGNOSTIC_DERIVED_VIOLATION_TYPES = frozenset({
+    "MALFORMED-OBSERVATION", "UNKNOWN-NONPASS", "BASELINE-OCCURRENCE-LIMIT",
+    "REQUIRED-COMMAND-UNAVAILABLE", "RELEASE-ONLY-SKIP-IN-REQUIRED-GATE",
+    "BASELINE-SOURCE-COMMAND-SPLIT", "KNOWN-SCOPE-NOT-OBSERVED",
+    "RESOLVED-CANDIDATE-SOURCE-INVALID", "REQUIRED-POLICY-SCOPE-NOT-OBSERVED",
+    "COMMAND-RESULT-JSON-LIMIT", "COMMAND-AUTHORITY-MISMATCH",
+    "DUPLICATE-COMMAND-ID", "EXECUTION-ARGV-MISMATCH",
+    "EXECUTION-INPUT-MODE-MISMATCH", "EXECUTION-INPUT-IDENTITY-MISMATCH",
+    "REQUIRED-COMMAND-EXECUTION", "COMMAND-EXIT-OUTSIDE-AUTHORITY",
+    "REQUIRED-COMMAND-NONZERO", "NONZERO-COMMAND-WITHOUT-OBSERVATION",
+    "MALFORMED-COMMAND-OBSERVATION", "MALFORMED-PRODUCER-OBSERVATION-SET",
+    "PRODUCER-OBSERVATION-SET-DIGEST-MISMATCH", "MALFORMED-PRODUCER-OBSERVATION",
+    "DUPLICATE-PRODUCER-OBSERVATION", "PRODUCER-OBSERVATION-ORDINAL-GAP",
+    "UNAUTHORIZED-PRODUCER-OBSERVATION", "PRODUCER-OBSERVATION-COMPLETENESS",
+    "MALFORMED-COMPLETED-COMMAND-CLASS",
+    "RESOLVED-CANDIDATE-WITHOUT-SUCCESSFUL-SCOPE",
+})
+_DIAGNOSTIC_AUTHORITY_FIELDS = frozenset({
+    "commandId", "ordinal", "commandClass", "commandRole", "required",
+    "profile", "platform", "argv", "logicalArgv", "executionArgv",
+    "executionInputMode", "executionInputSize", "executionInputSha256", "cwd",
+    "toolRole", "resolvedExecutablePath", "resolvedExecutableSize",
+    "resolvedExecutableSha256", "resolvedExecutableFileIdentity", "executionLease",
+    "targets", "resultSemantics", "allowedExecutionExits",
+})
+_MAX_DIAGNOSTIC_AUTHORITY_FIELDS = 4
+
+
+def _first_authority_mismatch_diagnostic(
+    command_records: Sequence[Mapping[str, Any]],
+    expected_authority: Sequence[Mapping[str, Any]],
+    *,
+    cross_job: bool = False,
+) -> tuple[Any, list[str]]:
+    """Locate the first unequal authority projection; return no raw values."""
+
+    if expected_authority and not isinstance(expected_authority[0], Mapping):
+        return None, ["OTHER"]
+    authority_fields = set(expected_authority[0]) if expected_authority else set()
+    for index in range(max(len(command_records), len(expected_authority))):
+        expected = expected_authority[index] if index < len(expected_authority) else {}
+        observed = command_records[index] if index < len(command_records) else {}
+        if not isinstance(expected, Mapping) or not isinstance(observed, Mapping):
+            return None, ["OTHER"]
+        command_id = expected.get("commandId", observed.get("commandId"))
+        if index >= len(command_records) or index >= len(expected_authority):
+            return command_id, ["command-membership"]
+        actual = {key: observed.get(key) for key in authority_fields}
+        if cross_job:
+            actual = _portable_command_plan_value([actual])[0]
+            expected = _portable_command_plan_value([expected])[0]
+        if actual == expected:
+            continue
+        categories: set[str] = set()
+        for key in set(actual) | set(expected):
+            if key in actual and key in expected and actual[key] == expected[key]:
+                continue
+            category = key if key in _DIAGNOSTIC_AUTHORITY_FIELDS else "OTHER"
+            if key == "targets":
+                left, right = actual.get(key), expected.get(key)
+                if (
+                    isinstance(left, list) and isinstance(right, list)
+                    and len(left) == len(right)
+                    and all(isinstance(item, Mapping) for item in [*left, *right])
+                    and [dict(item, fileIdentity=None) for item in left]
+                    == [dict(item, fileIdentity=None) for item in right]
+                ):
+                    category = "targets.fileIdentity"
+            categories.add(category)
+        fields = sorted(categories)
+        if len(fields) > _MAX_DIAGNOSTIC_AUTHORITY_FIELDS:
+            fields = fields[:_MAX_DIAGNOSTIC_AUTHORITY_FIELDS - 1] + ["additional-fields"]
+        return command_id, fields or ["OTHER"]
+    return None, ["OTHER"]
+
+
+def missing_derived_violation_diagnostic(
+    violation: Mapping[str, Any],
+    *,
+    command_records: Sequence[Mapping[str, Any]] | None = None,
+    expected_authority: Sequence[Mapping[str, Any]] | None = None,
+    cross_job: bool = False,
+) -> str:
+    """Identify a rejected claim without rendering producer-controlled content.
+
+    The digest uses the exact canonical JSON used by the membership check.
+    Command IDs with candidate-controlled suffixes (including paths) are hashed;
+    only fixed, path-free vocabulary is rendered verbatim. This projection is
+    diagnostic only and is never used to compare or authorize evidence.
+    """
+
+    canonical = json.dumps(
+        violation, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    command_id = violation.get("commandId")
+    mismatch_fields: list[str] | None = None
+    if (
+        violation.get("id") == "COMMAND-AUTHORITY-MISMATCH"
+        and command_records is not None and expected_authority is not None
+    ):
+        command_id, mismatch_fields = _first_authority_mismatch_diagnostic(
+            command_records, expected_authority, cross_job=cross_job
+        )
+    if isinstance(command_id, str) and command_id not in _DIAGNOSTIC_COMMAND_IDS:
+        command_id = "sha256:" + hashlib.sha256(
+            command_id.encode("utf-8", errors="surrogatepass")
+        ).hexdigest()
+    elif not isinstance(command_id, str):
+        command_id = None
+    violation_type = violation.get("id")
+    if (
+        not isinstance(violation_type, str)
+        or violation_type not in _DIAGNOSTIC_DERIVED_VIOLATION_TYPES
+    ):
+        violation_type = "OTHER"
+    return json.dumps(
+        {
+            "commandId": command_id,
+            "violationType": violation_type,
+            "violationDigest": "sha256:" + hashlib.sha256(
+                canonical.encode("utf-8", errors="surrogatepass")
+            ).hexdigest(),
+            **({"authorityFields": mismatch_fields} if mismatch_fields is not None else {}),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def verify_evidence_file_set(
     output_dir: Path = OUTPUT_DIR,
     *,
@@ -20028,6 +20201,7 @@ def _validate_evidence_semantics(
                 expected_authority,
                 authorization_context_binding_digest_value,
                 release_gate_required=authoritative_release_gate_required,
+                cross_job=True,
             )
             derived_sets = {
                 "knownDebtsObserved": derived["observedDebts"],
@@ -20048,7 +20222,15 @@ def _validate_evidence_semantics(
             for violation in derived["violations"]:
                 key = json.dumps(violation, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
                 if key not in policy_keys:
-                    errors.append("summary.json: derived command/baseline violation is missing")
+                    errors.append(
+                        "summary.json: derived command/baseline violation is missing: "
+                        + missing_derived_violation_diagnostic(
+                            violation,
+                            command_records=command_records,
+                            expected_authority=expected_authority,
+                            cross_job=True,
+                        )
+                    )
 
     manifest = summary.get("evidenceManifest")
     if not isinstance(manifest, list) or len(manifest) != len(EVIDENCE_MANIFEST_FILE_NAMES):
