@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import stat
 from pathlib import Path
 import shutil
 import subprocess
@@ -287,6 +288,52 @@ class GitSemanticState(unittest.TestCase):
     def recover(self, before, after):
         return gs.check_recovery(before, after, self.record, "parser", 1)
 
+    def frozen_fixture(self):
+        definitions = self.root / "developer/tests/ci"
+        definitions.mkdir(parents=True)
+        for name in ["run_ci_foundation.py", "test_ci_foundation.py", "governance_state.py",
+                     "current-authority.v1.schema.json", "evidence-receipt.v1.schema.json"]:
+            (definitions / name).write_bytes(b"fixture\n")
+        self.git("add", "developer")
+        self.git("commit", "-qm", "Add synthetic validator inputs")
+        self.record = authority(self.git("rev-parse", "HEAD^{tree}"))
+        contract = Path(self.temp.name) / "environment.json"
+        contract.write_text('{"runtime":"test"}', encoding="utf-8")
+        return contract
+
+    def child_context(self, contract, flags=(), environment=None, adapter=False):
+        code = (
+            "import json, sys\nfrom pathlib import Path\nfrom unittest import mock\n"
+            f"sys.path.insert(0, {str(CI_DIR)!r})\nimport governance_state as gs\n"
+            "with mock.patch.object(gs, 'live_environment', return_value={'tools':'fixture'}):\n"
+        )
+        if adapter:
+            code += (
+                " import test_governance_state as tests\nimport test_ci_foundation as harness\n"
+                "fixture = tests.ReceiptAdapter()\nfixture.setUp()\n"
+                "try:\n"
+                " with mock.patch.object(harness.ci, 'REPO_ROOT', Path(sys.argv[1])), "
+                "mock.patch.object(harness.unittest, 'main', return_value=tests.SimpleNamespace(result=fixture.result)) as full, "
+                "mock.patch.object(gs, 'live_environment', return_value={'tools':'fixture'}):\n"
+                "  fixture.args[3] = sys.argv[2]\n"
+                "  harness.run_with_receipt(fixture.args)\n"
+                "  print(json.dumps({'full_calls':full.call_count, 'receipts':len(list(fixture.receipts.glob('*.json')))}))\n"
+                "finally:\n fixture.doCleanups()\n"
+            )
+        else:
+            code += (
+                " try:\n  result = gs.frozen_context(Path(sys.argv[1]), Path(sys.argv[2]), None)\n"
+                " except ValueError:\n  print('REJECTED'); sys.exit(3)\n"
+                " print(json.dumps(result, sort_keys=True))\n"
+            )
+        env = dict(os.environ)
+        for key in list(env):
+            if key.upper().startswith("PYTHON") or key.upper() == "GITHUB_ACTIONS":
+                del env[key]
+        env.update(environment or {})
+        return subprocess.run([sys.executable, "-B", *flags, "-c", code, str(self.root), str(contract)],
+                              env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+
     def test_snapshot_auto_selects_destination_and_unchanged_retry(self):
         before = self.capture()
         self.assertIn(REF, before["selected_refs"])
@@ -307,6 +354,104 @@ class GitSemanticState(unittest.TestCase):
         self.assert_decision(self.recover(before, self.capture()), "ESCALATE")
         self.git("add", "tracked.txt")
         self.assert_decision(self.recover(before, self.capture()), "ESCALATE", "INDEX_CHANGED")
+
+    @mock.patch.object(gs, "live_environment", return_value={"tools": "fixture"})
+    def test_filtered_clean_bytes_invalidate_reuse_and_recovery(self, _runtime):
+        contract = self.frozen_fixture()
+        cleaner = Path(self.temp.name) / "clean.py"
+        cleaner.write_text(f"import sys\nsys.stdin.buffer.read()\nsys.stdout.buffer.write({self.tracked.read_bytes()!r})\n", encoding="utf-8")
+        self.git("config", "filter.frozen.clean", f'"{Path(sys.executable).as_posix()}" "{cleaner.as_posix()}"')
+        (self.root / ".gitattributes").write_bytes(b"tracked.txt filter=frozen\n")
+        self.git("add", ".gitattributes", "tracked.txt")
+        self.git("commit", "-qm", "Add a clean filter")
+        self.record = authority(self.git("rev-parse", "HEAD^{tree}"))
+        before = gs.frozen_context(self.root, contract, None)
+        receipt = gs.make_receipt(before)
+        before_snapshot = self.capture()
+        self.tracked.write_bytes(b"changed application bytes\n")
+        self.git("add", "tracked.txt")  # Refresh the index while the clean filter preserves its blob.
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(self.git("rev-parse", "HEAD^{tree}"), before["candidate_tree"])
+        after = gs.frozen_context(self.root, contract, None)
+        self.assert_decision(gs.check_evidence(receipt, after), "REVALIDATE", "ENVIRONMENT_CHANGED")
+        self.assert_decision(self.recover(before_snapshot, self.capture()), "ESCALATE", "WORKTREE_CHANGED")
+
+    @mock.patch.object(gs, "live_environment", return_value={"tools": "fixture"})
+    def test_clean_line_endings_and_unreported_modes_bind_checkout_identity(self, _runtime):
+        self.tracked.write_bytes(b"frozen\n")
+        self.git("add", "tracked.txt")
+        contract = self.frozen_fixture()
+        self.git("config", "core.autocrlf", "true")
+        self.git("config", "core.filemode", "false")
+        before = gs.frozen_context(self.root, contract, None)
+        self.tracked.write_bytes(b"frozen\r\n")
+        self.git("add", "tracked.txt")
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        after = gs.frozen_context(self.root, contract, None)
+        self.assertNotEqual(before, after)
+        mode = stat.S_IMODE(self.tracked.stat().st_mode)
+        try:
+            self.tracked.chmod(mode & ~stat.S_IWUSR if os.name == "nt" else mode ^ stat.S_IXUSR)
+            self.assertEqual(self.git("status", "--porcelain"), "")
+            self.assertNotEqual(after, gs.frozen_context(self.root, contract, None))
+        finally:
+            self.tracked.chmod(mode)
+        self.assertEqual(after, gs.frozen_context(self.root, contract, None))
+        self.tracked.touch()
+        self.assertEqual(after, gs.frozen_context(self.root, contract, None))
+
+    def test_snapshot_preserves_stable_tracked_deletion(self):
+        before = self.capture()
+        self.tracked.unlink()
+        deleted = self.capture()
+        self.assert_decision(self.recover(before, deleted), "ESCALATE", "WORKTREE_CHANGED")
+        self.assert_decision(self.recover(deleted, self.capture()), "RETRY_ALLOWED")
+
+    @mock.patch.object(gs, "live_environment", return_value={"tools": "fixture"})
+    def test_tracked_link_or_reparse_parents_and_leaves_fail_closed(self, _runtime):
+        contract = self.frozen_fixture()
+        real_lstat = Path.lstat
+        for target in [self.tracked, self.root / "developer"]:
+            for mode, attributes in [(stat.S_IFLNK, 0), (stat.S_IFREG, 0x400)]:
+                def metadata(path):
+                    return (SimpleNamespace(st_mode=mode, st_file_attributes=attributes)
+                            if path == target else real_lstat(path))
+                with self.subTest(target=target, mode=mode, attributes=attributes), \
+                     mock.patch.object(Path, "lstat", metadata):
+                    with self.assertRaises(ValueError):
+                        gs.frozen_context(self.root, contract, None)
+                    with self.assertRaises(ValueError):
+                        self.capture()
+
+    def test_optimized_python_cannot_reuse_or_mint_receipts(self):
+        contract = self.frozen_fixture()
+        normal = self.child_context(contract)
+        self.assertEqual(normal.returncode, 0, normal.stderr)
+        for flags, environment in [(("-O",), {}), (("-OO",), {}),
+                                   ((), {"PYTHONOPTIMIZE": "1"}), ((), {"PYTHONOPTIMIZE": "2"})]:
+            with self.subTest(flags=flags, environment=environment):
+                result = self.child_context(contract, flags, environment)
+                self.assertEqual((result.returncode, result.stdout.strip()), (3, "REJECTED"), result.stderr)
+                adapter = self.child_context(contract, flags, environment, adapter=True)
+                self.assertEqual(adapter.returncode, 0, adapter.stderr)
+                self.assertEqual(json.loads(adapter.stdout.splitlines()[-1]), {"full_calls": 1, "receipts": 0})
+
+    def test_python_startup_flags_options_and_environment_change_context(self):
+        contract = self.frozen_fixture()
+        normal = self.child_context(contract)
+        self.assertEqual(normal.returncode, 0, normal.stderr)
+        first = json.loads(normal.stdout)
+        self.assertEqual(first, json.loads(self.child_context(contract).stdout))
+        for flags, environment in [(("-E",), {}), (("-I",), {}), (("-X", "dev"), {}),
+                                   (("--check-hash-based-pycs", "always"), {}),
+                                   (("--check-hash-based-pycs", "never"), {}),
+                                   (("-W", "error"), {}), ((), {"PYTHONWARNINGS": "error"}),
+                                   ((), {"PYTHONHASHSEED": "7"}), ((), {"PYTHONOPTIMIZE": "0"})]:
+            with self.subTest(flags=flags, environment=environment):
+                result = self.child_context(contract, flags, environment)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                current = json.loads(result.stdout)
+                self.assert_decision(gs.check_evidence(gs.make_receipt(first), current), "REVALIDATE", "ENVIRONMENT_CHANGED")
 
     def test_snapshot_detects_ref_change_without_head_change(self):
         before = self.capture()

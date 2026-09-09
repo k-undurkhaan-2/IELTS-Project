@@ -73,6 +73,16 @@ resolves the existing static-profile trusted tools afresh, hashes their resolved
 executables, and binds the existing relevant environment-key authority plus
 PATH and runtime options. Ignored dependency/fixture contents are represented
 by the caller-maintained contract/fixture digest, not inferred from Git.
+The environment digest also binds the raw SHA-256 content, path, Git mode,
+and filesystem permission mode of every tracked regular file. Git clean filters,
+line-ending conversion, and `core.filemode=false` cannot hide a changed checkout
+from the cache. Linked/reparse paths and unstable reads fail closed. Timestamps
+and file IDs are used only to detect changes during capture, not as semantic
+fingerprint inputs.
+Python startup identity includes named `sys.flags`, `-X` options, warning options,
+the effective `--check-hash-based-pycs` policy, and `PYTHON*` environment settings.
+Optimized Python (`-O`, `-OO`, or an effective
+`PYTHONOPTIMIZE`) cannot reuse or mint a receipt; the existing harness still runs.
 The validation definition includes the existing runner, complete harness, new
 module, and both schemas. The candidate tree binds all tracked source/tests.
 
@@ -86,7 +96,9 @@ receipt and invokes the full harness zero times. Test selectors
 and hosted reuse are rejected; the default harness command, workflow, trusted
 verifier replay, and security/release checks remain unchanged.
 
-Snapshots use read-oriented Git identities and include untracked file contents.
+Snapshots use read-oriented Git identities and include raw tracked file contents
+and modes as well as untracked file contents. Stable tracked deletions remain
+representable; linked/reparse tracked paths are unknown state.
 They always select the authority's destination ref in addition to explicitly
 selected refs. V1 fails closed on missing refs, submodules, unmerged/hidden index
 entries, unreadable state, or changes detected during capture. Recovery requires

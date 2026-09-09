@@ -6,6 +6,7 @@ current authority and evidence provenance and still enforces transition gates.
 """
 from __future__ import annotations
 
+import _imp
 import argparse
 import hashlib
 import json
@@ -180,6 +181,61 @@ def git(repo, *args):
                           env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
 
 
+def _tracked_metadata(repo, relative):
+    path = repo
+    for component in relative.parts:
+        path = path / component
+        metadata = path.lstat()
+        require(not stat.S_ISLNK(metadata.st_mode) and not getattr(metadata, "st_file_attributes", 0) & 0x400)
+    require(stat.S_ISREG(metadata.st_mode))
+    return path, metadata
+
+
+def _read_identity(metadata):
+    # Windows ctime is creation time; lstat and fstat can report it differently.
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_size,
+            metadata.st_mtime_ns, metadata.st_ctime_ns if os.name != "nt" else None,
+            getattr(metadata, "st_file_attributes", 0))
+
+
+def tracked_worktree_identity(repo, entries, *, allow_missing=False):
+    """Measure checked-out bytes without Git clean filters or mode normalization."""
+    repo = Path(repo).resolve()
+    identities = []
+    for entry in entries.split(b"\0"):
+        if not entry:
+            continue
+        header, name = entry.split(b"\t", 1)
+        mode, _oid, stage = header.split()
+        require(stage == b"0" and mode in {b"100644", b"100755"})
+        relative = Path(os.fsdecode(name))
+        require(relative.parts and not relative.is_absolute() and not relative.drive and ".." not in relative.parts)
+        try:
+            path, metadata = _tracked_metadata(repo, relative)
+        except FileNotFoundError:
+            require(allow_missing)
+            identities.append([name.hex(), mode.decode(), None, None])
+            continue
+        with path.open("rb") as source:
+            require(_read_identity(metadata) == _read_identity(os.fstat(source.fileno())))
+            content_digest = hashlib.file_digest(source, "sha256").hexdigest()
+            require(_read_identity(metadata) == _read_identity(os.fstat(source.fileno())))
+        require(_read_identity(metadata) == _read_identity(_tracked_metadata(repo, relative)[1]))
+        identities.append([name.hex(), mode.decode(), stat.S_IMODE(metadata.st_mode), content_digest])
+    return digest(sorted(identities))
+
+
+def python_startup_identity():
+    # An optimized process cannot reuse or mint evidence for the full assertion-bearing harness.
+    require(sys.flags.optimize == 0)
+    flags = {name: getattr(sys.flags, name) for name in dir(sys.flags)
+             if not name.startswith(("_", "n_")) and type(getattr(sys.flags, name)) in (bool, int)}
+    python_keys = {key.upper() for key in os.environ if key.upper().startswith("PYTHON")}
+    environment = ci._EnvironmentKeyAuthority(os.environ, windows=os.name == "nt").canonical_subset(python_keys)
+    return dict(flags=flags, xoptions=dict(sys._xoptions), warnoptions=list(sys.warnoptions),
+                check_hash_based_pycs=_imp.check_hash_based_pycs, environment=environment)
+
+
 def capture(repo, authority, selected_refs):
     validate_authority(authority)
     require(git(repo, "cat-file", "-t", authority["candidate_tree"]).strip() == b"tree")
@@ -204,9 +260,10 @@ def capture(repo, authority, selected_refs):
             untracked.append([name.hex(), stat.S_IMODE(metadata.st_mode), hashlib.sha256(path.read_bytes()).hexdigest()])
     diffs = [git(repo, "diff", "--binary", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", *args).hex()
              for args in ((), ("--cached",))]
+    tracked = tracked_worktree_identity(repo, entries, allow_missing=True)
     return dict(schema_version=1, decision="SNAPSHOT", reason="CAPTURED", head_oid=head,
                 candidate_tree=authority["candidate_tree"], index_identity=hashlib.sha256(entries).hexdigest(),
-                worktree_diff_identity=digest([diffs, sorted(untracked)]), selected_refs=refs,
+                worktree_diff_identity=digest([diffs, sorted(untracked), tracked]), selected_refs=refs,
                 destination=authority["destination"], authority_digest=digest(authority), authority_id=authority["authority_id"])
 
 
@@ -265,10 +322,12 @@ def frozen_context(repo, environment_contract_path, fixtures_digest):
     authority, task ID or historical report contributes to technical identity.
     """
     repo = Path(repo).resolve()
+    startup = python_startup_identity()
     runtime = live_environment(repo)
     require(all(entry.startswith(b"H ") for entry in git(repo, "ls-files", "-v", "-z").split(b"\0") if entry))
     require(not git(repo, "status", "--porcelain=v1", "--untracked-files=all").strip())
-    require(b"160000 " not in git(repo, "ls-files", "--stage", "-z"))
+    entries = git(repo, "ls-files", "--stage", "-z")
+    checkout = tracked_worktree_identity(repo, entries)
     contract = read_document(external_path(environment_contract_path, repo))
     require(type(contract) is dict and bool(contract))
     tree = git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
@@ -279,6 +338,7 @@ def frozen_context(repo, environment_contract_path, fixtures_digest):
     material = dict(candidate_tree=tree, assurance_profile="r12-full-validation-v1",
                     validation_definition_digest=digest(definitions),
                     environment_contract_digest=digest(dict(contract=contract, runtime=runtime, python=sys.version,
+                        python_startup=startup, tracked_worktree_digest=checkout,
                         platform=platform.platform(), executable_digest=hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest())),
                     fixtures_digest=fixtures_digest)
     validate_material(material)
