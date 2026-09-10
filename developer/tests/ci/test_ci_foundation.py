@@ -13017,6 +13017,64 @@ class CI6ReplayVerificationTest(unittest.TestCase):
         )
         return errors
 
+    def bundle_normalization_fixture(
+        self, stdout: str, *, platform_name: str = "ubuntu",
+    ) -> tuple[dict, dict, ci.CommandCapture]:
+        tools = _explicit_local_test_tool_map("node")
+        node = tools["node"]
+        size, digest, identity = ci._measured_file_authority(Path(node))
+        target_path = "developer/tests/js/bundleNormalization.test.js"
+        argv = [node, "--test", target_path]
+        spec = synthetic_command_spec(
+            "bundle-normalization", "bundle-parity", 0,
+            targets=[
+                ci._target_authority(ci.REPO_ROOT, relative)
+                for relative in (target_path, "developer/package.json", "README.md")
+            ],
+            execution_input_mode="PROTECTED-TARGET-BUNDLE",
+        )
+        spec.update({
+            "profile": "frontend", "platform": platform_name,
+            "toolRole": "node-test", "resultSemantics": "exit-zero-required",
+            "argv": list(argv), "logicalArgv": list(argv), "executionArgv": list(argv),
+            "resolvedExecutablePath": node, "resolvedExecutableSize": size,
+            "resolvedExecutableSha256": digest,
+            "resolvedExecutableFileIdentity": identity,
+        })
+        capture = ci.CommandCapture(
+            command_id=spec["commandId"], command_class=spec["commandClass"],
+            argv=argv, executed=True, exit_code=0, duration_seconds=0.125,
+            stdout=stdout, stderr="", required=True, cwd=".",
+            stdout_raw=stdout.encode("utf-8"), stderr_raw=b"",
+            stdout_bytes=len(stdout.encode("utf-8")), stderr_bytes=0,
+            include_preview=False,
+            containment=("windows-job-object" if platform_name == "windows"
+                         else "linux-subreaper-pidfd-proc-supervisor"),
+            process_tree_status="contained-clean", containment_disposition="no-descendants",
+            logical_argv=argv, execution_input_mode="PROTECTED-TARGET-BUNDLE",
+        )
+        record = synthetic_record_from_spec(spec)
+        record.update({
+            key: value for key, value in capture.evidence().items()
+            if key not in {"executionInputs", "executionInputBundleDigest", "protectedTargetBundle"}
+        })
+        record.pop("parsedFailureSummary", None)
+        record.update({
+            "completedCommandClass": "bundle-parity",
+            "dependencyBacked": True, "runtimeClosureDigest": "4" * 64,
+            "dependencyClosureDigest": "6" * 64, "nodePath": [],
+            "resolvedTestRunnerEntrypoint": node, "resolvedTestRunnerSha256": digest,
+            "closureWatcherActive": True, "closureMutationState": "clean",
+            "runtimeClosureGuard": {
+                "guardSchemaVersion": ci.RUNTIME_DEPENDENCY_GUARD_SCHEMA_VERSION,
+                "watcherBackend": ("_WindowsDirectoryMutationWatcher" if platform_name == "windows"
+                                   else "_InotifyMutationWatcher"), "active": False,
+                "activeDuringReplay": True, "mutationState": "clean",
+                "queueOverflow": False, "mutationEventCount": 0,
+            },
+        })
+        return spec, record, capture
+
     def repository_policy_golden_fixture(self) -> SimpleNamespace:
         # Fixed measured content makes the pre-change transcript golden portable
         # across developer machines while exercising the complete real policy plan.
@@ -13136,6 +13194,13 @@ class CI6ReplayVerificationTest(unittest.TestCase):
         )
         policy_transcript = ci.verification_replay_transcript(policy_runner)
         self.assertEqual(policy_transcript["commandCount"], 14)
+        for raw, canonical in zip(policy_runner.command_results, policy_transcript["records"]):
+            with self.subTest(policy_stdout_authority=raw["commandId"]):
+                self.assertIsNone(ci._validated_bundle_normalization_success_output_identity(
+                    raw, protected_bundle_valid=True,
+                ))
+                for field in ("stdoutSha256", "stdoutBytesObserved", "stderrSha256", "stderrBytesObserved"):
+                    self.assertEqual(canonical[field], raw[field])
         self.assertEqual(
             [record["commandId"] for record in policy_transcript["records"]],
             [
@@ -13405,6 +13470,226 @@ class CI6ReplayVerificationTest(unittest.TestCase):
                 claims, replay_runner, self.comparison
             )[1]
         )
+
+        # Node's successful reporter is telemetry for this one exit-zero command.
+        # Compare independent captures, preserving their complete local streams.
+        reporters = (
+            "TAP version 13\n# Subtest: normalize bundle\nok 1 - normalize bundle\n"
+            "  ---\n  duration_ms: 1.25\n  ...\n1..1\n# duration_ms 18.75\n",
+            "TAP version 13\n# Subtest: normalize bundle\nok 1 - normalize bundle\n"
+            "  ---\n  duration_ms: 9.875\n  ...\n1..1\n# duration_ms 240.5\n",
+            "\u2714 normalize bundle (4.5ms)\n\u2139 tests 1\n\u2139 pass 1\n\u2139 fail 0\n",
+        )
+        success_frame = ci._canonical_frame({
+            "digestDomain": "ieltmps-exit-zero-required-success-output-v1",
+            "commandId": "bundle-normalization",
+            "resultSemantics": "exit-zero-required", "exitCode": 0,
+        })
+        success_identity = {
+            "stdoutSha256": hashlib.sha256(success_frame).hexdigest(),
+            "stdoutBytesObserved": len(success_frame),
+        }
+        for platform_name in ("ubuntu", "windows"):
+            fixtures = [
+                self.bundle_normalization_fixture(stdout, platform_name=platform_name)
+                for stdout in reporters
+            ]
+            canonical_records = []
+            for reporter_index, (spec, record, capture) in enumerate(fixtures):
+                for representation in ("full", "compact"):
+                    with self.subTest(bundle_platform=platform_name, reporter=reporter_index,
+                                      representation=representation):
+                        local = (copy.deepcopy(record) if representation == "full"
+                                 else ci._compact_command_record_for_evidence(record))
+                        before = copy.deepcopy(local)
+                        errors = []
+                        self.assertFalse(ci._validate_command_record(
+                            local, 0, errors, expected_record=spec,
+                        ))
+                        self.assertEqual(errors, [])
+                        self.assertIsNotNone(ci._validated_portable_protected_input_bundle_digest(local))
+                        self.assertEqual(ci._validated_bundle_normalization_success_output_identity(
+                            local, protected_bundle_valid=True,
+                        ), success_identity)
+                        canonical = ci._canonical_transcript_record(local)
+                        self.assertEqual({key: canonical[key] for key in success_identity}, success_identity)
+                        self.assertEqual(canonical["stderrSha256"], local["stderrSha256"])
+                        self.assertEqual(canonical["stderrBytesObserved"], local["stderrBytesObserved"])
+                        canonical_records.append(canonical)
+                        self.assertEqual(local, before, "raw local reporter evidence must remain intact")
+                        self.assertEqual(capture.authoritative_stdout_bytes(), reporters[reporter_index].encode("utf-8"))
+                        self.assertEqual(record["stdoutSha256"], hashlib.sha256(
+                            capture.authoritative_stdout_bytes()
+                        ).hexdigest())
+                        self.assertEqual(record["stdoutBytesObserved"], len(capture.authoritative_stdout_bytes()))
+            self.assertTrue(all(record == canonical_records[0] for record in canonical_records))
+            self.assertEqual(len({record["stdoutSha256"] for _, record, _ in fixtures}), 3)
+
+        spec, valid, _capture = self.bundle_normalization_fixture(reporters[0])
+        _other_spec, different_reporter, _other_capture = self.bundle_normalization_fixture(reporters[1])
+        canonical = ci._canonical_transcript_record(valid)
+        bundle_runner = copy.deepcopy(self.runner)
+        bundle_runner.profile = "frontend"
+        bundle_runner.command_plan = [spec]
+        bundle_runner.command_results = [different_reporter]
+        bundle_runner.observations = []
+        bundle_runner.execution_binding = synthetic_execution_binding(
+            "frontend", ci.command_plan_digest([spec]), platform_name="linux",
+        )
+        bundle_runner.verifier_execution_binding = synthetic_external_context(
+            bundle_runner.execution_binding
+        ).verifier_binding()
+        bundle_runner.authorization_context_binding = None
+        bundle_runner.authorization_context_binding_digest = None
+        ci.finalize_evidence_transcript(bundle_runner)
+        independent = ci.verification_replay_transcript(bundle_runner)
+        bindings = {name: copy.deepcopy(independent[name]) for name in (
+            "executionBinding", "executionBindingDigest",
+            "authorizationContextBinding", "authorizationContextBindingDigest",
+        )}
+        bundle_claims = {
+            "summary.json": {**copy.deepcopy(bindings), "status": "PASS", "profile": "frontend",
+                             "knownDebtsObserved": [], "resolvedCandidates": [],
+                             "expectedOmissions": [], "releaseOnlySkips": []},
+            "command-results.json": {**bindings, "commandAuthority": [copy.deepcopy(spec)],
+                                     "records": [copy.deepcopy(valid)]},
+        }
+        coherently_rebind_claimed_transcript(bundle_claims)
+        self.assertEqual(ci.compare_verification_replay_claims(
+            bundle_claims, bundle_runner, empty_comparison(),
+        )[1], [])
+
+        # Coherently changed input authority stays distinguishable even when
+        # both executions independently satisfy the successful-output contract.
+        for mode in ("target-sha256", "target-membership", "target-order"):
+            with self.subTest(bundle_authority_change=mode):
+                changed_spec = copy.deepcopy(spec)
+                if mode == "target-sha256":
+                    changed_spec["targets"][0]["sha256"] = "f" * 64
+                elif mode == "target-membership":
+                    changed_spec["targets"].pop()
+                else:
+                    changed_spec["targets"] = list(reversed(changed_spec["targets"]))
+                changed = copy.deepcopy(valid)
+                rebuilt = synthetic_record_from_spec(changed_spec)
+                for key in ("targets", "executionInputs", "executionInputBundleDigest", "protectedTargetBundle"):
+                    changed[key] = rebuilt[key]
+                self.assertIsNotNone(ci._validated_portable_protected_input_bundle_digest(changed))
+                self.assertNotEqual(ci._canonical_transcript_record(changed), canonical)
+                self.assertEqual(ci._validated_bundle_normalization_success_output_identity(
+                    changed, protected_bundle_valid=True,
+                ), success_identity)
+                for cross_job in (False, True):
+                    self.assertIn("COMMAND-AUTHORITY-MISMATCH", {
+                        item["id"] for item in ci._command_authority_violations(
+                            "frontend", [changed], [], expected_plan=[spec], cross_job=cross_job,
+                        )
+                    })
+                changed_claims = copy.deepcopy(bundle_claims)
+                changed_claims["command-results.json"]["records"] = [changed]
+                coherently_rebind_claimed_transcript(changed_claims)
+                self.assertTrue(ci.compare_verification_replay_claims(
+                    changed_claims, bundle_runner, empty_comparison(),
+                )[1])
+
+        unexpected = ci.make_raw_observation(
+            "bundle-normalization", 0, 0, "process-output-v1", "unexpected",
+            "developer/tests/js/bundleNormalization.test.js",
+            {"executed": True, "exitCode": 0, "stdout": "unexpected", "stderr": "", "error": None},
+            ci.command_output_digest(valid),
+        )
+        mutations = (
+            (("exitCode",), 1), (("exitCode",), False),
+            (("timeoutStatus",), "TIMED-OUT"),
+            (("outputLimitStatus",), "OUTPUT-LIMIT-EXCEEDED"),
+            (("executed",), False), (("started",), False), (("setupFailure",), True),
+            (("allowedExecutionExits",), [0, 1]), (("allowedExecutionExits",), [False]),
+            (("processTreeStatus",), "cleanup-failed"),
+            (("processTreeStatus",), "setup-failed"),
+            (("containment",), "uncontained"),
+            (("descendantsSurviving",), 1), (("descendantsSurviving",), False),
+            (("processTreeError",), "process cleanup failed"),
+            (("error",), "RUNTIME-CLOSURE-ERROR: executable drift"),
+            (("limitReason",), "stdout exceeded limit"),
+            (("runtimeClosureDigest",), "invalid"),
+            (("dependencyClosureDigest",), "invalid"),
+            (("dependencyBacked",), False),
+            (("closureWatcherActive",), False), (("closureMutationState",), "dirty"),
+            (("runtimeClosureGuard", "active"), True),
+            (("runtimeClosureGuard", "watcherBackend"), "unavailable"),
+            (("runtimeClosureGuard", "guardSchemaVersion"), True),
+            (("runtimeClosureGuard", "activeDuringReplay"), False),
+            (("runtimeClosureGuard", "mutationState"), "dirty"),
+            (("runtimeClosureGuard", "queueOverflow"), True),
+            (("runtimeClosureGuard", "mutationEventCount"), 1),
+            (("producerObservations",), [unexpected]),
+            (("producerObservationSetDigest",), "sha256:" + "f" * 64),
+            (("targets", 0, "sha256"), "f" * 64),
+            (("executionInputs", 0, "actualSha256"), "f" * 64),
+            (("executionInputBundleDigest",), "f" * 64),
+            (("protectedTargetBundle", "cleanupState"), "failed"),
+            (("protectedTargetBundle", "mutationDetected"), True),
+            (("protectedTargetBundle", "executionInputBundleDigest"), "f" * 64),
+            (("resolvedExecutableSha256",), "invalid"),
+            (("resolvedExecutableFileIdentity", "reparsePoint"), True),
+            (("resolvedTestRunnerSha256",), "f" * 64),
+            (("resolvedTestRunnerEntrypoint",), str(ci.REPO_ROOT / "untrusted-node")),
+            (("actualExecutionArgv",), [valid["resolvedExecutablePath"], "--test", "other.test.js"]),
+            (("stdoutSha256",), "invalid"), (("stdoutBytesObserved",), -1),
+        )
+        for keys, value in mutations:
+            with self.subTest(bundle_invalid_local_evidence=keys, value=value):
+                unsafe = copy.deepcopy(valid)
+                selected = unsafe
+                for key in keys[:-1]:
+                    selected = selected[key]
+                selected[keys[-1]] = value
+                if keys == ("producerObservations",):
+                    unsafe["producerObservationSetDigest"] = ci.producer_observation_set_digest([unexpected])
+                bundle_valid = ci._validated_portable_protected_input_bundle_digest(unsafe) is not None
+                self.assertIsNone(ci._validated_bundle_normalization_success_output_identity(
+                    unsafe, protected_bundle_valid=bundle_valid,
+                ))
+                projected = ci._canonical_transcript_record(unsafe)
+                self.assertNotEqual(projected, canonical)
+                for field in ("stdoutSha256", "stdoutBytesObserved", "stderrSha256", "stderrBytesObserved"):
+                    self.assertEqual(projected[field], unsafe[field])
+        self.assertIsNone(ci._validated_bundle_normalization_success_output_identity(
+            valid, protected_bundle_valid=False,
+        ))
+
+        # Nearby command contracts never inherit this success exception.
+        for field, value in (
+            ("commandId", "learner-focused"), ("commandClass", "learner-focused"),
+            ("commandRole", "observation-producing"), ("resultSemantics", "synthetic-replay-fixture"),
+            ("toolRole", "node-syntax-check"), ("profile", "policy"), ("required", False),
+        ):
+            with self.subTest(bundle_scope_exclusion=field):
+                left, right = copy.deepcopy(valid), copy.deepcopy(different_reporter)
+                left[field] = right[field] = value
+                self.assertIsNone(ci._validated_bundle_normalization_success_output_identity(
+                    left, protected_bundle_valid=True,
+                ))
+                self.assertNotEqual(ci._canonical_transcript_record(left), ci._canonical_transcript_record(right))
+                self.assertEqual(ci._canonical_transcript_record(left)["stdoutSha256"], left["stdoutSha256"])
+
+        # Failure stdout, stderr, and structured diagnostics remain separate
+        # authority; successful stderr also remains exact cross-job authority.
+        for exit_code, field, value in (
+            (1, "stdoutSha256", different_reporter["stdoutSha256"]),
+            (1, "stderrSha256", hashlib.sha256(b"assertion failed").hexdigest()),
+            (1, "parsedFailureSummary", {"status": "fail", "diagnostic": "assertion failed"}),
+            (0, "stderrSha256", hashlib.sha256(b"unexpected stderr").hexdigest()),
+        ):
+            with self.subTest(bundle_diagnostic_exit=exit_code, changed_field=field):
+                left = copy.deepcopy(valid)
+                left["exitCode"] = exit_code
+                right = copy.deepcopy(left)
+                right[field] = value
+                self.assertNotEqual(ci._canonical_transcript_record(left), ci._canonical_transcript_record(right))
+                if exit_code:
+                    self.assertEqual(ci._canonical_transcript_record(right)["stdoutSha256"], right["stdoutSha256"])
+                    self.assertEqual(ci._canonical_transcript_record(right)["stderrSha256"], right["stderrSha256"])
 
     def test_pass_replay_unavailable_or_nonpass_fails_closed(self) -> None:
         runner = copy.deepcopy(self.runner)

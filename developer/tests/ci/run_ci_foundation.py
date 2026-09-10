@@ -11757,6 +11757,102 @@ def _validated_portable_target_stdin_input_authority(
     }
 
 
+def _validated_bundle_normalization_success_output_identity(
+    record: Mapping[str, Any],
+    *,
+    protected_bundle_valid: bool,
+) -> dict[str, Any] | None:
+    """Project this one exit-zero contract after its local evidence validates.
+
+    Node's successful test reporter is telemetry for bundle-normalization. Its
+    raw streams, hashes, and lengths remain local evidence; only the cross-job
+    transcript receives a freshly derived semantic stdout identity. Immutable
+    plan/trusted-tool comparison still binds the surrounding command authority.
+    """
+
+    if (
+        protected_bundle_valid is not True
+        or record.get("commandId") != "bundle-normalization"
+        or record.get("commandClass") != "bundle-parity"
+        or record.get("commandRole") != "required-execution"
+        or record.get("resultSemantics") != "exit-zero-required"
+        or record.get("toolRole") != "node-test"
+        or record.get("profile") not in ("frontend", "all")
+        or record.get("required") is not True
+        or not _command_execution_completed(record)
+        or type(record.get("exitCode")) is not int
+        or record.get("exitCode") != 0
+        or record.get("allowedExecutionExits") != [0]
+        or record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or (record.get("platform"), record.get("containment")) not in {
+            ("ubuntu", "linux-subreaper-pidfd-proc-supervisor"),
+            ("windows", "windows-job-object"),
+        }
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("descendantsSurviving") != 0
+        or any(record.get(key) is not None for key in (
+            "error", "processTreeError", "limitReason",
+        ))
+        or record.get("producerObservations") != []
+        or record.get("dependencyBacked") is not True
+    ):
+        return None
+    errors: list[str] = []
+    try:
+        hard_failure = _validate_command_record(dict(record), 0, errors, expected_record=record)
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+        return None
+    if errors or hard_failure:
+        return None
+    guard = record["runtimeClosureGuard"]
+    if (
+        guard.get("active") is not False
+        or type(guard.get("guardSchemaVersion")) is not int
+        or type(guard.get("mutationEventCount")) is not int
+        or (record["platform"], guard.get("watcherBackend")) not in {
+            ("ubuntu", "_InotifyMutationWatcher"),
+            ("windows", "_WindowsDirectoryMutationWatcher"),
+        }
+    ):
+        return None
+    executable = record.get("resolvedExecutablePath")
+    stable = record.get("resolvedExecutableFileIdentity")
+    target_path = "developer/tests/js/bundleNormalization.test.js"
+    argv = [executable, "--test", target_path]
+    if (
+        not isinstance(executable, str)
+        or not Path(executable).is_absolute()
+        or record["resolvedExecutableSize"] <= 0
+        or record.get("resolvedTestRunnerEntrypoint") != executable
+        or record.get("resolvedTestRunnerSha256") != record.get("resolvedExecutableSha256")
+        or any(record.get(key) != argv for key in (
+            "argv", "logicalArgv", "executionArgv", "actualExecutionArgv",
+        ))
+        or sum(target.get("path") == target_path for target in record["targets"]) != 1
+        or record.get("cwd") != "."
+        or not isinstance(stable, Mapping)
+        or stable.get("reparsePoint") is not False
+        or any(
+            not isinstance(stable.get(key), str)
+            or re.fullmatch(r"-?[0-9]+", stable[key]) is None
+            for key in (
+                "deviceOrVolume", "inodeOrFileIndex", "creationOrChangeTimeNs", "writeTimeNs",
+            )
+        )
+    ):
+        return None
+    canonical = _canonical_frame({
+        "digestDomain": "ieltmps-exit-zero-required-success-output-v1",
+        "commandId": record["commandId"],
+        "resultSemantics": record["resultSemantics"],
+        "exitCode": record["exitCode"],
+    })
+    return {
+        "stdoutSha256": hashlib.sha256(canonical).hexdigest(),
+        "stdoutBytesObserved": len(canonical),
+    }
+
+
 def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
     source = dict(record)
     portable_stdin_authority = _validated_portable_target_stdin_input_authority(record)
@@ -11782,6 +11878,11 @@ def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
         source.get("executionInputMode") == "PROTECTED-TARGET-BUNDLE"
         or source.get("protectedTargetBundle") is not None
     ) and portable_bundle_digest is None
+    bundle_output_identity = _validated_bundle_normalization_success_output_identity(
+        record, protected_bundle_valid=portable_bundle_digest is not None,
+    )
+    if bundle_output_identity is not None:
+        source.update(bundle_output_identity)
     if "validatedStaticMachineReport" in source:
         static_output_identity = (
             _validated_static_machine_output_identity(record)
