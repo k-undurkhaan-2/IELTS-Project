@@ -18695,6 +18695,186 @@ _DIAGNOSTIC_AUTHORITY_FIELDS = frozenset({
 _MAX_DIAGNOSTIC_AUTHORITY_FIELDS = 4
 
 
+# Diagnostic values mirror the immutable build_profile_command_plan registry.
+# Only classes registered by trusted runner code can appear in output.
+_REPLAY_DIAGNOSTIC_COMMAND_CLASSES = frozenset({
+    "baseline-policy", "runtime-identity", "repository-boundary",
+    "private-resource-exclusion", "secret-operational-artifact-exclusion",
+    "license-governance", "workflow-policy", "static-suite", "direct-syntax",
+    "bundle-parity", "learner-focused", "frontend-security", "backend-canonical",
+    "standalone-packaging", "standalone-membership", "lockfile-integrity",
+    "evidence-size-limit",
+})
+_REPLAY_DIAGNOSTIC_COMMAND_FAMILIES = frozenset({
+    "node-check", "frontend-security", "fixed-command", "other",
+})
+_REPLAY_DIAGNOSTIC_TARGET_INPUT_FIELDS = {
+    "targets": frozenset({"targets"}),
+    "executionInputs": frozenset({"executionInputs"}),
+    "actualExecutionInputIdentity": frozenset({
+        "actualExecutionInputMode", "actualExecutionInputSize", "actualExecutionInputSha256",
+    }),
+    "targetExecutionLease": frozenset({"targetExecutionLease"}),
+    "protectedTargetBundle": frozenset({"protectedTargetBundle"}),
+    "executionInputBundleDigest": frozenset({"executionInputBundleDigest"}),
+    "other": frozenset({
+        "executionLease", "invalidGitBashLeaseLocalEvidence", "executionInputMode",
+        "executionInputSize", "executionInputSha256", "fileScans",
+    }),
+}
+
+
+def _replay_producer_observation_context_categories(
+    producer: Mapping[str, Any], replay: Mapping[str, Any],
+    *, producer_source: Mapping[str, Any] | None = None,
+    replay_source: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Describe context differences without inferring unproved source causality.
+
+    Inputs are canonical command records. Optional original records only supply
+    digest preimages after their canonical context is checked against the input.
+    This diagnostic neither validates nor changes replay authority. A changed
+    self-checking digest is downstream only when it recomputes from both records;
+    changed raw facts remain ``other`` and are diagnosed separately in the
+    validated machine report. This list alone never proves source-only change.
+    """
+
+    profile_fields = frozenset({
+        "producerObservationUniverseDigest", "producerTranscriptDigest",
+        "profileCompletedCommandClassSetDigest", "authorizationContextBindingDigest",
+    })
+    failure_fields = frozenset({
+        "failureIdentity", "failureIdentityHash", "derivedFailureMembers",
+        "canonicalFailureMaterialVersion", "legacyBaselineComparisonDigest",
+        "signature",
+    })
+    # extract_failure_identity supplies these direct parsedFailureSummary keys;
+    # make_internal_result instead supplies status/diagnostic. Status already
+    # belongs to execution-status; diagnostic and unknown members remain other.
+    summary_failure_fields = failure_fields | frozenset({
+        "scope", "testIds", "fileLocations", "assertionNames", "expectedValues",
+        "observedValues", "errorClasses", "errorMessages", "structuredFailureSet",
+        "pathAuthority",
+    })
+    categories: set[str] = set()
+
+    def member_equal(left: Mapping[str, Any], right: Mapping[str, Any], key: str) -> bool:
+        try:
+            return _canonical_frame({"present": key in left, "value": left.get(key)}) == _canonical_frame({
+                "present": key in right, "value": right.get(key),
+            })
+        except (TypeError, ValueError, UnicodeError):
+            return False
+
+    def record_digest_valid(record: Mapping[str, Any]) -> bool:
+        try:
+            return record.get("producerRecordDigest") == _producer_record_digest({
+                key: value for key, value in record.items() if key != "producerRecordDigest"
+            })
+        except (TypeError, ValueError, UnicodeError):
+            return False
+
+    for key in profile_fields | failure_fields:
+        if not member_equal(producer, replay, key):
+            categories.add("profileContext" if key in profile_fields else "failureIdentity")
+    if not member_equal(producer, replay, "diagnosticPreview"):
+        categories.add("other")
+    if not member_equal(producer, replay, "parsedFailureSummary"):
+        left_summary = producer.get("parsedFailureSummary")
+        right_summary = replay.get("parsedFailureSummary")
+        if isinstance(left_summary, Mapping) and isinstance(right_summary, Mapping):
+            for key in left_summary.keys() | right_summary.keys():
+                if key == "status" or member_equal(left_summary, right_summary, key):
+                    continue
+                categories.add(
+                    "profileContext" if key in profile_fields
+                    else "failureIdentity" if key in summary_failure_fields
+                    else "other"
+                )
+        else:
+            categories.add("other")
+
+    observations_changed = not member_equal(producer, replay, "producerObservations")
+    set_digest_changed = not member_equal(producer, replay, "producerObservationSetDigest")
+    if set_digest_changed:
+        categories.add("producerObservationSetDigest")
+    digest_observations: list[list[Any] | None] = [None, None]
+    if observations_changed or set_digest_changed:
+        for side, (command, original) in enumerate((
+            (producer, producer_source), (replay, replay_source),
+        )):
+            digest_command: Mapping[str, Any] | None = command
+            if original is not None:
+                # Raw constructor normalization is component-boundary-aware;
+                # replay substitution can still alter embedded root literals.
+                # Check correspondence before using the original digest bytes.
+                context_keys = (
+                    "commandId", "commandClass", "ordinal",
+                    "producerObservations", "producerObservationSetDigest",
+                )
+                if isinstance(original, Mapping) and isinstance(original.get("producerObservations"), list):
+                    original_context = _canonical_replay_value({
+                        key: original[key] for key in context_keys if key in original
+                    })
+                    if all(member_equal(command, original_context, key) for key in context_keys):
+                        digest_command = original
+                    else:
+                        digest_command = None
+                else:
+                    digest_command = None
+            observations = (
+                digest_command.get("producerObservations")
+                if digest_command is not None else None
+            )
+            try:
+                valid_set_digest = (
+                    isinstance(observations, list)
+                    and len(observations) <= MAX_EVIDENCE_COLLECTION_ITEMS
+                    and digest_command is not None
+                    and digest_command.get("producerObservationSetDigest") == producer_observation_set_digest(observations)
+                )
+            except (TypeError, ValueError, UnicodeError):
+                valid_set_digest = False
+            if not valid_set_digest:
+                categories.add("other")
+            if isinstance(observations, list):
+                digest_observations[side] = observations
+    if observations_changed:
+        left_observations = producer.get("producerObservations")
+        right_observations = replay.get("producerObservations")
+        if (
+            not isinstance(left_observations, list)
+            or not isinstance(right_observations, list)
+            or max(len(left_observations), len(right_observations)) > MAX_EVIDENCE_COLLECTION_ITEMS
+        ):
+            categories.add("other")
+        else:
+            if len(left_observations) != len(right_observations):
+                categories.add("other")
+            for index, (left_raw, right_raw) in enumerate(zip(left_observations, right_observations)):
+                if not isinstance(left_raw, Mapping) or not isinstance(right_raw, Mapping):
+                    categories.add("other")
+                    continue
+                changed = {
+                    key for key in left_raw.keys() | right_raw.keys()
+                    if not member_equal(left_raw, right_raw, key)
+                }
+                if not changed:
+                    continue
+                if "sourceOutputDigest" in changed:
+                    categories.add("sourceOutputDigest")
+                if changed - {"sourceOutputDigest", "producerRecordDigest"}:
+                    categories.add("other")
+                for originals in digest_observations:
+                    if (
+                        originals is None or index >= len(originals)
+                        or not isinstance(originals[index], Mapping)
+                        or not record_digest_valid(originals[index])
+                    ):
+                        categories.add("other")
+    return sorted(categories)
+
+
 _REPLAY_DIAGNOSTIC_FIELD_CATEGORIES = {
     "executionDurationClass": frozenset({"executionDurationClass"}),
     "stdout-identity": frozenset({
@@ -18806,9 +18986,75 @@ def _replay_changed_field_categories(
     return sorted(categories & _REPLAY_DIAGNOSTIC_CATEGORIES)
 
 
+def _replay_diagnostic_command_identity(
+    record: Mapping[str, Any], *, source_record: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Describe the command with fixed labels and its exact UTF-8 identity digest."""
+
+    command_id = record.get("commandId")
+    digest_command_id = command_id
+    if isinstance(source_record, Mapping) and isinstance(source_record.get("commandId"), str):
+        try:
+            # Replay may replace root spellings embedded in dynamic IDs. Use
+            # exact original UTF-8 bytes only after full canonical correspondence;
+            # this must not let a different source record relabel the diagnostic.
+            if _json_bytes(_canonical_transcript_record(source_record)) == _json_bytes(dict(record)):
+                digest_command_id = source_record["commandId"]
+        except (KeyError, TypeError, ValueError, UnicodeError, OSError):
+            pass
+    command_class = record.get("commandClass")
+    ordinal = record.get("ordinal")
+    family = "other"
+    if isinstance(command_id, str):
+        if command_id in _DIAGNOSTIC_COMMAND_IDS:
+            family = "fixed-command"
+        elif re.fullmatch(r"node-check:[^\x00-\x1f\x7f]+\.(?i:js|mjs)", command_id):
+            family = "node-check"
+        elif re.fullmatch(r"frontend-security:[^/\\\x00-\x1f\x7f]+\.js", command_id):
+            family = "frontend-security"
+    return {
+        "commandId": command_id if isinstance(command_id, str) and command_id in _DIAGNOSTIC_COMMAND_IDS else "OTHER",
+        "ordinal": ordinal if type(ordinal) is int and 0 <= ordinal < MAX_PROFILE_COMMANDS else None,
+        "commandClass": (
+            command_class if isinstance(command_class, str)
+            and command_class in _REPLAY_DIAGNOSTIC_COMMAND_CLASSES else None
+        ),
+        "commandFamily": family,
+        "commandIdDigest": (
+            "sha256:" + hashlib.sha256(digest_command_id.encode("utf-8")).hexdigest()
+            if isinstance(digest_command_id, str) else None
+        ),
+    }
+
+
+def _replay_target_input_difference_subcategories(
+    producer: Mapping[str, Any], replay: Mapping[str, Any],
+) -> list[str]:
+    """Name only differing fixed target/input categories, without their contents."""
+
+    missing = object()
+    categories: set[str] = set()
+    for category, fields in _REPLAY_DIAGNOSTIC_TARGET_INPUT_FIELDS.items():
+        for field in fields:
+            if producer.get(field, missing) == replay.get(field, missing):
+                continue
+            if field == "protectedTargetBundle" and not (
+                set(_replay_changed_field_categories(
+                    {field: producer[field]} if field in producer else {},
+                    {field: replay[field]} if field in replay else {},
+                )) & {"target-input-authority", "protectedTargetBundle.executionInputBundleDigest"}
+            ):
+                continue
+            categories.add(category)
+    return sorted(categories)
+
+
 def first_replay_transcript_difference_diagnostic(
     producer_records: Sequence[Mapping[str, Any]],
     replay_records: Sequence[Mapping[str, Any]],
+    *,
+    producer_source_records: Sequence[Mapping[str, Any]] | None = None,
+    replay_source_records: Sequence[Mapping[str, Any]] | None = None,
 ) -> str | None:
     """Describe only the first unequal canonical record; never authorize replay."""
 
@@ -18817,19 +19063,164 @@ def first_replay_transcript_difference_diagnostic(
         replay = replay_records[index] if index < len(replay_records) else None
         if producer == replay:
             continue
-        command_id = (replay if replay is not None else producer).get("commandId")
-        if not isinstance(command_id, str) or command_id not in _DIAGNOSTIC_COMMAND_IDS:
-            command_id = "OTHER"
-        return json.dumps({
-            "commandId": command_id,
+        identity_record = replay if replay is not None else producer
+        identity_sources = replay_source_records if replay is not None else producer_source_records
+        identity_source = (
+            identity_sources[index]
+            if identity_sources is not None and index < len(identity_sources) else None
+        )
+        diagnostic = {
+            **_replay_diagnostic_command_identity(identity_record, source_record=identity_source),
             "changedFieldCategories": (
                 ["command-membership"] if producer is None or replay is None
                 else _replay_changed_field_categories(producer, replay)
             ),
             "producerRecordDigest": canonical_failure_digest(producer),
             "replayRecordDigest": canonical_failure_digest(replay),
-        }, sort_keys=True, separators=(",", ":"))
+        }
+        if producer is not None and replay is not None:
+            target_categories = _replay_target_input_difference_subcategories(producer, replay)
+            if target_categories:
+                diagnostic["targetInputSubcategories"] = target_categories
+            diagnostic.update(_replay_static_machine_difference_diagnostic(
+                producer, replay,
+                producer_source=(
+                    producer_source_records[index]
+                    if producer_source_records is not None and index < len(producer_source_records)
+                    else None
+                ),
+                replay_source=(
+                    replay_source_records[index]
+                    if replay_source_records is not None and index < len(replay_source_records)
+                    else None
+                ),
+            ))
+        return json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
     return None
+
+
+_STATIC_REPORT_DIAGNOSTIC_FIELDS = {
+    "documentKind": "document/schema",
+    "schemaVersion": "document/schema",
+    "invocationId": "invocation",
+    "executionStatus": "execution-status",
+    "internalRunnerFailures": "execution-status",
+    "commandPlanDigest": "command-plan",
+    "commandResults": "command-results",
+    "observations": "observations",
+    "nativeNonPassCount": "summary/counts",
+}
+_STATIC_OBSERVATION_DIAGNOSTIC_FIELDS = {
+    "name": "identity", "status": "status", "detail": "detail",
+}
+
+
+def _replay_static_changed_categories(
+    producer: Mapping[str, Any], replay: Mapping[str, Any],
+    field_categories: Mapping[str, str],
+) -> list[str]:
+    """Compare JSON types and presence exactly; emit only fixed categories."""
+
+    return sorted({
+        field_categories.get(key, "other")
+        for key in producer.keys() | replay.keys()
+        if (key not in producer or key not in replay
+            or canonical_failure_digest(producer[key]) != canonical_failure_digest(replay[key]))
+    })
+
+
+def _replay_validated_static_report(
+    canonical: Mapping[str, Any], source: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Recheck original local authority before inspecting its existing projection."""
+
+    if not isinstance(source, Mapping) or source.get("commandId") != "static-suite":
+        return None
+    try:
+        if _validated_portable_protected_input_bundle_digest(source) is None:
+            return None
+        identity = _validated_static_machine_output_identity(source)
+        if identity is None:
+            return None
+        report = identity["validatedStaticMachineReport"]
+        if (
+            canonical.get("invalidStaticMachineLocalEvidence") is True
+            or canonical.get("invalidProtectedBundleLocalEvidence") is True
+            or canonical_failure_digest(canonical.get("validatedStaticMachineReport"))
+            != canonical_failure_digest(report)
+        ):
+            return None
+    except (KeyError, TypeError, ValueError, UnicodeError):
+        return None
+    return report
+
+
+def _replay_static_machine_difference_diagnostic(
+    producer: Mapping[str, Any], replay: Mapping[str, Any],
+    *, producer_source: Mapping[str, Any] | None = None,
+    replay_source: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Describe validated static facts without changing comparison or authority."""
+
+    if producer.get("commandId") != "static-suite" or replay.get("commandId") != "static-suite":
+        return {}
+    diagnostic: dict[str, Any] = {}
+    context_categories = _replay_producer_observation_context_categories(
+        producer, replay, producer_source=producer_source, replay_source=replay_source,
+    )
+    if context_categories:
+        diagnostic["producerObservationContextCategories"] = context_categories
+    if not any("validatedStaticMachineReport" in record for record in (producer, replay)):
+        return diagnostic
+    left = _replay_validated_static_report(producer, producer_source)
+    right = _replay_validated_static_report(replay, replay_source)
+    if left is None or right is None:
+        diagnostic["staticMachineReport"] = {
+            "validationStatus": (
+                "both-unavailable" if left is None and right is None
+                else "producer-unavailable" if left is None else "replay-unavailable"
+            ),
+            "changedCategories": ["other"],
+        }
+        return diagnostic
+    report_diagnostic: dict[str, Any] = {
+        "validationStatus": "both-validated",
+        "changedCategories": _replay_static_changed_categories(
+            left, right, _STATIC_REPORT_DIAGNOSTIC_FIELDS,
+        ),
+    }
+    diagnostic["staticMachineReport"] = report_diagnostic
+    if "observations" not in report_diagnostic["changedCategories"]:
+        return diagnostic
+    left_observations, right_observations = left["observations"], right["observations"]
+    # Existing report validation bounds each list to 10,000 entries. Keep the
+    # diagnostic ordinal independently bounded and include only its first change.
+    for index in range(min(10_000, max(len(left_observations), len(right_observations)))):
+        left_item = left_observations[index] if index < len(left_observations) else None
+        right_item = right_observations[index] if index < len(right_observations) else None
+        if canonical_failure_digest(left_item) == canonical_failure_digest(right_item):
+            continue
+        report_diagnostic["firstObservationDifference"] = {
+            "ordinal": index,
+            "producerObservationIdentityDigest": (
+                "sha256:" + hashlib.sha256(left_item["name"].encode("utf-8")).hexdigest()
+                if left_item is not None else None
+            ),
+            "replayObservationIdentityDigest": (
+                "sha256:" + hashlib.sha256(right_item["name"].encode("utf-8")).hexdigest()
+                if right_item is not None else None
+            ),
+            "changedSemanticCategories": (
+                ["membership"] if left_item is None or right_item is None
+                else _replay_static_changed_categories(
+                    left_item, right_item, _STATIC_OBSERVATION_DIAGNOSTIC_FIELDS,
+                )
+            ),
+            "producerObservationDigest": canonical_failure_digest(left_item),
+            "replayObservationDigest": canonical_failure_digest(right_item),
+        }
+        break
+    return diagnostic
 
 
 def replay_failure_diagnostics(
@@ -21082,6 +21473,10 @@ def compare_verification_replay_claims(
             errors.append("verification replay command execution transcript mismatch")
             diagnostic = first_replay_transcript_difference_diagnostic(
                 comparable_evidence_records, replay_records,
+                producer_source_records=[
+                    record for record in evidence_records if isinstance(record, Mapping)
+                ],
+                replay_source_records=runner.command_results,
             )
             if diagnostic is not None:
                 errors.append("verification replay first command difference: " + diagnostic)

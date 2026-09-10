@@ -6399,6 +6399,177 @@ class StaticProducerProtocolTest(unittest.TestCase):
         self.assertEqual(len(document["commandResults"]), 1)
         self.assertFalse(report_exists)
 
+        def context_record(value=True) -> dict:
+            raw = ci.make_raw_observation(
+                "static-suite", 0, 0, "static-producer-v1", "private-fixture-name",
+                ci.STATIC_SUITE_RELATIVE_PATH,
+                {"name": "private-fixture-name", "status": "pass", "detail": {"actual": value}},
+                "sha256:" + "a" * 64,
+            )
+            return {
+                "commandId": "static-suite", "commandClass": "static-suite",
+                "producerObservations": [raw],
+                "producerObservationSetDigest": ci.producer_observation_set_digest([raw]),
+            }
+
+        def refresh_context(record: dict, *, record_digest: bool = True) -> None:
+            for raw in record["producerObservations"]:
+                if record_digest:
+                    raw["producerRecordDigest"] = ci._producer_record_digest({
+                        key: value for key, value in raw.items() if key != "producerRecordDigest"
+                    })
+            record["producerObservationSetDigest"] = ci.producer_observation_set_digest(
+                record["producerObservations"]
+            )
+
+        original = context_record()
+        cases = [("identical", copy.deepcopy(original), [])]
+        propagated = copy.deepcopy(original)
+        propagated["producerObservations"][0]["sourceOutputDigest"] = "sha256:" + "b" * 64
+        refresh_context(propagated)
+        propagation_categories = ["producerObservationSetDigest", "sourceOutputDigest"]
+        cases.append(("valid-source-propagation", propagated, propagation_categories))
+        mixed = copy.deepcopy(propagated)
+        mixed["producerObservations"][0]["rawStructuredFields"]["detail"]["actual"] = False
+        refresh_context(mixed)
+        cases.append(("source-and-test-facts", mixed, ["other", *propagation_categories]))
+        changed_fact = copy.deepcopy(original)
+        changed_fact["producerObservations"][0]["rawStructuredFields"]["detail"]["actual"] = 1
+        refresh_context(changed_fact)
+        cases.append(("boolean-is-not-integer", changed_fact, ["other", "producerObservationSetDigest"]))
+        null_fact = copy.deepcopy(original)
+        null_fact["producerObservations"][0]["rawStructuredFields"]["detail"]["missing"] = None
+        refresh_context(null_fact)
+        cases.append(("absent-is-not-null-raw-fact", null_fact, ["other", "producerObservationSetDigest"]))
+        for key, value, category in (
+            ("producerObservationUniverseDigest", "sha256:" + "c" * 64, "profileContext"),
+            ("producerTranscriptDigest", None, "profileContext"),
+            ("profileCompletedCommandClassSetDigest", "sha256:" + "d" * 64, "profileContext"),
+            ("authorizationContextBindingDigest", "sha256:" + "e" * 64, "profileContext"),
+            ("failureIdentity", {"errorMessages": ["PRIVATE-DIAGNOSTIC-SENTINEL"]}, "failureIdentity"),
+            ("failureIdentityHash", "sha256:" + "f" * 64, "failureIdentity"),
+            ("diagnosticPreview", None, "other"),
+        ):
+            changed = copy.deepcopy(original)
+            changed[key] = value
+            cases.append((key, changed, [category]))
+        stale_record = copy.deepcopy(propagated)
+        stale_record["producerObservations"][0]["producerRecordDigest"] = original["producerObservations"][0]["producerRecordDigest"]
+        refresh_context(stale_record, record_digest=False)
+        cases.append(("source-with-stale-record-digest", stale_record, ["other", *propagation_categories]))
+        forged_record = copy.deepcopy(original)
+        forged_record["producerObservations"][0]["producerRecordDigest"] = "sha256:" + "0" * 64
+        refresh_context(forged_record, record_digest=False)
+        cases.append(("isolated-forged-record-digest", forged_record, ["other", "producerObservationSetDigest"]))
+        stale_set = copy.deepcopy(propagated)
+        stale_set["producerObservationSetDigest"] = original["producerObservationSetDigest"]
+        cases.append(("source-with-stale-set-digest", stale_set, ["other", "sourceOutputDigest"]))
+        forged_set = copy.deepcopy(original)
+        forged_set["producerObservationSetDigest"] = "sha256:" + "0" * 64
+        cases.append(("isolated-forged-set-digest", forged_set, ["other", "producerObservationSetDigest"]))
+        absent_observations = copy.deepcopy(original)
+        del absent_observations["producerObservations"]
+        cases.append(("absent-observations", absent_observations, ["other"]))
+        shortened = copy.deepcopy(original)
+        shortened["producerObservations"] = []
+        refresh_context(shortened)
+        cases.append(("observation-count", shortened, ["other", "producerObservationSetDigest"]))
+        unrelated = copy.deepcopy(original)
+        unrelated["stdoutSha256"] = "f" * 64
+        cases.append(("stdout-is-diagnosed-separately", unrelated, []))
+        allowed_categories = {
+            "sourceOutputDigest", "producerObservationSetDigest", "profileContext", "failureIdentity", "other",
+        }
+        for label, changed, expected in cases:
+            with self.subTest(context_diagnostic=label):
+                before = ci._canonical_frame([original, changed])
+                actual = ci._replay_producer_observation_context_categories(original, changed)
+                self.assertEqual(actual, expected)
+                self.assertEqual(actual, sorted(set(actual)))
+                self.assertTrue(set(actual) <= allowed_categories)
+                self.assertEqual(ci._canonical_frame([original, changed]), before)
+                self.assertNotIn("PRIVATE-DIAGNOSTIC-SENTINEL", json.dumps(actual))
+                self.assertEqual(ci._replay_producer_observation_context_categories(changed, original), expected)
+
+        summary_original = {**copy.deepcopy(original), "parsedFailureSummary": {}}
+        for key, value, category in (
+            ("errorMessages", ["PRIVATE-DIAGNOSTIC-SENTINEL"], "failureIdentity"),
+            ("structuredFailureSet", "sha256:" + "f" * 64, "failureIdentity"),
+            ("producerTranscriptDigest", "sha256:" + "a" * 64, "profileContext"),
+            ("diagnostic", "PRIVATE-DIAGNOSTIC-SENTINEL", "other"),
+            ("unknown-private-path", "/private/unlogged/path", "other"),
+        ):
+            with self.subTest(parsed_summary_field=key):
+                changed = copy.deepcopy(summary_original)
+                changed["parsedFailureSummary"][key] = value
+                self.assertEqual(
+                    ci._replay_producer_observation_context_categories(summary_original, changed),
+                    [category],
+                )
+        typed_profile = {**copy.deepcopy(original), "producerTranscriptDigest": True}
+        changed_type = {**copy.deepcopy(original), "producerTranscriptDigest": 1}
+        self.assertEqual(
+            ci._replay_producer_observation_context_categories(typed_profile, changed_type),
+            ["profileContext"],
+        )
+        changed_status = copy.deepcopy(summary_original)
+        changed_status["parsedFailureSummary"]["status"] = "fail"
+        self.assertEqual(
+            ci._replay_producer_observation_context_categories(summary_original, changed_status),
+            [],
+        )
+        # Constructor normalization preserves embedded root literals, whereas
+        # canonical replay substitution replaces them. The original digest is
+        # valid only over the original bytes, even for identical semantic facts.
+        for root in (ci.REPO_ROOT.resolve(), Path(tempfile.gettempdir()).resolve()):
+            with self.subTest(original_digest_preimage_root=str(root)):
+                raw_producer = context_record("prefix" + str(root))
+                raw_replay = copy.deepcopy(raw_producer)
+                raw_replay["producerObservations"][0]["sourceOutputDigest"] = "sha256:" + "b" * 64
+                refresh_context(raw_replay)
+                canonical_producer = ci._canonical_replay_value(raw_producer)
+                canonical_replay = ci._canonical_replay_value(raw_replay)
+                self.assertNotEqual(
+                    raw_producer["producerObservations"][0]["rawStructuredFields"],
+                    canonical_producer["producerObservations"][0]["rawStructuredFields"],
+                )
+                self.assertEqual(
+                    ci._replay_producer_observation_context_categories(canonical_producer, canonical_replay),
+                    ["other", *propagation_categories],
+                )
+                self.assertEqual(
+                    ci._replay_producer_observation_context_categories(
+                        canonical_producer, canonical_replay,
+                        producer_source=raw_producer, replay_source=raw_replay,
+                    ),
+                    propagation_categories,
+                )
+                self.assertEqual(
+                    ci._replay_producer_observation_context_categories(
+                        canonical_producer, canonical_replay, producer_source=raw_producer,
+                    ),
+                    ["other", *propagation_categories],
+                )
+                for corruption in ("digest", "facts", "missing", "command"):
+                    forged_original = copy.deepcopy(raw_producer)
+                    if corruption == "digest":
+                        forged_original["producerObservations"][0]["producerRecordDigest"] = "sha256:" + "0" * 64
+                    elif corruption == "facts":
+                        forged_original["producerObservations"][0]["rawStructuredFields"]["detail"]["actual"] = "different-facts"
+                        refresh_context(forged_original)
+                    elif corruption == "missing":
+                        del forged_original["producerObservations"]
+                    else:
+                        forged_original["commandId"] = "other-command"
+                    with self.subTest(original_source_corruption=corruption):
+                        self.assertEqual(
+                            ci._replay_producer_observation_context_categories(
+                                canonical_producer, canonical_replay,
+                                producer_source=forged_original, replay_source=raw_replay,
+                            ),
+                            ["other", *propagation_categories],
+                        )
+
     def test_machine_invalid_uuid_is_nonzero_with_empty_stdout(self) -> None:
         exit_code, stdout, _stderr, report_exists = self.invoke(
             passed=True,
@@ -6739,6 +6910,154 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
         errors = []
         ci._validate_command_record(incomplete, 0, errors, expected_record=incomplete)
         self.assertTrue(any("static machine observations are incomplete" in error for error in errors), errors)
+
+        self.assert_bounded_static_replay_diagnostics(transcript_records)
+
+    def assert_bounded_static_replay_diagnostics(self, equivalent_records: list[dict]) -> None:
+        unsafe = "PRIVATE-CANARY:C:\\private\\secret.txt?credential=token"
+
+        def complete(record):
+            result = copy.deepcopy(record)
+            result["completedCommandClass"] = "static-suite"
+            return result
+
+        def from_report(report):
+            result, _ = self.exercise(contained_capture(), report=report)
+            return complete(next(record for record in result.command_results
+                                 if record["commandId"] == "static-suite"))
+
+        def diagnose(left, right):
+            before = ci.canonical_failure_digest([left, right])
+            canonical = [ci._canonical_transcript_record(record) for record in (left, right)]
+            result = ci._replay_static_machine_difference_diagnostic(
+                *canonical, producer_source=left, replay_source=right,
+            )
+            self.assertEqual(before, ci.canonical_failure_digest([left, right]))
+            rendered = json.dumps(result, sort_keys=True)
+            self.assertNotIn(unsafe, rendered)
+            self.assertLess(len(rendered), 1600)
+            return result
+
+        equivalent = diagnose(*equivalent_records)
+        self.assertEqual(equivalent, {"staticMachineReport": {
+            "validationStatus": "both-validated", "changedCategories": [],
+        }})
+        self.assertIsNone(ci.first_replay_transcript_difference_diagnostic(
+            [ci._canonical_transcript_record(equivalent_records[0])],
+            [ci._canonical_transcript_record(equivalent_records[1])],
+            producer_source_records=[equivalent_records[0]],
+            replay_source_records=[equivalent_records[1]],
+        ))
+
+        report = self.passing_report()
+        report["observations"].extend([
+            {"name": unsafe, "status": "pass", "detail": {"flag": True, unsafe: unsafe}},
+            {"name": "later-private-observation", "status": "pass", "detail": None},
+        ])
+        original = from_report(report)
+        changed_report = copy.deepcopy(report)
+        changed_report["observations"][1]["detail"]["flag"] = 1
+        changed_report["observations"][2]["detail"] = {unsafe: unsafe}
+        changed = from_report(changed_report)
+        diagnostic = diagnose(original, changed)
+        nested = diagnostic["staticMachineReport"]
+        self.assertEqual(nested["validationStatus"], "both-validated")
+        self.assertEqual(nested["changedCategories"], ["observations"])
+        first = nested["firstObservationDifference"]
+        self.assertEqual(first["ordinal"], 1)
+        self.assertEqual(first["changedSemanticCategories"], ["detail"])
+        semantic_observation = ci._validated_static_machine_output_identity(original)[
+            "validatedStaticMachineReport"
+        ]["observations"][1]
+        expected_name_digest = "sha256:" + hashlib.sha256(
+            semantic_observation["name"].encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(first["producerObservationIdentityDigest"], expected_name_digest)
+        self.assertEqual(first["replayObservationIdentityDigest"], expected_name_digest)
+        self.assertEqual(first["producerObservationDigest"],
+                         ci.canonical_failure_digest(semantic_observation))
+        self.assertNotEqual(first["producerObservationDigest"], first["replayObservationDigest"])
+        self.assertEqual(set(first), {
+            "ordinal", "producerObservationIdentityDigest", "replayObservationIdentityDigest",
+            "changedSemanticCategories", "producerObservationDigest", "replayObservationDigest",
+        })
+        rendered = ci.first_replay_transcript_difference_diagnostic(
+            [ci._canonical_transcript_record(original)],
+            [ci._canonical_transcript_record(changed)],
+            producer_source_records=[original], replay_source_records=[changed],
+        )
+        self.assertEqual(ci.strict_json_loads(rendered)["staticMachineReport"], nested)
+        self.assertNotIn(unsafe, rendered)
+        self.assertLess(len(rendered), 2300)
+
+        # Complete report facts remain distinct even when only one result changes.
+        for field, value, categories in (
+            ("name", "changed-fixture-identity", ["identity"]),
+            ("status", "fail", ["status"]),
+            ("detail", None, ["detail"]),
+        ):
+            with self.subTest(static_observation_field=field):
+                altered_report = copy.deepcopy(report)
+                altered_report["observations"][1][field] = value
+                if field == "status":
+                    altered_report["nativeNonPassCount"] = 1
+                altered = from_report(altered_report)
+                result = diagnose(original, altered)["staticMachineReport"]
+                self.assertEqual(result["validationStatus"], "both-validated")
+                self.assertEqual(result["firstObservationDifference"]["ordinal"], 1)
+                self.assertEqual(result["firstObservationDifference"]["changedSemanticCategories"], categories)
+                expected = ["observations", "summary/counts"] if field == "status" else ["observations"]
+                self.assertEqual(result["changedCategories"], expected)
+        shorter_report = copy.deepcopy(report)
+        shorter_report["observations"] = shorter_report["observations"][:1]
+        membership = diagnose(original, from_report(shorter_report))["staticMachineReport"]
+        self.assertEqual(membership["firstObservationDifference"]["changedSemanticCategories"], ["membership"])
+        self.assertIsNone(membership["firstObservationDifference"]["replayObservationIdentityDigest"])
+
+        # The classifier's vocabulary is finite, with typed JSON and presence
+        # comparisons; arbitrary keys and values never become diagnostic fields.
+        for key, expected in ci._STATIC_REPORT_DIAGNOSTIC_FIELDS.items():
+            self.assertEqual(ci._replay_static_changed_categories(
+                {key: True}, {key: 1}, ci._STATIC_REPORT_DIAGNOSTIC_FIELDS,
+            ), [expected])
+        self.assertEqual(ci._replay_static_changed_categories(
+            {}, {unsafe: None}, ci._STATIC_REPORT_DIAGNOSTIC_FIELDS,
+        ), ["other"])
+        self.assertEqual(ci._replay_static_changed_categories(
+            {}, {"detail": None}, ci._STATIC_OBSERVATION_DIAGNOSTIC_FIELDS,
+        ), ["detail"])
+
+        mutations = (
+            lambda item: item["validatedStaticMachineReport"].update({"schemaVersion": True}),
+            lambda item: item["validatedStaticMachineReport"].update({unsafe: unsafe}),
+            lambda item: item["validatedStaticMachineReport"].update({"invocationId": unsafe}),
+            lambda item: item["validatedStaticMachineReport"].update({"commandPlanDigest": "f" * 64}),
+            lambda item: item["validatedStaticMachineReport"].update({"commandResults": []}),
+            lambda item: item["validatedStaticMachineReport"].update({"observations": None}),
+            lambda item: item.update({"producerObservations": [], "producerObservationSetDigest": ci.producer_observation_set_digest([])}),
+            lambda item: item["protectedTargetBundle"].update({"cleanupState": "failed"}),
+            lambda item: item.update({"descendantsSurviving": 1}),
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(unvalidated_static_diagnostic=index):
+                invalid = copy.deepcopy(original)
+                mutate(invalid)
+                result = diagnose(original, invalid)["staticMachineReport"]
+                self.assertEqual(result, {
+                    "validationStatus": "replay-unavailable", "changedCategories": ["other"],
+                })
+        canonical = ci._canonical_transcript_record(original)
+        no_sources = ci._replay_static_machine_difference_diagnostic(canonical, copy.deepcopy(canonical))
+        self.assertEqual(no_sources["staticMachineReport"], {
+            "validationStatus": "both-unavailable", "changedCategories": ["other"],
+        })
+        forged = copy.deepcopy(canonical)
+        forged["validatedStaticMachineReport"]["observations"][1]["detail"] = unsafe
+        mismatched_source = ci._replay_static_machine_difference_diagnostic(
+            canonical, forged, producer_source=original, replay_source=original,
+        )
+        self.assertEqual(mismatched_source["staticMachineReport"]["validationStatus"], "replay-unavailable")
+        self.assertNotIn("firstObservationDifference", mismatched_source["staticMachineReport"])
 
     def test_exit_zero_with_failing_json_records_semantic_failure(self) -> None:
         runner, _ = self.exercise(contained_capture(), report=self.failing_report())
@@ -12286,6 +12605,7 @@ class CI6ReplayVerificationTest(unittest.TestCase):
     def repository_policy_golden_fixture(self) -> SimpleNamespace:
         # Fixed measured content makes the pre-change transcript golden portable
         # across developer machines while exercising the complete real policy plan.
+        physical_root = ci.REPO_ROOT.resolve() / ".ci-policy-golden"
         stable_identity = {
             "deviceOrVolume": "11",
             "inodeOrFileIndex": "22",
@@ -12298,7 +12618,7 @@ class CI6ReplayVerificationTest(unittest.TestCase):
             content = relative.encode("utf-8")
             return {
                 "path": relative,
-                "canonicalSourcePath": "D:/policy-golden/" + relative,
+                "canonicalSourcePath": str(physical_root.joinpath(*relative.split("/"))),
                 "size": len(content),
                 "sha256": hashlib.sha256(content).hexdigest(),
                 "fileIdentity": copy.deepcopy(stable_identity),
@@ -12316,7 +12636,10 @@ class CI6ReplayVerificationTest(unittest.TestCase):
         ):
             plan = ci.build_profile_command_plan(
                 "policy",
-                tools={role: "/policy-golden-tools/" + role for role in ("python", "node", "git")},
+                tools={
+                    role: str(physical_root / "tools" / role)
+                    for role in ("python", "node", "git")
+                },
                 candidate_paths=["README.md", "backend/src/policy-fixture.js"],
                 baseline={},
                 current_platform="linux",
@@ -12326,10 +12649,10 @@ class CI6ReplayVerificationTest(unittest.TestCase):
         for record in records:
             if record["toolRole"] != "python-in-process":
                 record.update({
-                    "executable": record["argv"][0].rsplit("/", 1)[-1],
+                    "executable": Path(record["argv"][0]).name,
                     "containment": "linux-subreaper-pidfd-proc-supervisor",
                     "processTreeStatus": "contained-clean",
-                    "containmentDisposition": "quiescent",
+                    "containmentDisposition": "natural-exit-reaped",
                     "descendantsObserved": 1,
                     "descendantsReaped": 1,
                 })
@@ -12379,6 +12702,16 @@ class CI6ReplayVerificationTest(unittest.TestCase):
         self.assertEqual(ci.replay_failure_diagnostics([], []), [])
 
         policy_runner = self.repository_policy_golden_fixture()
+        for ordinal, record in enumerate(policy_runner.command_results):
+            with self.subTest(policy_command=record["commandId"]):
+                errors = []
+                ci._validate_command_record(
+                    record, ordinal, errors,
+                    expected_record=policy_runner.command_plan[ordinal],
+                )
+                self.assertEqual(errors, [])
+                for target in record["targets"]:
+                    self.assertTrue(Path(target["canonicalSourcePath"]).is_absolute())
         self.assertEqual(
             ci._command_authority_violations(
                 "policy", policy_runner.command_results, [],
@@ -12399,12 +12732,12 @@ class CI6ReplayVerificationTest(unittest.TestCase):
                 "lockfile-integrity",
             ],
         )
-        # Captured from the accepted 50f25d28 canonicalizer before the Windows
-        # lease/static-suite changes. This pins every canonical policy field,
-        # including successful containment telemetry and protected input bundles.
+        # Captured by applying the accepted 50f25d28 canonicalizer to this valid
+        # host-path fixture. This pins every canonical policy field, including
+        # successful containment telemetry and protected input bundles.
         self.assertEqual(
             hashlib.sha256(ci._canonical_frame(policy_transcript)).hexdigest(),
-            "3f54d91723db335d43ed7e028a47d40f3f8493f9a19f0bebede702bd7279ee95",
+            "18911651ce62fefbb30d257d574f3744968580a9a42635b5dc69ffe857f94475",
         )
         bindings = {
             name: copy.deepcopy(policy_transcript[name])
@@ -12910,10 +13243,26 @@ class CI6ReplayVerificationTest(unittest.TestCase):
                 right[keys[-1]] = {"stdout": unsafe, "environment": {unsafe: [unsafe]}}
                 rendered = ci.first_replay_transcript_difference_diagnostic([producer], [replay])
                 diagnostic = ci.strict_json_loads(rendered)
+                expected_subcategories = {
+                    "executionInputBundleDigest": ["executionInputBundleDigest"],
+                    "targets": ["targets"],
+                    "executionInputs": ["executionInputs"],
+                    "executionLease": ["other"],
+                }.get(keys[0], [])
+                if keys == ("protectedTargetBundle", "executionInputBundleDigest"):
+                    expected_subcategories = ["protectedTargetBundle"]
                 self.assertEqual(set(diagnostic), {
-                    "commandId", "changedFieldCategories",
-                    "producerRecordDigest", "replayRecordDigest",
+                    "commandId", "ordinal", "commandClass", "commandFamily", "commandIdDigest",
+                    "changedFieldCategories", "producerRecordDigest", "replayRecordDigest",
+                    *(["targetInputSubcategories"] if expected_subcategories else []),
                 })
+                self.assertEqual(diagnostic.get("targetInputSubcategories", []), expected_subcategories)
+                self.assertIsNone(diagnostic["ordinal"])
+                self.assertIsNone(diagnostic["commandClass"])
+                self.assertEqual(diagnostic["commandFamily"], "fixed-command")
+                self.assertEqual(diagnostic["commandIdDigest"], "sha256:" + hashlib.sha256(
+                    b"baseline-schema"
+                ).hexdigest())
                 self.assertEqual(diagnostic["commandId"], "baseline-schema")
                 self.assertEqual(diagnostic["changedFieldCategories"], [category])
                 self.assertTrue(set(diagnostic["changedFieldCategories"]).issubset(categories))
@@ -12923,7 +13272,7 @@ class CI6ReplayVerificationTest(unittest.TestCase):
                                  ci.canonical_failure_digest(replay))
                 self.assertNotEqual(diagnostic["producerRecordDigest"], diagnostic["replayRecordDigest"])
                 self.assertNotIn(unsafe, rendered)
-                self.assertLess(len(rendered), 600)
+                self.assertLess(len(rendered), 900)
                 self.assertEqual(rendered, ci.first_replay_transcript_difference_diagnostic(
                     [dict(reversed(list(producer.items())))], [copy.deepcopy(replay)]
                 ))
@@ -12940,7 +13289,7 @@ class CI6ReplayVerificationTest(unittest.TestCase):
         )
         combined_diagnostic = ci.strict_json_loads(rendered)
         self.assertEqual(combined_diagnostic["changedFieldCategories"], sorted(categories))
-        self.assertLess(len(rendered), 900)
+        self.assertLess(len(rendered), 1600)
         self.assertNotIn(unsafe, rendered)
 
         producer = {"commandId": unsafe, "executionDurationClass": "bounded"}
@@ -12961,6 +13310,154 @@ class CI6ReplayVerificationTest(unittest.TestCase):
                 [copy.deepcopy(equal_prefix), replay, second_replay],
             )
         ))
+
+        # Command classes are only the fixed literals in the immutable plan registry.
+        registered_classes = {
+            call.args[1].value
+            for call in ast.walk(ast.parse(inspect.getsource(ci.build_profile_command_plan)))
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+            and call.func.id in {"add", "add_internal"} and len(call.args) > 1
+            and isinstance(call.args[1], ast.Constant) and isinstance(call.args[1].value, str)
+        }
+        self.assertEqual(ci._REPLAY_DIAGNOSTIC_COMMAND_CLASSES,
+                         registered_classes | {"evidence-size-limit"})
+        self.assertEqual(ci._REPLAY_DIAGNOSTIC_COMMAND_FAMILIES,
+                         {"node-check", "frontend-security", "fixed-command", "other"})
+        for command_id, command_class, ordinal, family, emitted_id in (
+            ("node-check:private/secret.js", "direct-syntax", 711, "node-check", "OTHER"),
+            ("node-check:private/secret.mjs", "direct-syntax", 712, "node-check", "OTHER"),
+            ("node-check:private/secret.JS", "direct-syntax", 712, "node-check", "OTHER"),
+            ("frontend-security:secret.test.js", "frontend-security", 713, "frontend-security", "OTHER"),
+            ("baseline-schema", "baseline-policy", 0, "fixed-command", "baseline-schema"),
+            (unsafe, unsafe, -1, "other", "OTHER"),
+            ("node-check:", "direct-syntax", True, "other", "OTHER"),
+            ("frontend-security:private/secret.js", "frontend-security", ci.MAX_PROFILE_COMMANDS, "other", "OTHER"),
+            ({"private": unsafe}, {"private": unsafe}, unsafe, "other", "OTHER"),
+        ):
+            with self.subTest(command_family=family, command_id_type=type(command_id).__name__):
+                dynamic_producer = {
+                    "commandId": command_id, "commandClass": command_class,
+                    "ordinal": ordinal, "executionInputBundleDigest": "a" * 64,
+                }
+                dynamic_replay = {**dynamic_producer, "executionInputBundleDigest": "b" * 64}
+                before = copy.deepcopy((dynamic_producer, dynamic_replay))
+                rendered = ci.first_replay_transcript_difference_diagnostic(
+                    [dynamic_producer], [dynamic_replay],
+                )
+                dynamic = ci.strict_json_loads(rendered)
+                self.assertEqual(dynamic["commandId"], emitted_id)
+                self.assertEqual(dynamic["commandFamily"], family)
+                self.assertEqual(dynamic["ordinal"],
+                                 ordinal if type(ordinal) is int and 0 <= ordinal < ci.MAX_PROFILE_COMMANDS else None)
+                self.assertEqual(dynamic["commandClass"],
+                                 command_class if isinstance(command_class, str)
+                                 and command_class in registered_classes else None)
+                self.assertEqual(dynamic["commandIdDigest"],
+                                 "sha256:" + hashlib.sha256(command_id.encode("utf-8")).hexdigest()
+                                 if isinstance(command_id, str) else None)
+                self.assertEqual(dynamic["targetInputSubcategories"], ["executionInputBundleDigest"])
+                self.assertNotIn("private", rendered)
+                self.assertNotIn("secret", rendered)
+                self.assertNotIn("credential", rendered)
+                self.assertLess(len(rendered), 900)
+                self.assertEqual((dynamic_producer, dynamic_replay), before)
+
+        exact_id_digests = []
+        for command_id in ("node-check:private/caf\u00e9.js", "node-check:private/cafe\u0301.js"):
+            record = {"commandId": command_id, "commandClass": "direct-syntax", "ordinal": 7}
+            diagnostic = ci.strict_json_loads(ci.first_replay_transcript_difference_diagnostic(
+                [record], [{**record, "actualExecutionInputSize": 1}],
+            ))
+            exact_id_digests.append(diagnostic["commandIdDigest"])
+        self.assertNotEqual(*exact_id_digests)
+
+        # Diagnostics hash the exact original ID even if replay replaced an
+        # embedded local root; fixed identity labels still use compared authority.
+        for raw_root in (ci.REPO_ROOT, Path(tempfile.gettempdir())):
+            with self.subTest(exact_source_command_id_root=str(raw_root)):
+                raw_id = "node-check:" + str(raw_root / "PRIVATE-ROOT-CANARY" / "secret.js")
+                raw_producer = {
+                    "commandId": raw_id, "commandClass": "direct-syntax", "ordinal": 31,
+                    "stdoutSha256": "a" * 64,
+                }
+                raw_replay = {**raw_producer, "stdoutSha256": "b" * 64}
+                canonical_producer = ci._canonical_transcript_record(raw_producer)
+                canonical_replay = ci._canonical_transcript_record(raw_replay)
+                self.assertNotEqual(canonical_replay["commandId"], raw_id)
+                raw_digest = "sha256:" + hashlib.sha256(raw_id.encode("utf-8")).hexdigest()
+                projected_digest = "sha256:" + hashlib.sha256(
+                    canonical_replay["commandId"].encode("utf-8")
+                ).hexdigest()
+                self.assertNotEqual(raw_digest, projected_digest)
+                before = copy.deepcopy((raw_producer, raw_replay))
+                rendered = ci.first_replay_transcript_difference_diagnostic(
+                    [canonical_producer], [canonical_replay],
+                    producer_source_records=[raw_producer], replay_source_records=[raw_replay],
+                )
+                diagnostic = ci.strict_json_loads(rendered)
+                self.assertEqual(diagnostic["commandIdDigest"], raw_digest)
+                self.assertEqual(diagnostic["commandId"], "OTHER")
+                self.assertEqual(diagnostic["commandFamily"], "node-check")
+                self.assertEqual(diagnostic["commandClass"], "direct-syntax")
+                self.assertEqual(diagnostic["ordinal"], 31)
+                self.assertNotIn("PRIVATE-ROOT-CANARY", rendered)
+                self.assertNotIn("secret.js", rendered)
+                self.assertNotIn(str(raw_root), rendered)
+                self.assertEqual((raw_producer, raw_replay), before)
+                for source_records in (
+                    None, [], [{**raw_replay, "stdoutSha256": "c" * 64}],
+                    [{**raw_replay, "commandId": "node-check:UNRELATED.js"}],
+                    [{**raw_replay, "ordinal": "31"}],
+                ):
+                    fallback = ci.strict_json_loads(ci.first_replay_transcript_difference_diagnostic(
+                        [canonical_producer], [canonical_replay],
+                        producer_source_records=[raw_producer], replay_source_records=source_records,
+                    ))
+                    self.assertEqual(fallback["commandIdDigest"], projected_digest)
+                    self.assertEqual({key: value for key, value in fallback.items() if key != "commandIdDigest"},
+                                     {key: value for key, value in diagnostic.items() if key != "commandIdDigest"})
+                producer_only = ci.strict_json_loads(ci.first_replay_transcript_difference_diagnostic(
+                    [canonical_producer], [], producer_source_records=[raw_producer],
+                ))
+                self.assertEqual(producer_only["commandIdDigest"], raw_digest)
+                self.assertEqual(producer_only["changedFieldCategories"], ["command-membership"])
+
+        target_subcategories = {
+            "targets": "targets",
+            "executionInputs": "executionInputs",
+            "actualExecutionInputMode": "actualExecutionInputIdentity",
+            "actualExecutionInputSize": "actualExecutionInputIdentity",
+            "actualExecutionInputSha256": "actualExecutionInputIdentity",
+            "targetExecutionLease": "targetExecutionLease",
+            "protectedTargetBundle": "protectedTargetBundle",
+            "executionInputBundleDigest": "executionInputBundleDigest",
+            "executionLease": "other",
+            "executionInputSha256": "other",
+            "fileScans": "other",
+        }
+        for field, subcategory in target_subcategories.items():
+            with self.subTest(target_input_subcategory=subcategory, field=field):
+                source = {
+                    "commandId": "node-check:private/secret.js", "commandClass": "direct-syntax",
+                    "ordinal": 23, field: None,
+                }
+                changed = {**source, field: {unsafe: unsafe}}
+                diagnostic = ci.strict_json_loads(ci.first_replay_transcript_difference_diagnostic(
+                    [source], [changed],
+                ))
+                self.assertEqual(diagnostic["targetInputSubcategories"], [subcategory])
+                self.assertNotIn(unsafe, json.dumps(diagnostic))
+        missing_bundle_source = {"commandId": "node-check:private/secret.js", "ordinal": 23}
+        diagnostic = ci.strict_json_loads(ci.first_replay_transcript_difference_diagnostic(
+            [missing_bundle_source], [{**missing_bundle_source, "protectedTargetBundle": None}],
+        ))
+        self.assertEqual(diagnostic["targetInputSubcategories"], ["protectedTargetBundle"])
+        all_target_source = {"commandId": "node-check:private/secret.js", "ordinal": 23}
+        all_target_replay = {**all_target_source, **{field: unsafe for field in target_subcategories}}
+        diagnostic = ci.strict_json_loads(ci.first_replay_transcript_difference_diagnostic(
+            [all_target_source], [all_target_replay],
+        ))
+        self.assertEqual(diagnostic["targetInputSubcategories"], sorted(set(target_subcategories.values())))
 
         forged = copy.deepcopy(self.documents)
         forged["command-results.json"]["records"][0]["executionDurationClass"] = unsafe
