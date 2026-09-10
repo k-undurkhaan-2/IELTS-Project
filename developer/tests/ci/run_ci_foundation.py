@@ -10997,24 +10997,22 @@ def _canonical_protected_execution_inputs(
     return copy.deepcopy(inputs)
 
 
-def _protected_bundle_compact_identity_digests(
+def _portable_protected_bundle_authority(
     command: Mapping[str, Any],
-    *,
-    phase: str,
-) -> list[str]:
-    """Derive compact bundle identities from portable command-plan authority.
+) -> dict[str, Any] | None:
+    """Derive the shared portable bundle authority from the ordered target plan.
 
     The preimage deliberately excludes checkout-local canonical paths, inode/file
     indexes, and timestamps: a fresh verifier checkout has different values.
     Those values remain protected by each producer/replay TargetExecutionLease.
     The portable semantic identity instead binds the ordered path/content/input
     plan, the command association, the bundle version/adapter, and the pre/post
-    phase, all of which the verifier reconstructs without trusting these digests.
+    phase for compact leaves, all reconstructed without trusting these digests.
     """
 
     targets = command.get("targets")
     if not isinstance(targets, list) or not targets:
-        return []
+        return None
     execution_adapter = command.get("executionInputMode")
     ordered_authority = [
         {
@@ -11029,7 +11027,7 @@ def _protected_bundle_compact_identity_digests(
         if isinstance(target, Mapping)
     ]
     if len(ordered_authority) != len(targets):
-        return []
+        return None
     portable_input_digest = hashlib.sha256(
         _canonical_frame(
             {
@@ -11042,7 +11040,7 @@ def _protected_bundle_compact_identity_digests(
             }
         )
     ).hexdigest()
-    bundle_authority = {
+    return {
         "digestDomain": _PROTECTED_BUNDLE_COMPACT_IDENTITY_DOMAIN,
         "bundleVersion": PROTECTED_TARGET_BUNDLE_VERSION,
         "executionAdapter": execution_adapter,
@@ -11057,6 +11055,19 @@ def _protected_bundle_compact_identity_digests(
         "orderedTargetAndInputAuthority": ordered_authority,
         "portableExecutionInputBundleDigest": portable_input_digest,
     }
+
+
+def _protected_bundle_compact_identity_digests(
+    command: Mapping[str, Any],
+    *,
+    phase: str,
+) -> list[str]:
+    """Bind each phase and target to the shared portable bundle authority."""
+
+    bundle_authority = _portable_protected_bundle_authority(command)
+    if bundle_authority is None:
+        return []
+    ordered_authority = bundle_authority["orderedTargetAndInputAuthority"]
     bundle_authority_digest = hashlib.sha256(
         _canonical_frame(bundle_authority)
     ).hexdigest()
@@ -11074,7 +11085,7 @@ def _protected_bundle_compact_identity_digests(
                 }
             )
         ).hexdigest()
-        for index in range(len(targets))
+        for index in range(len(ordered_authority))
     ]
 
 
@@ -11180,6 +11191,8 @@ def _compact_command_record_for_evidence(
         return copy.deepcopy(source)
     if pre != post:
         return copy.deepcopy(source)
+    if _validated_portable_protected_input_bundle_digest(source) is None:
+        return copy.deepcopy(source)
     pre_digests = _protected_bundle_compact_identity_digests(source, phase="pre")
     post_digests = _protected_bundle_compact_identity_digests(source, phase="post")
     compact = {
@@ -11206,12 +11219,104 @@ def _compact_command_record_for_evidence(
     return compact
 
 
+def _validated_portable_protected_input_bundle_digest(
+    record: Mapping[str, Any],
+) -> str | None:
+    """Portableize only after raw evidence passes this job's local authority.
+
+    The ordinary validator checks full physical evidence or reconstructs compact
+    references, including the raw input digest, before any fields are removed.
+    Using the retained record here checks local consistency only: verification
+    still independently compares it with the freshly rebuilt command plan.
+    """
+
+    targets = record.get("targets")
+    if (
+        record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or record.get("executed") is not True
+        or not isinstance(targets, list)
+        or not targets
+        or any(
+            not isinstance(target, dict)
+            or target.get("modeType") != "regular-file"
+            or target.get("reparsePoint") is not False
+            for target in targets
+        )
+    ):
+        return None
+    errors: list[str] = []
+    _validate_command_record(dict(record), 0, errors, expected_record=record)
+    if errors:
+        return None
+    for target in targets:
+        stable = target.get("fileIdentity")
+        if (
+            type(target.get("size")) is not int
+            or not 0 <= target["size"] <= MAX_SCANNED_FILE_BYTES
+            or not isinstance(target.get("sha256"), str)
+            or not isinstance(target.get("canonicalSourcePath"), str)
+            or not isinstance(stable, Mapping)
+            or set(stable) != {
+                "deviceOrVolume", "inodeOrFileIndex", "creationOrChangeTimeNs",
+                "writeTimeNs", "reparsePoint",
+            }
+            or stable.get("reparsePoint") is not False
+            or any(
+                not isinstance(stable.get(key), str)
+                or not re.fullmatch(r"-?[0-9]+", stable[key])
+                for key in (
+                    "deviceOrVolume", "inodeOrFileIndex", "creationOrChangeTimeNs",
+                    "writeTimeNs",
+                )
+            )
+        ):
+            return None
+    # Full evidence retains the held lease identity. POSIX uses the same stable
+    # identity as the path; Windows captures a separate handle-information shape.
+    bundle = record["protectedTargetBundle"]
+    for target, identity in zip(targets, bundle["preExecutionIdentities"]):
+        if not isinstance(identity, Mapping):
+            continue  # Compact phase digests were independently checked above.
+        held = identity["heldStableIdentity"]
+        if held == target.get("fileIdentity"):
+            continue
+        if (
+            set(held) != {
+                "volumeSerial", "fileIndex", "size", "creationTime", "writeTime",
+                "linkCount", "reparsePoint",
+            }
+            or type(held.get("size")) is not int
+            or held.get("size") != target.get("size")
+            or type(held.get("linkCount")) is not int
+            or held["linkCount"] < 1
+            or any(
+                not isinstance(held.get(key), str)
+                or not re.fullmatch(r"[0-9]+", held[key])
+                for key in ("volumeSerial", "fileIndex", "creationTime", "writeTime")
+            )
+        ):
+            return None
+    authority = _portable_protected_bundle_authority(record)
+    if authority is None:
+        return None
+    return hashlib.sha256(_canonical_frame(authority)).hexdigest()
+
+
 def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
     source = dict(record)
-    if "executionInputs" in source:
+    portable_bundle_digest = _validated_portable_protected_input_bundle_digest(source)
+    invalid_protected_bundle = (
+        source.get("executionInputMode") == "PROTECTED-TARGET-BUNDLE"
+        or source.get("protectedTargetBundle") is not None
+    ) and portable_bundle_digest is None
+    if invalid_protected_bundle:
+        # Even a forged raw digest equal to the portable digest cannot make
+        # invalid physical evidence indistinguishable from a valid transcript.
+        source["invalidProtectedBundleLocalEvidence"] = True
+    if "executionInputs" in source and not invalid_protected_bundle:
         source["executionInputs"] = _canonical_protected_execution_inputs(source)
     protected_source = source.get("protectedTargetBundle")
-    if isinstance(protected_source, Mapping):
+    if isinstance(protected_source, Mapping) and not invalid_protected_bundle:
         source = {
             key: copy.deepcopy(value)
             for key, value in source.items()
@@ -11243,6 +11348,8 @@ def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
                 phase="post",
             )
         )
+        source["executionInputBundleDigest"] = portable_bundle_digest
+        protected_projection["executionInputBundleDigest"] = portable_bundle_digest
         source["protectedTargetBundle"] = protected_projection
     canonical = _canonical_replay_value(source)
     canonical.pop("durationSeconds", None)
@@ -11263,16 +11370,18 @@ def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
         canonical["resolvedTestRunnerEntrypoint"] = (
             f"<TRUSTED-TOOL:{tool_role}>"
         )
-    for target in canonical.get("targets", []):
+    for target in ([] if invalid_protected_bundle else canonical.get("targets", [])):
         if isinstance(target, dict):
             target["canonicalSourcePath"] = None
             target["fileIdentity"] = None
-    for execution_input in canonical.get("executionInputs", []):
+    for execution_input in (
+        [] if invalid_protected_bundle else canonical.get("executionInputs", [])
+    ):
         if isinstance(execution_input, dict):
             execution_input["canonicalSourcePath"] = None
             execution_input["plannedStableIdentity"] = None
     lease = canonical.get("targetExecutionLease")
-    if isinstance(lease, dict):
+    if isinstance(lease, dict) and not invalid_protected_bundle:
         for key in (
             "canonicalSourcePath",
             "plannedStableFileIdentity",
@@ -11281,7 +11390,7 @@ def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
             if key in lease:
                 lease[key] = None
     protected = canonical.get("protectedTargetBundle")
-    if isinstance(protected, dict):
+    if isinstance(protected, dict) and not invalid_protected_bundle:
         for key in _PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS:
             protected[key] = []
     canonical["executionDurationClass"] = record.get("executionDurationClass")

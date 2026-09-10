@@ -12554,6 +12554,61 @@ class P52CompactIdentitySecurityTest(unittest.TestCase):
                     ),
                 )
 
+        # Fresh jobs retain exact local physical authority while sharing one
+        # portable transcript identity. Vary each excluded physical category
+        # independently so equality cannot rely on copying the raw digest.
+        spec = self.runner.command_plan[0]
+        original = self.runner.command_results[0]
+        canonical = ci._canonical_transcript_record(original)
+        portable_digest = canonical["executionInputBundleDigest"]
+        self.assertRegex(portable_digest, r"^[0-9a-f]{64}$")
+        self.assertNotEqual(portable_digest, original["executionInputBundleDigest"])
+        self.assertEqual(
+            canonical["protectedTargetBundle"]["executionInputBundleDigest"],
+            portable_digest,
+        )
+        for variation in ("file-identity", "timestamps", "checkout-root", "all"):
+            local_spec = copy.deepcopy(spec)
+            for index, target in enumerate(local_spec["targets"]):
+                identity = target["fileIdentity"]
+                if variation in {"file-identity", "all"}:
+                    for key in ("deviceOrVolume", "inodeOrFileIndex"):
+                        identity[key] = str(int(identity[key]) + 1000 + index)
+                if variation in {"timestamps", "all"}:
+                    for key in ("creationOrChangeTimeNs", "writeTimeNs"):
+                        identity[key] = str(int(identity[key]) + 1000 + index)
+                if variation in {"checkout-root", "all"}:
+                    target["canonicalSourcePath"] = str(
+                        ci.REPO_ROOT.parent / "independent-replay-checkout" / target["path"]
+                    )
+            local_record = synthetic_record_from_spec(local_spec)
+            local_record["completedCommandClass"] = original["completedCommandClass"]
+            self.assertNotEqual(
+                local_record["executionInputBundleDigest"],
+                original["executionInputBundleDigest"],
+                variation,
+            )
+            for representation in ("full", "compact"):
+                with self.subTest(variation=variation, representation=representation):
+                    supplied = (
+                        local_record if representation == "full"
+                        else ci._compact_command_record_for_evidence(local_record)
+                    )
+                    raw_before = copy.deepcopy(supplied)
+                    errors: list[str] = []
+                    ci._validate_command_record(
+                        supplied, 0, errors, expected_record=local_spec,
+                    )
+                    self.assertEqual(errors, [])
+                    portable = ci._canonical_transcript_record(supplied)
+                    self.assertEqual(portable["executionInputBundleDigest"], portable_digest)
+                    self.assertEqual(
+                        portable["protectedTargetBundle"]["executionInputBundleDigest"],
+                        portable_digest,
+                    )
+                    self.assertEqual(portable, canonical)
+                    self.assertEqual(supplied, raw_before)
+
     def test_compact_bundle_digest_forgery_cannot_self_authorize(self) -> None:
         modes = (
             "zero-all",
@@ -12688,6 +12743,195 @@ class P52CompactIdentitySecurityTest(unittest.TestCase):
                     any("transcript" in error.casefold() for error in errors),
                     errors,
                 )
+
+        # Canonicalization must validate raw local evidence first, including
+        # fields that disappear from the successful portable projection.
+        original = self.runner.command_results[0]
+        valid_canonical = ci._canonical_transcript_record(original)
+        modes = (
+            "raw-digest", "protected-digest", "both-digests", "portable-digest-forgery",
+            "input-hash", "input-size", "input-adapter", "input-order",
+            "input-local-path", "input-local-identity", "malformed-inputs",
+            "protected-inputs", "protected-paths", "protected-identities",
+            "target-hash", "target-size", "target-mode", "target-reparse",
+            "malformed-target-identity", "null-target-size", "null-target-hash",
+            "command-adapter", "actual-adapter", "protected-adapter", "target-order",
+            "pre-physical-mutation", "post-physical-mutation",
+            "malformed-held-identity", "local-target-lease", "local-executable-lease",
+            "mutation-detected", "unclosed-bundle",
+        )
+        for representation, mode in itertools.product(("full", "compact"), modes):
+            with self.subTest(representation=representation, raw_mutation=mode):
+                forged = copy.deepcopy(self.documents)
+                record = (
+                    copy.deepcopy(original) if representation == "full"
+                    else copy.deepcopy(forged["command-results.json"]["records"][0])
+                )
+                forged["command-results.json"]["records"][0] = record
+                bundle = record["protectedTargetBundle"]
+                if mode in {"malformed-target-identity", "null-target-size", "null-target-hash"}:
+                    malformed_spec = copy.deepcopy(self.runner.command_plan[0])
+                    field = {
+                        "malformed-target-identity": "fileIdentity",
+                        "null-target-size": "size",
+                        "null-target-hash": "sha256",
+                    }[mode]
+                    malformed_spec["targets"][0][field] = (
+                        {"reparsePoint": False} if field == "fileIdentity" else None
+                    )
+                    malformed = synthetic_record_from_spec(malformed_spec)
+                    malformed["completedCommandClass"] = original["completedCommandClass"]
+                    record = (
+                        malformed if representation == "full"
+                        else ci._compact_command_record_for_evidence(malformed)
+                    )
+                    forged["command-results.json"]["records"][0] = record
+                    bundle = record["protectedTargetBundle"]
+                if mode in {"raw-digest", "both-digests"}:
+                    record["executionInputBundleDigest"] = "f" * 64
+                if mode in {"protected-digest", "both-digests"}:
+                    bundle["executionInputBundleDigest"] = "f" * 64
+                if mode == "portable-digest-forgery":
+                    record["executionInputBundleDigest"] = valid_canonical[
+                        "executionInputBundleDigest"
+                    ]
+                    bundle["executionInputBundleDigest"] = record["executionInputBundleDigest"]
+                if mode.startswith("input-"):
+                    # Expand compact input references before corrupting them;
+                    # matching raw digests must not legitimize forged inputs.
+                    record["executionInputs"] = [
+                        p52_execution_input_from_target(target) for target in record["targets"]
+                    ]
+                    first_input = record["executionInputs"][0]
+                    if mode == "input-hash":
+                        first_input["actualSha256"] = "f" * 64
+                    elif mode == "input-size":
+                        first_input["actualByteLength"] += 1
+                    elif mode == "input-adapter":
+                        first_input["inputMode"] = "TARGET-BYTES-STDIN"
+                    elif mode == "input-order":
+                        record["executionInputs"].reverse()
+                    elif mode == "input-local-path":
+                        first_input["canonicalSourcePath"] += ".forged"
+                    else:
+                        first_input["plannedStableIdentity"] = {
+                            **first_input["plannedStableIdentity"],
+                            "inodeOrFileIndex": "999999999",
+                        }
+                    record["executionInputBundleDigest"] = ci.execution_input_bundle_digest(
+                        record["executionInputs"]
+                    )
+                    bundle["executionInputBundleDigest"] = record["executionInputBundleDigest"]
+                    if representation == "full":
+                        bundle["executionInputs"] = copy.deepcopy(record["executionInputs"])
+                elif mode == "malformed-inputs":
+                    record["executionInputs"] = {"logicalPath": "forged"}
+                elif mode == "protected-inputs":
+                    bundle["executionInputs"] = [{"actualSha256": "f" * 64}]
+                elif mode == "protected-paths":
+                    bundle["canonicalSourcePaths"] = ["forged-local-path"]
+                elif mode == "protected-identities":
+                    bundle["plannedStableIdentities"] = [{"reparsePoint": False}]
+                elif mode == "target-hash":
+                    record["targets"][0]["sha256"] = "f" * 64
+                elif mode == "target-size":
+                    record["targets"][0]["size"] += 1
+                elif mode == "target-mode":
+                    record["targets"][0]["modeType"] = "other"
+                elif mode == "target-reparse":
+                    record["targets"][0]["reparsePoint"] = True
+                elif mode == "command-adapter":
+                    record["executionInputMode"] = "TARGET-BYTES-STDIN"
+                elif mode == "actual-adapter":
+                    record["actualExecutionInputMode"] = "TARGET-BYTES-STDIN"
+                elif mode == "protected-adapter":
+                    bundle["executionAdapter"] = "TARGET-BYTES-STDIN"
+                elif mode == "target-order":
+                    record["targets"].reverse()
+                elif mode in {"pre-physical-mutation", "post-physical-mutation"}:
+                    phase = "pre" if mode.startswith("pre-") else "post"
+                    identities = bundle[f"{phase}ExecutionIdentities"]
+                    if representation == "full":
+                        identities[0]["heldStableIdentity"]["inodeOrFileIndex"] = "999999999"
+                    else:
+                        identities[0] = "f" * 64
+                elif mode == "malformed-held-identity":
+                    if representation == "full":
+                        for phase in ("pre", "post"):
+                            bundle[f"{phase}ExecutionIdentities"][0]["heldStableIdentity"] = {
+                                "reparsePoint": False,
+                            }
+                    else:
+                        bundle["preExecutionIdentities"][0] = {"reparsePoint": False}
+                elif mode == "local-target-lease":
+                    record["targetExecutionLease"] = {"cleanupState": "closed"}
+                elif mode == "local-executable-lease":
+                    record["executionLease"] = {"reparsePoint": False}
+                elif mode == "mutation-detected":
+                    bundle["mutationDetected"] = True
+                elif mode == "unclosed-bundle":
+                    bundle["cleanupState"] = "open"
+
+                raw_before = copy.deepcopy(record)
+                canonical = ci._canonical_transcript_record(record)
+                self.assertNotEqual(canonical, valid_canonical)
+                self.assertTrue(canonical.get("invalidProtectedBundleLocalEvidence"))
+                compacted = ci._compact_command_record_for_evidence(record)
+                self.assertEqual(compacted, record, "compaction must preserve invalid raw evidence")
+                self.assertEqual(ci._canonical_transcript_record(compacted), canonical)
+                self.assertEqual(
+                    canonical["executionInputBundleDigest"],
+                    record["executionInputBundleDigest"],
+                    "invalid local evidence must retain its raw bundle digest",
+                )
+                self.assertEqual(
+                    canonical["protectedTargetBundle"]["executionInputBundleDigest"],
+                    bundle["executionInputBundleDigest"],
+                    "invalid protected evidence must not receive a portable digest",
+                )
+                self.assertEqual(record, raw_before)
+                coherently_rebind_claimed_transcript(forged)
+                errors = self.compare(forged)
+                self.assertTrue(errors, (representation, mode))
+                self.assertTrue(any("transcript" in error.casefold() for error in errors), errors)
+
+        # A coherent replacement can pass its own local physical checks, but
+        # the portable digest and replay comparison must retain all semantic
+        # target/input/command authority rather than treating equal bytes alone
+        # as authorization to reuse another command's bundle.
+        for variation in ("sha256", "size", "target-order", "command-id", "ordinal"):
+            changed_spec = copy.deepcopy(self.runner.command_plan[0])
+            if variation == "sha256":
+                changed_spec["targets"][0]["sha256"] = "f" * 64
+            elif variation == "size":
+                changed_spec["targets"][0]["size"] += 1
+            elif variation == "target-order":
+                changed_spec["targets"].reverse()
+            elif variation == "command-id":
+                changed_spec["commandId"] = "p52-compact-foreign-command"
+            else:
+                changed_spec["ordinal"] += 1
+            changed = synthetic_record_from_spec(changed_spec)
+            changed["completedCommandClass"] = original["completedCommandClass"]
+            for representation in ("full", "compact"):
+                with self.subTest(semantic_mutation=variation, representation=representation):
+                    record = (
+                        changed if representation == "full"
+                        else ci._compact_command_record_for_evidence(changed)
+                    )
+                    canonical = ci._canonical_transcript_record(record)
+                    self.assertNotEqual(
+                        canonical["executionInputBundleDigest"],
+                        valid_canonical["executionInputBundleDigest"],
+                    )
+                    self.assertEqual(
+                        canonical["executionInputBundleDigest"],
+                        canonical["protectedTargetBundle"]["executionInputBundleDigest"],
+                    )
+                    forged = copy.deepcopy(self.documents)
+                    forged["command-results.json"]["records"][0] = copy.deepcopy(record)
+                    coherently_rebind_claimed_transcript(forged)
+                    self.assertTrue(self.compare(forged), variation)
 
 
 class CI6ProtectedPolicyInputTest(unittest.TestCase):
