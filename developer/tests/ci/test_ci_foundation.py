@@ -6443,6 +6443,8 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
         *,
         report: dict | bytes | None,
         stale_report: dict | None = None,
+        compact_stdout: bool = False,
+        mutate_document=None,
     ) -> tuple[ci.FoundationRunner, bool]:
         with tempfile.TemporaryDirectory(prefix="ci-static-authority-") as temp_dir:
             repo = Path(temp_dir)
@@ -6477,7 +6479,15 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
                             "containmentStatus": "parent-contained",
                         }
                     ]
-                    data = (json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+                    if mutate_document is not None:
+                        mutate_document(document)
+                    data = (json.dumps(
+                        document,
+                        ensure_ascii=compact_stdout,
+                        indent=None if compact_stdout else 2,
+                        sort_keys=not compact_stdout,
+                        separators=(",", ":") if compact_stdout else None,
+                    ) + "\n").encode("utf-8")
                 elif isinstance(report, bytes):
                     data = report
                 else:
@@ -6520,8 +6530,22 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
                     "plannedStableIdentities": [target.get("fileIdentity") for target in targets],
                     "executionInputs": inputs,
                     "executionInputBundleDigest": bundle_digest,
-                    "preExecutionIdentities": [{} for _target in targets],
-                    "postExecutionIdentities": [{} for _target in targets],
+                    "preExecutionIdentities": [
+                        {
+                            "pathStableIdentity": target["fileIdentity"],
+                            "heldStableIdentity": target["fileIdentity"],
+                            "canonicalPath": target["canonicalSourcePath"],
+                        }
+                        for target in targets
+                    ],
+                    "postExecutionIdentities": [
+                        {
+                            "pathStableIdentity": target["fileIdentity"],
+                            "heldStableIdentity": target["fileIdentity"],
+                            "canonicalPath": target["canonicalSourcePath"],
+                        }
+                        for target in targets
+                    ],
                     "mutationDetected": False,
                     "cleanupState": "closed",
                 }
@@ -6530,6 +6554,7 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
             with (
                 mock.patch.multiple(ci, REPO_ROOT=repo),
                 mock.patch.object(ci.uuid, "uuid4", return_value=self.INVOCATION_UUID),
+                mock.patch.object(ci, "deterministic_candidate_paths", return_value=([ci.STATIC_SUITE_RELATIVE_PATH], [])),
                 mock.patch.object(ci, "execute_planned_static_suite", side_effect=fake_snapshot),
                 mock.patch.object(ci.FoundationRunner, "run_direct_syntax", autospec=True),
             ):
@@ -6544,6 +6569,14 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
                 )
                 self.addCleanup(runner.cleanup_task_resources)
                 runner.run_static_profile()
+                static_record = next(
+                    record for record in runner.command_results
+                    if record["commandId"] == "static-suite"
+                )
+                if self.gate(runner, "STATIC-SUITE-EXECUTION")["status"] != "pass":
+                    self.assertIsNone(capture.validated_static_machine_report)
+                    self.assertNotIn("validatedStaticMachineReport", static_record)
+                    self.assertIsNone(ci._validated_static_machine_output_identity(static_record))
             return runner, report_path.exists()
 
     @staticmethod
@@ -6582,10 +6615,130 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
         compile(source, ci.STATIC_SUITE_RELATIVE_PATH, "exec")
 
     def test_exit_zero_with_passing_json_passes_execution(self) -> None:
-        runner, report_exists = self.exercise(contained_capture(), report=self.passing_report())
+        first_capture = contained_capture()
+        report = self.passing_report()
+        report["observations"][0]["detail"]["label"] = "structured \u2713"
+        runner, report_exists = self.exercise(first_capture, report=report)
         self.assertEqual(self.gate(runner, "STATIC-SUITE-EXECUTION")["status"], "pass")
         self.assertEqual(runner.observations[0]["outcome"], "pass")
         self.assertFalse(report_exists)
+        second_capture = contained_capture()
+        second_capture.duration_seconds = 3.25
+        second, _ = self.exercise(second_capture, report=report, compact_stdout=True)
+        records = [
+            next(record for record in item.command_results if record["commandId"] == "static-suite")
+            for item in (runner, second)
+        ]
+        self.assertNotEqual(first_capture.stdout_raw, second_capture.stdout_raw)
+        self.assertNotEqual(records[0]["stdoutSha256"], records[1]["stdoutSha256"])
+        self.assertNotEqual(records[0]["stdoutBytesObserved"], records[1]["stdoutBytesObserved"])
+        for capture, record in zip((first_capture, second_capture), records):
+            self.assertEqual(record["stdoutSha256"], hashlib.sha256(capture.stdout_raw).hexdigest())
+            self.assertEqual(record["stdoutBytesObserved"], len(capture.stdout_raw))
+            self.assertIsNotNone(ci._validated_static_machine_output_identity(record))
+            # A single nested registry command carries one static script target,
+            # so this evidence does not duplicate the full workspace input plan.
+            self.assertEqual(len(record["validatedStaticMachineReport"]["commandResults"]), 1)
+            self.assertEqual(len(record["validatedStaticMachineReport"]["commandResults"][0]["targets"]), 1)
+            self.assertLess(len(ci._json_bytes(record["validatedStaticMachineReport"])), 10_000)
+
+        # Controlled pre-fix reproduction: identical observations and semantic
+        # report acquire different producer identities solely from raw streams.
+        legacy_observations = []
+        for record in records:
+            legacy_source = {key: value for key, value in record.items() if key != "validatedStaticMachineReport"}
+            legacy = copy.deepcopy(record["producerObservations"][0])
+            legacy["sourceOutputDigest"] = ci.command_output_digest(legacy_source)
+            legacy["producerRecordDigest"] = ci._producer_record_digest({
+                key: value for key, value in legacy.items() if key != "producerRecordDigest"
+            })
+            legacy_observations.append(legacy)
+        for key in ("sourceOutputDigest", "producerRecordDigest"):
+            self.assertNotEqual(legacy_observations[0][key], legacy_observations[1][key])
+        self.assertNotEqual(
+            ci.producer_observation_set_digest([legacy_observations[0]]),
+            ci.producer_observation_set_digest([legacy_observations[1]]),
+        )
+        self.assertEqual(ci.command_output_digest(records[0]), ci.command_output_digest(records[1]))
+        self.assertEqual(records[0]["producerObservations"], records[1]["producerObservations"])
+        self.assertEqual(records[0]["producerObservationSetDigest"], records[1]["producerObservationSetDigest"])
+        transcript_records = copy.deepcopy(records)
+        for record in transcript_records:
+            record["completedCommandClass"] = "static-suite"
+            errors = []
+            ci._validate_command_record(record, record["ordinal"], errors, expected_record=record)
+            self.assertEqual(errors, [])
+            self.assertIsNotNone(ci._validated_portable_protected_input_bundle_digest(record))
+        self.assertEqual(
+            ci._canonical_transcript_record(transcript_records[0]),
+            ci._canonical_transcript_record(transcript_records[1]),
+        )
+        for record in records:
+            self.assertEqual(ci._validate_raw_observation(
+                record["producerObservations"][0], label="controlled-static", source=record,
+            ), [])
+
+        # Independent executable installations keep exact local self-plans.
+        # Only their successfully validated portable machine identity converges.
+        relocated = copy.deepcopy(records[1])
+        relocated_path = str(Path(sys.executable).parent / "independent-runner" / Path(sys.executable).name)
+        relocated["resolvedExecutablePath"] = relocated_path
+        for key in ("argv", "logicalArgv", "executionArgv", "actualExecutionArgv"):
+            relocated[key][0] = relocated_path
+        local_report = relocated["validatedStaticMachineReport"]
+        local_result = local_report["commandResults"][0]
+        local_result["resolvedExecutablePath"] = relocated_path
+        local_result["argv"][0] = relocated_path
+        result_fields = {"started", "executed", "exitCode", "timeoutStatus", "outputLimitStatus", "containmentStatus"}
+        local_report["commandPlanDigest"] = ci.static_machine_command_plan_digest([
+            {key: value for key, value in local_result.items() if key not in result_fields}
+        ])
+        self.assertNotEqual(local_report["commandPlanDigest"], records[0]["validatedStaticMachineReport"]["commandPlanDigest"])
+        self.assertEqual(
+            ci._validated_static_machine_output_identity(records[0]),
+            ci._validated_static_machine_output_identity(relocated),
+        )
+        self.assertEqual(ci.command_output_digest(records[0]), ci.command_output_digest(relocated))
+
+        semantic_change = copy.deepcopy(records[0])
+        semantic_change["validatedStaticMachineReport"]["observations"][0]["detail"]["ok"] = False
+        self.assertNotEqual(ci.command_output_digest(records[0]), ci.command_output_digest(semantic_change))
+        stderr_change = copy.deepcopy(records[0])
+        stderr_change["stderrSha256"] = "1" * 64
+        self.assertNotEqual(ci.command_output_digest(records[0]), ci.command_output_digest(stderr_change))
+        other_command = copy.deepcopy(records[0])
+        other_command["commandId"] = "learner-focused"
+        self.assertIsNone(ci._validated_static_machine_output_identity(other_command))
+        other_raw = {key: value for key, value in other_command.items() if key != "validatedStaticMachineReport"}
+        self.assertEqual(ci.command_output_digest(other_command), ci.command_output_digest(other_raw))
+        for key, value in (("cleanupState", "failed"), ("mutationDetected", True)):
+            with self.subTest(unsafe_static_bundle=key):
+                unsafe = copy.deepcopy(records[0])
+                unsafe["protectedTargetBundle"][key] = value
+                self.assertIsNone(ci._validated_static_machine_output_identity(unsafe))
+        drifted = copy.deepcopy(records[0])
+        drifted["protectedTargetBundle"]["postExecutionIdentities"][0]["canonicalPath"] += ".replaced"
+        self.assertIsNone(ci._validated_static_machine_output_identity(drifted))
+
+        for key, value in (
+            ("documentKind", "forged"), ("schemaVersion", 99),
+            ("invocationId", "wrong-invocation"), ("commandPlanDigest", "f" * 64),
+            ("executionStatus", "INCOMPLETE"), ("commandResults", []),
+            ("nativeNonPassCount", 1), ("internalRunnerFailures", ["failure"]),
+        ):
+            with self.subTest(forged_machine_authority=key):
+                forged = copy.deepcopy(records[0])
+                forged["validatedStaticMachineReport"][key] = value
+                self.assertIsNone(ci._validated_static_machine_output_identity(forged))
+                errors = []
+                ci._validate_command_record(forged, 0, errors, expected_record=forged)
+                self.assertTrue(any("validated static machine report" in error for error in errors), errors)
+        incomplete = copy.deepcopy(records[0])
+        incomplete["producerObservations"] = []
+        incomplete["producerObservationSetDigest"] = ci.producer_observation_set_digest([])
+        errors = []
+        ci._validate_command_record(incomplete, 0, errors, expected_record=incomplete)
+        self.assertTrue(any("static machine observations are incomplete" in error for error in errors), errors)
 
     def test_exit_zero_with_failing_json_records_semantic_failure(self) -> None:
         runner, _ = self.exercise(contained_capture(), report=self.failing_report())
@@ -6654,6 +6807,25 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
         report["documentKind"] = "forged-kind"
         runner, _ = self.exercise(contained_capture(), report=report)
         self.assertEqual(self.gate(runner, "STATIC-SUITE-EXECUTION")["status"], "fail")
+        mutations = (
+            lambda document: document.update({"schemaVersion": 99}),
+            lambda document: document.update({"schemaVersion": 2.0}),
+            lambda document: document.update({"unexpected": True}),
+            lambda document: document.update({"commandPlanDigest": "f" * 64}),
+            lambda document: document.update({"commandResults": []}),
+            lambda document: document["commandResults"][0].update({"argv": ["forged"]}),
+            lambda document: document["commandResults"][0].update({"allowedExecutionExits": 0}),
+            lambda document: document["commandResults"][0].update({"ordinal": False}),
+            lambda document: document["commandResults"][0].update({"exitCode": False}),
+            lambda document: document["commandResults"][0].update({"containmentStatus": "uncontained"}),
+        )
+        for index, mutation in enumerate(mutations):
+            with self.subTest(invalid_machine_output=index):
+                rejected, _ = self.exercise(
+                    contained_capture(), report=self.passing_report(), mutate_document=mutation,
+                )
+                self.assertEqual(self.gate(rejected, "STATIC-SUITE-EXECUTION")["status"], "fail")
+                self.assertEqual(rejected.observations, [])
 
     def test_two_json_documents_fail_execution(self) -> None:
         data = self.framed(self.passing_report()) + self.framed(self.passing_report())
@@ -9419,6 +9591,133 @@ class WindowsGitBashResolutionTest(unittest.TestCase):
                 self.assertTrue(product.execution_passed(), product.error)
                 self.assertIn("GNU bash version 5.2.37", product.stdout)
 
+                def lease_record(held, capture):
+                    spec = synthetic_command_spec("git-bash-version", "runtime-identity", 0)
+                    size, digest, stable = ci._measured_file_authority(Path(held.path))
+                    spec.update({
+                        "argv": list(capture.argv),
+                        "logicalArgv": list(capture.argv),
+                        "executionArgv": list(capture.argv),
+                        "toolRole": "git-bash-runtime",
+                        "resolvedExecutablePath": held.path,
+                        "resolvedExecutableSize": size,
+                        "resolvedExecutableSha256": digest,
+                        "resolvedExecutableFileIdentity": stable,
+                        "executionLease": held.validated_identity(),
+                    })
+                    result = {**spec, **capture.evidence()}
+                    result["commandId"] = "git-bash-version"
+                    result["commandClass"] = "runtime-identity"
+                    result["completedCommandClass"] = "runtime-identity"
+                    return result
+
+                original_record = lease_record(lease, product)
+                original_portable = ci._validated_portable_git_bash_execution_lease(original_record)
+                self.assertIsNotNone(original_portable)
+                self.assertEqual(original_portable, {
+                    "leaseKind": "windows-git-bash-executable-v1",
+                    "tool": "git-bash",
+                    "size": bash.stat().st_size,
+                    "sha256": original_hash,
+                    "reparsePoint": False,
+                    "links": 1,
+                    "trustedProductRelationship": "fixed-candidate-in-trusted-git-installation",
+                    "nonReparseDirectoryChain": True,
+                })
+                independent_git, independent_bash = self.make_executable_lease_install(
+                    Path(temp_dir) / "IndependentGit"
+                )
+                independent = ci.TrustedBashLease(str(independent_bash), str(independent_git))
+                try:
+                    self.assertEqual(independent.verify(), (True, None))
+                    independent_product = ci.execute_command(
+                        "lease-product-verification",
+                        "runtime-identity",
+                        [independent.path, "/d", "/c", "echo GNU bash version 5.2.37"],
+                        timeout=10,
+                        executable_lease=independent,
+                    )
+                    self.assertTrue(independent_product.execution_passed(), independent_product.error)
+                    independent_record = lease_record(independent, independent_product)
+                    self.assertNotEqual(original_record["executionLease"], independent_record["executionLease"])
+                    self.assertNotEqual(lease.identity["fileIndex"], independent.identity["fileIndex"])
+                    self.assertEqual(
+                        original_portable,
+                        ci._validated_portable_git_bash_execution_lease(independent_record),
+                    )
+                    self.assertEqual(
+                        ci._canonical_transcript_record(original_record),
+                        ci._canonical_transcript_record(independent_record),
+                    )
+                finally:
+                    independent.close()
+                with self.assertRaisesRegex(OSError, "closed"):
+                    independent.validated_identity()
+
+                # Producer physical fields cannot be forged into a valid semantic lease.
+                for key, value in (
+                    ("sha256", "f" * 64),
+                    ("size", lease.identity["size"] + 1),
+                    ("size", True),
+                    ("reparsePoint", True),
+                    ("links", 2),
+                    ("links", True),
+                    ("trustedGitRoot", str(root / "UntrustedProduct")),
+                    ("canonicalPath", str(root / "tools" / "bash.exe")),
+                    ("fileIndex", "invalid"),
+                ):
+                    with self.subTest(forged_field=key, value=value):
+                        forged = copy.deepcopy(original_record)
+                        forged["executionLease"][key] = value
+                        self.assertIsNone(ci._validated_portable_git_bash_execution_lease(forged))
+                        self.assertTrue(ci._canonical_transcript_record(forged)["invalidGitBashLeaseLocalEvidence"])
+                        errors: list[str] = []
+                        ci._validate_command_record(forged, 0, errors)
+                        self.assertTrue(any("trusted Bash execution lease is invalid" in item for item in errors))
+                for key, value in (
+                    ("processTreeStatus", "cleanup-failed"),
+                    ("descendantsSurviving", 1),
+                    ("executed", False),
+                    ("error", "EXECUTABLE-LEASE-ERROR: local identity drifted"),
+                    ("timeoutStatus", "TIMED-OUT"),
+                    ("outputLimitStatus", "OUTPUT-LIMIT-EXCEEDED"),
+                ):
+                    with self.subTest(failed_execution=key):
+                        failed = copy.deepcopy(original_record)
+                        failed[key] = value
+                        self.assertIsNone(ci._validated_portable_git_bash_execution_lease(failed))
+
+                # Local identity remains exact, including every excluded physical field.
+                saved_identity = dict(lease.identity)
+                for key, value in (
+                    ("canonicalPath", str(independent_bash)),
+                    ("trustedGitRoot", str(independent_git.parent.parent)),
+                    ("volumeSerial", str(int(saved_identity["volumeSerial"]) + 1)),
+                    ("fileIndex", str(int(saved_identity["fileIndex"]) + 1)),
+                    ("creationTime", str(int(saved_identity["creationTime"]) + 1)),
+                    ("writeTime", str(int(saved_identity["writeTime"]) + 1)),
+                    ("sha256", "f" * 64),
+                    ("size", saved_identity["size"] + 1),
+                    ("reparsePoint", True),
+                    ("links", 2),
+                ):
+                    with self.subTest(local_identity_drift=key):
+                        lease.identity[key] = value
+                        try:
+                            self.assertFalse(lease.verify()[0])
+                            with self.assertRaisesRegex(OSError, "identity drifted"):
+                                lease.validated_identity()
+                            rejected = ci.execute_command(
+                                "lease-drift-before-execution", "runtime-identity",
+                                [lease.path, "/d", "/c", "echo unexpected"],
+                                timeout=10, executable_lease=lease,
+                            )
+                            self.assertFalse(rejected.executed)
+                            self.assertEqual(rejected.process_tree_status, "setup-failed")
+                        finally:
+                            lease.identity = dict(saved_identity)
+                self.assertEqual(lease.verify(), (True, None))
+
                 # Rename replacement after verification but before execution.
                 with self.assertRaises(OSError):
                     os.replace(replacement, bash)
@@ -9457,12 +9756,33 @@ class WindowsGitBashResolutionTest(unittest.TestCase):
                 self.assertEqual(capture.process_tree_status, "setup-failed")
                 self.assertFalse(sentinel.exists())
                 self.assertEqual(ci._sha256_file(bash), original_hash)
+                with self.assertRaisesRegex(OSError, "identity drifted"):
+                    lease.validated_identity()
             finally:
                 lease.close()
 
             # Closing the lease releases the fixture lock; no executable handle leaks.
             os.replace(replacement, bash)
             self.assertNotEqual(ci._sha256_file(bash), original_hash)
+            changed_lease = ci.TrustedBashLease(str(bash), str(git))
+            try:
+                changed_capture = ci.execute_command(
+                    "lease-product-verification", "runtime-identity",
+                    [changed_lease.path, "/d", "/c", "echo GNU bash version 5.2.37"],
+                    timeout=10, executable_lease=changed_lease,
+                )
+                self.assertTrue(changed_capture.execution_passed(), changed_capture.error)
+                changed_record = lease_record(changed_lease, changed_capture)
+                changed_portable = ci._validated_portable_git_bash_execution_lease(changed_record)
+                self.assertIsNotNone(changed_portable)
+                self.assertEqual(changed_portable["size"], original_portable["size"])
+                self.assertNotEqual(changed_portable["sha256"], original_portable["sha256"])
+                self.assertNotEqual(
+                    ci._canonical_transcript_record(original_record),
+                    ci._canonical_transcript_record(changed_record),
+                )
+            finally:
+                changed_lease.close()
 
     def test_junction_substitution_cannot_redirect_a_canonical_bash_lease(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ci-bash-junction-") as temp_dir:
@@ -11963,6 +12283,85 @@ class CI6ReplayVerificationTest(unittest.TestCase):
         )
         return errors
 
+    def repository_policy_golden_fixture(self) -> SimpleNamespace:
+        # Fixed measured content makes the pre-change transcript golden portable
+        # across developer machines while exercising the complete real policy plan.
+        stable_identity = {
+            "deviceOrVolume": "11",
+            "inodeOrFileIndex": "22",
+            "creationOrChangeTimeNs": "33",
+            "writeTimeNs": "44",
+            "reparsePoint": False,
+        }
+
+        def target_authority(_root: Path, relative: str) -> dict:
+            content = relative.encode("utf-8")
+            return {
+                "path": relative,
+                "canonicalSourcePath": "D:/policy-golden/" + relative,
+                "size": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "fileIdentity": copy.deepcopy(stable_identity),
+                "modeType": "regular-file",
+                "reparsePoint": False,
+            }
+
+        with mock.patch.object(
+            ci, "_measured_file_authority",
+            return_value=(32, "a" * 64, stable_identity),
+        ), mock.patch.object(
+            ci, "_target_authority", side_effect=target_authority,
+        ), mock.patch.object(
+            ci, "require_tool", side_effect=lambda tools, role, **_kwargs: tools[role],
+        ):
+            plan = ci.build_profile_command_plan(
+                "policy",
+                tools={role: "/policy-golden-tools/" + role for role in ("python", "node", "git")},
+                candidate_paths=["README.md", "backend/src/policy-fixture.js"],
+                baseline={},
+                current_platform="linux",
+                static_invocation_id="policy-does-not-run-static-suite",
+            )
+        records = [synthetic_record_from_spec(spec) for spec in plan]
+        for record in records:
+            if record["toolRole"] != "python-in-process":
+                record.update({
+                    "executable": record["argv"][0].rsplit("/", 1)[-1],
+                    "containment": "linux-subreaper-pidfd-proc-supervisor",
+                    "processTreeStatus": "contained-clean",
+                    "containmentDisposition": "quiescent",
+                    "descendantsObserved": 1,
+                    "descendantsReaped": 1,
+                })
+        binding = synthetic_execution_binding(
+            "policy", ci.command_plan_digest(plan), platform_name="linux"
+        )
+        binding.update({
+            "bindingMode": "github-actions",
+            "producerJobId": "repository-policy-producer",
+            "runId": "123456",
+            "eventName": "push",
+            "repository": "fixture/repository",
+        })
+        context = synthetic_external_context(binding)
+        runner = SimpleNamespace(
+            profile="policy",
+            release_gate_required=False,
+            command_plan=plan,
+            command_results=records,
+            observations=[],
+            completed_classes=set(),
+            hard_gate_results=[],
+            violations=[],
+            execution_binding=binding,
+            verifier_execution_binding=context.verifier_binding(),
+            runtime_closure_digest=context.fresh_runtime_closure_digest,
+            dependency_closure_digest="6" * 64,
+            dependency_member_count=0,
+        )
+        ci.finalize_evidence_transcript(runner)
+        return runner
+
     def test_legitimate_claims_match_independent_replay(self) -> None:
         self.assertEqual(self.compare(), [])
         commands = self.documents["command-results.json"]
@@ -11978,6 +12377,84 @@ class CI6ReplayVerificationTest(unittest.TestCase):
         )
         self.assertIsNone(ci.first_replay_transcript_difference_diagnostic([], []))
         self.assertEqual(ci.replay_failure_diagnostics([], []), [])
+
+        policy_runner = self.repository_policy_golden_fixture()
+        self.assertEqual(
+            ci._command_authority_violations(
+                "policy", policy_runner.command_results, [],
+                expected_plan=policy_runner.command_plan,
+            ),
+            [],
+        )
+        policy_transcript = ci.verification_replay_transcript(policy_runner)
+        self.assertEqual(policy_transcript["commandCount"], 14)
+        self.assertEqual(
+            [record["commandId"] for record in policy_transcript["records"]],
+            [
+                "baseline-schema", "node-version", "npm-version",
+                "git-candidate-paths", "git-tracked-paths", "git-diff-check",
+                "git-cached-diff-check", "git-stage-modes", "git-dir",
+                "tracked-private-resource-scan", "tracked-secret-scan",
+                "license-governance-consistency", "workflow-self-policy",
+                "lockfile-integrity",
+            ],
+        )
+        # Captured from the accepted 50f25d28 canonicalizer before the Windows
+        # lease/static-suite changes. This pins every canonical policy field,
+        # including successful containment telemetry and protected input bundles.
+        self.assertEqual(
+            hashlib.sha256(ci._canonical_frame(policy_transcript)).hexdigest(),
+            "3f54d91723db335d43ed7e028a47d40f3f8493f9a19f0bebede702bd7279ee95",
+        )
+        bindings = {
+            name: copy.deepcopy(policy_transcript[name])
+            for name in (
+                "executionBinding", "executionBindingDigest",
+                "authorizationContextBinding", "authorizationContextBindingDigest",
+            )
+        }
+        policy_documents = {
+            "summary.json": {
+                **copy.deepcopy(bindings),
+                "status": "PASS",
+                "profile": "policy",
+                "knownDebtsObserved": [],
+                "resolvedCandidates": [],
+                "expectedOmissions": [],
+                "releaseOnlySkips": [],
+            },
+            "command-results.json": {
+                **bindings,
+                "commandAuthority": copy.deepcopy(policy_runner.command_plan),
+                "records": copy.deepcopy(policy_runner.command_results),
+            },
+        }
+        coherently_rebind_claimed_transcript(policy_documents)
+        policy_runner.run = mock.Mock(return_value=empty_comparison())
+        policy_runner.close_execution_leases = mock.Mock()
+        policy_replay, errors = ci.run_verification_replay(
+            copy.deepcopy(policy_documents),
+            expected_context=synthetic_external_context(policy_runner.execution_binding),
+            verification_runner=policy_runner,
+        )
+        self.assertEqual(errors, [])
+        self.assertIsNotNone(policy_replay)
+        self.assertEqual(policy_replay["records"], policy_transcript["records"])
+        self.assertEqual(policy_replay["finalAcceptance"], "PASS")
+        self.assertEqual(
+            policy_replay["verifierReplayContextBinding"]["actualVerifierJobId"],
+            "repository-policy",
+        )
+        self.assertEqual(
+            policy_replay["replayAuthorizationEnvelopeDigest"],
+            ci.replay_authorization_envelope_digest(
+                current_full_context_set_digest=policy_replay["currentFullContextDigestSetDigest"],
+                authorization_context_binding_digest_value=policy_replay["authorizationContextBindingDigest"],
+                verifier_replay_context_digest_value=policy_replay["verifierReplayContextDigest"],
+            ),
+        )
+        policy_runner.run.assert_called_once_with()
+        policy_runner.close_execution_leases.assert_called_once_with()
 
     def test_forged_pass_observation_and_exit_matrix_is_rejected(self) -> None:
         modes = (
@@ -14745,6 +15222,39 @@ class CI8PosixContainmentStateMachineTest(unittest.TestCase):
             discovery_generation=generation,
         )
 
+    def static_containment_record(self, observed_count: int = 122) -> tuple[dict, dict]:
+        state = ci.PosixContainmentStateMachine(10)
+        identities = {
+            pid: self.identity(pid, 10)
+            for pid in range(20, 20 + observed_count)
+        }
+        state.observe(identities)
+        for pid in identities:
+            state.mark_reaped(pid)
+        outcome = state.outcome()
+        self.assertTrue(outcome.pop("cleanupComplete"))
+        spec = synthetic_command_spec(
+            "static-suite", "static-suite", 0,
+            command_role="observation-producing",
+            targets=[ci._target_authority(ci.REPO_ROOT, ci.STATIC_SUITE_RELATIVE_PATH)],
+            execution_input_mode="PROTECTED-TARGET-BUNDLE",
+        )
+        spec.update({
+            "platform": "ubuntu",
+            "toolRole": "python-static-producer",
+            "resultSemantics": "machine-v2-complete-execution",
+            "dependencyBacked": False,
+        })
+        record = synthetic_record_from_spec(spec)
+        record.update({
+            **outcome,
+            "containment": "linux-subreaper-pidfd-proc-supervisor",
+            "processTreeStatus": "contained-clean",
+            "descendantsTerminated": 0,
+            "completedCommandClass": "static-suite",
+        })
+        return spec, record
+
     def test_setsid_escape_model_remains_in_descendant_registry(self) -> None:
         state = ci.PosixContainmentStateMachine(10)
         child = self.identity(20, 10, group=20, session=20)
@@ -14907,6 +15417,58 @@ class CI8PosixContainmentStateMachineTest(unittest.TestCase):
         self.assertEqual(outcome["descendantsSurviving"], 0)
         self.assertEqual(outcome["containmentDisposition"], "natural-exit-reaped")
 
+        # Hosted Ubuntu producer run 34456417842 observed/reaped 122 descendants
+        # with no survivors, terminations, or errors. Independently sampled
+        # transient children can add a registry entry without changing the
+        # successful local death/reap proof. Reproduce exactly that bounded
+        # telemetry difference through the supervisor's shared state machine.
+        records = []
+        for count in (122, 123):
+            spec, record = self.static_containment_record(count)
+            errors: list[str] = []
+            self.assertFalse(ci._validate_command_record(record, 0, errors, expected_record=spec))
+            self.assertEqual(errors, [])
+            self.assertIsNotNone(ci._validated_portable_protected_input_bundle_digest(record))
+            records.append(record)
+        first, second = records
+        self.assertEqual(
+            {key for key in first if first[key] != second[key]},
+            {"descendantsObserved", "descendantsReaped"},
+        )
+        self.assertNotEqual(ci._canonical_frame(first), ci._canonical_frame(second))
+        before = copy.deepcopy(records)
+        self.assertEqual(
+            ci._canonical_transcript_record(first),
+            ci._canonical_transcript_record(second),
+        )
+        self.assertEqual(records, before, "exact local telemetry must remain intact")
+        canonical = ci._canonical_transcript_record(first)
+        for field in (
+            "containment", "processTreeStatus", "containmentDisposition",
+            "descendantsTerminated", "descendantsSurviving",
+            "timeoutStatus", "outputLimitStatus", "protectedTargetBundle",
+        ):
+            if field != "protectedTargetBundle":
+                self.assertEqual(canonical[field], first[field])
+        self.assertEqual(canonical["protectedTargetBundle"]["cleanupState"], "closed")
+        self.assertIs(canonical["protectedTargetBundle"]["mutationDetected"], False)
+        # Scope exclusions retain exact counts, including Repository policy and
+        # Windows, whose corresponding telemetry mismatch has not been proved.
+        for field, value in (
+            ("profile", "policy"),
+            ("commandId", "baseline-schema"),
+            ("platform", "windows"),
+            ("containment", "windows-job-object"),
+            ("containmentDisposition", "forced-terminated"),
+        ):
+            with self.subTest(excluded_field=field, value=value):
+                left, right = copy.deepcopy(records)
+                left[field] = right[field] = value
+                self.assertNotEqual(
+                    ci._canonical_transcript_record(left),
+                    ci._canonical_transcript_record(right),
+                )
+
     def test_truth_outcome_distinguishes_forced_termination(self) -> None:
         state = ci.PosixContainmentStateMachine(10)
         child = self.identity(20, 10)
@@ -14928,6 +15490,62 @@ class CI8PosixContainmentStateMachineTest(unittest.TestCase):
         unknown = state.outcome()
         self.assertFalse(unknown["cleanupComplete"])
         self.assertEqual(unknown["containmentDisposition"], "unknown-ancestry")
+
+        _spec, valid = self.static_containment_record()
+        canonical = ci._canonical_transcript_record(valid)
+        mutations = [
+            ("processTreeStatus", "cleanup-failed"),
+            ("processTreeStatus", "setup-failed"),
+            ("descendantsSurviving", 1),
+            ("descendantsTerminated", 1),
+            ("containmentDisposition", "survivor"),
+            ("containmentDisposition", "unknown-ancestry"),
+            ("timeoutStatus", "TIMED-OUT"),
+            ("outputLimitStatus", "OUTPUT-LIMIT-EXCEEDED"),
+            ("processTreeError", "descendant cleanup settle timeout"),
+            ("error", "watcher failure"),
+            ("limitReason", "output cap exceeded"),
+            ("executed", False),
+            ("started", False),
+            ("setupFailure", True),
+            ("exitCode", 1),
+            ("runtimeClosureGuard", {"mutationState": "watcher-failed"}),
+            ("closureWatcherActive", False),
+            ("closureMutationState", "dirty"),
+            ("descendantsReaped", 121),
+            ("descendantsObserved", 0),
+        ]
+        mutations.extend(
+            (field, value)
+            for field in (
+                "descendantsObserved", "descendantsReaped",
+                "descendantsTerminated", "descendantsSurviving",
+            )
+            for value in (None, True, False, "122", 1.5, -1, 4097)
+        )
+        for field, value in mutations:
+            with self.subTest(unsafe_field=field, value=value):
+                unsafe = copy.deepcopy(valid)
+                unsafe[field] = value
+                self.assertIsNone(ci._validated_portable_static_containment(
+                    unsafe, protected_bundle_valid=True,
+                ))
+                projected = ci._canonical_transcript_record(unsafe)
+                self.assertNotEqual(projected, canonical)
+                self.assertEqual(projected["descendantsObserved"], unsafe["descendantsObserved"])
+                self.assertEqual(projected["descendantsReaped"], unsafe["descendantsReaped"])
+        for field, value in (("cleanupState", "failed"), ("mutationDetected", True)):
+            with self.subTest(protected_failure=field):
+                unsafe = copy.deepcopy(valid)
+                unsafe["protectedTargetBundle"][field] = value
+                self.assertIsNone(ci._validated_portable_protected_input_bundle_digest(unsafe))
+                self.assertIsNone(ci._validated_portable_static_containment(
+                    unsafe, protected_bundle_valid=False,
+                ))
+                self.assertNotEqual(ci._canonical_transcript_record(unsafe), canonical)
+        self.assertIsNone(ci._validated_portable_static_containment(
+            valid, protected_bundle_valid=False,
+        ))
 
 
 class _CI8FixtureLease:

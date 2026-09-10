@@ -39,7 +39,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import quote, unquote_to_bytes, urlsplit
@@ -4688,6 +4688,7 @@ class CommandCapture:
     identity_stdout_raw: bytes | None = field(default=None, repr=False)
     identity_stderr_raw: bytes | None = field(default=None, repr=False)
     failure_path_authority: Any | None = field(default=None, repr=False)
+    validated_static_machine_report: dict[str, Any] | None = field(default=None, repr=False)
 
     def execution_passed(self) -> bool:
         return (
@@ -4790,6 +4791,12 @@ class CommandCapture:
             )
         if failure_summary:
             record["parsedFailureSummary"] = normalized_json_value(failure_summary)
+        if self.validated_static_machine_report is not None:
+            # Preserve local machine-plan authority for independent validation;
+            # the physical stdout hash above remains exact local evidence.
+            record["validatedStaticMachineReport"] = copy.deepcopy(
+                self.validated_static_machine_report
+            )
         return record
 
     def authoritative_stdout_bytes(self) -> bytes:
@@ -5662,6 +5669,7 @@ class TrustedBashLease:
             raise ctypes.WinError(ctypes.get_last_error())
         self.handle = handle
         self.path = str(canonical)
+        self.git_path = str(Path(git_path).resolve(strict=True))
         self.trusted_git_root = str(git_root.resolve(strict=True))
         try:
             self._initial_info = self._information(self.handle)
@@ -5729,15 +5737,38 @@ class TrustedBashLease:
                 return False, f"trusted Git Bash path drifted: {reason}"
             if str(path.resolve(strict=True)) != self.path:
                 return False, "trusted Git Bash canonical path drifted"
+            git_root, root_error = _trusted_git_installation_root(Path(self.git_path))
+            if git_root is None or str(git_root.resolve(strict=True)) != self.trusted_git_root:
+                return False, root_error or "trusted Git Bash installation relationship drifted"
+            if (
+                _trusted_git_bash_candidate_position(path, git_root, windows=True) is None
+                or not _non_reparse_directory_chain(path.parent, git_root)
+            ):
+                return False, "trusted Git Bash installation topology drifted"
             handle_info = self._information(self.handle)
             path_info = self._open_path_identity()
             if handle_info != self._initial_info or path_info != self._initial_info:
                 return False, "trusted Git Bash stable file identity drifted"
             if _sha256_file(path) != self.expected_sha256:
                 return False, "trusted Git Bash SHA-256 drifted"
+            if self.identity != {
+                "canonicalPath": self.path,
+                "trustedGitRoot": self.trusted_git_root,
+                **self._initial_info,
+                "sha256": self.expected_sha256,
+            }:
+                return False, "trusted Git Bash recorded lease identity drifted"
         except OSError as exc:
             return False, f"trusted Git Bash lease verification failed: {type(exc).__name__}"
         return True, None
+
+    def validated_identity(self) -> dict[str, Any]:
+        """Snapshot physical authority only while the locally held lease verifies."""
+
+        okay, error = self.verify()
+        if not okay:
+            raise OSError(error or "trusted Git Bash lease verification failed")
+        return dict(self.identity)
 
     def close(self) -> None:
         handle = getattr(self, "handle", None)
@@ -9219,7 +9250,7 @@ def parse_static_machine_report(
         return None, ["static machine report top-level schema is not exact"]
     if value.get("documentKind") != STATIC_MACHINE_DOCUMENT_KIND:
         errors.append("static machine report documentKind is invalid")
-    if value.get("schemaVersion") != STATIC_MACHINE_SCHEMA_VERSION:
+    if type(value.get("schemaVersion")) is not int or value.get("schemaVersion") != STATIC_MACHINE_SCHEMA_VERSION:
         errors.append("static machine report schemaVersion is invalid")
     if value.get("invocationId") != expected_invocation_id:
         errors.append("static machine report invocationId does not match the parent invocation")
@@ -9282,11 +9313,18 @@ def parse_static_machine_report(
         if not isinstance(record, dict) or set(record) != command_required:
             errors.append(f"{label} schema is not exact")
             continue
-        if record.get("ordinal") != index:
+        if type(record.get("ordinal")) is not int or record.get("ordinal") != index:
             errors.append(f"{label} ordinal is invalid")
         if record.get("required") is not True or record.get("started") is not True or record.get("executed") is not True:
             errors.append(f"{label} did not execute as required")
-        if record.get("exitCode") not in record.get("allowedExecutionExits", []):
+        allowed_exits = record.get("allowedExecutionExits")
+        if (
+            not isinstance(allowed_exits, list)
+            or not allowed_exits
+            or any(type(exit_code) is not int for exit_code in allowed_exits)
+            or type(record.get("exitCode")) is not int
+            or record.get("exitCode") not in allowed_exits
+        ):
             errors.append(f"{label} exitCode is outside immutable authority")
         if record.get("timeoutStatus") != "within-limit" or record.get("outputLimitStatus") != "within-limit":
             errors.append(f"{label} has an execution-limit failure")
@@ -9766,14 +9804,140 @@ def syntax_failure_signature(scope: str, stderr: str, stdout: str) -> str:
 
 
 def command_output_digest(record: Mapping[str, Any]) -> str:
+    static_identity = _validated_static_machine_output_identity(record)
+    stdout_identity = static_identity if static_identity is not None else record
     return canonical_failure_digest(
         {
-            "stdoutSha256": record.get("stdoutSha256"),
+            "stdoutSha256": stdout_identity.get("stdoutSha256"),
             "stderrSha256": record.get("stderrSha256"),
-            "stdoutBytesObserved": record.get("stdoutBytesObserved"),
+            "stdoutBytesObserved": stdout_identity.get("stdoutBytesObserved"),
             "stderrBytesObserved": record.get("stderrBytesObserved"),
         }
     )
+
+
+def _validated_static_machine_output_identity(
+    record: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Project only a completed static machine report bound to local authority.
+
+    Raw stream hashes remain in execution evidence. A report cannot authorize
+    semantic stream identity merely by supplying a digest: reconstruct its
+    exact local producer plan from the independently verified parent command.
+    """
+
+    report = record.get("validatedStaticMachineReport")
+    if (
+        not isinstance(report, Mapping)
+        or record.get("commandId") != "static-suite"
+        or record.get("commandClass") != "static-suite"
+        or record.get("resultSemantics") != "machine-v2-complete-execution"
+        or record.get("executed") is not True
+        or record.get("started") is not True
+        or record.get("setupFailure") is not False
+        or record.get("exitCode") != 0
+        or record.get("timeoutStatus") != "within-limit"
+        or record.get("outputLimitStatus") != "within-limit"
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("processTreeError") is not None
+        or record.get("descendantsSurviving") != 0
+    ):
+        return None
+    invocation_id = report.get("invocationId")
+    argv = [
+        record.get("resolvedExecutablePath"), "-B", STATIC_SUITE_RELATIVE_PATH,
+        "--ci-machine-json-stdout", "--ci-invocation-id", invocation_id,
+    ]
+    if (
+        not isinstance(invocation_id, str)
+        or any(record.get(key) != argv for key in (
+            "argv", "logicalArgv", "executionArgv", "actualExecutionArgv",
+        ))
+        or record.get("toolRole") != "python-static-producer"
+    ):
+        return None
+    targets = record.get("targets")
+    if not isinstance(targets, list):
+        return None
+    protected = record.get("protectedTargetBundle")
+    if (
+        record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or not isinstance(protected, Mapping)
+        or protected.get("mutationDetected") is not False
+        or protected.get("cleanupState") != "closed"
+    ):
+        return None
+    pre = protected.get("preExecutionIdentities")
+    post = protected.get("postExecutionIdentities")
+    valid_full_identities = (
+        pre == post
+        and _full_protected_identity_array_matches_authority(record, pre)
+        and _full_protected_identity_array_matches_authority(record, post)
+    )
+    valid_compact_identities = (
+        bool(targets)
+        and all(protected.get(key) == [] for key in _PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS)
+        and pre == _protected_bundle_compact_identity_digests(record, phase="pre")
+        and post == _protected_bundle_compact_identity_digests(record, phase="post")
+    )
+    if not valid_full_identities and not valid_compact_identities:
+        return None
+    static_targets = [
+        target for target in targets
+        if isinstance(target, Mapping) and target.get("path") == STATIC_SUITE_RELATIVE_PATH
+    ]
+    if len(static_targets) != 1:
+        return None
+    static_target = static_targets[0]
+    expected_plan = [{
+        "commandId": "static-check-registry",
+        "ordinal": 0,
+        "commandClass": "static-machine-producer",
+        "required": True,
+        "profile": "static",
+        "platform": record.get("platform"),
+        "argv": argv,
+        "cwd": ".",
+        "toolRole": "python-static-producer",
+        "resolvedExecutablePath": record.get("resolvedExecutablePath"),
+        "resolvedExecutableSize": record.get("resolvedExecutableSize"),
+        "resolvedExecutableSha256": record.get("resolvedExecutableSha256"),
+        "targets": [{key: static_target.get(key) for key in ("path", "size", "sha256")}],
+        "resultSemantics": "complete-registry-execution-with-native-observations",
+        "allowedExecutionExits": [0],
+    }]
+    try:
+        validated, errors = parse_static_machine_report(
+            _json_bytes(report), expected_invocation_id=invocation_id,
+        )
+        if validated is None or errors:
+            return None
+        authority_keys = set(expected_plan[0])
+        reported_plan = [
+            {key: value for key, value in result.items() if key in authority_keys}
+            for result in validated["commandResults"]
+        ]
+        if (
+            reported_plan != expected_plan
+            or validated["commandPlanDigest"] != static_machine_command_plan_digest(expected_plan)
+        ):
+            return None
+        semantic_report = copy.deepcopy(validated)
+        # The local nested plan was checked exactly above. Bind the same tool
+        # bytes/targets/argv through the established portable plan projection.
+        semantic_report["commandResults"] = _portable_command_plan_value(
+            validated["commandResults"]
+        )
+        semantic_report["commandPlanDigest"] = command_plan_digest(expected_plan)
+        semantic_report = normalized_json_value(semantic_report)
+        canonical = _json_bytes(semantic_report)
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    return {
+        "stdoutSha256": hashlib.sha256(canonical).hexdigest(),
+        "stdoutBytesObserved": len(canonical),
+        "validatedStaticMachineReport": semantic_report,
+    }
 
 
 def command_capture_output_digest(capture: CommandCapture) -> str:
@@ -10791,6 +10955,74 @@ def _command_execution_completed(record: Mapping[str, Any]) -> bool:
     )
 
 
+def _validated_portable_static_containment(
+    record: Mapping[str, Any],
+    *,
+    protected_bundle_valid: bool,
+) -> dict[str, str] | None:
+    """Project only proven Linux static-suite natural-reap count telemetry.
+
+    The supervisor's sampled registry can observe different numbers of transient
+    children in independent executions. Its exact local reap/death proof remains
+    mandatory. The bounded projection preserves the backend, disposition, zero
+    survivors/terminations, and every execution/cleanup/watcher fact in the
+    surrounding record; no other command or successful disposition is changed.
+    """
+
+    if (
+        protected_bundle_valid is not True
+        or record.get("commandId") != "static-suite"
+        or record.get("commandClass") != "static-suite"
+        or record.get("commandRole") != "observation-producing"
+        or record.get("toolRole") != "python-static-producer"
+        or record.get("profile") not in ("static", "all")
+        or record.get("platform") != "ubuntu"
+        or record.get("resultSemantics") != "machine-v2-complete-execution"
+        or record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or record.get("required") is not True
+        or record.get("executed") is not True
+        or record.get("started") is not True
+        or record.get("setupFailure") is not False
+        or type(record.get("exitCode")) is not int
+        or record.get("exitCode") != 0
+        or record.get("allowedExecutionExits") != [0]
+        or record.get("timeoutStatus") != "within-limit"
+        or record.get("outputLimitStatus") != "within-limit"
+        or record.get("containment") != "linux-subreaper-pidfd-proc-supervisor"
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("containmentDisposition") != "natural-exit-reaped"
+        or any(record.get(key) not in (None, "") for key in (
+            "error", "processTreeError", "limitReason",
+        ))
+        # Static-suite currently has no dependency watcher. Retain any future
+        # watcher evidence exactly until its successful projection is justified.
+        or record.get("dependencyBacked") is not False
+        or any(record.get(key) is not None for key in (
+            "runtimeClosureGuard", "closureWatcherActive", "closureMutationState",
+        ))
+    ):
+        return None
+    counts = {
+        key: record.get(key)
+        for key in (
+            "descendantsObserved", "descendantsReaped",
+            "descendantsTerminated", "descendantsSurviving",
+        )
+    }
+    if (
+        any(type(value) is not int or not 0 <= value <= 4096 for value in counts.values())
+        or counts["descendantsObserved"] == 0
+        or counts["descendantsObserved"] != counts["descendantsReaped"]
+        or counts["descendantsTerminated"] != 0
+        or counts["descendantsSurviving"] != 0
+    ):
+        return None
+    return {
+        "descendantsObserved": "<VALIDATED-NATURALLY-REAPED-COUNT>",
+        "descendantsReaped": "<VALIDATED-NATURALLY-REAPED-COUNT>",
+    }
+
+
 def _plan_command_requires_completion(record: Mapping[str, Any]) -> bool:
     return bool(record.get("required")) or record.get("commandRole") == "observation-producing"
 
@@ -10904,6 +11136,93 @@ def _canonical_replay_value(value: Any) -> Any:
                 )
         return normalized
     return value
+
+
+def _git_bash_execution_lease_valid(record: Mapping[str, Any]) -> bool:
+    """Validate portable evidence without resolving another runner's local paths."""
+
+    lease = record.get("executionLease")
+    if (
+        record.get("commandId") != "git-bash-version"
+        or record.get("toolRole") != "git-bash-runtime"
+        or record.get("platform") != "windows"
+        or not isinstance(lease, dict)
+        or set(lease) != {
+            "canonicalPath", "trustedGitRoot", "size", "volumeSerial", "fileIndex",
+            "links", "creationTime", "writeTime", "reparsePoint", "sha256",
+        }
+        or lease.get("reparsePoint") is not False
+        or type(lease.get("links")) is not int
+        or lease["links"] != 1
+        or type(lease.get("size")) is not int
+        or not 0 <= lease["size"] < 2**64
+        or lease["size"] != record.get("resolvedExecutableSize")
+        or not isinstance(lease.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", lease["sha256"])
+        or lease["sha256"] != record.get("resolvedExecutableSha256")
+        or lease.get("canonicalPath") != record.get("resolvedExecutablePath")
+        or any(
+            not isinstance(lease.get(key), str)
+            or not re.fullmatch(r"[0-9]{1,20}", lease[key])
+            or int(lease[key]) >= 2**64
+            for key in ("volumeSerial", "fileIndex", "creationTime", "writeTime")
+        )
+        or any(
+            not isinstance(lease.get(key), str) or not lease[key] or "\x00" in lease[key]
+            for key in ("canonicalPath", "trustedGitRoot")
+        )
+    ):
+        return False
+    executable = PureWindowsPath(lease["canonicalPath"])
+    git_root = PureWindowsPath(lease["trustedGitRoot"])
+    if (
+        not executable.is_absolute()
+        or not git_root.is_absolute()
+        or ".." in executable.parts
+        or ".." in git_root.parts
+    ):
+        return False
+    try:
+        candidate = tuple(part.casefold() for part in executable.relative_to(git_root).parts)
+    except ValueError:
+        return False
+    return candidate in WINDOWS_GIT_BASH_CANDIDATE_SUFFIXES
+
+
+def _validated_portable_git_bash_execution_lease(
+    record: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Project a locally verified successful lease; failed physical evidence stays exact.
+
+    TrustedBashLease constructs the held identity and verifies it before the plan
+    snapshot and both sides of execution. Those checks remain local authority;
+    this projection is only the cross-job identity of their successful record.
+    """
+
+    if (
+        not _git_bash_execution_lease_valid(record)
+        or not _required_command_execution_passed(record)
+        or record.get("containment") != "windows-job-object"
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("descendantsSurviving") != 0
+        or any(record.get(key) is not None for key in ("error", "processTreeError", "limitReason"))
+    ):
+        return None
+    errors: list[str] = []
+    _validate_command_record(dict(record), 0, errors, expected_record=record)
+    if errors:
+        return None
+    lease = record["executionLease"]
+    return {
+        "leaseKind": "windows-git-bash-executable-v1",
+        "tool": "git-bash",
+        "size": lease["size"],
+        "sha256": lease["sha256"],
+        "reparsePoint": False,
+        "links": 1,
+        "trustedProductRelationship": "fixed-candidate-in-trusted-git-installation",
+        "nonReparseDirectoryChain": True,
+    }
 
 
 _PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS = (
@@ -11304,11 +11623,31 @@ def _validated_portable_protected_input_bundle_digest(
 
 def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
     source = dict(record)
+    if source.get("executionLease") is not None:
+        portable_bash_lease = _validated_portable_git_bash_execution_lease(record)
+        if portable_bash_lease is None:
+            source["invalidGitBashLeaseLocalEvidence"] = True
+        else:
+            source["executionLease"] = portable_bash_lease
     portable_bundle_digest = _validated_portable_protected_input_bundle_digest(source)
+    portable_containment = _validated_portable_static_containment(
+        record, protected_bundle_valid=portable_bundle_digest is not None,
+    )
+    if portable_containment is not None:
+        source.update(portable_containment)
     invalid_protected_bundle = (
         source.get("executionInputMode") == "PROTECTED-TARGET-BUNDLE"
         or source.get("protectedTargetBundle") is not None
     ) and portable_bundle_digest is None
+    if "validatedStaticMachineReport" in source:
+        static_output_identity = (
+            _validated_static_machine_output_identity(record)
+            if portable_bundle_digest is not None else None
+        )
+        if static_output_identity is None:
+            source["invalidStaticMachineLocalEvidence"] = True
+        else:
+            source.update(static_output_identity)
     if invalid_protected_bundle:
         # Even a forged raw digest equal to the portable digest cannot make
         # invalid physical evidence indistinguishable from a valid transcript.
@@ -11834,6 +12173,7 @@ def _validate_raw_observation(
     *,
     label: str,
     source: Mapping[str, Any] | None,
+    source_output_digest: str | None = None,
 ) -> list[str]:
     expected_keys = {
         "schemaVersion",
@@ -11907,7 +12247,12 @@ def _validate_raw_observation(
             errors.append(f"{label}: commandId does not bind the source command")
         if raw.get("commandOrdinal") != source.get("ordinal"):
             errors.append(f"{label}: commandOrdinal does not bind the source command")
-        if raw.get("sourceOutputDigest") != command_output_digest(source):
+        expected_output_digest = (
+            source_output_digest
+            if source_output_digest is not None
+            else command_output_digest(source)
+        )
+        if raw.get("sourceOutputDigest") != expected_output_digest:
             errors.append(f"{label}: sourceOutputDigest does not bind the producer command streams")
     return errors
 
@@ -11964,6 +12309,7 @@ def _validate_observation_record(
     command_by_id: Mapping[str, Mapping[str, Any]],
     *,
     authorization_context_binding_digest_value: str | None = None,
+    source_output_digests: Mapping[int, str] | None = None,
 ) -> list[str]:
     label = f"command-results.json.observations[{index}]"
     expected_keys = {
@@ -12042,7 +12388,15 @@ def _validate_observation_record(
         errors.append(f"{label}: source command did not execute successfully enough to emit observations")
     else:
         raw = item.get("rawObservation")
-        errors.extend(_validate_raw_observation(raw, label=f"{label}.rawObservation", source=source))
+        errors.extend(_validate_raw_observation(
+            raw,
+            label=f"{label}.rawObservation",
+            source=source,
+            source_output_digest=(
+                source_output_digests.get(id(source))
+                if source_output_digests is not None else None
+            ),
+        ))
         if isinstance(raw, dict):
             command_class = str(item.get("commandClass", ""))
             scope = str(item.get("testOrPathScope", ""))
@@ -12156,6 +12510,12 @@ def derive_authoritative_evidence(
         if not command_id or command_id in command_by_id:
             continue
         command_by_id[command_id] = record
+    # This operation does not mutate command evidence. Validate structured
+    # source-output authority once per command, then reuse it for its records.
+    source_output_digests = {
+        id(record): command_output_digest(record)
+        for record in command_records
+    }
     valid_observations: list[Mapping[str, Any]] = []
     for index, item in enumerate(observations):
         item_errors = _validate_observation_record(
@@ -12165,6 +12525,7 @@ def derive_authoritative_evidence(
             authorization_context_binding_digest_value=(
                 authorization_context_binding_digest_value
             ),
+            source_output_digests=source_output_digests,
         )
         if item_errors:
             derivation_violations.extend(
@@ -12199,6 +12560,7 @@ def derive_authoritative_evidence(
                 raw,
                 label=f"command:{command_id}.producerObservations[{index}]",
                 source=record,
+                source_output_digest=source_output_digests.get(id(record)),
             )
             if raw_errors:
                 derivation_violations.extend(
@@ -13855,7 +14217,7 @@ def build_profile_command_plan(
                 "resolvedExecutableSha256": executable_hash,
                 "resolvedExecutableFileIdentity": executable_identity,
                 "executionLease": (
-                    dict(bash_lease.identity)
+                    bash_lease.validated_identity()
                     if command_id == "git-bash-version" and bash_lease is not None
                     else None
                 ),
@@ -17483,7 +17845,7 @@ class FoundationRunner:
             report_errors.append("static machine invocation argv identity is not exact")
         canonical_report: dict[str, Any] | None = None
         canonical_observation_bindings: list[Mapping[str, Any] | None] = []
-        if report is not None and not report_errors:
+        if report is not None and not report_errors and capture.execution_passed():
             canonical_report = copy.deepcopy(report)
             canonical_results: list[Any] = []
             for result in report["observations"]:
@@ -17512,6 +17874,7 @@ class FoundationRunner:
                 canonical_observation_bindings.append(binding)
             canonical_report["observations"] = canonical_results
             _canonicalize_static_machine_capture(capture, canonical_report)
+            capture.validated_static_machine_report = copy.deepcopy(canonical_report)
         static_command_record = self.add_command(capture)
         static_command_record["executionInputs"] = copy.deepcopy(
             protected_bundle["executionInputs"]
@@ -17540,6 +17903,7 @@ class FoundationRunner:
             self.add_hard_gate("STATIC-SUITE-RESULT", False, "; ".join(detail_parts))
         else:
             assert canonical_report is not None
+            static_source_output_digest = command_output_digest(static_command_record)
             release_scopes = {
                 entry["testOrPathScope"] for entry in self.baseline.get("releaseOnlySkips", [])
             }
@@ -17572,7 +17936,7 @@ class FoundationRunner:
                     str(result["name"]),
                     STATIC_SUITE_RELATIVE_PATH,
                     result,
-                    command_output_digest(static_command_record),
+                    static_source_output_digest,
                     failure_path_authority=path_binding,
                 )
                 self.add_observation(
@@ -18335,6 +18699,7 @@ _REPLAY_DIAGNOSTIC_FIELD_CATEGORIES = {
     "executionDurationClass": frozenset({"executionDurationClass"}),
     "stdout-identity": frozenset({
         "stdoutSha256", "stdoutBytesObserved", "stdoutByteLimit",
+        "validatedStaticMachineReport", "invalidStaticMachineLocalEvidence",
     }),
     "stderr-identity": frozenset({
         "stderrSha256", "stderrBytesObserved", "stderrByteLimit",
@@ -18350,6 +18715,7 @@ _REPLAY_DIAGNOSTIC_FIELD_CATEGORIES = {
     }),
     "target-input-authority": frozenset({
         "targets", "executionInputs", "executionLease", "targetExecutionLease",
+        "invalidGitBashLeaseLocalEvidence",
         "executionInputMode", "executionInputSize", "executionInputSha256",
         "actualExecutionInputMode", "actualExecutionInputSize",
         "actualExecutionInputSha256", "fileScans",
@@ -19295,6 +19661,7 @@ def _validate_command_record(
         "closureWatcherActive",
         "closureMutationState",
         "runtimeClosureGuard",
+        "validatedStaticMachineReport",
     }
     if not isinstance(record, dict):
         errors.append(f"{label}: record must be an object")
@@ -19428,31 +19795,8 @@ def _validate_command_record(
         }
         if not isinstance(executable_identity, dict) or set(executable_identity) != identity_keys:
             errors.append(f"{label}: executable stable identity is invalid")
-    if execution_lease is not None:
-        lease_keys = {
-            "canonicalPath",
-            "trustedGitRoot",
-            "size",
-            "volumeSerial",
-            "fileIndex",
-            "links",
-            "creationTime",
-            "writeTime",
-            "reparsePoint",
-            "sha256",
-        }
-        if (
-            record.get("commandId") != "git-bash-version"
-            or not isinstance(execution_lease, dict)
-            or set(execution_lease) != lease_keys
-            or execution_lease.get("reparsePoint") is not False
-            or execution_lease.get("links") != 1
-            or execution_lease.get("canonicalPath") != resolved_executable
-            or execution_lease.get("size") != executable_size
-            or execution_lease.get("sha256") != executable_hash
-            or not re.fullmatch(r"[0-9a-f]{64}", str(execution_lease.get("sha256", "")))
-        ):
-            errors.append(f"{label}: trusted Bash execution lease is invalid")
+    if execution_lease is not None and not _git_bash_execution_lease_valid(record):
+        errors.append(f"{label}: trusted Bash execution lease is invalid")
     targets = record.get("targets")
     if not isinstance(targets, list) or len(targets) > MAX_EVIDENCE_COLLECTION_ITEMS:
         errors.append(f"{label}: targets must be a bounded array")
@@ -19771,6 +20115,18 @@ def _validate_command_record(
         errors.append(f"{label}: producerObservations must be a bounded array")
     elif record.get("producerObservationSetDigest") != producer_observation_set_digest(producer):
         errors.append(f"{label}: producerObservationSetDigest is invalid")
+    if "validatedStaticMachineReport" in record:
+        static_identity = _validated_static_machine_output_identity(record)
+        if static_identity is None:
+            errors.append(f"{label}: validated static machine report does not bind local execution authority")
+        elif isinstance(producer, list) and [
+            raw.get("rawStructuredFields") if isinstance(raw, Mapping) else None
+            for raw in producer
+        ] != [
+            raw_observation_json_value(result)
+            for result in record["validatedStaticMachineReport"]["observations"]
+        ]:
+            errors.append(f"{label}: static machine observations are incomplete or differ from validated output")
     if not isinstance(record.get("resultSemantics"), str) or not record.get("resultSemantics"):
         errors.append(f"{label}: resultSemantics is invalid")
     allowed_exits = record.get("allowedExecutionExits")
