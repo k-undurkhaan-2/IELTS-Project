@@ -6335,8 +6335,11 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
 class StaticProducerProtocolTest(unittest.TestCase):
     INVOCATION_ID = "12345678-1234-4234-9234-1234567890ab"
 
-    def invoke(self, *, passed: bool, argv: list[str]) -> tuple[int, str, str, bool]:
-        results = [
+    def invoke(
+        self, *, passed: bool, argv: list[str], results: list[dict] | None = None,
+        check_effect=None,
+    ) -> tuple[int, str, str, bool]:
+        results = results if results is not None else [
             {
                 "name": "fixture",
                 "status": "pass" if passed else "fail",
@@ -6352,7 +6355,10 @@ class StaticProducerProtocolTest(unittest.TestCase):
             stderr = io.StringIO()
             with (
                 mock.patch.object(static_suite, "REPO_ROOT", root),
-                mock.patch.object(static_suite, "run_checks", return_value=(results, passed)),
+                mock.patch.object(
+                    static_suite, "run_checks", return_value=(results, passed),
+                    side_effect=check_effect,
+                ),
                 contextlib.redirect_stdout(stdout),
                 contextlib.redirect_stderr(stderr),
             ):
@@ -6362,6 +6368,52 @@ class StaticProducerProtocolTest(unittest.TestCase):
             ).exists()
         return exit_code, stdout.getvalue(), stderr.getvalue(), report_exists
 
+    def invoke_standalone(self, execution, *, machine_mode: bool = True):
+        def check_effect(*, machine_mode):
+            passed, detail = static_suite._check_standalone_release_manifest_security_tests(
+                machine_mode=machine_mode
+            )
+            return ([static_suite._format_result(
+                "Standalone release manifest security tests", passed, detail,
+            )], passed)
+
+        argv = (
+            ["--ci-machine-json-stdout", "--ci-invocation-id", self.INVOCATION_ID]
+            if machine_mode else []
+        )
+        with mock.patch.object(
+            static_suite.subprocess, "run",
+            side_effect=execution if isinstance(execution, Exception) else None,
+            return_value=execution,
+        ):
+            return self.invoke(passed=False, argv=argv, check_effect=check_effect)
+
+    def machine_identity(self, invocation):
+        exit_code, stdout, stderr, report_exists = invocation
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        self.assertFalse(report_exists)
+        report, errors = ci.parse_static_machine_report(
+            stdout.encode("utf-8"), expected_invocation_id=self.INVOCATION_ID,
+        )
+        self.assertEqual(errors, [])
+        self.assertIsNotNone(report)
+        capture = ci.CommandCapture(
+            "static-suite", "static-suite", [], True, 0, 0.0, stdout, "",
+            stdout_raw=stdout.encode("utf-8"), stderr_raw=b"",
+        )
+        ci._canonicalize_static_machine_capture(capture, report)
+        source_digest = ci.command_capture_output_digest(capture)
+        raws = [
+            ci.make_raw_observation(
+                "static-suite", 0, ordinal, "static-producer-v1", result["name"],
+                ci.STATIC_SUITE_RELATIVE_PATH, result, source_digest,
+            )
+            for ordinal, result in enumerate(report["observations"])
+        ]
+        outputs = [ci._raw_failure_outputs(raw, {"commandClass": "static-suite"}) for raw in raws]
+        return report, capture.identity_stdout_raw, raws, outputs
+
     def test_legacy_default_invocation_preserves_human_and_file_behavior(self) -> None:
         exit_code, stdout, stderr, report_exists = self.invoke(passed=True, argv=[])
         self.assertEqual(exit_code, 0)
@@ -6370,12 +6422,78 @@ class StaticProducerProtocolTest(unittest.TestCase):
         document = ci.strict_json_loads(stdout)
         self.assertEqual(set(document), {"generatedAt", "status", "results"})
         self.assertNotIn("documentKind", document)
+        stdout_lines = [f"diagnostic line {index}" for index in range(90)]
+        execution = subprocess.CompletedProcess([], 0, "\n".join(stdout_lines) + "\n", "final diagnostic\n")
+        exit_code, stdout, stderr, report_exists = self.invoke_standalone(execution, machine_mode=False)
+        self.assertEqual((exit_code, stderr, report_exists), (0, "", True))
+        result = ci.strict_json_loads(stdout)["results"][0]
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["detail"], {
+            "returnCode": 0, "outputTail": (stdout_lines + ["final diagnostic"])[-80:],
+        })
 
     def test_legacy_default_failure_exit_is_unchanged(self) -> None:
         exit_code, stdout, _stderr, report_exists = self.invoke(passed=False, argv=[])
         self.assertEqual(exit_code, 1)
         self.assertEqual(ci.strict_json_loads(stdout)["status"], "fail")
         self.assertTrue(report_exists)
+        success = self.machine_identity(self.invoke_standalone(
+            subprocess.CompletedProcess([], 0, "success telemetry\n", ""),
+        ))
+        # Exercise an actual failed unittest child before supplying its captured
+        # execution to the same producer path used for standalone security tests.
+        actual_failure = subprocess.run(
+            [sys.executable, "-B", "-c",
+             "import unittest\nclass F(unittest.TestCase):\n"
+             " def test_failure(self): self.fail('controlled security-test failure')\n"
+             "unittest.main()\n"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+        )
+        self.assertNotEqual(actual_failure.returncode, 0)
+        self.assertIn("FAILED (failures=1)", actual_failure.stderr)
+        diagnostics = [f"failure line {index}" for index in range(95)]
+        nonzero = subprocess.CompletedProcess([], 7, "\n".join(diagnostics) + "\n", "last failure\n")
+        timeout = subprocess.TimeoutExpired(
+            "standalone security tests", 900,
+            output="\n".join(diagnostics), stderr="\n".join(reversed(diagnostics)),
+        )
+        for label, execution in (
+            ("nonzero", nonzero), ("actual-failed-test", actual_failure), ("timeout", timeout),
+            ("incomplete-return", subprocess.CompletedProcess([], None, "incomplete\n", "")),
+            ("boolean-return", subprocess.CompletedProcess([], False, "malformed\n", "")),
+            ("floating-return", subprocess.CompletedProcess([], 0.0, "malformed\n", "")),
+        ):
+            with self.subTest(standalone_failure=label):
+                report, identity, raws, outputs = self.machine_identity(self.invoke_standalone(execution))
+                self.assertEqual(report["nativeNonPassCount"], 1)
+                self.assertEqual(report["observations"][0]["status"], "fail")
+                self.assertEqual(outputs[0]["outcome"], "fail")
+                self.assertNotEqual(outputs[0]["signature"], "pass")
+                self.assertNotEqual(identity, success[1])
+                self.assertNotEqual(ci.producer_observation_set_digest(raws), ci.producer_observation_set_digest(success[2]))
+                detail = report["observations"][0]["detail"]
+                if label == "timeout":
+                    self.assertEqual(detail, {
+                        "error": "standalone packaging security tests timed out", "timeoutSeconds": 900,
+                        "stdoutTail": diagnostics[-40:], "stderrTail": list(reversed(diagnostics))[-40:],
+                    })
+                else:
+                    self.assertEqual(detail["returnCode"], execution.returncode)
+                    self.assertEqual(detail["outputTail"], (execution.stdout + execution.stderr).splitlines()[-80:])
+        exit_code, stdout, stderr, report_exists = self.invoke_standalone(nonzero, machine_mode=False)
+        self.assertEqual((exit_code, stderr, report_exists), (1, "", True))
+        self.assertEqual(ci.strict_json_loads(stdout)["results"][0]["detail"]["outputTail"],
+                         (diagnostics + ["last failure"])[-80:])
+        for execution, error_class in (
+            (subprocess.CompletedProcess([], 0, b"malformed output", ""), "TypeError"),
+            (OSError("controlled incomplete execution"), "OSError"),
+        ):
+            with self.subTest(malformed_execution=error_class):
+                exit_code, stdout, stderr, report_exists = self.invoke_standalone(execution)
+                self.assertEqual(exit_code, 2)
+                self.assertEqual(stdout, "")
+                self.assertFalse(report_exists)
+                self.assertEqual(stderr, f"static machine execution error: {error_class}\n")
 
     def test_machine_mode_stdout_is_one_framed_document_and_uses_no_report_file(self) -> None:
         exit_code, stdout, stderr, report_exists = self.invoke(
@@ -6398,6 +6516,58 @@ class StaticProducerProtocolTest(unittest.TestCase):
         self.assertEqual(document["internalRunnerFailures"], [])
         self.assertEqual(len(document["commandResults"]), 1)
         self.assertFalse(report_exists)
+
+        success = None
+        for label, telemetry in (
+            ("localhost-port-one", "endpoint http://localhost:41871/\n"),
+            ("localhost-port-two", "endpoint http://localhost:52349/\n"),
+            ("elapsed-one", "Ran 71 tests in 1.003s\n"),
+            ("elapsed-two", "Ran 71 tests in 9.874s\n"),
+            ("temporary-path-one", "/tmp/security-producer-a/manifest.json\n"),
+            ("temporary-path-two", "/tmp/security-replay-b/manifest.json\n"),
+            ("runtime-path-one", "/opt/python/3.13.7/bin/python3\n"),
+            ("runtime-path-two", "C:/runtime/Python313/python.exe\n"),
+        ):
+            with self.subTest(success_telemetry=label):
+                current = self.machine_identity(self.invoke_standalone(
+                    subprocess.CompletedProcess([], 0, telemetry, "passed diagnostics\n"),
+                ))
+                report, identity, raws, outputs = current
+                self.assertEqual(report["observations"], [{
+                    "name": "Standalone release manifest security tests", "status": "pass",
+                    "detail": {"returnCode": 0},
+                }])
+                self.assertEqual(report["nativeNonPassCount"], 0)
+                self.assertEqual(outputs[0]["outcome"], "pass")
+                if success is None:
+                    success = current
+                else:
+                    self.assertEqual(identity, success[1])
+                    self.assertEqual(raws[0]["sourceOutputDigest"], success[2][0]["sourceOutputDigest"])
+                    self.assertEqual(raws[0]["producerRecordDigest"], success[2][0]["producerRecordDigest"])
+                    self.assertEqual(ci.producer_observation_set_digest(raws), ci.producer_observation_set_digest(success[2]))
+        for key, value in (("name", "Different security check"), ("status", "fail")):
+            with self.subTest(changed_observation_field=key):
+                changed_result = {**success[0]["observations"][0], key: value}
+                changed = self.machine_identity(self.invoke(
+                    passed=key != "status", results=[changed_result],
+                    argv=["--ci-machine-json-stdout", "--ci-invocation-id", self.INVOCATION_ID],
+                ))
+                self.assertNotEqual(changed[1], success[1])
+                self.assertNotEqual(ci.producer_observation_set_digest(changed[2]), ci.producer_observation_set_digest(success[2]))
+                if key == "status":
+                    self.assertEqual(changed[0]["nativeNonPassCount"], 1)
+                    self.assertEqual(changed[3][0]["outcome"], "fail")
+        # The serializer does not remove telemetry from any supplied observation;
+        # only the exact standalone producer's successful machine path omits it.
+        other_results = [{"name": "Other static check", "status": "pass", "detail": {
+            "returnCode": 0, "outputTail": ["other authoritative diagnostic"],
+        }}]
+        other = self.machine_identity(self.invoke(
+            passed=True, results=other_results,
+            argv=["--ci-machine-json-stdout", "--ci-invocation-id", self.INVOCATION_ID],
+        ))
+        self.assertEqual(other[0]["observations"], other_results)
 
         def context_record(value=True) -> dict:
             raw = ci.make_raw_observation(
@@ -12238,6 +12408,13 @@ class CI5TargetExecutionLeaseTest(unittest.TestCase):
         self.assertEqual(capture.exit_code, 1)
         self.assertEqual(capture.execution_input_sha256, plan["executionInputSha256"])
         self.assertIn("SyntaxError", capture.stderr)
+        assert lease is not None
+        record = self.final_record(plan, capture, lease)
+        self.assertIsNotNone(ci._validated_portable_target_stdin_input_authority(record))
+        canonical = ci._canonical_transcript_record(record)
+        self.assertEqual(canonical["exitCode"], 1)
+        self.assertEqual(canonical["stderrSha256"], record["stderrSha256"])
+        self.assertEqual(canonical["parsedFailureSummary"], ci._canonical_replay_value(record["parsedFailureSummary"]))
 
     def test_valid_plan_then_invalid_replacement_before_lease_never_executes(self) -> None:
         plan = self.plan()
@@ -12453,6 +12630,128 @@ class CI5TargetExecutionLeaseTest(unittest.TestCase):
             lease_evidence["executedInputSha256"],
             lease_evidence["plannedSha256"],
         )
+        raw_snapshot = copy.deepcopy(record)
+        portable = ci._validated_portable_target_stdin_input_authority(record)
+        self.assertIsNotNone(portable)
+        assert portable is not None
+        canonical = ci._canonical_transcript_record(record)
+        self.assertEqual(record, raw_snapshot)
+        self.assertEqual(canonical["executionInputs"], [
+            ci._portable_protected_execution_input_authority(plan["targets"][0], "TARGET-BYTES-STDIN")
+        ])
+        self.assertEqual(canonical["targetExecutionLease"], portable["targetExecutionLease"])
+        self.assertEqual(canonical["executionInputBundleDigest"], portable["executionInputBundleDigest"])
+        self.assertNotEqual(record["executionInputBundleDigest"], canonical["executionInputBundleDigest"])
+        self.assertEqual(portable["targetExecutionLease"], {
+            "leaseVersion": ci.TARGET_EXECUTION_LEASE_VERSION,
+            "logicalTargetPath": self.relative,
+            "executionAdapter": "TARGET-BYTES-STDIN",
+            "plannedByteLength": len(self.valid_bytes),
+            "plannedSha256": hashlib.sha256(self.valid_bytes).hexdigest(),
+            "executedInputByteLength": len(self.valid_bytes),
+            "executedInputSha256": hashlib.sha256(self.valid_bytes).hexdigest(),
+            "modeType": "regular-file", "reparsePoint": False,
+            "mutationDetected": False, "cleanupState": "closed", "targetIndex": 0,
+            "commandAssociation": {
+                key: plan[key] for key in ("commandId", "ordinal", "commandClass", "profile", "toolRole")
+            },
+        })
+        expected_digest = hashlib.sha256(ci._canonical_frame({
+            "digestDomain": "ieltmps-target-bytes-stdin-portable-input-v1",
+            "targetExecutionLease": portable["targetExecutionLease"],
+            "orderedExecutionInputs": portable["executionInputs"],
+        })).hexdigest()
+        self.assertEqual(portable["executionInputBundleDigest"], expected_digest)
+
+        # Independently lease and execute identical target bytes in another checkout.
+        verifier_root = self.root / "independent-checkout"
+        (verifier_root / "js").mkdir(parents=True)
+        (verifier_root / self.relative).write_bytes(self.valid_bytes)
+        with mock.patch.object(self, "root", verifier_root):
+            verifier_plan = self.plan()
+            verifier_capture, verifier_lease = self.execute(verifier_plan)
+            assert verifier_lease is not None
+            verifier_record = self.final_record(verifier_plan, verifier_capture, verifier_lease)
+        self.assertNotEqual(record["targets"][0]["canonicalSourcePath"],
+                            verifier_record["targets"][0]["canonicalSourcePath"])
+        self.assertNotEqual(record["targetExecutionLease"], verifier_record["targetExecutionLease"])
+        self.assertEqual(canonical, ci._canonical_transcript_record(verifier_record))
+
+        # Synthetic Windows snapshots keep host-valid absolute paths, so Linux
+        # also exercises both Windows handle schemas without accepting D:/ paths.
+        windows_records = []
+        for seed in (101, 202):
+            windows_record = copy.deepcopy(record)
+            windows_record["platform"] = "windows"
+            windows_record["containment"] = "windows-job-object"
+            target = windows_record["targets"][0]
+            target["canonicalSourcePath"] = str(self.root / f"windows-checkout-{seed}" / self.relative)
+            target["fileIdentity"] = {
+                "deviceOrVolume": str(seed), "inodeOrFileIndex": str(seed + 1),
+                "creationOrChangeTimeNs": str(seed + 2), "writeTimeNs": str(seed + 3),
+                "reparsePoint": False,
+            }
+            held = {
+                "volumeSerial": str(seed + 4), "fileIndex": str(seed + 5),
+                "size": len(self.valid_bytes), "creationTime": str(seed + 6),
+                "writeTime": str(seed + 7), "linkCount": 1, "reparsePoint": False,
+            }
+            input_record = windows_record["executionInputs"][0]
+            input_record["canonicalSourcePath"] = target["canonicalSourcePath"]
+            input_record["plannedStableIdentity"] = copy.deepcopy(target["fileIdentity"])
+            windows_lease = windows_record["targetExecutionLease"]
+            windows_lease["canonicalSourcePath"] = target["canonicalSourcePath"]
+            windows_lease["plannedStableFileIdentity"] = copy.deepcopy(target["fileIdentity"])
+            for phase in ("preExecutionSourceIdentity", "postExecutionSourceIdentity"):
+                windows_lease[phase] = {
+                    "canonicalPath": target["canonicalSourcePath"],
+                    "pathStableIdentity": copy.deepcopy(target["fileIdentity"]),
+                    "heldStableIdentity": copy.deepcopy(held),
+                }
+            windows_record["executionInputBundleDigest"] = ci.execution_input_bundle_digest(windows_record["executionInputs"])
+            errors = []
+            self.assertFalse(ci._validate_command_record(windows_record, 0, errors))
+            self.assertEqual(errors, [])
+            self.assertIsNotNone(ci._validated_portable_target_stdin_input_authority(windows_record))
+            windows_records.append(windows_record)
+        self.assertNotEqual(windows_records[0]["executionInputBundleDigest"], windows_records[1]["executionInputBundleDigest"])
+        self.assertNotEqual(windows_records[0]["targetExecutionLease"], windows_records[1]["targetExecutionLease"])
+        self.assertEqual(ci._canonical_transcript_record(windows_records[0]),
+                         ci._canonical_transcript_record(windows_records[1]))
+        for relabel in ("windows-path-shape", "windows-linux-backend", "ubuntu-windows-backend", "ubuntu-handle-shape"):
+            with self.subTest(invalid_backend_identity=relabel):
+                invalid_windows = copy.deepcopy(windows_records[0])
+                if relabel == "windows-path-shape":
+                    for phase in ("preExecutionSourceIdentity", "postExecutionSourceIdentity"):
+                        invalid_windows["targetExecutionLease"][phase]["heldStableIdentity"] = copy.deepcopy(
+                            invalid_windows["targets"][0]["fileIdentity"]
+                        )
+                elif relabel == "windows-linux-backend":
+                    invalid_windows["containment"] = "linux-subreaper-pidfd-proc-supervisor"
+                else:
+                    invalid_windows["platform"] = "ubuntu"
+                    if relabel == "ubuntu-handle-shape":
+                        invalid_windows["containment"] = "linux-subreaper-pidfd-proc-supervisor"
+                self.assertIsNone(ci._validated_portable_target_stdin_input_authority(invalid_windows))
+                self.assertTrue(ci._canonical_transcript_record(invalid_windows)["invalidTargetStdinLocalEvidence"])
+        for field, value in (
+            ("volumeSerial", str(2**32)), ("fileIndex", str(2**64)),
+            ("creationTime", str(2**64)), ("writeTime", "not-a-timestamp"),
+            ("linkCount", 0), ("linkCount", True), ("linkCount", 2**32),
+            ("size", True), ("reparsePoint", True), ("unexpectedField", "untrusted"),
+        ):
+            with self.subTest(invalid_windows_handle_field=field, value=value):
+                malformed = copy.deepcopy(windows_records[0])
+                for phase in ("preExecutionSourceIdentity", "postExecutionSourceIdentity"):
+                    malformed["targetExecutionLease"][phase]["heldStableIdentity"][field] = value
+                self.assertIsNone(ci._validated_portable_target_stdin_input_authority(malformed))
+                self.assertTrue(ci._canonical_transcript_record(malformed)["invalidTargetStdinLocalEvidence"])
+        for field, value in (("commandId", "node-check:js/other.js"), ("ordinal", 1)):
+            associated = {**record, field: value}
+            associated_portable = ci._validated_portable_target_stdin_input_authority(associated)
+            self.assertIsNotNone(associated_portable)
+            self.assertNotEqual(portable["executionInputBundleDigest"], associated_portable["executionInputBundleDigest"])
+
         for identity_field in ("target", "executable", "both"):
             with self.subTest(identity_field=identity_field):
                 verifier_plan = copy.deepcopy(self.plan())
@@ -12529,6 +12828,122 @@ class CI5TargetExecutionLeaseTest(unittest.TestCase):
                             else "EXECUTION-INPUT-IDENTITY-MISMATCH",
                             ids,
                         )
+
+        valid_portable = ci._validated_portable_target_stdin_input_authority(record)
+        assert valid_portable is not None
+        valid_canonical = ci._canonical_transcript_record(record)
+        mutation_matrix = (
+            (("targets", 0, "sha256"), "f" * 64),
+            (("targets", 0, "size"), len(self.valid_bytes) + 1),
+            (("targets", 0, "path"), "js/other.js"),
+            (("targets", 0, "modeType"), "other"),
+            (("targets", 0, "reparsePoint"), True),
+            (("targets", 0, "canonicalSourcePath"), None),
+            (("targets", 0, "fileIdentity"), None),
+            (("actualExecutionInputSize",), len(self.valid_bytes) + 1),
+            (("actualExecutionInputSha256",), "f" * 64),
+            (("actualExecutionInputMode",), "NONE"),
+            (("executionInputs", 0, "plannedByteLength"), len(self.valid_bytes) + 1),
+            (("executionInputs", 0, "actualByteLength"), len(self.valid_bytes) + 1),
+            (("executionInputs", 0, "actualSha256"), "f" * 64),
+            (("targetExecutionLease", "leaseVersion"), True),
+            (("targetExecutionLease", "logicalTargetPath"), "js/other.js"),
+            (("targetExecutionLease", "executionAdapter"), "PROTECTED-TARGET-BUNDLE"),
+            (("targetExecutionLease", "plannedByteLength"), len(self.valid_bytes) + 1),
+            (("targetExecutionLease", "executedInputByteLength"), len(self.valid_bytes) + 1),
+            (("targetExecutionLease", "executedInputSha256"), "f" * 64),
+            (("targetExecutionLease", "modeType"), "other"),
+            (("targetExecutionLease", "reparsePoint"), True),
+            (("targetExecutionLease", "mutationDetected"), True),
+            (("targetExecutionLease", "cleanupState"), "open"),
+            (("targetExecutionLease", "preExecutionSourceIdentity"), None),
+            (("targetExecutionLease", "postExecutionSourceIdentity"), None),
+            (("targetExecutionLease", "postExecutionSourceIdentity", "canonicalPath"), str(self.root / "other.js")),
+            (("targetExecutionLease", "postExecutionSourceIdentity", "pathStableIdentity", "inodeOrFileIndex"), "999999999"),
+            (("targetExecutionLease", "postExecutionSourceIdentity", "heldStableIdentity", "reparsePoint"), True),
+            (("targetExecutionLease",), None),
+            (("executionInputBundleDigest",), valid_portable["executionInputBundleDigest"]),
+            (("processTreeStatus",), "cleanup-failed"),
+            (("descendantsSurviving",), 1),
+            (("timeoutStatus",), "TIMED-OUT"),
+            (("outputLimitStatus",), "OUTPUT-LIMIT-EXCEEDED"),
+            (("executed",), False),
+        )
+        for field_path, value in mutation_matrix:
+            with self.subTest(nonportable_local_mutation=field_path):
+                forged = copy.deepcopy(record)
+                selected = forged
+                for key in field_path[:-1]:
+                    selected = selected[key]
+                selected[field_path[-1]] = value
+                self.assertIsNone(ci._validated_portable_target_stdin_input_authority(forged))
+                invalid = ci._canonical_transcript_record(forged)
+                self.assertTrue(invalid["invalidTargetStdinLocalEvidence"])
+                self.assertNotEqual(valid_canonical, invalid)
+                for physical_field in ("targets", "executionInputs", "targetExecutionLease"):
+                    self.assertEqual(invalid[physical_field], ci._canonical_replay_value(forged[physical_field]))
+                forged["executionInputBundleDigest"] = valid_portable["executionInputBundleDigest"]
+                self.assertIsNone(ci._validated_portable_target_stdin_input_authority(forged))
+                self.assertTrue(ci._canonical_transcript_record(forged)["invalidTargetStdinLocalEvidence"])
+
+        # Non-None snapshots alone are insufficient: both identical malformed
+        # maps must still reject, even where the original validator accepted them.
+        for malformed_held in (
+            {"reparsePoint": False}, {"reparsePoint": False, "size": False},
+            {"reparsePoint": False, "size": float("nan")},
+        ):
+            forged = copy.deepcopy(record)
+            for phase in ("preExecutionSourceIdentity", "postExecutionSourceIdentity"):
+                forged["targetExecutionLease"][phase]["heldStableIdentity"] = copy.deepcopy(malformed_held)
+            errors = []
+            self.assertFalse(ci._validate_command_record(forged, 0, errors))
+            self.assertEqual(errors, [])
+            self.assertIsNone(ci._validated_portable_target_stdin_input_authority(forged))
+            self.assertTrue(ci._canonical_transcript_record(forged)["invalidTargetStdinLocalEvidence"])
+
+        # Different valid planned content remains bound by the semantic digest.
+        for changed_bytes in (self.valid_bytes.replace(b"1", b"2"), self.valid_bytes + b"\n"):
+            with self.subTest(changed_planned_bytes=changed_bytes):
+                self.target.write_bytes(changed_bytes)
+                changed_plan = self.plan()
+                changed_capture, changed_lease = self.execute(changed_plan)
+                assert changed_lease is not None
+                changed = self.final_record(changed_plan, changed_capture, changed_lease)
+                changed_portable = ci._validated_portable_target_stdin_input_authority(changed)
+                self.assertIsNotNone(changed_portable)
+                self.assertNotEqual(valid_portable["executionInputBundleDigest"], changed_portable["executionInputBundleDigest"])
+                self.assertNotEqual(valid_canonical, ci._canonical_transcript_record(changed))
+                self.assertIn("COMMAND-AUTHORITY-MISMATCH", [
+                    item["id"] for item in ci._command_authority_violations(
+                        "static", [changed], [], expected_plan=[plan], cross_job=True,
+                    )
+                ])
+
+
+        # Empty files are valid stdin targets; bool aliases for their zero
+        # lengths cannot pass the stricter gate by Python's False == 0 equality.
+        self.target.write_bytes(b"")
+        empty_plan = self.plan()
+        empty_capture, empty_lease = self.execute(empty_plan)
+        assert empty_lease is not None
+        empty_record = self.final_record(empty_plan, empty_capture, empty_lease)
+        self.assertIsNotNone(ci._validated_portable_target_stdin_input_authority(empty_record))
+        for path in (
+            ("executionInputSize",), ("actualExecutionInputSize",),
+            ("targetExecutionLease", "plannedByteLength"),
+            ("targetExecutionLease", "executedInputByteLength"),
+            ("executionInputs", 0, "plannedByteLength"),
+            ("executionInputs", 0, "actualByteLength"),
+        ):
+            with self.subTest(boolean_zero_length_alias=path):
+                forged = copy.deepcopy(empty_record)
+                selected = forged
+                for key in path[:-1]:
+                    selected = selected[key]
+                selected[path[-1]] = False
+                forged["executionInputBundleDigest"] = ci.execution_input_bundle_digest(forged["executionInputs"])
+                self.assertIsNone(ci._validated_portable_target_stdin_input_authority(forged))
+                self.assertTrue(ci._canonical_transcript_record(forged)["invalidTargetStdinLocalEvidence"])
 
     def test_logical_or_execution_argv_forgery_is_rejected_by_rebuilt_plan(self) -> None:
         plan = self.plan()

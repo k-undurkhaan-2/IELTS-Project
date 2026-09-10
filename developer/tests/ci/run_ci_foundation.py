@@ -11621,8 +11621,151 @@ def _validated_portable_protected_input_bundle_digest(
     return hashlib.sha256(_canonical_frame(authority)).hexdigest()
 
 
+def _validated_portable_target_stdin_input_authority(
+    record: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Project a single immutable stdin input only after complete local validation.
+
+    Retain all physical evidence in the raw record. The successful projection
+    shares the protected-bundle byte representation and binds the closed lease,
+    command association, and target ordering in a distinct digest domain.
+    """
+
+    if record.get("executionInputMode") != "TARGET-BYTES-STDIN":
+        return None
+    errors: list[str] = []
+    try:
+        hard_failure = _validate_command_record(dict(record), 0, errors, expected_record=record)
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+        return None
+    if (
+        errors or hard_failure or not _command_execution_completed(record)
+        or (record.get("platform"), record.get("containment")) not in {
+            ("windows", "windows-job-object"), ("ubuntu", "linux-subreaper-pidfd-proc-supervisor"),
+        }
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("descendantsSurviving") != 0
+        or any(record.get(key) is not None for key in ("error", "processTreeError", "limitReason"))
+    ):
+        return None
+    target = record["targets"][0]
+    lease = record["targetExecutionLease"]
+    execution_input = record["executionInputs"][0]
+    stable = target.get("fileIdentity")
+    if (
+        type(target.get("size")) is not int
+        or not 0 <= target["size"] <= MAX_SCANNED_FILE_BYTES
+        or not isinstance(target.get("sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", target["sha256"]) is None
+        or not isinstance(target.get("canonicalSourcePath"), str)
+        or not Path(target["canonicalSourcePath"]).is_absolute()
+        or target.get("modeType") != "regular-file"
+        or target.get("reparsePoint") is not False
+        or lease.get("reparsePoint") is not False
+        or type(lease.get("leaseVersion")) is not int
+        or lease["leaseVersion"] != TARGET_EXECUTION_LEASE_VERSION
+        or any(
+            type(value) is not int or value != target["size"]
+            for value in (
+                record.get("executionInputSize"), record.get("actualExecutionInputSize"),
+                lease.get("plannedByteLength"), lease.get("executedInputByteLength"),
+                execution_input.get("plannedByteLength"), execution_input.get("actualByteLength"),
+            )
+        )
+        or not isinstance(stable, Mapping)
+        or set(stable) != {
+            "deviceOrVolume", "inodeOrFileIndex", "creationOrChangeTimeNs", "writeTimeNs", "reparsePoint",
+        }
+        or stable.get("reparsePoint") is not False
+        or any(
+            not isinstance(stable.get(key), str) or re.fullmatch(r"-?[0-9]+", stable[key]) is None
+            for key in ("deviceOrVolume", "inodeOrFileIndex", "creationOrChangeTimeNs", "writeTimeNs")
+        )
+    ):
+        return None
+    relative = target["path"]
+    if (
+        Path(relative).is_absolute() or "\\" in relative
+        or any(part in {"", ".", ".."} for part in relative.split("/"))
+    ):
+        return None
+    pre = lease["preExecutionSourceIdentity"]
+    post = lease["postExecutionSourceIdentity"]
+    # The ordinary stdin validator requires snapshots to exist; this projection
+    # additionally proves their full physical content before discarding it.
+    try:
+        snapshots_match = (
+            _protected_source_identity_matches_target(pre, target)
+            and _protected_source_identity_matches_target(post, target)
+            and _json_bytes(pre) == _json_bytes(post)
+            and _json_bytes(pre["pathStableIdentity"]) == _json_bytes(stable)
+            and _json_bytes(lease["plannedStableFileIdentity"]) == _json_bytes(stable)
+            and _json_bytes(execution_input["plannedStableIdentity"]) == _json_bytes(stable)
+        )
+    except (KeyError, TypeError, ValueError, UnicodeError):
+        return None
+    if not snapshots_match:
+        return None
+    held = pre["heldStableIdentity"]
+    if record["platform"] == "windows":
+        if (
+            set(held) != {
+                "volumeSerial", "fileIndex", "size", "creationTime", "writeTime", "linkCount", "reparsePoint",
+            }
+            or type(held.get("size")) is not int or held["size"] != target["size"]
+            or type(held.get("linkCount")) is not int or not 1 <= held["linkCount"] < 2**32
+            or held.get("reparsePoint") is not False
+            or any(
+                not isinstance(held.get(key), str)
+                or re.fullmatch(r"[0-9]{1,20}", held[key]) is None
+                or int(held[key]) >= 2**width
+                for key, width in (
+                    ("volumeSerial", 32), ("fileIndex", 64), ("creationTime", 64), ("writeTime", 64),
+                )
+            )
+        ):
+            return None
+    elif _json_bytes(held) != _json_bytes(stable):
+        return None
+    portable_input = _portable_protected_execution_input_authority(target, "TARGET-BYTES-STDIN")
+    portable_lease = {
+        "leaseVersion": lease["leaseVersion"],
+        "logicalTargetPath": portable_input["logicalPath"],
+        "executionAdapter": portable_input["inputMode"],
+        "plannedByteLength": portable_input["plannedByteLength"],
+        "plannedSha256": portable_input["plannedSha256"],
+        "executedInputByteLength": portable_input["actualByteLength"],
+        "executedInputSha256": portable_input["actualSha256"],
+        "modeType": target["modeType"],
+        "reparsePoint": False,
+        "mutationDetected": False,
+        "cleanupState": "closed",
+        "targetIndex": 0,
+        "commandAssociation": {
+            key: record[key] for key in ("commandId", "ordinal", "commandClass", "profile", "toolRole")
+        },
+    }
+    portable_digest = hashlib.sha256(_canonical_frame({
+        "digestDomain": "ieltmps-target-bytes-stdin-portable-input-v1",
+        "targetExecutionLease": portable_lease,
+        "orderedExecutionInputs": [portable_input],
+    })).hexdigest()
+    return {
+        "executionInputs": [portable_input],
+        "executionInputBundleDigest": portable_digest,
+        "targetExecutionLease": portable_lease,
+    }
+
+
 def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
     source = dict(record)
+    portable_stdin_authority = _validated_portable_target_stdin_input_authority(record)
+    invalid_stdin_authority = (
+        record.get("executionInputMode") == "TARGET-BYTES-STDIN"
+        or record.get("targetExecutionLease") is not None
+    ) and portable_stdin_authority is None
+    if invalid_stdin_authority:
+        source["invalidTargetStdinLocalEvidence"] = True
     if source.get("executionLease") is not None:
         portable_bash_lease = _validated_portable_git_bash_execution_lease(record)
         if portable_bash_lease is None:
@@ -11652,7 +11795,7 @@ def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
         # Even a forged raw digest equal to the portable digest cannot make
         # invalid physical evidence indistinguishable from a valid transcript.
         source["invalidProtectedBundleLocalEvidence"] = True
-    if "executionInputs" in source and not invalid_protected_bundle:
+    if "executionInputs" in source and not (invalid_protected_bundle or invalid_stdin_authority):
         source["executionInputs"] = _canonical_protected_execution_inputs(source)
     protected_source = source.get("protectedTargetBundle")
     if isinstance(protected_source, Mapping) and not invalid_protected_bundle:
@@ -11690,6 +11833,9 @@ def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
         source["executionInputBundleDigest"] = portable_bundle_digest
         protected_projection["executionInputBundleDigest"] = portable_bundle_digest
         source["protectedTargetBundle"] = protected_projection
+    if portable_stdin_authority is not None:
+        source.update(portable_stdin_authority)
+    invalid_input_authority = invalid_protected_bundle or invalid_stdin_authority
     canonical = _canonical_replay_value(source)
     canonical.pop("durationSeconds", None)
     tool_role = str(canonical.get("toolRole", "unknown"))
@@ -11709,18 +11855,19 @@ def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
         canonical["resolvedTestRunnerEntrypoint"] = (
             f"<TRUSTED-TOOL:{tool_role}>"
         )
-    for target in ([] if invalid_protected_bundle else canonical.get("targets", [])):
+    for target in ([] if invalid_input_authority else canonical.get("targets", [])):
         if isinstance(target, dict):
             target["canonicalSourcePath"] = None
             target["fileIdentity"] = None
     for execution_input in (
-        [] if invalid_protected_bundle else canonical.get("executionInputs", [])
+        [] if invalid_input_authority or portable_stdin_authority is not None
+        else canonical.get("executionInputs", [])
     ):
         if isinstance(execution_input, dict):
             execution_input["canonicalSourcePath"] = None
             execution_input["plannedStableIdentity"] = None
     lease = canonical.get("targetExecutionLease")
-    if isinstance(lease, dict) and not invalid_protected_bundle:
+    if isinstance(lease, dict) and not invalid_input_authority and portable_stdin_authority is None:
         for key in (
             "canonicalSourcePath",
             "plannedStableFileIdentity",
