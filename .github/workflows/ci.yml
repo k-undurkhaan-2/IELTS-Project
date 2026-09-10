@@ -38,7 +38,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "24.x"
+          node-version: "24.20.0"
 
       - name: Run CI foundation self-tests
         run: python -B developer/tests/ci/test_ci_foundation.py
@@ -80,7 +80,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "24.x"
+          node-version: "24.20.0"
 
       - name: Install locked developer dependencies for untrusted production
         run: npm --prefix developer ci --ignore-scripts --no-audit --no-fund
@@ -125,7 +125,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "24.x"
+          node-version: "24.20.0"
 
       - name: Install locked developer dependencies for untrusted production
         run: npm --prefix developer ci --ignore-scripts --no-audit --no-fund
@@ -172,7 +172,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "24.x"
+          node-version: "24.20.0"
 
       - name: Capture trusted runtime paths
         shell: bash
@@ -219,7 +219,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "24.x"
+          node-version: "24.20.0"
 
       - name: Capture trusted runtime paths
         shell: bash
@@ -281,7 +281,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "24.x"
+          node-version: "24.20.0"
 
       - name: Capture trusted runtime paths
         shell: pwsh

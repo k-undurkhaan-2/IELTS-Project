@@ -4235,6 +4235,18 @@ class WorkflowPolicyTest(unittest.TestCase):
 
     def test_current_workflow_passes_narrow_policy(self) -> None:
         self.assertEqual(ci.check_workflow_text(self.workflow), [])
+        exact_node_selector = 'node-version: "24.20.0"'
+        selectors = list(re.finditer(re.escape(exact_node_selector), self.workflow))
+        self.assertEqual(len(selectors), 6)
+        for index, selector in enumerate(selectors):
+            with self.subTest(floating_node_selector=index):
+                candidate = (
+                    self.workflow[:selector.start()]
+                    + 'node-version: "24.x"'
+                    + self.workflow[selector.end():]
+                )
+                errors = ci.check_workflow_text(candidate)
+                self.assertTrue(any("Node setup is not exact" in error for error in errors), errors)
         _assert_windows_runtime_capture(self, _HostedToolFixture)
 
     def test_write_permission_is_rejected(self) -> None:
@@ -11956,6 +11968,16 @@ class CI6ReplayVerificationTest(unittest.TestCase):
         commands = self.documents["command-results.json"]
         self.assertEqual(commands["producerObservationCount"], 787)
         self.assertTrue(commands["completedCommandClasses"])
+        canonical_records = [
+            ci._canonical_transcript_record(record) for record in commands["records"]
+        ]
+        self.assertIsNone(
+            ci.first_replay_transcript_difference_diagnostic(
+                canonical_records, copy.deepcopy(canonical_records)
+            )
+        )
+        self.assertIsNone(ci.first_replay_transcript_difference_diagnostic([], []))
+        self.assertEqual(ci.replay_failure_diagnostics([], []), [])
 
     def test_forged_pass_observation_and_exit_matrix_is_rejected(self) -> None:
         modes = (
@@ -12071,6 +12093,23 @@ class CI6ReplayVerificationTest(unittest.TestCase):
                 self.assertTrue(errors, mode)
                 self.assertTrue(any("command" in error.lower() for error in errors), errors)
 
+        fixed_record = {"commandId": "baseline-schema", "exitCode": 0}
+        for producer, replay in (([fixed_record], []), ([], [fixed_record])):
+            with self.subTest(missing_side="replay" if producer else "producer"):
+                diagnostic = ci.strict_json_loads(
+                    ci.first_replay_transcript_difference_diagnostic(producer, replay)
+                )
+                self.assertEqual(diagnostic["commandId"], "baseline-schema")
+                self.assertEqual(diagnostic["changedFieldCategories"], ["command-membership"])
+                self.assertEqual(
+                    diagnostic["producerRecordDigest"],
+                    ci.canonical_failure_digest(producer[0] if producer else None),
+                )
+                self.assertEqual(
+                    diagnostic["replayRecordDigest"],
+                    ci.canonical_failure_digest(replay[0] if replay else None),
+                )
+
     def test_fake_evidence_replay_fields_do_not_authorize_execution(self) -> None:
         forged = copy.deepcopy(self.documents)
         forged["summary.json"]["replayStatus"] = "PASS"
@@ -12155,6 +12194,101 @@ class CI6ReplayVerificationTest(unittest.TestCase):
         )
         self.assertIsNone(transcript)
         self.assertTrue(any("unavailable" in error for error in errors), errors)
+
+        unsafe = "PRIVATE-CANARY:/tmp/private/token-output?credential=secret"
+        failures = [
+            {
+                "id": ci.HARD_GATE_AUTHORITY[index % len(ci.HARD_GATE_AUTHORITY)],
+                "status": "fail",
+                "detail": {"path": unsafe, "stdout": unsafe, "environment": {unsafe: unsafe}},
+                "sequence": index,
+            }
+            for index in range(10)
+        ]
+        violations = [
+            {
+                "id": "UNKNOWN-NONPASS",
+                "commandId": "static-suite",
+                "detail": {"stderr": unsafe, "observations": [unsafe]},
+                "sequence": index,
+            }
+            for index in range(10)
+        ]
+        failures[1]["id"] = unsafe
+        violations[1]["id"] = unsafe
+        violations[1]["commandId"] = unsafe
+        violations[2].pop("commandId")
+        violations[3]["id"] = "CI-RUNNER-ERROR"
+        violations[4]["id"] = ci.HARD_GATE_AUTHORITY[0]
+        hard_prefix = "verification replay failed hard gate: "
+        violation_prefix = "verification replay violation: "
+        diagnostics = ci.replay_failure_diagnostics(failures, violations)
+        self.assertEqual(diagnostics, ci.replay_failure_diagnostics(
+            copy.deepcopy(failures), copy.deepcopy(violations)
+        ))
+        self.assertEqual(len(diagnostics), 16)
+        self.assertNotIn(unsafe, "\n".join(diagnostics))
+        hard_diagnostics = [ci.strict_json_loads(line.removeprefix(hard_prefix))
+                            for line in diagnostics if line.startswith(hard_prefix)]
+        violation_diagnostics = [ci.strict_json_loads(line.removeprefix(violation_prefix))
+                                 for line in diagnostics if line.startswith(violation_prefix)]
+        self.assertEqual(len(hard_diagnostics), 8)
+        self.assertEqual(len(violation_diagnostics), 8)
+        for index, diagnostic in enumerate(hard_diagnostics):
+            self.assertEqual(set(diagnostic), {"hardGateId", "diagnosticDigest"})
+            self.assertEqual(diagnostic["hardGateId"],
+                             "OTHER" if index == 1 else failures[index]["id"])
+            self.assertEqual(diagnostic["diagnosticDigest"],
+                             ci.canonical_failure_digest(failures[index]))
+        for index, diagnostic in enumerate(violation_diagnostics):
+            expected_keys = {"violationId", "diagnosticDigest"}
+            if index not in {1, 2}:
+                expected_keys.add("commandId")
+                self.assertEqual(diagnostic["commandId"], "static-suite")
+            self.assertEqual(set(diagnostic), expected_keys)
+            self.assertEqual(diagnostic["violationId"],
+                             "OTHER" if index == 1 else violations[index]["id"])
+            self.assertEqual(diagnostic["diagnosticDigest"],
+                             ci.canonical_failure_digest(violations[index]))
+        changed_failures = copy.deepcopy(failures)
+        changed_failures[0]["detail"]["path"] += "-changed"
+        changed_diagnostics = ci.replay_failure_diagnostics(changed_failures, violations)
+        self.assertNotEqual(diagnostics[0], changed_diagnostics[0])
+        self.assertEqual(diagnostics[1:], changed_diagnostics[1:])
+        for gate_id in sorted(ci._REPLAY_DIAGNOSTIC_HARD_GATE_IDS):
+            with self.subTest(allowlisted_gate=gate_id):
+                record = {"id": gate_id, "status": "fail", "detail": unsafe}
+                hard_line, violation_line = ci.replay_failure_diagnostics([record], [record])
+                self.assertEqual(ci.strict_json_loads(hard_line.removeprefix(hard_prefix))["hardGateId"],
+                                 gate_id)
+                self.assertEqual(ci.strict_json_loads(violation_line.removeprefix(violation_prefix))["violationId"],
+                                 gate_id)
+        for invalid_id in (None, 7, [unsafe], {unsafe: unsafe}):
+            with self.subTest(nonstring_identity=type(invalid_id).__name__):
+                record = {"id": invalid_id, "commandId": invalid_id, "detail": unsafe}
+                hard_line, violation_line = ci.replay_failure_diagnostics([record], [record])
+                self.assertEqual(ci.strict_json_loads(hard_line.removeprefix(hard_prefix))["hardGateId"],
+                                 "OTHER")
+                violation = ci.strict_json_loads(violation_line.removeprefix(violation_prefix))
+                self.assertEqual(set(violation), {"violationId", "diagnosticDigest"})
+                self.assertEqual(violation["violationId"], "OTHER")
+                self.assertNotIn(unsafe, hard_line + violation_line)
+
+        nonpass_runner = copy.deepcopy(self.runner)
+        nonpass_runner.hard_gate_results = failures[:3] + [
+            {"id": ci.HARD_GATE_AUTHORITY[3], "status": "pass", "detail": unsafe}
+        ]
+        nonpass_runner.violations = violations[:4]
+        transcript, errors = ci.compare_verification_replay_claims(
+            self.documents, nonpass_runner, self.comparison
+        )
+        self.assertIn(
+            "verification replay profile is non-PASS: hardFailures=3 violations=4", errors
+        )
+        self.assertEqual(sum(line.startswith(hard_prefix) for line in errors), 3)
+        self.assertEqual(sum(line.startswith(violation_prefix) for line in errors), 4)
+        self.assertNotIn(unsafe, "\n".join(errors))
+        self.assertNotIn("replayAuthorizationEnvelope", transcript)
 
     def test_coherent_five_file_rewrite_remains_read_only_and_nonpassing(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ci6-five-file-forgery-") as temp_dir:
@@ -12243,6 +12377,126 @@ class CI6ReplayVerificationTest(unittest.TestCase):
             "processTreeStatus",
         }
         self.assertTrue(required_record.issubset(transcript["records"][0]))
+
+        # Diagnostics inspect the compared record without changing its canonical
+        # acceptance projection, including the still-authoritative duration class.
+        source = copy.deepcopy(self.documents["command-results.json"]["records"][0])
+        source["executionDurationClass"] = "bounded"
+        source["durationSeconds"] = 0.125
+        canonical = ci._canonical_transcript_record(source)
+        duration_only = copy.deepcopy(source)
+        duration_only["durationSeconds"] = 9.875
+        self.assertEqual(canonical, ci._canonical_transcript_record(duration_only))
+        duration_only["executionDurationClass"] = "not-started"
+        self.assertNotEqual(canonical, ci._canonical_transcript_record(duration_only))
+        self.assertEqual(canonical["executionDurationClass"], "bounded")
+
+        categories = {
+            "executionDurationClass", "stdout-identity", "stderr-identity",
+            "execution-status", "process-containment", "target-input-authority",
+            "executionInputBundleDigest", "protectedTargetBundle.executionInputBundleDigest",
+            "runtime-closure", "producer-observation-context", "command-membership",
+            "other-authorized-fixed-category",
+        }
+        unsafe = "PRIVATE-CANARY:C:\\private\\secret.txt?credential=token"
+        matrix = (
+            (("executionDurationClass",), "executionDurationClass"),
+            (("stdoutSha256",), "stdout-identity"),
+            (("stderrSha256",), "stderr-identity"),
+            (("exitCode",), "execution-status"),
+            (("parsedFailureSummary", "status"), "execution-status"),
+            (("parsedFailureSummary", "diagnostic"), "producer-observation-context"),
+            (("processTreeStatus",), "process-containment"),
+            (("protectedTargetBundle", "cleanupState"), "process-containment"),
+            (("protectedTargetBundle", "mutationDetected"), "process-containment"),
+            (("executionInputBundleDigest",), "executionInputBundleDigest"),
+            (("protectedTargetBundle", "executionInputBundleDigest"),
+             "protectedTargetBundle.executionInputBundleDigest"),
+            (("targets",), "target-input-authority"),
+            (("executionInputs",), "target-input-authority"),
+            (("executionLease",), "target-input-authority"),
+            (("runtimeClosureDigest",), "runtime-closure"),
+            (("producerObservationSetDigest",), "producer-observation-context"),
+            ((unsafe,), "other-authorized-fixed-category"),
+        )
+        combined_producer = {"commandId": "baseline-schema"}
+        combined_replay = {"commandId": "static-suite"}
+        for keys, category in matrix:
+            with self.subTest(category=category, field=keys):
+                producer = {"commandId": "baseline-schema"}
+                replay = copy.deepcopy(producer)
+                left, right = producer, replay
+                for key in keys[:-1]:
+                    left[key], right[key] = {}, {}
+                    left, right = left[key], right[key]
+                left[keys[-1]] = "unchanged-identity"
+                right[keys[-1]] = {"stdout": unsafe, "environment": {unsafe: [unsafe]}}
+                rendered = ci.first_replay_transcript_difference_diagnostic([producer], [replay])
+                diagnostic = ci.strict_json_loads(rendered)
+                self.assertEqual(set(diagnostic), {
+                    "commandId", "changedFieldCategories",
+                    "producerRecordDigest", "replayRecordDigest",
+                })
+                self.assertEqual(diagnostic["commandId"], "baseline-schema")
+                self.assertEqual(diagnostic["changedFieldCategories"], [category])
+                self.assertTrue(set(diagnostic["changedFieldCategories"]).issubset(categories))
+                self.assertEqual(diagnostic["producerRecordDigest"],
+                                 ci.canonical_failure_digest(producer))
+                self.assertEqual(diagnostic["replayRecordDigest"],
+                                 ci.canonical_failure_digest(replay))
+                self.assertNotEqual(diagnostic["producerRecordDigest"], diagnostic["replayRecordDigest"])
+                self.assertNotIn(unsafe, rendered)
+                self.assertLess(len(rendered), 600)
+                self.assertEqual(rendered, ci.first_replay_transcript_difference_diagnostic(
+                    [dict(reversed(list(producer.items())))], [copy.deepcopy(replay)]
+                ))
+                left, right = combined_producer, combined_replay
+                for key in keys[:-1]:
+                    left, right = left.setdefault(key, {}), right.setdefault(key, {})
+                left[keys[-1]] = "unchanged-identity"
+                right[keys[-1]] = {"stdout": unsafe, "environment": {unsafe: [unsafe]}}
+        # An arbitrarily broad record still yields only one finite category set.
+        for index in range(100):
+            combined_replay[f"{unsafe}:{index}"] = {"content": unsafe}
+        rendered = ci.first_replay_transcript_difference_diagnostic(
+            [combined_producer], [combined_replay]
+        )
+        combined_diagnostic = ci.strict_json_loads(rendered)
+        self.assertEqual(combined_diagnostic["changedFieldCategories"], sorted(categories))
+        self.assertLess(len(rendered), 900)
+        self.assertNotIn(unsafe, rendered)
+
+        producer = {"commandId": unsafe, "executionDurationClass": "bounded"}
+        replay = {"commandId": unsafe, "executionDurationClass": "not-started"}
+        second_producer = {"commandId": "static-suite", "stdoutSha256": "a" * 64}
+        second_replay = {"commandId": "static-suite", "stdoutSha256": "b" * 64}
+        diagnostic = ci.strict_json_loads(ci.first_replay_transcript_difference_diagnostic(
+            [producer, second_producer], [replay, second_replay]
+        ))
+        self.assertEqual(diagnostic["commandId"], "OTHER")
+        self.assertEqual(diagnostic["changedFieldCategories"], ["executionDurationClass"])
+        self.assertNotIn(unsafe, json.dumps(diagnostic))
+        self.assertEqual(diagnostic["producerRecordDigest"], ci.canonical_failure_digest(producer))
+        equal_prefix = {"commandId": "node-version", "exitCode": 0}
+        self.assertEqual(diagnostic, ci.strict_json_loads(
+            ci.first_replay_transcript_difference_diagnostic(
+                [equal_prefix, producer, second_producer],
+                [copy.deepcopy(equal_prefix), replay, second_replay],
+            )
+        ))
+
+        forged = copy.deepcopy(self.documents)
+        forged["command-results.json"]["records"][0]["executionDurationClass"] = unsafe
+        forged["command-results.json"]["records"][1]["exitCode"] = -99
+        errors = self.compare(forged)
+        self.assertIn("verification replay command execution transcript mismatch", errors)
+        prefix = "verification replay first command difference: "
+        differences = [ci.strict_json_loads(error.removeprefix(prefix))
+                       for error in errors if error.startswith(prefix)]
+        self.assertEqual(len(differences), 1)
+        self.assertEqual(differences[0]["commandId"], "baseline-schema")
+        self.assertEqual(differences[0]["changedFieldCategories"], ["executionDurationClass"])
+        self.assertNotIn(unsafe, "\n".join(errors))
 
 
 class P52CompactIdentitySecurityTest(unittest.TestCase):

@@ -7457,7 +7457,7 @@ def _validate_workflow_steps(job_name: str, steps: Any, errors: list[str]) -> No
 
     setup_node = by_name.get("Set up Node.js", {})
     if job_name != "final-result":
-        if tuple(setup_node) != ("name", "uses", "with") or setup_node.get("with") != {"node-version": "24.x"}:
+        if tuple(setup_node) != ("name", "uses", "with") or setup_node.get("with") != {"node-version": "24.20.0"}:
             errors.append(f"{job_name} Node setup is not exact")
         if setup_node.get("uses") != f"actions/setup-node@{APPROVED_ACTIONS['actions/setup-node']['sha']}":
             errors.append(f"{job_name} Node action pin is not exact")
@@ -18222,6 +18222,171 @@ _DIAGNOSTIC_AUTHORITY_FIELDS = frozenset({
 _MAX_DIAGNOSTIC_AUTHORITY_FIELDS = 4
 
 
+_REPLAY_DIAGNOSTIC_FIELD_CATEGORIES = {
+    "executionDurationClass": frozenset({"executionDurationClass"}),
+    "stdout-identity": frozenset({
+        "stdoutSha256", "stdoutBytesObserved", "stdoutByteLimit",
+    }),
+    "stderr-identity": frozenset({
+        "stderrSha256", "stderrBytesObserved", "stderrByteLimit",
+    }),
+    "execution-status": frozenset({
+        "executed", "started", "setupFailure", "exitCode", "timeoutStatus",
+        "outputLimitStatus", "completedCommandClass", "error", "limitReason",
+    }),
+    "process-containment": frozenset({
+        "containment", "processTreeStatus", "processTreeError",
+        "descendantsTerminated", "descendantsObserved", "descendantsReaped",
+        "descendantsSurviving", "containmentDisposition",
+    }),
+    "target-input-authority": frozenset({
+        "targets", "executionInputs", "executionLease", "targetExecutionLease",
+        "executionInputMode", "executionInputSize", "executionInputSha256",
+        "actualExecutionInputMode", "actualExecutionInputSize",
+        "actualExecutionInputSha256", "fileScans",
+    }),
+    "executionInputBundleDigest": frozenset({"executionInputBundleDigest"}),
+    "runtime-closure": frozenset({
+        "dependencyBacked", "runtimeClosureDigest", "dependencyClosureDigest",
+        "nodePath", "resolvedTestRunnerEntrypoint", "resolvedTestRunnerSha256",
+        "closureWatcherActive", "closureMutationState", "runtimeClosureGuard",
+        "toolRole", "resolvedExecutablePath", "resolvedExecutableSize",
+        "resolvedExecutableSha256", "resolvedExecutableFileIdentity",
+    }),
+    "producer-observation-context": frozenset({
+        "producerObservations", "producerObservationSetDigest", "diagnosticPreview",
+    }),
+    "command-membership": frozenset({"commandId", "ordinal"}),
+}
+_REPLAY_DIAGNOSTIC_NESTED_CATEGORIES = {
+    "parsedFailureSummary": (
+        "producer-observation-context", {"status": "execution-status"},
+    ),
+    "protectedTargetBundle": (
+        "target-input-authority", {
+            "executionInputBundleDigest": "protectedTargetBundle.executionInputBundleDigest",
+            "cleanupState": "process-containment",
+            "mutationDetected": "process-containment",
+        },
+    ),
+}
+_REPLAY_DIAGNOSTIC_CATEGORIES = frozenset({
+    *_REPLAY_DIAGNOSTIC_FIELD_CATEGORIES,
+    "protectedTargetBundle.executionInputBundleDigest",
+    "other-authorized-fixed-category",
+})
+_REPLAY_DIAGNOSTIC_HARD_GATE_IDS = frozenset({
+    *HARD_GATE_AUTHORITY,
+    "DIRECT-JAVASCRIPT-SYNTAX-EXECUTION", "DIRECT-PYTHON-SYNTAX",
+    "GIT-BASH-TRUSTED-RUNTIME", "IMMUTABLE-COMMAND-AUTHORITY",
+    "NODE-CI-FAMILY", "NPM-REQUIRED", "PYTHON-CI-FAMILY",
+    "RUNTIME-DEPENDENCY-CLOSURE", "RUNTIME-DEPENDENCY-CLOSURE-FINAL",
+    "RUNTIME-DEPENDENCY-CLOSURE-SETUP", "STATIC-SUITE-EXECUTION",
+    "STATIC-SUITE-RESULT", "TARGET-EXECUTION-SOURCE-INTEGRITY",
+    "TRUSTED-EXECUTABLE-RESOLUTION", "TRUSTED-FILE-MANIFEST",
+    *(
+        f"{prefix}-{phase}"
+        for prefix in (
+            "TRUSTED-TOOL-AUTHORITY", "TRUSTED-FILE-INTEGRITY",
+            "RUNTIME-DEPENDENCY-CLOSURE",
+        )
+        for phase in (
+            "RUNTIME", "POLICY", "STATIC", "FRONTEND", "BACKEND",
+            "STANDALONE", "LOCKFILE-CHECK", "POST-EXECUTION",
+        )
+    ),
+})
+_REPLAY_DIAGNOSTIC_VIOLATION_IDS = frozenset({
+    *_REPLAY_DIAGNOSTIC_HARD_GATE_IDS, *_DIAGNOSTIC_DERIVED_VIOLATION_TYPES,
+    "CI-RUNNER-ERROR", "RUNTIME-CLOSURE-PRECONDITION",
+})
+_MAX_REPLAY_FAILURE_DIAGNOSTICS = 8
+
+
+def _replay_changed_field_categories(
+    producer: Mapping[str, Any], replay: Mapping[str, Any],
+) -> list[str]:
+    """Classify differences with fixed vocabulary, never record keys or values."""
+
+    categories: set[str] = set()
+    missing = object()
+    for key in producer.keys() | replay.keys():
+        left, right = producer.get(key, missing), replay.get(key, missing)
+        if left == right:
+            continue
+        if key in _REPLAY_DIAGNOSTIC_NESTED_CATEGORIES:
+            fallback, nested = _REPLAY_DIAGNOSTIC_NESTED_CATEGORIES[key]
+            if isinstance(left, Mapping) and isinstance(right, Mapping):
+                for child in left.keys() | right.keys():
+                    if left.get(child, missing) != right.get(child, missing):
+                        categories.add(nested.get(child, fallback))
+            else:
+                categories.add(fallback)
+        else:
+            categories.add(next(
+                (category for category, fields in _REPLAY_DIAGNOSTIC_FIELD_CATEGORIES.items()
+                 if key in fields),
+                "other-authorized-fixed-category",
+            ))
+    return sorted(categories & _REPLAY_DIAGNOSTIC_CATEGORIES)
+
+
+def first_replay_transcript_difference_diagnostic(
+    producer_records: Sequence[Mapping[str, Any]],
+    replay_records: Sequence[Mapping[str, Any]],
+) -> str | None:
+    """Describe only the first unequal canonical record; never authorize replay."""
+
+    for index in range(max(len(producer_records), len(replay_records))):
+        producer = producer_records[index] if index < len(producer_records) else None
+        replay = replay_records[index] if index < len(replay_records) else None
+        if producer == replay:
+            continue
+        command_id = (replay if replay is not None else producer).get("commandId")
+        if not isinstance(command_id, str) or command_id not in _DIAGNOSTIC_COMMAND_IDS:
+            command_id = "OTHER"
+        return json.dumps({
+            "commandId": command_id,
+            "changedFieldCategories": (
+                ["command-membership"] if producer is None or replay is None
+                else _replay_changed_field_categories(producer, replay)
+            ),
+            "producerRecordDigest": canonical_failure_digest(producer),
+            "replayRecordDigest": canonical_failure_digest(replay),
+        }, sort_keys=True, separators=(",", ":"))
+    return None
+
+
+def replay_failure_diagnostics(
+    hard_failures: Sequence[Mapping[str, Any]],
+    violations: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Bound rejection details to eight identities per kind and canonical digests."""
+
+    diagnostics: list[str] = []
+    for records, id_key, allowed_ids, prefix in (
+        (hard_failures, "hardGateId", _REPLAY_DIAGNOSTIC_HARD_GATE_IDS,
+         "verification replay failed hard gate: "),
+        (violations, "violationId", _REPLAY_DIAGNOSTIC_VIOLATION_IDS,
+         "verification replay violation: "),
+    ):
+        for record in records[:_MAX_REPLAY_FAILURE_DIAGNOSTICS]:
+            record_id = record.get("id")
+            diagnostic = {
+                id_key: (record_id if isinstance(record_id, str) and record_id in allowed_ids
+                         else "OTHER"),
+                "diagnosticDigest": canonical_failure_digest(record),
+            }
+            command_id = record.get("commandId")
+            if (id_key == "violationId" and isinstance(command_id, str)
+                    and command_id in _DIAGNOSTIC_COMMAND_IDS):
+                diagnostic["commandId"] = command_id
+            diagnostics.append(prefix + json.dumps(
+                diagnostic, sort_keys=True, separators=(",", ":"),
+            ))
+    return diagnostics
+
+
 def _first_authority_mismatch_diagnostic(
     command_records: Sequence[Mapping[str, Any]],
     expected_authority: Sequence[Mapping[str, Any]],
@@ -20403,6 +20568,7 @@ def compare_verification_replay_claims(
             "verification replay profile is non-PASS: "
             f"hardFailures={len(hard_failures)} violations={len(runner.violations)}"
         )
+        errors.extend(replay_failure_diagnostics(hard_failures, runner.violations))
 
     if summary.get("profile") != runner.profile or transcript.get("profile") != runner.profile:
         errors.append("verification replay profile selector mismatch")
@@ -20449,6 +20615,11 @@ def compare_verification_replay_claims(
         ]
         if comparable_evidence_records != replay_records:
             errors.append("verification replay command execution transcript mismatch")
+            diagnostic = first_replay_transcript_difference_diagnostic(
+                comparable_evidence_records, replay_records,
+            )
+            if diagnostic is not None:
+                errors.append("verification replay first command difference: " + diagnostic)
     if isinstance(evidence_records, list) and len(evidence_records) != transcript["commandCount"]:
         errors.append("verification replay commandCount mismatch")
     top_level_fields = (
