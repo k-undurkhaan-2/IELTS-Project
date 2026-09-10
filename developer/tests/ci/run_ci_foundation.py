@@ -255,7 +255,7 @@ WORKFLOW_JOB_PROFILE_AUTHORITY = MappingProxyType(
                 "profile": "policy",
                 "verificationProfile": "policy",
                 "artifactIdentity": "untrusted-repository-policy-${{ runner.os }}-${{ github.run_attempt }}",
-                "evidenceRoot": ".ci-untrusted/repository-policy",
+                "evidenceRoot": "${{ runner.temp }}/ci-untrusted/repository-policy",
                 "evidencePaths": EVIDENCE_FILE_NAMES,
             }
         ),
@@ -268,7 +268,7 @@ WORKFLOW_JOB_PROFILE_AUTHORITY = MappingProxyType(
                 "profile": "all",
                 "verificationProfile": "all",
                 "artifactIdentity": "untrusted-ubuntu-canonical-${{ runner.os }}-${{ github.run_attempt }}",
-                "evidenceRoot": ".ci-untrusted/ubuntu-canonical",
+                "evidenceRoot": "${{ runner.temp }}/ci-untrusted/ubuntu-canonical",
                 "evidencePaths": EVIDENCE_FILE_NAMES,
             }
         ),
@@ -281,7 +281,7 @@ WORKFLOW_JOB_PROFILE_AUTHORITY = MappingProxyType(
                 "profile": "all",
                 "verificationProfile": "all",
                 "artifactIdentity": "untrusted-windows-compatibility-${{ runner.os }}-${{ github.run_attempt }}",
-                "evidenceRoot": ".ci-untrusted/windows-compatibility",
+                "evidenceRoot": "${{ runner.temp }}/ci-untrusted/windows-compatibility",
                 "evidencePaths": EVIDENCE_FILE_NAMES,
             }
         ),
@@ -7193,7 +7193,7 @@ FINAL_VERIFIER_COMMANDS = MappingProxyType(
             "--verify-evidence --expected-profile policy "
             "--expected-producer-job repository-policy-producer "
             "--expected-verifier-job repository-policy --expected-runner-os Linux "
-            "--untrusted-evidence-root .ci-untrusted/repository-policy "
+            '--untrusted-evidence-root "$RUNNER_TEMP/ci-untrusted/repository-policy" '
             "--require-linux-containment-self-test"
         ),
         "ubuntu-canonical": (
@@ -7201,7 +7201,7 @@ FINAL_VERIFIER_COMMANDS = MappingProxyType(
             "--verify-evidence --expected-profile all "
             "--expected-producer-job ubuntu-canonical-producer "
             "--expected-verifier-job ubuntu-canonical --expected-runner-os Linux "
-            "--untrusted-evidence-root .ci-untrusted/ubuntu-canonical "
+            '--untrusted-evidence-root "$RUNNER_TEMP/ci-untrusted/ubuntu-canonical" '
             "--require-linux-containment-self-test --require-fresh-runtime-closure"
         ),
         "windows-compatibility": (
@@ -7209,7 +7209,7 @@ FINAL_VERIFIER_COMMANDS = MappingProxyType(
             "--verify-evidence --expected-profile all "
             "--expected-producer-job windows-compatibility-producer "
             "--expected-verifier-job windows-compatibility --expected-runner-os Windows "
-            "--untrusted-evidence-root .ci-untrusted/windows-compatibility "
+            '--untrusted-evidence-root "$env:RUNNER_TEMP/ci-untrusted/windows-compatibility" '
             "--require-fresh-runtime-closure"
         ),
     }

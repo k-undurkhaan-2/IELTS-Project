@@ -5241,61 +5241,70 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
 
     def test_verification_only_mode_does_not_modify_evidence(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ci-evidence-mode-") as temp_dir:
-            repo = Path(temp_dir)
-            output = repo / ".ci-results"
+            workspace = Path(temp_dir).resolve(strict=True)
+            repo = workspace / "checkout"
+            repo.mkdir()
+            producer_output = repo / ".ci-results"
             baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
             with mock.patch.object(ci, "REPO_ROOT", repo):
                 runner = fake_runner(baseline)
-                ci.create_fresh_evidence_root(output, repo_root=repo)
-                with mock.patch.object(ci, "OUTPUT_DIR", output):
+                ci.create_fresh_evidence_root(producer_output, repo_root=repo)
+                with mock.patch.object(ci, "OUTPUT_DIR", producer_output):
                     ci.write_evidence(runner, empty_comparison())
-                before = {
-                    name: (
-                        hashlib.sha256((output / name).read_bytes()).hexdigest(),
-                        (output / name).stat().st_mtime_ns,
-                    )
-                    for name in ci.EVIDENCE_FILE_NAMES
-                }
-                context = synthetic_external_context(runner.execution_binding)
-                verification_runner = mock.Mock()
-                with mock.patch.object(ci, "OUTPUT_DIR", output), mock.patch.object(
-                    ci,
-                    "prepare_verification_authority",
-                    return_value=(context, verification_runner),
-                ), mock.patch.object(
-                    ci,
-                    "capture_live_external_authority",
-                    return_value=_explicit_live_local_external_authority(),
-                ), mock.patch.object(
-                    ci,
-                    "verify_evidence_with_replay",
-                    return_value=([], {"kind": "VerificationReplayTranscript"}),
-                ) as replay:
-                    exit_code = ci.main(
-                        [
+                external_output = workspace / "runner temp" / "ci-untrusted" / "repository-policy"
+                shutil.copytree(producer_output, external_output)
+                for output in (producer_output, external_output):
+                    with self.subTest(evidence_root=output.relative_to(workspace).as_posix()):
+                        arguments = [
                             "--verify-evidence",
                             "--expected-profile",
                             "policy",
                             "--expected-invocation-id",
                             runner.execution_binding["producerInvocationId"],
                         ]
-                    )
-                after = {
-                    name: (
-                        hashlib.sha256((output / name).read_bytes()).hexdigest(),
-                        (output / name).stat().st_mtime_ns,
-                    )
-                    for name in ci.EVIDENCE_FILE_NAMES
-                }
-        self.assertEqual(exit_code, ci.EXIT_SUCCESS)
-        self.assertEqual(after, before)
-        replay.assert_called_once_with(
-            output,
-            expected_context=context,
-            verification_runner=verification_runner,
-            repo_root=repo,
-            evidence_authority_root=repo,
-        )
+                        if output == external_output:
+                            self.assertTrue(output.is_absolute())
+                            self.assertFalse(_path_is_relative_to(output, repo))
+                            arguments.extend(["--untrusted-evidence-root", str(output)])
+                        before = {
+                            name: (
+                                hashlib.sha256((output / name).read_bytes()).hexdigest(),
+                                (output / name).stat().st_mtime_ns,
+                            )
+                            for name in ci.EVIDENCE_FILE_NAMES
+                        }
+                        context = synthetic_external_context(runner.execution_binding)
+                        verification_runner = mock.Mock()
+                        with mock.patch.object(ci, "OUTPUT_DIR", producer_output), mock.patch.object(
+                            ci,
+                            "prepare_verification_authority",
+                            return_value=(context, verification_runner),
+                        ), mock.patch.object(
+                            ci,
+                            "capture_live_external_authority",
+                            return_value=_explicit_live_local_external_authority(),
+                        ), mock.patch.object(
+                            ci,
+                            "verify_evidence_with_replay",
+                            return_value=([], {"kind": "VerificationReplayTranscript"}),
+                        ) as replay:
+                            exit_code = ci.main(arguments)
+                        after = {
+                            name: (
+                                hashlib.sha256((output / name).read_bytes()).hexdigest(),
+                                (output / name).stat().st_mtime_ns,
+                            )
+                            for name in ci.EVIDENCE_FILE_NAMES
+                        }
+                        self.assertEqual(exit_code, ci.EXIT_SUCCESS)
+                        self.assertEqual(after, before)
+                        replay.assert_called_once_with(
+                            output,
+                            expected_context=context,
+                            verification_runner=verification_runner,
+                            repo_root=repo,
+                            evidence_authority_root=output.parent,
+                        )
 
     def assert_redacted(self, source: str, *forbidden: str) -> str:
         sanitized = ci.sanitize_text(source)
@@ -5392,6 +5401,60 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
             output.mkdir()
             with mock.patch.object(ci, "_is_reparse_point", return_value=True):
                 self.assertTrue(ci.validate_evidence_root(output, repo_root=repo))
+        with tempfile.TemporaryDirectory(prefix="ci-external-evidence-bounds-") as temp_dir:
+            workspace = Path(temp_dir).resolve(strict=True)
+            checkout = workspace / "checkout"
+            parent = workspace / "runner temp" / "ci-untrusted"
+            checkout.mkdir()
+            parent.mkdir(parents=True)
+            source, _summary = self.create_valid_evidence(checkout)
+            output = parent / "repository-policy"
+            shutil.copytree(source, output)
+            self.assertTrue(output.is_absolute())
+            self.assertFalse(_path_is_relative_to(output, checkout))
+            self.assertEqual(ci.validate_evidence_root(output, repo_root=parent), [])
+            self.assertEqual(ci.verify_evidence_file_set(output, repo_root=parent), [])
+            for wrong_parent in (checkout, parent.parent, output):
+                with self.subTest(external_evidence_wrong_parent=wrong_parent.name):
+                    errors = ci.validate_evidence_root(output, repo_root=wrong_parent)
+                    self.assertTrue(any("parent resolves outside" in error for error in errors), errors)
+                    self.assertTrue(ci.verify_evidence_file_set(output, repo_root=wrong_parent))
+            sibling_parent = parent.with_name(parent.name + "-other")
+            sibling_output = sibling_parent / output.name
+            nested_output = parent / "nested" / output.name
+            sibling_output.mkdir(parents=True)
+            nested_output.mkdir(parents=True)
+            for wrong_root in (sibling_output, nested_output, parent / ".." / sibling_parent.name / output.name):
+                with self.subTest(external_evidence_wrong_root=str(wrong_root.relative_to(workspace))):
+                    self.assertTrue(ci.validate_evidence_root(wrong_root, repo_root=parent))
+            with mock.patch.object(ci, "_is_reparse_point", return_value=True):
+                self.assertTrue(ci.validate_evidence_root(output, repo_root=parent))
+            root_resolve = Path.resolve
+
+            def redirected_root(path, *args, **kwargs):
+                if path == output:
+                    return sibling_output
+                return root_resolve(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "resolve", redirected_root):
+                errors = ci.validate_evidence_root(output, repo_root=parent)
+                self.assertTrue(any("outside its exact workspace path" in error for error in errors), errors)
+            leaf = output / "summary.json"
+            snapshot, errors = ci._read_evidence_file_snapshot(
+                leaf, output_dir=output, byte_limit=ci.EVIDENCE_FILE_BYTE_LIMITS[leaf.name]
+            )
+            self.assertEqual(errors, [])
+            self.assertIsNotNone(snapshot)
+            for escaped_leaf in (source / leaf.name, sibling_output / leaf.name, output / "nested" / leaf.name):
+                if not escaped_leaf.exists():
+                    escaped_leaf.parent.mkdir(parents=True, exist_ok=True)
+                    escaped_leaf.write_bytes(leaf.read_bytes())
+                with self.subTest(external_evidence_escaped_leaf=str(escaped_leaf.relative_to(workspace))):
+                    snapshot, errors = ci._read_evidence_file_snapshot(
+                        escaped_leaf, output_dir=output, byte_limit=ci.EVIDENCE_FILE_BYTE_LIMITS[leaf.name]
+                    )
+                    self.assertIsNone(snapshot)
+                    self.assertIn("evidence parent resolution escaped", errors)
 
     def test_unexpected_json_evidence_file_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -13761,11 +13824,182 @@ class CI8FreshVerifierTrustDomainTest(unittest.TestCase):
             self.assertEqual(uploads[0]["with"]["name"], authority["artifactIdentity"])
             self.assertEqual(downloads[0]["with"]["name"], authority["artifactIdentity"])
             self.assertEqual(downloads[0]["with"]["path"], authority["evidenceRoot"])
+            self.assertEqual(
+                downloads[0]["with"]["path"],
+                "${{ runner.temp }}/ci-untrusted/" + verifier,
+            )
+            shell_root = "$env:RUNNER_TEMP" if verifier == "windows-compatibility" else "$RUNNER_TEMP"
+            self.assertIn(
+                f'--untrusted-evidence-root "{shell_root}/ci-untrusted/{verifier}"',
+                jobs[verifier]["steps"][-1]["run"],
+            )
             self.assertEqual(uploads[0]["with"]["path"].splitlines(), [
                 f".ci-results/{name}" for name in ci.EVIDENCE_FILE_NAMES
             ])
             names.append(authority["artifactIdentity"])
         self.assertEqual(len(names), len(set(names)))
+        self.assert_external_download_preserves_candidate_authority(parsed)
+
+    def assert_external_download_preserves_candidate_authority(self, parsed: dict) -> None:
+        policy, tools = _resolved_local_test_authority("python", "git")
+        with tempfile.TemporaryDirectory(prefix="ci-verifier-isolation-") as temp_dir:
+            workspace = Path(temp_dir).resolve(strict=True)
+            checkout = workspace / "checkout"
+            runner_temp = workspace / "runner temp"
+            checkout.mkdir()
+            runner_temp.mkdir()
+            (checkout / "tracked.txt").write_bytes(b"public fixture\n")
+            environment = ci.child_process_environment(
+                tools,
+                source_environment=_explicit_local_test_environment(),
+                repo_root=checkout,
+                policy=policy,
+            )
+            for arguments in (("init", "--quiet"), ("add", "--", "tracked.txt")):
+                completed = subprocess.run(
+                    [tools["git"], "-c", f"safe.directory={checkout}", *arguments],
+                    cwd=checkout,
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+            planned_paths, errors = ci.deterministic_candidate_paths(checkout)
+            self.assertEqual(errors, [])
+            self.assertEqual(planned_paths, ["tracked.txt"])
+            original_execute = ci.execute_command
+
+            def execute_in_checkout(*args, **kwargs):
+                kwargs["cwd"] = checkout
+                return original_execute(*args, **kwargs)
+
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(ci, "REPO_ROOT", checkout))
+                stack.enter_context(mock.patch.object(ci, "execute_command", side_effect=execute_in_checkout))
+                leases = {
+                    name: ci.ExecutableIdentityLease(path, f"isolation-{name}")
+                    for name, path in tools.items()
+                }
+                for lease in leases.values():
+                    stack.callback(lease.close)
+                plan = ci.build_profile_command_plan(
+                    "policy",
+                    tools={**tools, "node": tools["python"]},
+                    candidate_paths=planned_paths,
+                    baseline=ci.strict_json_load_file(ci.BASELINE_PATH),
+                    current_platform=ci.platform_key(),
+                    static_invocation_id=str(uuid.uuid4()),
+                    repo_root=checkout,
+                )
+                scan_ids = {"tracked-private-resource-scan", "tracked-secret-scan"}
+                scan_plan = {
+                    item["commandId"]: item for item in plan if item["commandId"] in scan_ids
+                }
+
+                def fresh_runner():
+                    runner = object.__new__(ci.FoundationRunner)
+                    runner.tools = tools
+                    runner.tool_policy = policy
+                    runner.tool_leases = leases
+                    runner.tool_authority_frozen = True
+                    runner.tool_resolution_errors = []
+                    runner.child_environment = environment
+                    runner.planned_candidate_paths = planned_paths
+                    runner.candidate_paths = None
+                    runner.command_plan_by_id = scan_plan
+                    runner.target_phase_hook = None
+                    runner.captures = []
+                    runner.command_results = []
+                    runner.hard_gate_results = []
+                    runner.violations = []
+                    return runner
+
+                before = fresh_runner()
+                self.assertEqual(before.ensure_candidate_paths(), planned_paths)
+                self.assertEqual(before.violations, [])
+                for verifier in ci.WORKFLOW_JOB_PROFILE_AUTHORITY:
+                    with self.subTest(external_download=verifier):
+                        download = next(
+                            step for step in parsed["jobs"][verifier]["steps"]
+                            if str(step.get("uses", "")).startswith("actions/download-artifact@")
+                        )
+                        evidence_root = Path(download["with"]["path"].replace(
+                            "${{ runner.temp }}", str(runner_temp)
+                        ))
+                        evidence_root.mkdir(parents=True)
+                        self.assertTrue(evidence_root.is_absolute())
+                        self.assertFalse(_path_is_relative_to(evidence_root.resolve(), checkout))
+                        for name in ci.EVIDENCE_FILE_NAMES:
+                            (evidence_root / name).write_bytes(b"downloaded untrusted evidence\n")
+                        self.assertEqual(
+                            ci.deterministic_candidate_paths(checkout), (planned_paths, [])
+                        )
+                        replay = fresh_runner()
+                        self.assertEqual(replay.ensure_candidate_paths(), planned_paths)
+                        replay.run_private_and_secret_policy()
+                        self.assertEqual(replay.violations, [])
+                        self.assertEqual({
+                            record["commandId"] for record in replay.command_results
+                            if record["commandId"] in scan_ids
+                        }, scan_ids)
+                        for record in replay.command_results:
+                            if record["commandId"] in scan_ids:
+                                self.assertEqual(record["exitCode"], 0, record)
+                                self.assertFalse(record["protectedTargetBundle"]["mutationDetected"])
+                clean = fresh_runner()
+                clean.run_repository_boundary()
+                self.assertEqual(clean.violations, [])
+
+                for relative in (".ci-untrusted/unexpected.json", "unexpected-candidate.txt"):
+                    with self.subTest(in_repository_mutation=relative):
+                        unexpected = checkout.joinpath(*relative.split("/"))
+                        unexpected.parent.mkdir(parents=True, exist_ok=True)
+                        unexpected.write_bytes(b"unexpected candidate\n")
+                        try:
+                            replay = fresh_runner()
+                            replay.run_repository_boundary()
+                            self.assertIn(relative, replay.candidate_paths)
+                            boundary_failures = [
+                                gate["detail"] for gate in replay.hard_gate_results
+                                if gate["id"] == "REPOSITORY-GIT-BOUNDARY" and gate["status"] == "fail"
+                            ]
+                            self.assertTrue(any("precomputed index authority" in detail for detail in boundary_failures))
+                            self.assertTrue(any("unexpected untracked paths" in detail for detail in boundary_failures))
+                            replay.run_private_and_secret_policy()
+                            self.assert_protected_scans_fail_closed(replay, scan_ids)
+                            self.assertEqual(
+                                ci.deterministic_candidate_paths(checkout), (planned_paths, [])
+                            )
+                        finally:
+                            unexpected.unlink()
+                with self.subTest(tracked_bytes_mutation=True):
+                    tracked = checkout / "tracked.txt"
+                    tracked.write_bytes(b"mutate fixture\n")
+                    replay = fresh_runner()
+                    replay.run_private_and_secret_policy()
+                    self.assertEqual(replay.candidate_paths, planned_paths)
+                    self.assert_protected_scans_fail_closed(replay, scan_ids)
+
+    def assert_protected_scans_fail_closed(self, runner, scan_ids: set[str]) -> None:
+        scans = {
+            record["commandId"]: record for record in runner.command_results
+            if record["commandId"] in scan_ids
+        }
+        self.assertEqual(set(scans), scan_ids)
+        for command_id, record in scans.items():
+            self.assertNotEqual(record["exitCode"], 0, command_id)
+            self.assertIn(
+                "PROTECTED-TARGET-BUNDLE-ERROR",
+                record["parsedFailureSummary"]["diagnostic"],
+            )
+        failed_gates = {
+            gate["id"] for gate in runner.hard_gate_results if gate["status"] == "fail"
+        }
+        self.assertTrue({
+            "TRACKED-PRIVATE-RESOURCE-EXCLUSION",
+            "SECRET-OPERATIONAL-ARTIFACT-EXCLUSION",
+        }.issubset(failed_gates))
 
     def test_same_job_verification_and_verify_then_upload_are_rejected(self) -> None:
         marker = "      - name: Upload untrusted policy evidence"
@@ -13949,13 +14183,33 @@ class CI8FreshVerifierTrustDomainTest(unittest.TestCase):
                 "--expected-producer-job windows-compatibility-producer",
             ),
             "wrong-untrusted-root": (
-                "--untrusted-evidence-root .ci-untrusted/ubuntu-canonical",
-                "--untrusted-evidence-root .ci-untrusted/windows-compatibility",
+                '--untrusted-evidence-root "$RUNNER_TEMP/ci-untrusted/ubuntu-canonical"',
+                '--untrusted-evidence-root "$RUNNER_TEMP/ci-untrusted/windows-compatibility"',
             ),
         }
         for label, (source, replacement) in substitutions.items():
             with self.subTest(label=label):
                 self.assert_rejected(self.workflow.replace(source, replacement, 1), label)
+        for verifier in ci.WORKFLOW_JOB_PROFILE_AUTHORITY:
+            download_root = "${{ runner.temp }}/ci-untrusted/" + verifier
+            shell_root = "$env:RUNNER_TEMP" if verifier == "windows-compatibility" else "$RUNNER_TEMP"
+            invocation_root = f'"{shell_root}/ci-untrusted/{verifier}"'
+            for label, download_replacement, invocation_replacement in (
+                ("relative-checkout", f".ci-untrusted/{verifier}", f".ci-untrusted/{verifier}"),
+                ("absolute-checkout", "${{ github.workspace }}/.ci-untrusted/" + verifier,
+                 f'"{shell_root.replace("RUNNER_TEMP", "GITHUB_WORKSPACE")}/.ci-untrusted/{verifier}"'),
+                ("external-parent", "${{ runner.temp }}/ci-untrusted", f'"{shell_root}/ci-untrusted"'),
+                ("external-sibling", download_root + "-other", invocation_root[:-1] + '-other"'),
+            ):
+                with self.subTest(verifier=verifier, root_mutation=label):
+                    self.assert_rejected(
+                        self.workflow.replace(download_root, download_replacement, 1),
+                        f"{verifier}-{label}-download",
+                    )
+                    self.assert_rejected(
+                        self.workflow.replace(invocation_root, invocation_replacement, 1),
+                        f"{verifier}-{label}-invocation",
+                    )
 
     def test_linux_live_gate_and_fresh_closure_flags_are_mandatory(self) -> None:
         cases = {

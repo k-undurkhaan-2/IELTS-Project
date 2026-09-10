@@ -191,11 +191,11 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: untrusted-repository-policy-${{ runner.os }}-${{ github.run_attempt }}
-          path: .ci-untrusted/repository-policy
+          path: ${{ runner.temp }}/ci-untrusted/repository-policy
 
       - name: Verify untrusted policy evidence by fresh replay
         shell: bash
-        run: '"$CI_TRUSTED_PYTHON" -B developer/tests/ci/run_ci_foundation.py --verify-evidence --expected-profile policy --expected-producer-job repository-policy-producer --expected-verifier-job repository-policy --expected-runner-os Linux --untrusted-evidence-root .ci-untrusted/repository-policy --require-linux-containment-self-test'
+        run: '"$CI_TRUSTED_PYTHON" -B developer/tests/ci/run_ci_foundation.py --verify-evidence --expected-profile policy --expected-producer-job repository-policy-producer --expected-verifier-job repository-policy --expected-runner-os Linux --untrusted-evidence-root "$RUNNER_TEMP/ci-untrusted/repository-policy" --require-linux-containment-self-test'
 
   ubuntu-canonical:
     name: Ubuntu canonical validation
@@ -253,11 +253,11 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: untrusted-ubuntu-canonical-${{ runner.os }}-${{ github.run_attempt }}
-          path: .ci-untrusted/ubuntu-canonical
+          path: ${{ runner.temp }}/ci-untrusted/ubuntu-canonical
 
       - name: Verify untrusted Ubuntu evidence by fresh replay
         shell: bash
-        run: '"$CI_TRUSTED_PYTHON" -B developer/tests/ci/run_ci_foundation.py --verify-evidence --expected-profile all --expected-producer-job ubuntu-canonical-producer --expected-verifier-job ubuntu-canonical --expected-runner-os Linux --untrusted-evidence-root .ci-untrusted/ubuntu-canonical --require-linux-containment-self-test --require-fresh-runtime-closure'
+        run: '"$CI_TRUSTED_PYTHON" -B developer/tests/ci/run_ci_foundation.py --verify-evidence --expected-profile all --expected-producer-job ubuntu-canonical-producer --expected-verifier-job ubuntu-canonical --expected-runner-os Linux --untrusted-evidence-root "$RUNNER_TEMP/ci-untrusted/ubuntu-canonical" --require-linux-containment-self-test --require-fresh-runtime-closure'
 
   windows-compatibility:
     name: Windows compatibility validation
@@ -334,11 +334,11 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: untrusted-windows-compatibility-${{ runner.os }}-${{ github.run_attempt }}
-          path: .ci-untrusted/windows-compatibility
+          path: ${{ runner.temp }}/ci-untrusted/windows-compatibility
 
       - name: Verify untrusted Windows evidence by fresh replay
         shell: pwsh
-        run: '& $env:CI_TRUSTED_PYTHON -B developer/tests/ci/run_ci_foundation.py --verify-evidence --expected-profile all --expected-producer-job windows-compatibility-producer --expected-verifier-job windows-compatibility --expected-runner-os Windows --untrusted-evidence-root .ci-untrusted/windows-compatibility --require-fresh-runtime-closure'
+        run: '& $env:CI_TRUSTED_PYTHON -B developer/tests/ci/run_ci_foundation.py --verify-evidence --expected-profile all --expected-producer-job windows-compatibility-producer --expected-verifier-job windows-compatibility --expected-runner-os Windows --untrusted-evidence-root "$env:RUNNER_TEMP/ci-untrusted/windows-compatibility" --require-fresh-runtime-closure'
 
   final-result:
     name: Final result
