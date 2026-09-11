@@ -1,0 +1,540 @@
+{
+  "schema": "Issue13WindowsGnuPGRuntime",
+  "version": 1,
+  "authority": "NON-AUTHORITATIVE / DIAGNOSTIC-ONLY / ISSUE-13-ACQUISITION",
+  "distributionVersion": "2.5.22",
+  "source": "https://gnupg.org/ftp/gcrypt/binary/gnupg-w32-2.5.22_20260831.wixlib",
+  "packageName": "gnupg-w32-2.5.22_20260831.wixlib",
+  "packageSha256": "d4e3d0fe66a09567d40cf64071ea935c13175b03b5bb83556130040a927cc9e1",
+  "packageBytes": 7205212,
+  "cabinetBytes": 7045608,
+  "releaseSignerFingerprint": "6DAA6E64A76D2840571B4902528897B826403ADA",
+  "runtimeDirectory": "issue13-gnupg",
+  "binaryRelativePath": "bin/gpg.exe",
+  "binarySha256": "576b217cc73f83058d7867d2dc4994fd8bc9328d5214c7917f2dc0a1e9e56fd3",
+  "runtimeClosureSha256": "01be0bac21b43acd9ad6dc2cf5ed8e13a2847213909fae58cc42c3ce22810694",
+  "files": [
+    {
+      "path": "README.txt",
+      "cabinetFileId": "0",
+      "sha256": "79dabd32062ad4cd3e2530e146102d6e55548ba6981b03718bea8617d59a4fb6",
+      "bytes": 37522
+    },
+    {
+      "path": "VERSION",
+      "cabinetFileId": "1",
+      "sha256": "aff29fff6d90352b69f1513603211cb24ed8adcf7bb4d0789ee17098aeb584d9",
+      "bytes": 17
+    },
+    {
+      "path": "bin/dirmngr.exe",
+      "cabinetFileId": "2",
+      "sha256": "c25522b09da857d0db7487d74b052d10213116225ae339ec2d0d9cb955bf5fe3",
+      "bytes": 705056
+    },
+    {
+      "path": "bin/dirmngr_ldap.exe",
+      "cabinetFileId": "3",
+      "sha256": "d552fde96f71d997b10c828b5db39e4150e2058944542d041ee0aa80a3145ef7",
+      "bytes": 151592
+    },
+    {
+      "path": "bin/gpg-agent.exe",
+      "cabinetFileId": "4",
+      "sha256": "41202b543b1282441cdd17160ebb4fef5b26c08bfa6694aff561185667e3c559",
+      "bytes": 483880
+    },
+    {
+      "path": "bin/gpg-card.exe",
+      "cabinetFileId": "6",
+      "sha256": "594b0241e6b74e33d5a235fc90aa99cecf03dbfd61fed1dff81c2db8da36afe8",
+      "bytes": 339496
+    },
+    {
+      "path": "bin/gpg-check-pattern.exe",
+      "cabinetFileId": "9",
+      "sha256": "041ca11c07564dff57dce9870307ceb5734714128121ae1034b9823d21f29ee5",
+      "bytes": 157736
+    },
+    {
+      "path": "bin/gpg-connect-agent.exe",
+      "cabinetFileId": "5",
+      "sha256": "6c6dfef13db600b9c2f8bd24f6163edebe6a2cd255448b35c44d10c0729db6e7",
+      "bytes": 182824
+    },
+    {
+      "path": "bin/gpg-preset-passphrase.exe",
+      "cabinetFileId": "8",
+      "sha256": "fc9eae576e74dbe480f97f013cf6190e91bc71e31b950d2813fb9cdb6293ccd6",
+      "bytes": 121384
+    },
+    {
+      "path": "bin/gpg-wks-client.exe",
+      "cabinetFileId": "10",
+      "sha256": "2eedcbe2cfc27e641c048d95f2734fde7487c3181ecc988831f757ca4e7dfa4b",
+      "bytes": 262696
+    },
+    {
+      "path": "bin/gpg.exe",
+      "cabinetFileId": "11",
+      "sha256": "576b217cc73f83058d7867d2dc4994fd8bc9328d5214c7917f2dc0a1e9e56fd3",
+      "bytes": 1376296
+    },
+    {
+      "path": "bin/gpgconf-w32.exe",
+      "cabinetFileId": "13",
+      "sha256": "0ac541b73788c927db86ac7a8e0080e3048cffd9e7829f773b0e5f0d0d9fc9aa",
+      "bytes": 196096
+    },
+    {
+      "path": "bin/gpgconf.exe",
+      "cabinetFileId": "12",
+      "sha256": "a98ef16ee13c06aa6a819bc32e5c8c77a63178abfbe3417cdaba9dc00c0575d0",
+      "bytes": 208424
+    },
+    {
+      "path": "bin/gpgsm.exe",
+      "cabinetFileId": "14",
+      "sha256": "317dd74f806f3dd09b9ecd19908c2cfe43fab4a883741b0a1c0452c72176719d",
+      "bytes": 684072
+    },
+    {
+      "path": "bin/gpgtar.exe",
+      "cabinetFileId": "15",
+      "sha256": "ca52ab657d6580825afe668f000d0c0956c85cf3220db77c2f2819a3de2ddabd",
+      "bytes": 182312
+    },
+    {
+      "path": "bin/gpgv.exe",
+      "cabinetFileId": "16",
+      "sha256": "2f594d6ca46b34094e3c1b4ea6b462b20807b8dd34840d2dfcc2c4599dcab25b",
+      "bytes": 695336
+    },
+    {
+      "path": "bin/keyboxd.exe",
+      "cabinetFileId": "7",
+      "sha256": "53a6982a960bcde92d5e7b1f523002ec2e4b54b9bd59b7b2c4f9e1eff5fc2e37",
+      "bytes": 343080
+    },
+    {
+      "path": "bin/libassuan-9.dll",
+      "cabinetFileId": "17",
+      "sha256": "0a9d955632ca759f30beb8b9f4e5b717cdb8145b0411e3e347d37bfe509c7efb",
+      "bytes": 170632
+    },
+    {
+      "path": "bin/libgcrypt-20.dll",
+      "cabinetFileId": "18",
+      "sha256": "eefc7f8b5a1117e73603bb863abdfff8db0b6fb27574f1e62988147a085984dc",
+      "bytes": 2260552
+    },
+    {
+      "path": "bin/libgpg-error-0.dll",
+      "cabinetFileId": "19",
+      "sha256": "8aafdabc6db036c9fb3b6f138ece2764ce3116226f544231122fdecd0fb3b035",
+      "bytes": 258424
+    },
+    {
+      "path": "bin/libksba-8.dll",
+      "cabinetFileId": "20",
+      "sha256": "17e4b843a4df8715c027e656f4a40ee1857c9c5bd709ba5783b7278f8696d1f5",
+      "bytes": 335432
+    },
+    {
+      "path": "bin/libnpth-0.dll",
+      "cabinetFileId": "21",
+      "sha256": "5c2c3eed2f877ceaa3ec992941dc0b53d72013462ae68adb3191dbcf84c89eb5",
+      "bytes": 46384
+    },
+    {
+      "path": "bin/libntbtls-0.dll",
+      "cabinetFileId": "23",
+      "sha256": "f6495b39fe6b700e30a2ddc0943c100b0263281b35ff64d477b2adfc4aa28778",
+      "bytes": 115984
+    },
+    {
+      "path": "bin/libsqlite3-0.dll",
+      "cabinetFileId": "22",
+      "sha256": "59d46fb1e2bbde849e6fad2f73ecf184e48d99dc37d6d31c5e8f0fef7c482a71",
+      "bytes": 1286088
+    },
+    {
+      "path": "bin/pinentry-basic.exe",
+      "cabinetFileId": "24",
+      "sha256": "6d7e10c7203a2aa3dc077acf809b49425f858b473ba51afc841bbd389fcfd2aa",
+      "bytes": 115240
+    },
+    {
+      "path": "bin/scdaemon.exe",
+      "cabinetFileId": "25",
+      "sha256": "22cabb5e061fdaf3044901fe5c9f9360aaf7b54178216f44f00c0b78235bfe31",
+      "bytes": 647208
+    },
+    {
+      "path": "bin/zlib1.dll",
+      "cabinetFileId": "26",
+      "sha256": "7391114b4629b84f006de4d20cb310c3af7ae1cad896f60337215ed91bde766e",
+      "bytes": 145960
+    },
+    {
+      "path": "include/assuan.h",
+      "cabinetFileId": "27",
+      "sha256": "40d8fff0c80753b50d7955662e9bdb3d5577069e3af9de3b4500dfa12f59065e",
+      "bytes": 25486
+    },
+    {
+      "path": "include/gcrypt.h",
+      "cabinetFileId": "28",
+      "sha256": "cc05a57863446040e5d9d6a00e6f6d9a9d5e2af3009e16488c27525d8d8c659d",
+      "bytes": 87404
+    },
+    {
+      "path": "include/gpg-error.h",
+      "cabinetFileId": "29",
+      "sha256": "c7a0d06b5034113a8217d09597ec3ab883800740857edce91b5479e999493efc",
+      "bytes": 87399
+    },
+    {
+      "path": "include/ksba.h",
+      "cabinetFileId": "30",
+      "sha256": "acd27ef029d4d2ddfe861cf5bfd58d641a3f4c52e5f9770d2ae80984f6e5bee4",
+      "bytes": 27563
+    },
+    {
+      "path": "include/npth.h",
+      "cabinetFileId": "31",
+      "sha256": "de2a424c8b2aae9066a96a5ff8b3b36425561b64034a8a5c63b97bed3ba3b872",
+      "bytes": 8541
+    },
+    {
+      "path": "lib/libassuan.imp",
+      "cabinetFileId": "32",
+      "sha256": "85a68630b154f82f6569af5f32485964a394deaebbdd66dcfd187125b6208ab2",
+      "bytes": 66248
+    },
+    {
+      "path": "lib/libgcrypt.imp",
+      "cabinetFileId": "33",
+      "sha256": "ba01ef79493b0d405ddb5cf03d43218211ce461ad5949f340c46d7b35f6f74d2",
+      "bytes": 141260
+    },
+    {
+      "path": "lib/libgpg-error.imp",
+      "cabinetFileId": "34",
+      "sha256": "4b170cece038430671cfba77ab20be2f6fb619b677ff3bc1e7468aea1da603df",
+      "bytes": 138030
+    },
+    {
+      "path": "lib/libksba.imp",
+      "cabinetFileId": "35",
+      "sha256": "498109b5b91108cab036f1c21838bdbaa415b1f56d7b711b01da8c6b7de175cf",
+      "bytes": 107540
+    },
+    {
+      "path": "lib/libnpth.imp",
+      "cabinetFileId": "36",
+      "sha256": "b1f5bb9f9bab6a93740796ff9911ac597bd917645dd8b3e9471b93640e4f715e",
+      "bytes": 39592
+    },
+    {
+      "path": "share/doc/gnupg/examples/pwpattern.list",
+      "cabinetFileId": "37",
+      "sha256": "7c1d7a1c780f015a46667cc06cd6355063c78c8fd5cfd57127d7937ab9c38765",
+      "bytes": 1231
+    },
+    {
+      "path": "share/gnupg/distsigkey.gpg",
+      "cabinetFileId": "38",
+      "sha256": "29f3d75bf9bbe132724fde19b69198c4997540b85b6f04d4ac2eb67d26a59da1",
+      "bytes": 4714
+    },
+    {
+      "path": "share/locale/ca/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "39",
+      "sha256": "fd32c188f1ac37555ba86da7d14807ec5a4b36a4da0e09dc532110e06c406866",
+      "bytes": 43010
+    },
+    {
+      "path": "share/locale/cs/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "40",
+      "sha256": "59a5922d9cc457686fffa1ab6ee75655873d216bafa004d49a9cf6f273a535f2",
+      "bytes": 240953
+    },
+    {
+      "path": "share/locale/cs/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "41",
+      "sha256": "1c5300ee1672bc5b079c362d1bbf1a19452a6076a248f7c8478d52c9d21929a2",
+      "bytes": 34671
+    },
+    {
+      "path": "share/locale/da/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "42",
+      "sha256": "c034d4c8db5a20da9b054d7f7f58eac78a9346b6c4462f86f5a808b5ed177beb",
+      "bytes": 130594
+    },
+    {
+      "path": "share/locale/da/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "43",
+      "sha256": "1a10fc982a5e2a08bf8b42ddffa86160e95e3a5900f265fa6bfccc6d7dc52aa9",
+      "bytes": 20822
+    },
+    {
+      "path": "share/locale/de/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "44",
+      "sha256": "e3de3034aa04f884eff07fe0095bf272fc2bb3f85a112e5521580e8855345bdc",
+      "bytes": 249118
+    },
+    {
+      "path": "share/locale/de/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "45",
+      "sha256": "63a949d4d8a2d681866fb2bc87a09a3a990aa6e4a4da6b9a34d4fb7f81e826bc",
+      "bytes": 35630
+    },
+    {
+      "path": "share/locale/el/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "46",
+      "sha256": "8d2b74065124734aaa0650df887bfeb8a3519de633c79c5f60e7a823224e373c",
+      "bytes": 56832
+    },
+    {
+      "path": "share/locale/en@boldquot/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "47",
+      "sha256": "62e68ba06b8c4745e68ddbbc9120c7e7c7c79733f944b252c089b84c2ca0b569",
+      "bytes": 226925
+    },
+    {
+      "path": "share/locale/en@quot/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "48",
+      "sha256": "fc6a6b9a44e11980702fae75231f8c31f8e8507879204a4c8e7e68b91c757664",
+      "bytes": 224509
+    },
+    {
+      "path": "share/locale/eo/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "49",
+      "sha256": "a10d8a5e69ca608f6cedb16868597930306f4b6219d38863e02790228dfa5431",
+      "bytes": 28068
+    },
+    {
+      "path": "share/locale/eo/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "50",
+      "sha256": "c6bcd649e8cb54c3805df1fa22e849afd6b45ac5b7f7dc92e311185fdabade75",
+      "bytes": 16312
+    },
+    {
+      "path": "share/locale/es/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "51",
+      "sha256": "3af1b0011e52731e25762c77e5cef0299331ef3307c9ac4bbaef56a0eaa51384",
+      "bytes": 213743
+    },
+    {
+      "path": "share/locale/es/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "52",
+      "sha256": "db6bfb99034dde596407adcce723c0a63dd585415f148d19b9f3f777e98df33b",
+      "bytes": 27013
+    },
+    {
+      "path": "share/locale/et/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "53",
+      "sha256": "ded92e0daa3deb6d85cf52df85a48ffdcdecdb7ffa5d51044540dc5ecef2f81c",
+      "bytes": 41196
+    },
+    {
+      "path": "share/locale/fi/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "54",
+      "sha256": "3de9053043eff3ba610037360224be7b7c28c7b2a8f94aa5a1fe16187122a4b9",
+      "bytes": 42743
+    },
+    {
+      "path": "share/locale/fr/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "55",
+      "sha256": "a9c2488774b8486c45d83962e95e08362148bfbdfc376703eb5014d5561dae2d",
+      "bytes": 253276
+    },
+    {
+      "path": "share/locale/fr/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "56",
+      "sha256": "43c4e3737f68548f7e15e6053917cf34dded9eabc71606baa836cbd64878341c",
+      "bytes": 22649
+    },
+    {
+      "path": "share/locale/gl/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "57",
+      "sha256": "c887dc550b6a7d33e1a131547b51d79403cb37fb819f48e08c7ac8a273f3c327",
+      "bytes": 42679
+    },
+    {
+      "path": "share/locale/hu/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "58",
+      "sha256": "4f8de79d608d59fb3a78f5bea34628d6a46ed8dd1bb327ffeca047ca50fa7d13",
+      "bytes": 44132
+    },
+    {
+      "path": "share/locale/hu/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "59",
+      "sha256": "4fb08b814593f50929cce15d5d6bc8f1eff796961646d7e30d9022a5cf59091a",
+      "bytes": 17540
+    },
+    {
+      "path": "share/locale/id/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "60",
+      "sha256": "98b72fddaec69b73544ef9d2439309929c8e5378bfd8cbd45534cdbbc0db4183",
+      "bytes": 41028
+    },
+    {
+      "path": "share/locale/it/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "61",
+      "sha256": "79d70f0626ffeb443f75e3b0dc2e264e1f7e4f2085e20ebbcf0b410ebe43c9df",
+      "bytes": 234794
+    },
+    {
+      "path": "share/locale/it/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "62",
+      "sha256": "49e53663c67a3da73cc93254f44a53a4265a34cf67e724d17bff3351a337fa99",
+      "bytes": 21084
+    },
+    {
+      "path": "share/locale/ja/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "63",
+      "sha256": "4ad50dc6277674b966d138f6bc5b9c8b22a219c36e66fbc86199a3eec00b7957",
+      "bytes": 256410
+    },
+    {
+      "path": "share/locale/ja/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "64",
+      "sha256": "a6d76e2305d8da4656242f15ddabc6712caf79acb2daa1ae7bcb9dac86da3303",
+      "bytes": 39527
+    },
+    {
+      "path": "share/locale/nb/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "65",
+      "sha256": "9211e63d2c1722afc7c02c9b5440949ba12793d0a20c9246ae91409a1107ea35",
+      "bytes": 208882
+    },
+    {
+      "path": "share/locale/nl/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "66",
+      "sha256": "bab673e0d10d31a7d2110bbb5d1bf09a8393239435bf64319d4fd056c76fdd67",
+      "bytes": 20438
+    },
+    {
+      "path": "share/locale/pl/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "67",
+      "sha256": "00bd75e840bacd53d7a57ca1a27465f07ecd32fd11b5f1e684225687a3d1dae7",
+      "bytes": 243695
+    },
+    {
+      "path": "share/locale/pl/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "68",
+      "sha256": "1ee0a412a37221ceb9d8385c5d44a38805e627e4eb95af41d0cb8a9444b7f7fd",
+      "bytes": 35396
+    },
+    {
+      "path": "share/locale/pt/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "69",
+      "sha256": "bc0f2589ee1156d2d7902347d2fafefc2704ab3b2c4fd205c580af7a714adc09",
+      "bytes": 239436
+    },
+    {
+      "path": "share/locale/pt/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "70",
+      "sha256": "8e68aa38b6007575ad96cfb28f2b46fd9676667eb558b8468d45842a07edaea6",
+      "bytes": 35234
+    },
+    {
+      "path": "share/locale/ro/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "71",
+      "sha256": "3c6aeefc1da28f906cc73200deb4b7af455c8cdad9a286f1b505b9886ef49b4e",
+      "bytes": 82389
+    },
+    {
+      "path": "share/locale/ro/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "72",
+      "sha256": "be32e601b982c8af7f1219accd449ef628b20061f6d30e0853a8e68d7b4b067b",
+      "bytes": 14455
+    },
+    {
+      "path": "share/locale/ru/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "73",
+      "sha256": "d0f7ad7c4f8fd859e5357947a4191f37fc04462d83a6d356ea13dcee956937a6",
+      "bytes": 288312
+    },
+    {
+      "path": "share/locale/ru/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "74",
+      "sha256": "0dbf9e867336a2a85e21f01b7fff72e7426dc2da8ab001d47371b364086621a9",
+      "bytes": 45183
+    },
+    {
+      "path": "share/locale/sk/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "75",
+      "sha256": "66e60fae85871d6a1e0a10e3e45dc73b3992be0287e2d7b01e0ca8d7b7cd3d0c",
+      "bytes": 43653
+    },
+    {
+      "path": "share/locale/sr/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "76",
+      "sha256": "41a6fb3310646c718bc435d2e9c5b9d263552b56c8b80463c2ab135361d6da08",
+      "bytes": 21279
+    },
+    {
+      "path": "share/locale/sv/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "77",
+      "sha256": "4b09d94bca2a3ae3278b1fa9ad0485c9efbbaaac4f8db52c0c043d6796af0206",
+      "bytes": 238067
+    },
+    {
+      "path": "share/locale/sv/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "78",
+      "sha256": "e160e96606dc3736b9268b355cd7fd0ad4d84d8a298977e0a7105c6ea69b3764",
+      "bytes": 33554
+    },
+    {
+      "path": "share/locale/tr/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "79",
+      "sha256": "37b965342c9fad0d4c598070a321a7aa649d456fc035cc21828d2a54193a66d4",
+      "bytes": 241870
+    },
+    {
+      "path": "share/locale/uk/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "80",
+      "sha256": "2056f64fe4dbe4434417a4bf9c6bc56542a8c63b5eaeef7e5d07fdf1dc0f5fbf",
+      "bytes": 293603
+    },
+    {
+      "path": "share/locale/uk/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "81",
+      "sha256": "08e033401ac22731f5d6d69f76241cb5a12e3699001a989df6cb52f8bb7f676e",
+      "bytes": 45209
+    },
+    {
+      "path": "share/locale/vi/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "82",
+      "sha256": "67be007bde95759f6d22b59403c0dcdb50d95a4da4fafc021fd1a7f1b7c6745f",
+      "bytes": 18302
+    },
+    {
+      "path": "share/locale/zh_CN/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "83",
+      "sha256": "52079ba6ac04594e7180bf94cee551975b3e29a35b5f0842ac08bb986ddbaf5a",
+      "bytes": 218941
+    },
+    {
+      "path": "share/locale/zh_CN/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "84",
+      "sha256": "08d4ca3ab9ecf1e3e322c99071032666a071b19b601fa07eb3db56615d73ecb7",
+      "bytes": 31390
+    },
+    {
+      "path": "share/locale/zh_TW/LC_MESSAGES/gnupg2.mo",
+      "cabinetFileId": "85",
+      "sha256": "75f19fc063b3935e7ba00fcdad915fcbb141e73238ad68a76e07d4a7a1f0774c",
+      "bytes": 219290
+    },
+    {
+      "path": "share/locale/zh_TW/LC_MESSAGES/libgpg-error.mo",
+      "cabinetFileId": "86",
+      "sha256": "eccfee80064d5051019028fd78ae6ac7b844a84cccd8c95cab78295c01dd2aa3",
+      "bytes": 31924
+    }
+  ]
+}
