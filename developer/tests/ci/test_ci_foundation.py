@@ -5845,10 +5845,15 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
 
         message_origin_template = records[message_origin_command["ordinal"]]
         message_origin_stdout = (
-            "TAP version 13\n"
-            "# Subtest: postMessage origin guard tests pass\n"
-            "ok 1 - postMessage origin guard tests pass\n"
-            "1..1\n"
+            "\u2714 postMessage origin guard tests pass (1.25ms)\n"
+            "\u2139 tests 1\n"
+            "\u2139 suites 0\n"
+            "\u2139 pass 1\n"
+            "\u2139 fail 0\n"
+            "\u2139 cancelled 0\n"
+            "\u2139 skipped 0\n"
+            "\u2139 todo 0\n"
+            "\u2139 duration_ms 40.5\n"
         )
         message_origin_stdout_raw = message_origin_stdout.encode("utf-8")
         message_origin_capture = ci.CommandCapture(
@@ -13075,6 +13080,382 @@ class CI6ReplayVerificationTest(unittest.TestCase):
         })
         return spec, record, capture
 
+    def node_test_reporter_fixture(
+        self, *, command_id: str = "learner-focused", duration: str = "1.25",
+        total_duration: str = "40.5", windows_paths: bool = False,
+        names: list[str] | None = None, payload: dict | None = None,
+        omit_payload: bool = False,
+    ) -> str:
+        names = list(names if names is not None else ["palette restore succeeds", "palette interaction succeeds"])
+        lines = [f"\u2714 {name} ({duration}ms)" for name in names]
+        if command_id == "learner-focused":
+            if not omit_payload:
+                payload = payload if payload is not None else {
+                    "status": "pass",
+                    "detail": "learner UI runtime stabilization regression tests passed",
+                    "tests": {
+                        "practiceSummaryToggle": "pass", "practiceBeforeBrowse": "pass",
+                        "paletteLayoutStability": "pass",
+                    },
+                    "evidence": {
+                        "expandedToggle": {"left": 628, "top": 24, "width": 36, "height": 36},
+                        "collapsedToggle": {"left": 628, "top": 24, "width": 36, "height": 36},
+                        "practiceFirstCalls": [
+                            "ensure-browse", "ensure-practice-suite", "update:false:false", "update:true:true",
+                        ],
+                        "widgetClicks": 1,
+                    },
+                }
+                lines.append(json.dumps(payload, ensure_ascii=False, indent=2))
+            runtime_path = "developer/tests/js/learnerUiRuntimeStabilization.test.js"
+            if windows_paths:
+                runtime_path = runtime_path.replace("/", "\\")
+            lines.append(f"\u2714 {runtime_path} ({duration}ms)")
+            count = len(names) + 1
+        else:
+            count = len(names)
+            basename = command_id.removeprefix("frontend-security:")
+            security_detail = ci._NODE_TEST_SECURITY_JSON_DETAILS.get(basename)
+            if security_detail is not None or basename == "adminFrontendGuard.test.js":
+                target_path = "developer/tests/js/" + basename
+                if windows_paths:
+                    target_path = target_path.replace("/", "\\")
+                payload_text = (json.dumps({"status": "pass", "detail": security_detail}, indent=2)
+                                if security_detail is not None else "adminFrontendGuard.test.js passed")
+                lines = [payload_text, f"\u2714 {target_path} ({duration}ms)"]
+                count = 1
+        lines.extend([
+            f"\u2139 tests {count}", "\u2139 suites 0", f"\u2139 pass {count}",
+            "\u2139 fail 0", "\u2139 cancelled 0", "\u2139 skipped 0", "\u2139 todo 0",
+            f"\u2139 duration_ms {total_duration}",
+        ])
+        return "\n".join(lines) + "\n"
+
+    def direct_node_test_fixture(
+        self, stdout: str, *, command_id: str = "learner-focused",
+        platform_name: str = "ubuntu", exit_code: int = 0,
+    ) -> tuple[dict, dict, ci.CommandCapture]:
+        _base_spec, base_record, capture = self.bundle_normalization_fixture(
+            stdout, platform_name=platform_name,
+        )
+        learner = command_id == "learner-focused"
+        builtin = command_id == "frontend-security:messageOriginGuard.test.js"
+        target_paths = ([
+            "developer/tests/js/learnerPalette.test.js",
+            "developer/tests/js/learnerUiRuntimeStabilization.test.js",
+        ] if learner else [
+            next(relative for relative in (*ci.SECURITY_GUARD_FILES, ci.MESSAGE_ORIGIN_SECURITY_GUARD)
+                 if Path(relative).name == command_id.removeprefix("frontend-security:")),
+        ])
+        command_class = "learner-focused" if learner else "frontend-security"
+        node = base_record["resolvedExecutablePath"]
+        argv = [node, "--test", *target_paths]
+        spec = synthetic_command_spec(
+            command_id, command_class, 0, command_role="observation-producing",
+            allowed_exits=[0, 1], execution_input_mode="PROTECTED-TARGET-BUNDLE",
+            targets=[ci._target_authority(ci.REPO_ROOT, relative)
+                     for relative in (*target_paths, "developer/package.json", "README.md")],
+        )
+        spec.update({
+            "profile": "frontend", "platform": platform_name,
+            "toolRole": ("node-test" if learner else
+                         "node-builtin-security-test" if builtin else "node-security-test"),
+            "resultSemantics": "exit-zero-pass-exit-one-classified-observation",
+            "argv": list(argv), "logicalArgv": list(argv), "executionArgv": list(argv),
+            **{key: base_record[key] for key in (
+                "resolvedExecutablePath", "resolvedExecutableSize", "resolvedExecutableSha256",
+                "resolvedExecutableFileIdentity",
+            )},
+        })
+        capture.command_id = command_id
+        capture.command_class = command_class
+        capture.argv = list(argv)
+        capture.logical_argv = list(argv)
+        capture.exit_code = exit_code
+        record = synthetic_record_from_spec(spec)
+        record.update({
+            key: value for key, value in capture.evidence().items()
+            if key not in {"executionInputs", "executionInputBundleDigest", "protectedTargetBundle"}
+        })
+        record.pop("parsedFailureSummary", None)
+        record["completedCommandClass"] = command_class
+        record["dependencyBacked"] = not builtin
+        if not builtin:
+            record.update({key: copy.deepcopy(base_record[key]) for key in (
+                "runtimeClosureDigest", "dependencyClosureDigest", "nodePath",
+                "resolvedTestRunnerEntrypoint", "resolvedTestRunnerSha256",
+                "closureWatcherActive", "closureMutationState", "runtimeClosureGuard",
+            )})
+        if exit_code == 0:
+            record["directNodeTestRawStreams"] = {"stdout": stdout, "stderr": ""}
+        source_path = target_paths[0]
+        raw = ci.make_raw_observation(
+            command_id, 0, 0, "process-output-v1",
+            "command:learner-focused-runtime" if learner else f"file:{source_path}",
+            source_path,
+            {"executed": True, "exitCode": exit_code, "stdout": stdout, "stderr": "", "error": None},
+            ci.command_output_digest(record),
+        )
+        record["producerObservations"] = [raw]
+        record["producerObservationSetDigest"] = ci.producer_observation_set_digest([raw])
+        return spec, record, capture
+
+    def assert_direct_node_test_semantic_parser_matrix(self) -> None:
+        paths = ["developer/tests/js/learnerPalette.test.js",
+                 "developer/tests/js/learnerUiRuntimeStabilization.test.js"]
+
+        def parse(stdout: str, *, authorized_paths: list[str] | None = None):
+            return ci.parse_node_test_semantic_result(
+                stdout, command_id="learner-focused",
+                authorized_test_paths=paths if authorized_paths is None else authorized_paths,
+            )
+
+        stdout = self.node_test_reporter_fixture()
+        semantic = parse(stdout)
+        self.assertIsNotNone(semantic)
+        for variant in (
+            self.node_test_reporter_fixture(duration="999.123"),
+            self.node_test_reporter_fixture(total_duration="9876.125"),
+            self.node_test_reporter_fixture(windows_paths=True),
+        ):
+            self.assertEqual(parse(variant), semantic)
+        differing = {
+            "test-name": self.node_test_reporter_fixture(names=["different palette restore", "palette interaction succeeds"]),
+            "test-order": self.node_test_reporter_fixture(names=["palette interaction succeeds", "palette restore succeeds"]),
+            "omitted-test": self.node_test_reporter_fixture(names=["palette restore succeeds"]),
+            "extra-test": self.node_test_reporter_fixture(names=["palette restore succeeds", "palette interaction succeeds", "extra test"]),
+        }
+        payload = ci.strict_json_loads(stdout[stdout.index("{"):stdout.index("\n\u2714 developer/")])
+        for label, keys, value in (
+            ("geometry", ("evidence", "expandedToggle", "left"), 629),
+            ("runtime-geometry", ("evidence", "collapsedToggle", "height"), 37),
+            ("call-order", ("evidence", "practiceFirstCalls"), list(reversed(payload["evidence"]["practiceFirstCalls"]))),
+            ("widget-interaction", ("evidence", "widgetClicks"), 2),
+        ):
+            changed = copy.deepcopy(payload)
+            selected = changed
+            for key in keys[:-1]:
+                selected = selected[key]
+            selected[keys[-1]] = value
+            differing[label] = self.node_test_reporter_fixture(payload=changed)
+        for label, variant in differing.items():
+            with self.subTest(node_semantic_identity_change=label):
+                self.assertNotEqual(parse(variant), semantic)
+        malformed = {
+            "test-count": stdout.replace("\u2139 tests 3", "\u2139 tests 4"),
+            "pass-count": stdout.replace("\u2139 pass 3", "\u2139 pass 2"),
+            "fail-count": stdout.replace("\u2139 fail 0", "\u2139 fail 1"),
+            "cancelled-count": stdout.replace("\u2139 cancelled 0", "\u2139 cancelled 1"),
+            "skipped-count": stdout.replace("\u2139 skipped 0", "\u2139 skipped 1"),
+            "todo-count": stdout.replace("\u2139 todo 0", "\u2139 todo 1"),
+            "suite-count": stdout.replace("\u2139 suites 0", "\u2139 suites 1"),
+            "negative-duration": stdout.replace("(1.25ms)", "(-1ms)", 1),
+            "nan-duration": stdout.replace("(1.25ms)", "(NaNms)", 1),
+            "unknown-reporter": stdout.replace("\u2714", "PASS", 1),
+            "missing-summary": stdout[:stdout.index("\u2139 duration_ms")],
+            "duplicate-summary": stdout + "\u2139 tests 3\n",
+            "unexpected-stdout": "unrecognized runtime message\n" + stdout,
+            "learner-payload-omitted": self.node_test_reporter_fixture(omit_payload=True),
+            "learner-duplicate-json-key": stdout.replace('"status": "pass",', '"status": "pass", "status": "pass",', 1),
+            "unauthorized-file-identifier": stdout.replace(paths[1], "private/learnerUiRuntimeStabilization.test.js"),
+        }
+        for key in ("status", "practiceSummaryToggle", "practiceBeforeBrowse", "paletteLayoutStability"):
+            changed = copy.deepcopy(payload)
+            (changed if key == "status" else changed["tests"])[key] = "fail"
+            malformed[f"learner-status-{key}"] = self.node_test_reporter_fixture(payload=changed)
+        changed = copy.deepcopy(payload)
+        changed["tests"]["unexpectedTest"] = "pass"
+        malformed["learner-test-membership"] = self.node_test_reporter_fixture(payload=changed)
+        changed = copy.deepcopy(payload)
+        del changed["evidence"]["expandedToggle"]
+        malformed["learner-evidence-omitted"] = self.node_test_reporter_fixture(payload=changed)
+        for label, variant in malformed.items():
+            with self.subTest(node_reporter_rejection=label):
+                self.assertIsNone(parse(variant))
+        self.assertIsNone(parse(stdout, authorized_paths=[paths[0]]))
+
+    def assert_direct_node_test_projection_matrix(self) -> None:
+        families = ["learner-focused", *(f"frontend-security:{Path(path).name}" for path in ci.SECURITY_GUARD_FILES),
+                    "frontend-security:messageOriginGuard.test.js"]
+        for command_id in families:
+            for platform_name in ("ubuntu", "windows"):
+                with self.subTest(node_command_family=command_id, platform=platform_name):
+                    variants = [self.direct_node_test_fixture(
+                        self.node_test_reporter_fixture(command_id=command_id, duration=duration,
+                                                        total_duration=total_duration, windows_paths=windows_paths),
+                        command_id=command_id, platform_name=platform_name,
+                    ) for duration, total_duration, windows_paths in (("1.25", "40.5", False), ("19.75", "801.25", True))]
+                    canonicals, universes, outputs = [], [], []
+                    for spec, record, capture in variants:
+                        before = copy.deepcopy(record)
+                        outputs.append(ci.command_output_digest(record))
+                        for local in (record, ci._compact_command_record_for_evidence(record)):
+                            errors = []
+                            self.assertFalse(ci._validate_command_record(local, 0, errors, expected_record=spec), errors)
+                            self.assertEqual(errors, [])
+                            projection = ci._validated_direct_node_test_semantic_projection(local, protected_bundle_valid=True)
+                            self.assertIsNotNone(projection, (command_id, platform_name, capture.stdout))
+                            canonical = ci._canonical_transcript_record(local)
+                            for field in ("stdoutSha256", "stdoutBytesObserved", "producerObservationSetDigest"):
+                                self.assertEqual(canonical[field], projection[field])
+                            portable_raw = projection["producerObservations"][0]
+                            self.assertEqual(portable_raw["sourceOutputDigest"], projection["semanticSourceOutputDigest"])
+                            self.assertNotEqual(portable_raw["producerRecordDigest"], record["producerObservations"][0]["producerRecordDigest"])
+                            self.assertEqual(canonical["stderrSha256"], record["stderrSha256"])
+                            canonicals.append(canonical)
+                            universes.append(ci.producer_observation_universe_digest([local]))
+                        self.assertEqual(record, before, "raw stdout and observations remain persisted unchanged")
+                        self.assertEqual(record["stdoutSha256"], hashlib.sha256(capture.authoritative_stdout_bytes()).hexdigest())
+                    self.assertTrue(all(item == canonicals[0] for item in canonicals))
+                    self.assertEqual(len(set(universes)), 1)
+                    self.assertNotEqual(outputs[0], outputs[1], "local source output digests remain raw")
+
+        _spec, valid, _capture = self.direct_node_test_fixture(self.node_test_reporter_fixture())
+        mutations = (
+            (("executed",), False), (("started",), False), (("setupFailure",), True),
+            (("exitCode",), 1), (("exitCode",), False),
+            (("timeoutStatus",), "TIMED-OUT"), (("outputLimitStatus",), "OUTPUT-LIMIT-EXCEEDED"),
+            (("processTreeStatus",), "cleanup-failed"), (("containment",), "uncontained"),
+            (("descendantsSurviving",), 1), (("descendantsTerminated",), 1),
+            (("processTreeError",), "cleanup failed"), (("error",), "RUNTIME-CLOSURE-ERROR: drift"),
+            (("runtimeClosureDigest",), "invalid"), (("dependencyBacked",), False),
+            (("closureWatcherActive",), False), (("closureMutationState",), "dirty"),
+            (("runtimeClosureGuard", "mutationState"), "dirty"),
+            (("runtimeClosureGuard", "queueOverflow"), True),
+            (("runtimeClosureGuard", "mutationEventCount"), 1),
+            (("protectedTargetBundle", "cleanupState"), "failed"),
+            (("protectedTargetBundle", "mutationDetected"), True),
+            (("resolvedExecutableSha256",), "invalid"),
+            (("resolvedExecutableFileIdentity", "reparsePoint"), True),
+            (("resolvedTestRunnerSha256",), "f" * 64),
+            (("actualExecutionArgv",), [valid["resolvedExecutablePath"], "--test", "other.test.js"]),
+            (("stdoutSha256",), "f" * 64), (("stdoutBytesObserved",), 1),
+            (("directNodeTestRawStreams", "stdout"), "unrecognized output"),
+            (("directNodeTestRawStreams", "stderr"), "unexpected stderr"),
+            (("producerObservations",), []), (("producerObservationSetDigest",), "sha256:" + "f" * 64),
+            (("producerObservations", 0, "sourceOutputDigest"), "sha256:" + "f" * 64),
+            (("producerObservations", 0, "producerRecordDigest"), "sha256:" + "f" * 64),
+            (("producerObservations", 0, "rawStructuredFields", "stdout"), "forged observation stdout"),
+            (("allowedExecutionExits",), [0]), (("resultSemantics",), "exit-zero-required"),
+            (("toolRole",), "node-syntax-check"), (("commandRole",), "required-execution"),
+            (("commandId",), "backend-canonical"), (("commandId",), "arbitrary-node-process"),
+            (("commandId",), "frontend-security:unknown.test.js"), (("profile",), "policy"),
+        )
+        for keys, value in mutations:
+            with self.subTest(node_projection_rejection=keys):
+                unsafe = copy.deepcopy(valid)
+                selected = unsafe
+                for key in keys[:-1]:
+                    selected = selected[key]
+                selected[keys[-1]] = value
+                protected_valid = ci._validated_portable_protected_input_bundle_digest(unsafe) is not None
+                self.assertIsNone(ci._validated_direct_node_test_semantic_projection(
+                    unsafe, protected_bundle_valid=protected_valid,
+                ))
+                self.assertEqual(ci._canonical_transcript_record(unsafe)["stdoutSha256"], unsafe["stdoutSha256"])
+        self.assertIsNone(ci._validated_direct_node_test_semantic_projection(valid, protected_bundle_valid=False))
+        absent_streams = copy.deepcopy(valid)
+        del absent_streams["directNodeTestRawStreams"]
+        self.assertIsNone(ci._validated_direct_node_test_semantic_projection(absent_streams, protected_bundle_valid=True))
+
+        for stdout in (
+            self.node_test_reporter_fixture().replace("\u2139 tests 3", "\u2139 tests 4"),
+            "unexpected stdout\n" + self.node_test_reporter_fixture(),
+            self.node_test_reporter_fixture(omit_payload=True),
+            self.node_test_reporter_fixture().replace('"practiceSummaryToggle": "pass"', '"practiceSummaryToggle": "fail"'),
+        ):
+            with self.subTest(invalid_success_reporter=stdout[:60]):
+                spec, malformed, _capture = self.direct_node_test_fixture(stdout)
+                self.assertIsNone(ci._validated_direct_node_test_semantic_projection(malformed, protected_bundle_valid=True))
+                errors = []
+                ci._validate_command_record(malformed, 0, errors, expected_record=spec)
+                self.assertTrue(errors)
+                self.assertEqual(ci._canonical_transcript_record(malformed)["stdoutSha256"], malformed["stdoutSha256"])
+
+        # Canonically equivalent Unicode spellings are distinct test names;
+        # reporter duration/path spelling is the entire normalization boundary.
+        unicode_projections = []
+        for name in ("security caf\u00e9", "security cafe\u0301"):
+            command_id = "frontend-security:privacyLoggingGuard.test.js"
+            stdout = self.node_test_reporter_fixture(command_id=command_id, names=[name])
+            _spec, record, _capture = self.direct_node_test_fixture(stdout, command_id=command_id)
+            projection = ci._validated_direct_node_test_semantic_projection(record, protected_bundle_valid=True)
+            self.assertIsNotNone(projection)
+            unicode_projections.append(projection)
+        for field in ("stdoutSha256", "semanticSourceOutputDigest", "producerObservationSetDigest"):
+            self.assertNotEqual(unicode_projections[0][field], unicode_projections[1][field])
+
+        for command_id, failure in (
+            ("learner-focused", "browserType.launch: Executable doesn't exist; browser unavailable"),
+            ("learner-focused", "AssertionError: palette geometry changed"),
+            ("frontend-security:adminFrontendGuard.test.js", "TypeError: document.addEventListener is not a function"),
+            ("frontend-security:messageOriginGuard.test.js", "AssertionError: unexpected origin accepted"),
+            ("frontend-security:secureIdentifierGuard.test.js", "SyntaxError: Unexpected token"),
+        ):
+            with self.subTest(raw_node_failure=command_id, failure=failure):
+                _spec, failed, _capture = self.direct_node_test_fixture(failure, command_id=command_id, exit_code=1)
+                original = copy.deepcopy(failed)
+                failed["directNodeTestRawStreams"] = {"stdout": self.node_test_reporter_fixture(command_id=command_id), "stderr": ""}
+                self.assertIsNone(ci._validated_direct_node_test_semantic_projection(failed, protected_bundle_valid=True))
+                raw = failed["producerObservations"][0]
+                self.assertEqual(ci._raw_failure_outputs(raw, failed), ci._raw_failure_outputs(raw, original))
+                for candidate in (original, failed):
+                    canonical = ci._canonical_transcript_record(candidate)
+                    for field in ("stdoutSha256", "stdoutBytesObserved", "stderrSha256", "stderrBytesObserved"):
+                        self.assertEqual(canonical[field], candidate[field])
+                errors = []
+                ci._validate_command_record(failed, 0, errors, expected_record=_spec)
+                self.assertTrue(errors, "a forged success-only stream claim cannot bless an exit-one result")
+                self.assertEqual(ci.producer_observation_universe([failed]), ci.producer_observation_universe([original]))
+                self.assertNotEqual(ci._raw_failure_outputs(raw, failed)["outcome"], "pass")
+
+    def assert_direct_node_test_replay_convergence(self) -> None:
+        fixtures = [self.direct_node_test_fixture(self.node_test_reporter_fixture(duration=duration))
+                    for duration in ("1.25", "120.5")]
+        # A fresh verifier also has different physical source identities. The
+        # immutable logical paths/content match and each local bundle proves its
+        # own held source identity before cross-job result comparison.
+        independent_spec, independent_record, _capture = fixtures[1]
+        for target in independent_spec["targets"]:
+            target["canonicalSourcePath"] = str(ci.REPO_ROOT / ".ci-node-independent-source" / target["path"])
+            target["fileIdentity"] = {
+                **target["fileIdentity"], "inodeOrFileIndex": "987654321",
+                "creationOrChangeTimeNs": "123456789", "writeTimeNs": "987654321",
+            }
+        rebuilt = synthetic_record_from_spec(independent_spec)
+        for field in ("targets", "executionInputs", "executionInputBundleDigest", "protectedTargetBundle"):
+            independent_record[field] = rebuilt[field]
+        self.assertIsNotNone(ci._validated_portable_protected_input_bundle_digest(independent_record))
+        self.assertNotEqual(fixtures[0][1]["executionInputBundleDigest"], independent_record["executionInputBundleDigest"])
+        runners, transcripts = [], []
+        for spec, record, _capture in fixtures:
+            runner = copy.deepcopy(self.runner)
+            runner.profile = "frontend"
+            runner.command_plan = [spec]
+            runner.command_results = [record]
+            runner.observations = [{"commandId": record["commandId"], "rawObservation": record["producerObservations"][0]}]
+            runner.execution_binding = synthetic_execution_binding("frontend", ci.command_plan_digest([spec]), platform_name="linux")
+            runner.verifier_execution_binding = synthetic_external_context(runner.execution_binding).verifier_binding()
+            runner.authorization_context_binding = None
+            runner.authorization_context_binding_digest = None
+            ci.finalize_evidence_transcript(runner)
+            runners.append(runner)
+            transcripts.append(ci.verification_replay_transcript(runner))
+        for field in ("records", "producerObservationUniverseDigest", "producerTranscriptDigest"):
+            self.assertEqual(transcripts[0][field], transcripts[1][field], field)
+        for field in ("currentFullContextDigest", "derivedFailureDigest"):
+            self.assertEqual(runners[0].observations[0][field], runners[1].observations[0][field], field)
+        bindings = {key: copy.deepcopy(transcripts[0][key]) for key in (
+            "executionBinding", "executionBindingDigest", "authorizationContextBinding", "authorizationContextBindingDigest",
+        )}
+        claims = {
+            "summary.json": {**copy.deepcopy(bindings), "status": "PASS", "profile": "frontend",
+                             "knownDebtsObserved": [], "resolvedCandidates": [], "expectedOmissions": [], "releaseOnlySkips": []},
+            "command-results.json": {**bindings, "commandAuthority": [fixtures[0][0]], "records": [fixtures[0][1]]},
+        }
+        coherently_rebind_claimed_transcript(claims)
+        self.assertEqual(ci.compare_verification_replay_claims(claims, runners[1], empty_comparison())[1], [])
+
     def repository_policy_golden_fixture(self) -> SimpleNamespace:
         # Fixed measured content makes the pre-change transcript golden portable
         # across developer machines while exercising the complete real policy plan.
@@ -13159,6 +13540,9 @@ class CI6ReplayVerificationTest(unittest.TestCase):
         return runner
 
     def test_legitimate_claims_match_independent_replay(self) -> None:
+        self.assert_direct_node_test_semantic_parser_matrix()
+        self.assert_direct_node_test_projection_matrix()
+        self.assert_direct_node_test_replay_convergence()
         self.assertEqual(self.compare(), [])
         commands = self.documents["command-results.json"]
         self.assertEqual(commands["producerObservationCount"], 787)
@@ -13912,6 +14296,7 @@ class CI6ReplayVerificationTest(unittest.TestCase):
         matrix = (
             (("executionDurationClass",), "executionDurationClass"),
             (("stdoutSha256",), "stdout-identity"),
+            (("directNodeTestRawStreams",), "stdout-identity"),
             (("stderrSha256",), "stderr-identity"),
             (("exitCode",), "execution-status"),
             (("parsedFailureSummary", "status"), "execution-status"),
@@ -13943,6 +14328,9 @@ class CI6ReplayVerificationTest(unittest.TestCase):
                 right[keys[-1]] = {"stdout": unsafe, "environment": {unsafe: [unsafe]}}
                 rendered = ci.first_replay_transcript_difference_diagnostic([producer], [replay])
                 diagnostic = ci.strict_json_loads(rendered)
+                self.assertEqual(ci.replay_transcript_difference_diagnostics(
+                    [producer], [replay],
+                ), [diagnostic])
                 expected_subcategories = {
                     "executionInputBundleDigest": ["executionInputBundleDigest"],
                     "targets": ["targets"],
@@ -14104,6 +14492,12 @@ class CI6ReplayVerificationTest(unittest.TestCase):
                 self.assertNotIn("secret.js", rendered)
                 self.assertNotIn(str(raw_root), rendered)
                 self.assertEqual((raw_producer, raw_replay), before)
+                self.assertEqual(ci.replay_transcript_difference_diagnostics(
+                    [equal_prefix, canonical_producer, canonical_producer],
+                    [equal_prefix, canonical_replay, canonical_replay],
+                    producer_source_records=[equal_prefix, raw_producer, raw_producer],
+                    replay_source_records=[equal_prefix, raw_replay, raw_replay],
+                ), [diagnostic, diagnostic])
                 for source_records in (
                     None, [], [{**raw_replay, "stdoutSha256": "c" * 64}],
                     [{**raw_replay, "commandId": "node-check:UNRELATED.js"}],
@@ -14159,17 +14553,93 @@ class CI6ReplayVerificationTest(unittest.TestCase):
         ))
         self.assertEqual(diagnostic["targetInputSubcategories"], sorted(set(target_subcategories.values())))
 
+        # Keep original positions and nested categories while skipping equal
+        # records, and stop only the diagnostic output after eight mismatches.
+        cluster_producer, cluster_replay = [], []
+        mismatch_ordinals = [1, 3, 4, 6, 7, 9, 10, 11, 12, 13]
+        for ordinal in range(14):
+            source = {
+                "commandId": f"node-check:private/secret-{ordinal}.js",
+                "commandClass": "direct-syntax", "ordinal": ordinal,
+                "actualExecutionInputSize": 1,
+            }
+            cluster_producer.append(source)
+            cluster_replay.append({
+                **source, "actualExecutionInputSize": (
+                    {unsafe: [unsafe]} if ordinal in mismatch_ordinals else 1
+                ),
+            })
+        before = copy.deepcopy((cluster_producer, cluster_replay))
+        for mismatch_count in range(len(mismatch_ordinals) + 1):
+            with self.subTest(bounded_transcript_mismatch_count=mismatch_count):
+                end = mismatch_ordinals[mismatch_count - 1] + 1 if mismatch_count else 1
+                diagnostics = ci.replay_transcript_difference_diagnostics(
+                    cluster_producer[:end], cluster_replay[:end],
+                )
+                self.assertEqual([item["ordinal"] for item in diagnostics],
+                                 mismatch_ordinals[:min(mismatch_count, 8)])
+                for item in diagnostics:
+                    self.assertEqual(item["commandId"], "OTHER")
+                    self.assertEqual(item["commandClass"], "direct-syntax")
+                    self.assertEqual(item["commandFamily"], "node-check")
+                    self.assertEqual(item["changedFieldCategories"], ["target-input-authority"])
+                    self.assertEqual(item["targetInputSubcategories"], ["actualExecutionInputIdentity"])
+                    self.assertEqual(item["producerRecordDigest"], ci.canonical_failure_digest(
+                        cluster_producer[item["ordinal"]],
+                    ))
+                    self.assertEqual(item["replayRecordDigest"], ci.canonical_failure_digest(
+                        cluster_replay[item["ordinal"]],
+                    ))
+                rendered = json.dumps(diagnostics)
+                self.assertNotIn(unsafe, rendered)
+                self.assertNotIn("private", rendered)
+                self.assertNotIn("secret", rendered)
+                self.assertLess(len(rendered), 8 * 900)
+        self.assertEqual((cluster_producer, cluster_replay), before)
+        self.assertEqual(ci.replay_transcript_difference_diagnostics([], []), [])
+        for missing_side in ("producer", "replay"):
+            with self.subTest(missing_transcript_side=missing_side):
+                diagnostics = ci.replay_transcript_difference_diagnostics(
+                    [] if missing_side == "producer" else cluster_producer,
+                    [] if missing_side == "replay" else cluster_replay,
+                )
+                self.assertEqual([item["ordinal"] for item in diagnostics], list(range(8)))
+                self.assertTrue(all(item["changedFieldCategories"] == ["command-membership"]
+                                    for item in diagnostics))
+
         forged = copy.deepcopy(self.documents)
         forged["command-results.json"]["records"][0]["executionDurationClass"] = unsafe
         forged["command-results.json"]["records"][1]["exitCode"] = -99
         errors = self.compare(forged)
         self.assertIn("verification replay command execution transcript mismatch", errors)
-        prefix = "verification replay first command difference: "
-        differences = [ci.strict_json_loads(error.removeprefix(prefix))
-                       for error in errors if error.startswith(prefix)]
-        self.assertEqual(len(differences), 1)
+        prefix = "verification replay first command differences: "
+        difference_lists = [ci.strict_json_loads(error.removeprefix(prefix))
+                            for error in errors if error.startswith(prefix)]
+        self.assertEqual(len(difference_lists), 1)
+        differences = difference_lists[0]
+        self.assertEqual(len(differences), 2)
         self.assertEqual(differences[0]["commandId"], "baseline-schema")
         self.assertEqual(differences[0]["changedFieldCategories"], ["executionDurationClass"])
+        self.assertEqual(differences[1]["changedFieldCategories"], ["execution-status"])
+        self.assertNotIn(unsafe, "\n".join(errors))
+
+        # Diagnostics cannot suppress the mismatch or affect any acceptance
+        # comparison, even if no diagnostic records are returned.
+        with mock.patch.object(ci, "replay_transcript_difference_diagnostics", return_value=[]):
+            without_diagnostics = self.compare(forged)
+        self.assertEqual(without_diagnostics,
+                         [error for error in errors if not error.startswith(prefix)])
+
+        forged_records = forged["command-results.json"]["records"]
+        while len(forged_records) < 10:
+            forged_records.append({**copy.deepcopy(forged_records[-1]), "ordinal": len(forged_records)})
+        for record in forged_records[:10]:
+            record["executionDurationClass"] = unsafe
+        errors = self.compare(forged)
+        differences = next(ci.strict_json_loads(error.removeprefix(prefix))
+                           for error in errors if error.startswith(prefix))
+        self.assertEqual([item["ordinal"] for item in differences], list(range(8)))
+        self.assertIn("verification replay command execution transcript mismatch", errors)
         self.assertNotIn(unsafe, "\n".join(errors))
 
 
@@ -16452,6 +16922,65 @@ class CI8PosixContainmentStateMachineTest(unittest.TestCase):
         })
         return spec, record
 
+    def external_test_containment_record(
+        self, observed_count: int = 2, *, family: str = "learner",
+    ) -> dict:
+        node = _explicit_local_test_tool_map("node")["node"]
+        size, digest, identity = ci._measured_file_authority(Path(node))
+        if family == "learner":
+            command_id = command_class = "learner-focused"
+            tool_role = "node-test"
+            target_paths = [
+                "developer/tests/js/learnerPalette.test.js",
+                "developer/tests/js/learnerUiRuntimeStabilization.test.js",
+            ]
+        else:
+            target_paths = [
+                ci.MESSAGE_ORIGIN_SECURITY_GUARD if family == "builtin"
+                else ci.SECURITY_GUARD_FILES[0]
+            ]
+            command_id = f"frontend-security:{Path(target_paths[0]).name}"
+            command_class = "frontend-security"
+            tool_role = "node-builtin-security-test" if family == "builtin" else "node-security-test"
+        spec = synthetic_command_spec(
+            command_id, command_class, 0,
+            command_role="observation-producing", allowed_exits=[0, 1],
+            targets=[ci._target_authority(ci.REPO_ROOT, relative) for relative in target_paths],
+            execution_input_mode="PROTECTED-TARGET-BUNDLE",
+        )
+        argv = [node, "--test", *target_paths]
+        spec.update({
+            "profile": "frontend", "platform": "ubuntu", "toolRole": tool_role,
+            "resultSemantics": "exit-zero-pass-exit-one-classified-observation",
+            "argv": list(argv), "logicalArgv": list(argv), "executionArgv": list(argv),
+            "resolvedExecutablePath": node, "resolvedExecutableSize": size,
+            "resolvedExecutableSha256": digest, "resolvedExecutableFileIdentity": identity,
+            "dependencyBacked": family != "builtin",
+        })
+        record = synthetic_record_from_spec(spec)
+        record.update({
+            "containment": "linux-subreaper-pidfd-proc-supervisor",
+            "processTreeStatus": "contained-clean",
+            "containmentDisposition": "natural-exit-reaped",
+            "descendantsObserved": observed_count, "descendantsReaped": observed_count,
+            "descendantsTerminated": 0, "descendantsSurviving": 0,
+            "completedCommandClass": command_class,
+        })
+        if family != "builtin":
+            record.update({
+                "runtimeClosureDigest": "4" * 64, "dependencyClosureDigest": "6" * 64,
+                "nodePath": [], "resolvedTestRunnerEntrypoint": node,
+                "resolvedTestRunnerSha256": digest,
+                "closureWatcherActive": True, "closureMutationState": "clean",
+                "runtimeClosureGuard": {
+                    "guardSchemaVersion": ci.RUNTIME_DEPENDENCY_GUARD_SCHEMA_VERSION,
+                    "watcherBackend": "_InotifyMutationWatcher", "active": False,
+                    "activeDuringReplay": True, "mutationState": "clean",
+                    "queueOverflow": False, "mutationEventCount": 0,
+                },
+            })
+        return record
+
     def test_setsid_escape_model_remains_in_descendant_registry(self) -> None:
         state = ci.PosixContainmentStateMachine(10)
         child = self.identity(20, 10, group=20, session=20)
@@ -16666,6 +17195,37 @@ class CI8PosixContainmentStateMachineTest(unittest.TestCase):
                     ci._canonical_transcript_record(right),
                 )
 
+        # The separately validated direct-Node success protocol permits the
+        # same two telemetry fields for learner/security, including builtin
+        # security's deliberately absent dependency watcher. The outer semantic
+        # result validator is exercised by the replay protocol regression tests.
+        for family in ("learner", "security", "builtin"):
+            with self.subTest(external_test_family=family):
+                left = self.external_test_containment_record(2, family=family)
+                right = copy.deepcopy(left)
+                right["descendantsObserved"] = right["descendantsReaped"] = 3
+                before = copy.deepcopy((left, right))
+                projected = []
+                for record in (left, right):
+                    errors = []
+                    self.assertFalse(ci._validate_command_record(
+                        record, 0, errors, expected_record=record,
+                    ))
+                    self.assertEqual(errors, [])
+                    counts = ci._validated_portable_successful_external_test_containment(
+                        record, protected_bundle_valid=True, node_test_semantics_valid=True,
+                    )
+                    self.assertEqual(counts, {
+                        "descendantsObserved": "<VALIDATED-NATURALLY-REAPED-COUNT>",
+                        "descendantsReaped": "<VALIDATED-NATURALLY-REAPED-COUNT>",
+                    })
+                    projected.append({**record, **counts})
+                self.assertEqual(projected[0], projected[1])
+                self.assertEqual((left, right), before)
+                self.assertIsNone(ci._validated_portable_successful_external_test_containment(
+                    left, protected_bundle_valid=True, node_test_semantics_valid=False,
+                ))
+
     def test_truth_outcome_distinguishes_forced_termination(self) -> None:
         state = ci.PosixContainmentStateMachine(10)
         child = self.identity(20, 10)
@@ -16742,6 +17302,49 @@ class CI8PosixContainmentStateMachineTest(unittest.TestCase):
                 self.assertNotEqual(ci._canonical_transcript_record(unsafe), canonical)
         self.assertIsNone(ci._validated_portable_static_containment(
             valid, protected_bundle_valid=False,
+        ))
+
+        external = self.external_test_containment_record()
+        for field, value in [*mutations,
+            ("profile", "policy"), ("platform", "windows"),
+            ("commandId", "backend-canonical"), ("commandId", "frontend-security:unknown.test.js"),
+            ("commandId", []), ("toolRole", "npm-backend-test"),
+            ("commandClass", "backend-canonical"), ("commandRole", "required-execution"),
+            ("required", False), ("resultSemantics", "exit-zero-required"),
+            ("executionInputMode", "NONE"), ("allowedExecutionExits", [0]),
+            ("dependencyBacked", False), ("containment", "windows-job-object"),
+            ("containmentDisposition", "forced-terminated"),
+            ("containmentDisposition", "no-descendants"),
+            ("stdoutSha256", "invalid-raw-output-digest"),
+            ("producerObservationSetDigest", "invalid-raw-observation-digest"),
+        ]:
+            with self.subTest(unsafe_external_field=field, value=value):
+                unsafe = copy.deepcopy(external)
+                unsafe[field] = value
+                self.assertIsNone(ci._validated_portable_successful_external_test_containment(
+                    unsafe, protected_bundle_valid=True, node_test_semantics_valid=True,
+                ))
+        for field, value in (
+            ("guardSchemaVersion", True), ("active", True),
+            ("activeDuringReplay", False), ("watcherBackend", "unavailable"),
+            ("queueOverflow", True), ("mutationState", "dirty"),
+            ("mutationEventCount", 1), ("mutationEventCount", False),
+        ):
+            with self.subTest(unsafe_external_guard=field):
+                unsafe = copy.deepcopy(external)
+                unsafe["runtimeClosureGuard"][field] = value
+                self.assertIsNone(ci._validated_portable_successful_external_test_containment(
+                    unsafe, protected_bundle_valid=True, node_test_semantics_valid=True,
+                ))
+        for field, value in (("cleanupState", "failed"), ("mutationDetected", True)):
+            with self.subTest(unsafe_external_bundle=field):
+                unsafe = copy.deepcopy(external)
+                unsafe["protectedTargetBundle"][field] = value
+                self.assertIsNone(ci._validated_portable_successful_external_test_containment(
+                    unsafe, protected_bundle_valid=True, node_test_semantics_valid=True,
+                ))
+        self.assertIsNone(ci._validated_portable_successful_external_test_containment(
+            external, protected_bundle_valid=False, node_test_semantics_valid=True,
         ))
 
 

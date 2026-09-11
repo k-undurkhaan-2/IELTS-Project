@@ -4,7 +4,8 @@
 The runner intentionally uses only Python's standard library.  It invokes a
 small allowlist of repository validation commands, converts their output into
 scoped observations, and compares every non-pass observation with the frozen
-Phase 1 baseline.  Raw command output is never printed or persisted.
+Phase 1 baseline. Raw output is excluded from public diagnostics. Eligible
+direct Node successes retain bounded exact streams in locally validated evidence.
 """
 
 from __future__ import annotations
@@ -10198,6 +10199,12 @@ def derive_canonical_failure_material(
 ) -> dict[str, Any]:
     """Build baseline-blind failure material from command facts and one raw observation."""
 
+    portable_source = _portable_node_test_observation_source(validated_command_record)
+    if portable_source is not validated_command_record:
+        raw_set = validated_command_record.get("producerObservations", [])
+        if any(validated_raw_observation == raw for raw in raw_set):
+            validated_raw_observation = portable_source["producerObservations"][0]
+            validated_command_record = _canonical_transcript_record(validated_command_record)
     targets = []
     for target in validated_command_record.get("targets", []):
         if isinstance(target, Mapping):
@@ -11023,6 +11030,115 @@ def _validated_portable_static_containment(
     }
 
 
+def _validated_portable_successful_external_test_containment(
+    record: Mapping[str, Any],
+    *,
+    protected_bundle_valid: bool,
+    node_test_semantics_valid: bool,
+) -> dict[str, str] | None:
+    """Project only natural-reap counts after independent Node success proof.
+
+    The caller derives ``node_test_semantics_valid`` from the validated raw
+    reporter and immutable direct-Node authority, never from a producer claim.
+    All containment and applicable dependency-guard evidence remains exact;
+    these two counts alone describe non-authoritative supervisor sampling.
+    Existing static-suite projection is deliberately kept separate and intact.
+    """
+
+    command_id = record.get("commandId")
+    if not isinstance(command_id, str):
+        return None
+    security_ids = {
+        f"frontend-security:{Path(relative).name}" for relative in SECURITY_GUARD_FILES
+    }
+    approved_command = (
+        command_id == "learner-focused"
+        and record.get("commandClass") == "learner-focused"
+        and record.get("toolRole") == "node-test"
+    ) or (
+        command_id in security_ids
+        and record.get("commandClass") == "frontend-security"
+        and record.get("toolRole") == "node-security-test"
+    ) or (
+        command_id == "frontend-security:messageOriginGuard.test.js"
+        and record.get("commandClass") == "frontend-security"
+        and record.get("toolRole") == "node-builtin-security-test"
+    )
+    if (
+        node_test_semantics_valid is not True
+        or protected_bundle_valid is not True
+        or not approved_command
+        or record.get("commandRole") != "observation-producing"
+        or record.get("profile") not in ("frontend", "all")
+        or record.get("platform") != "ubuntu"
+        or record.get("resultSemantics") != "exit-zero-pass-exit-one-classified-observation"
+        or record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or record.get("required") is not True
+        or not _command_execution_completed(record)
+        or type(record.get("exitCode")) is not int
+        or record.get("exitCode") != 0
+        or record.get("allowedExecutionExits") != [0, 1]
+        or record.get("containment") != "linux-subreaper-pidfd-proc-supervisor"
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("containmentDisposition") != "natural-exit-reaped"
+        or any(record.get(key) not in (None, "") for key in (
+            "error", "processTreeError", "limitReason",
+        ))
+    ):
+        return None
+    counts = {
+        key: record.get(key)
+        for key in (
+            "descendantsObserved", "descendantsReaped",
+            "descendantsTerminated", "descendantsSurviving",
+        )
+    }
+    if (
+        any(type(value) is not int or not 0 <= value <= 4096 for value in counts.values())
+        or counts["descendantsObserved"] == 0
+        or counts["descendantsObserved"] != counts["descendantsReaped"]
+        or counts["descendantsTerminated"] != 0
+        or counts["descendantsSurviving"] != 0
+    ):
+        return None
+    dependency_backed = record.get("toolRole") != "node-builtin-security-test"
+    if record.get("dependencyBacked") is not dependency_backed:
+        return None
+    guard = record.get("runtimeClosureGuard")
+    if dependency_backed:
+        if (
+            not isinstance(guard, dict)
+            or guard.get("active") is not False
+            or type(guard.get("guardSchemaVersion")) is not int
+            or guard.get("watcherBackend") != "_InotifyMutationWatcher"
+            or guard.get("activeDuringReplay") is not True
+            or guard.get("mutationState") != "clean"
+            or guard.get("queueOverflow") is not False
+            or type(guard.get("mutationEventCount")) is not int
+            or guard.get("mutationEventCount") != 0
+            or record.get("closureWatcherActive") is not True
+            or record.get("closureMutationState") != "clean"
+        ):
+            return None
+    elif any(record.get(key) is not None for key in (
+        "runtimeClosureGuard", "closureWatcherActive", "closureMutationState",
+    )):
+        return None
+    errors: list[str] = []
+    try:
+        if _validated_portable_protected_input_bundle_digest(record) is None:
+            return None
+        hard_failure = _validate_command_record(dict(record), 0, errors, expected_record=record)
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+        return None
+    if errors or hard_failure:
+        return None
+    return {
+        "descendantsObserved": "<VALIDATED-NATURALLY-REAPED-COUNT>",
+        "descendantsReaped": "<VALIDATED-NATURALLY-REAPED-COUNT>",
+    }
+
+
 def _plan_command_requires_completion(record: Mapping[str, Any]) -> bool:
     return bool(record.get("required")) or record.get("commandRole") == "observation-producing"
 
@@ -11091,7 +11207,8 @@ def producer_observation_universe(
             "producerObservations": copy.deepcopy(record.get("producerObservations", [])),
             "producerObservationSetDigest": record.get("producerObservationSetDigest"),
         }
-        for record in command_records
+        for raw_record in command_records
+        for record in (_portable_node_test_observation_source(raw_record),)
     ]
 
 
@@ -11853,6 +11970,447 @@ def _validated_bundle_normalization_success_output_identity(
     }
 
 
+_NODE_TEST_MAX_STDOUT_BYTES = 256 * 1024
+_NODE_TEST_MAX_TESTS = 1024
+_NODE_TEST_MAX_NAME_LENGTH = 2048
+_NODE_TEST_MAX_PAYLOAD_BYTES = 16 * 1024
+_NODE_TEST_DURATION_PATTERN = r"(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?"
+_NODE_TEST_SUMMARY_KEYS = (
+    "tests", "suites", "pass", "fail", "cancelled", "skipped", "todo",
+)
+_NODE_TEST_LEARNER_PATHS = (
+    "developer/tests/js/learnerPalette.test.js",
+    "developer/tests/js/learnerUiRuntimeStabilization.test.js",
+)
+_NODE_TEST_SECURITY_JSON_DETAILS = {
+    "appActionsExportGuard.test.js": "app actions markdown export step-up guard passed",
+    "dataManagementPanel.test.js": "data management panel export and stale file read guard tests passed",
+    "examActionsExportGuard.test.js": "exam actions fallback export guard passed",
+    "examSessionReplayCloneGuard.test.js": "exam session replay clone guard passed",
+    "localDataRenderingGuard.test.js": "local data rendering guard tests passed",
+    "practiceRecordExportServerGuard.test.js": "server-owned practice-record export guard tests passed",
+    "remotePracticeDataSource.test.js": "remote practice data source tests passed",
+    "resourceCoreProbeBypassGuard.test.js": "resource core probe bypass guard passed",
+    "secureIdentifierGuard.test.js": "secure identifier guard tests passed",
+    "suiteBackGuardSecurity.test.js": "suite back guard history state sanitization tests passed",
+    "vocabSessionExportGuard.test.js": "vocab session export step-up guard passed",
+}
+
+
+def _node_test_geometry_valid(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"left", "top", "width", "height"}
+        and all(
+            type(number) in (int, float)
+            and abs(number) <= 1_000_000_000
+            and math.isfinite(number)
+            for number in value.values()
+        )
+        and value["width"] >= 0
+        and value["height"] >= 0
+    )
+
+
+def _node_test_learner_payload_valid(payload: Any) -> bool:
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"status", "detail", "tests", "evidence"}
+        or payload["status"] != "pass"
+        or payload["detail"] != "learner UI runtime stabilization regression tests passed"
+        or payload["tests"] != {
+            "practiceSummaryToggle": "pass",
+            "practiceBeforeBrowse": "pass",
+            "paletteLayoutStability": "pass",
+        }
+    ):
+        return False
+    evidence = payload["evidence"]
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != {
+            "expandedToggle", "collapsedToggle", "practiceFirstCalls", "widgetClicks",
+        }
+        or not _node_test_geometry_valid(evidence["expandedToggle"])
+        or not _node_test_geometry_valid(evidence["collapsedToggle"])
+        or type(evidence["widgetClicks"]) is not int
+        or not 0 <= evidence["widgetClicks"] <= 1_000_000
+    ):
+        return False
+    calls = evidence["practiceFirstCalls"]
+    return (
+        isinstance(calls, list)
+        and 1 <= len(calls) <= 128
+        and all(
+            isinstance(call, str)
+            and re.fullmatch(
+                r"ensure-browse|ensure-practice-suite|update:(?:true|false):(?:true|false)",
+                call,
+            ) is not None
+            for call in calls
+        )
+    )
+
+
+def _node_test_payload_valid(payload: Any, command_id: str) -> bool:
+    if command_id == "learner-focused":
+        return _node_test_learner_payload_valid(payload)
+    basename = command_id.removeprefix("frontend-security:")
+    detail = _NODE_TEST_SECURITY_JSON_DETAILS.get(basename)
+    return (
+        detail is not None
+        and isinstance(payload, dict)
+        and set(payload) == {"status", "detail"}
+        and payload["status"] == "pass"
+        and payload["detail"] == detail
+    )
+
+
+def _node_test_authorized_reporter_path(name: str, paths: tuple[str, ...]) -> str | None:
+    for path in paths:
+        if re.fullmatch(re.escape(path).replace("/", r"[/\\]"), name) is not None:
+            return path
+    return None
+
+
+def parse_node_test_semantic_result(
+    stdout: str,
+    *,
+    command_id: str,
+    authorized_test_paths: Sequence[str],
+) -> dict[str, Any] | None:
+    """Derive NodeTestSemanticResultV1, never accepting a producer digest.
+
+    Exact repository identifiers come solely from caller-validated immutable
+    argv/target authority. A slash or backslash spelling is normalized only
+    when an entire reporter test name equals that identifier. All other test
+    names and all structured payload values retain their semantic content.
+    """
+    if (
+        not isinstance(stdout, str)
+        or not stdout
+        or len(stdout) > _NODE_TEST_MAX_STDOUT_BYTES
+        or not isinstance(command_id, str)
+        or isinstance(authorized_test_paths, (str, bytes))
+        or not isinstance(authorized_test_paths, Sequence)
+        or not 1 <= len(authorized_test_paths) <= 2
+    ):
+        return None
+    try:
+        if len(stdout.encode("utf-8")) > _NODE_TEST_MAX_STDOUT_BYTES:
+            return None
+    except UnicodeError:
+        return None
+    # Node's captured spec reporter writes LF on both authorized platforms.
+    # Do not broaden normalization to ANSI escapes or arbitrary whitespace.
+    if not stdout.endswith("\n") or any(
+        ord(character) < 32 and character != "\n" or ord(character) == 127
+        for character in stdout
+    ):
+        return None
+    paths = tuple(authorized_test_paths)
+    if any(
+        not isinstance(path, str)
+        or re.fullmatch(r"developer/tests/js/[A-Za-z0-9_-]+\.test\.js", path) is None
+        for path in paths
+    ) or len(set(paths)) != len(paths):
+        return None
+    if command_id == "learner-focused":
+        if paths != _NODE_TEST_LEARNER_PATHS:
+            return None
+        payload_kind = "learner-runtime"
+        payload_path = paths[1]
+    elif command_id.startswith("frontend-security:"):
+        basename = command_id.removeprefix("frontend-security:")
+        if len(paths) != 1 or basename != paths[0].rsplit("/", 1)[1]:
+            return None
+        payload_path = paths[0]
+        if basename in _NODE_TEST_SECURITY_JSON_DETAILS:
+            payload_kind = "security-result"
+        elif basename == "adminFrontendGuard.test.js":
+            payload_kind = "security-success-line"
+        else:
+            payload_kind = None
+    else:
+        return None
+    lines = stdout[:-1].split("\n")
+    if not 9 <= len(lines) <= _NODE_TEST_MAX_TESTS + 256:
+        return None
+    summary_lines = lines[-8:]
+    counts: dict[str, int] = {}
+    for key, line in zip(_NODE_TEST_SUMMARY_KEYS, summary_lines[:7]):
+        match = re.fullmatch(rf"ℹ {key} (0|[1-9][0-9]{{0,3}})", line)
+        if match is None:
+            return None
+        counts[key] = int(match[1])
+    if (
+        re.fullmatch(rf"ℹ duration_ms {_NODE_TEST_DURATION_PATTERN}", summary_lines[-1]) is None
+        or not 1 <= counts["tests"] <= _NODE_TEST_MAX_TESTS
+        or counts["pass"] != counts["tests"]
+        or any(counts[key] != 0 for key in ("suites", "fail", "cancelled", "skipped", "todo"))
+    ):
+        return None
+    body = lines[:-8]
+    tests: list[dict[str, Any]] = []
+    payloads: list[dict[str, Any]] = []
+    index = 0
+    while index < len(body):
+        line = body[index]
+        test_match = re.fullmatch(rf"✔ (.+) \({_NODE_TEST_DURATION_PATTERN}ms\)", line)
+        if test_match is not None:
+            name = test_match[1]
+            if (
+                len(name) > _NODE_TEST_MAX_NAME_LENGTH
+                or name != name.strip()
+                or len(tests) >= _NODE_TEST_MAX_TESTS
+            ):
+                return None
+            normalized_name = _node_test_authorized_reporter_path(name, paths) or name
+            tests.append({"ordinal": len(tests) + 1, "name": normalized_name, "status": "pass"})
+            index += 1
+            continue
+        if payload_kind is None or payloads:
+            return None
+        if payload_kind == "security-success-line":
+            if line != "adminFrontendGuard.test.js passed":
+                return None
+            payload: Any = {"status": "pass", "detail": line}
+            index += 1
+        else:
+            if line != "{":
+                return None
+            # JSON.stringify(..., null, 2) emits one top-level closing brace
+            # on a line of its own. No arbitrary leading/trailing text passes.
+            closing = next((i for i in range(index + 1, len(body)) if body[i] == "}"), None)
+            if closing is None:
+                return None
+            payload_text = "\n".join(body[index:closing + 1])
+            if len(payload_text.encode("utf-8")) > _NODE_TEST_MAX_PAYLOAD_BYTES:
+                return None
+            try:
+                payload = strict_json_loads(payload_text, label="direct Node test payload")
+            except (ValueError, RecursionError, OverflowError):
+                return None
+            if not _node_test_payload_valid(payload, command_id):
+                return None
+            index = closing + 1
+        # Payload is emitted by the script whose immediately following file
+        # result closes the reporter body. Association and placement matter.
+        if index != len(body) - 1:
+            return None
+        associated_test = re.fullmatch(
+            rf"✔ (.+) \({_NODE_TEST_DURATION_PATTERN}ms\)", body[index],
+        )
+        if (
+            associated_test is None
+            or _node_test_authorized_reporter_path(associated_test[1], paths) != payload_path
+        ):
+            return None
+        payloads.append({"testOrdinal": len(tests) + 1, "kind": payload_kind, "value": payload})
+    if (
+        len(tests) != counts["tests"]
+        or bool(payloads) != (payload_kind is not None)
+        or (payload_kind is not None and command_id != "learner-focused" and len(tests) != 1)
+    ):
+        return None
+    return {
+        "schema": "NodeTestSemanticResultV1",
+        "commandId": command_id,
+        "authorizedTestPaths": list(paths),
+        "tests": tests,
+        "counts": counts,
+        "payloads": payloads,
+    }
+
+
+def _direct_node_test_authorized_paths(record: Mapping[str, Any]) -> tuple[str, ...] | None:
+    """Recognize only the immutable direct-test adapters in the frontend plan."""
+    command_id = record.get("commandId")
+    if command_id == "learner-focused":
+        command_class, role = "learner-focused", "node-test"
+        paths = (
+            "developer/tests/js/learnerPalette.test.js",
+            "developer/tests/js/learnerUiRuntimeStabilization.test.js",
+        )
+    elif command_id == "frontend-security:messageOriginGuard.test.js":
+        command_class, role = "frontend-security", "node-builtin-security-test"
+        paths = (MESSAGE_ORIGIN_SECURITY_GUARD,)
+    else:
+        matching = [path for path in SECURITY_GUARD_FILES
+                    if command_id == f"frontend-security:{Path(path).name}"]
+        if len(matching) != 1:
+            return None
+        command_class, role = "frontend-security", "node-security-test"
+        paths = tuple(matching)
+    executable = record.get("resolvedExecutablePath")
+    argv = [executable, "--test", *paths]
+    if (
+        record.get("commandClass") != command_class
+        or record.get("toolRole") != role
+        or record.get("commandRole") != "observation-producing"
+        or record.get("resultSemantics") != "exit-zero-pass-exit-one-classified-observation"
+        or record.get("profile") not in {"frontend", "all"}
+        or record.get("allowedExecutionExits") != [0, 1]
+        or record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or record.get("required") is not True
+        or record.get("cwd") != "."
+        or not isinstance(executable, str) or not Path(executable).is_absolute()
+        or any(record.get(key) != argv for key in ("argv", "logicalArgv", "executionArgv"))
+    ):
+        return None
+    return paths
+
+
+def _direct_node_test_raw_stream_errors(record: Mapping[str, Any]) -> list[str]:
+    """Validate exact retained streams independently of sanitized observations."""
+    streams = record.get("directNodeTestRawStreams")
+    if (
+        _direct_node_test_authorized_paths(record) is None
+        or type(record.get("exitCode")) is not int or record.get("exitCode") != 0
+        or not isinstance(streams, dict) or set(streams) != {"stdout", "stderr"}
+    ):
+        return ["direct Node test raw stream authority/schema is invalid"]
+    for name in ("stdout", "stderr"):
+        value = streams[name]
+        if not isinstance(value, str):
+            return ["direct Node test raw stream must be UTF-8 text"]
+        try:
+            data = value.encode("utf-8", errors="strict")
+        except UnicodeError:
+            return ["direct Node test raw stream must be UTF-8 text"]
+        if (len(data) > MAX_RECORDED_STREAM_BYTES
+            or len(data) != record.get(name + "BytesObserved")
+            or hashlib.sha256(data).hexdigest() != record.get(name + "Sha256")):
+            return ["direct Node test raw stream differs from observed bytes"]
+    return []
+
+
+def _validated_direct_node_test_semantic_projection(
+    record: Mapping[str, Any], *, protected_bundle_valid: bool,
+) -> dict[str, Any] | None:
+    """Derive a portable result only after the complete raw success proof."""
+    paths = _direct_node_test_authorized_paths(record)
+    if (
+        paths is None or protected_bundle_valid is not True
+        or not _command_execution_completed(record)
+        or type(record.get("exitCode")) is not int or record.get("exitCode") != 0
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("descendantsSurviving") != 0
+        or record.get("descendantsTerminated") != 0
+        or record.get("containmentDisposition") not in {"no-descendants", "natural-exit-reaped"}
+        or any(record.get(key) is not None for key in ("error", "processTreeError", "limitReason"))
+        or (record.get("platform"), record.get("containment")) not in {
+            ("ubuntu", "linux-subreaper-pidfd-proc-supervisor"),
+            ("windows", "windows-job-object"),
+        }
+        or _direct_node_test_raw_stream_errors(record)
+    ):
+        return None
+    try:
+        errors: list[str] = []
+        if _validate_command_record(dict(record), 0, errors, expected_record=record) or errors:
+            return None
+        if _validated_portable_protected_input_bundle_digest(record) is None:
+            return None
+        if any(sum(target.get("path") == path for target in record["targets"]) != 1 for path in paths):
+            return None
+        if record["actualExecutionArgv"] != record["logicalArgv"]:
+            return None
+        if record["resolvedExecutableSize"] <= 0:
+            return None
+        stable = record["resolvedExecutableFileIdentity"]
+        if stable.get("reparsePoint") is not False or any(
+            not isinstance(stable.get(key), str) or re.fullmatch(r"-?[0-9]+", stable[key]) is None
+            for key in ("deviceOrVolume", "inodeOrFileIndex", "creationOrChangeTimeNs", "writeTimeNs")
+        ):
+            return None
+        if record.get("dependencyBacked") is True:
+            guard = record["runtimeClosureGuard"]
+            if (
+                record.get("resolvedTestRunnerEntrypoint") != record["resolvedExecutablePath"]
+                or record.get("resolvedTestRunnerSha256") != record["resolvedExecutableSha256"]
+                or guard.get("active") is not False
+                or type(guard.get("guardSchemaVersion")) is not int
+                or type(guard.get("mutationEventCount")) is not int
+                or (record["platform"], guard.get("watcherBackend")) not in {
+                    ("ubuntu", "_InotifyMutationWatcher"),
+                    ("windows", "_WindowsDirectoryMutationWatcher"),
+                }
+            ):
+                return None
+        elif (record.get("toolRole") != "node-builtin-security-test"
+              or record.get("dependencyBacked") is not False
+              or any(record.get(key) is not None for key in (
+                  "runtimeClosureGuard", "closureWatcherActive", "closureMutationState"))):
+            return None
+        observed, reaped = record["descendantsObserved"], record["descendantsReaped"]
+        if (record["containmentDisposition"] == "no-descendants" and (observed or reaped)
+            or record["containmentDisposition"] == "natural-exit-reaped"
+            and (observed <= 0 or observed != reaped)):
+            return None
+        producer = record["producerObservations"]
+        if len(producer) != 1:
+            return None
+        raw = producer[0]
+        if _validate_raw_observation(raw, label="direct-node-test", source=record):
+            return None
+        expected_scope = ("command:learner-focused-runtime" if record["commandId"] == "learner-focused"
+                          else f"file:{paths[0]}")
+        streams = record["directNodeTestRawStreams"]
+        expected_fields = raw_observation_json_value({
+            "executed": True, "exitCode": 0, "stdout": streams["stdout"],
+            "stderr": streams["stderr"], "error": None,
+        })
+        if (raw["observationOrdinal"] != 0 or raw["occurrences"] != 1
+            or raw["sourceResultId"] != expected_scope or raw["sourcePath"] != paths[0]
+            or raw["rawStructuredFields"] != expected_fields):
+            return None
+        semantic = parse_node_test_semantic_result(
+            streams["stdout"], command_id=record["commandId"], authorized_test_paths=paths,
+        )
+        if semantic is None:
+            return None
+        # Preserve exact test-name/payload Unicode too: the general frame's NFC
+        # string normalization is not an authorized reporter transformation.
+        semantic_bytes = json.dumps(
+            semantic, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8", errors="strict")
+        canonical = _canonical_frame({
+            "digestDomain": "ieltmps-direct-node-test-semantic-result-v1", "resultUtf8": semantic_bytes,
+        })
+        output_identity = {
+            "stdoutSha256": hashlib.sha256(canonical).hexdigest(),
+            "stdoutBytesObserved": len(canonical),
+        }
+        semantic_source_digest = canonical_failure_digest({
+            "digestDomain": "ieltmps-direct-node-test-semantic-source-output-v1",
+            "resultUtf8": semantic_bytes, "stderrSha256": record["stderrSha256"],
+            "stderrBytesObserved": record["stderrBytesObserved"],
+        })
+        portable_raw = copy.deepcopy(raw)
+        portable_raw["rawStructuredFields"]["stdout"] = semantic
+        portable_raw["sourceOutputDigest"] = semantic_source_digest
+        portable_raw["producerRecordDigest"] = _producer_record_digest({
+            key: value for key, value in portable_raw.items() if key != "producerRecordDigest"
+        })
+        return {
+            **output_identity, "semanticSourceOutputDigest": semantic_source_digest,
+            "producerObservations": [portable_raw],
+            "producerObservationSetDigest": producer_observation_set_digest([portable_raw]),
+        }
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+        return None
+
+
+def _portable_node_test_observation_source(record: Mapping[str, Any]) -> Mapping[str, Any]:
+    if _direct_node_test_authorized_paths(record) is None or record.get("exitCode") != 0:
+        return record
+    projection = _validated_direct_node_test_semantic_projection(
+        record, protected_bundle_valid=_validated_portable_protected_input_bundle_digest(record) is not None,
+    )
+    return {**record, **projection} if projection is not None else record
+
+
 def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
     source = dict(record)
     portable_stdin_authority = _validated_portable_target_stdin_input_authority(record)
@@ -11883,6 +12441,17 @@ def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
     )
     if bundle_output_identity is not None:
         source.update(bundle_output_identity)
+    node_projection = _validated_direct_node_test_semantic_projection(
+        record, protected_bundle_valid=portable_bundle_digest is not None,
+    )
+    if node_projection is not None:
+        source.update(node_projection)
+        source.pop("directNodeTestRawStreams", None)
+        external_containment = _validated_portable_successful_external_test_containment(
+            record, protected_bundle_valid=True, node_test_semantics_valid=True,
+        )
+        if external_containment is not None:
+            source.update(external_containment)
     if "validatedStaticMachineReport" in source:
         static_output_identity = (
             _validated_static_machine_output_identity(record)
@@ -17493,6 +18062,18 @@ class FoundationRunner:
     ) -> dict[str, Any]:
         """Bind one process result to its command's raw output identity."""
 
+        if (_direct_node_test_authorized_paths(command_record) is not None
+            and capture.exit_code == 0 and capture.stdout_raw is not None
+            and capture.stderr_raw is not None and isinstance(command_record, dict)):
+            try:
+                command_record["directNodeTestRawStreams"] = {
+                    "stdout": capture.stdout_raw.decode("utf-8", errors="strict"),
+                    "stderr": capture.stderr_raw.decode("utf-8", errors="strict"),
+                }
+            except UnicodeError:
+                # Exact decoding is necessary for this protocol. The ordinary
+                # execution/observation evidence still records the raw failure.
+                pass
         raw_fields: Any = {
             "executed": capture.executed,
             "exitCode": capture.exit_code,
@@ -19128,6 +19709,7 @@ _REPLAY_DIAGNOSTIC_FIELD_CATEGORIES = {
     "stdout-identity": frozenset({
         "stdoutSha256", "stdoutBytesObserved", "stdoutByteLimit",
         "validatedStaticMachineReport", "invalidStaticMachineLocalEvidence",
+        "directNodeTestRawStreams",
     }),
     "stderr-identity": frozenset({
         "stderrSha256", "stderrBytesObserved", "stderrByteLimit",
@@ -19158,6 +19740,7 @@ _REPLAY_DIAGNOSTIC_FIELD_CATEGORIES = {
     }),
     "producer-observation-context": frozenset({
         "producerObservations", "producerObservationSetDigest", "diagnosticPreview",
+        "semanticSourceOutputDigest",
     }),
     "command-membership": frozenset({"commandId", "ordinal"}),
 }
@@ -19204,6 +19787,7 @@ _REPLAY_DIAGNOSTIC_VIOLATION_IDS = frozenset({
     "CI-RUNNER-ERROR", "RUNTIME-CLOSURE-PRECONDITION",
 })
 _MAX_REPLAY_FAILURE_DIAGNOSTICS = 8
+_MAX_REPLAY_TRANSCRIPT_DIAGNOSTICS = 8
 
 
 def _replay_changed_field_categories(
@@ -19297,15 +19881,16 @@ def _replay_target_input_difference_subcategories(
     return sorted(categories)
 
 
-def first_replay_transcript_difference_diagnostic(
+def replay_transcript_difference_diagnostics(
     producer_records: Sequence[Mapping[str, Any]],
     replay_records: Sequence[Mapping[str, Any]],
     *,
     producer_source_records: Sequence[Mapping[str, Any]] | None = None,
     replay_source_records: Sequence[Mapping[str, Any]] | None = None,
-) -> str | None:
-    """Describe only the first unequal canonical record; never authorize replay."""
+) -> list[dict[str, Any]]:
+    """Describe at most eight unequal canonical records; never authorize replay."""
 
+    diagnostics: list[dict[str, Any]] = []
     for index in range(max(len(producer_records), len(replay_records))):
         producer = producer_records[index] if index < len(producer_records) else None
         replay = replay_records[index] if index < len(replay_records) else None
@@ -19343,8 +19928,27 @@ def first_replay_transcript_difference_diagnostic(
                     else None
                 ),
             ))
-        return json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
-    return None
+        diagnostics.append(diagnostic)
+        if len(diagnostics) == _MAX_REPLAY_TRANSCRIPT_DIAGNOSTICS:
+            break
+    return diagnostics
+
+
+def first_replay_transcript_difference_diagnostic(
+    producer_records: Sequence[Mapping[str, Any]],
+    replay_records: Sequence[Mapping[str, Any]],
+    *,
+    producer_source_records: Sequence[Mapping[str, Any]] | None = None,
+    replay_source_records: Sequence[Mapping[str, Any]] | None = None,
+) -> str | None:
+    """Retain the single-record diagnostic interface for existing consumers."""
+
+    diagnostics = replay_transcript_difference_diagnostics(
+        producer_records, replay_records,
+        producer_source_records=producer_source_records,
+        replay_source_records=replay_source_records,
+    )
+    return json.dumps(diagnostics[0], sort_keys=True, separators=(",", ":")) if diagnostics else None
 
 
 _STATIC_REPORT_DIAGNOSTIC_FIELDS = {
@@ -20301,12 +20905,21 @@ def _validate_command_record(
         "closureMutationState",
         "runtimeClosureGuard",
         "validatedStaticMachineReport",
+        "directNodeTestRawStreams",
     }
     if not isinstance(record, dict):
         errors.append(f"{label}: record must be an object")
         return True
     if not required.issubset(record) or set(record) - required - optional:
         errors.append(f"{label}: command record keys are not valid")
+    if "directNodeTestRawStreams" in record:
+        stream_errors = _direct_node_test_raw_stream_errors(record)
+        errors.extend(f"{label}: {error}" for error in stream_errors)
+        if not stream_errors and parse_node_test_semantic_result(
+            record["directNodeTestRawStreams"]["stdout"], command_id=record["commandId"],
+            authorized_test_paths=_direct_node_test_authorized_paths(record),
+        ) is None:
+            errors.append(f"{label}: successful direct Node test reporter/payload is invalid")
     if (
         not isinstance(record.get("commandId"), str)
         or not isinstance(record.get("commandClass"), str)
@@ -21639,6 +22252,32 @@ def _read_evidence_documents_for_replay(
     return documents, snapshots, sorted(set(errors))
 
 
+def _portable_replay_observations(
+    observations: Any, records: Sequence[Mapping[str, Any]],
+) -> Any:
+    """Project only reconstructed observation sources; keep claimed derived fields."""
+    if not isinstance(observations, list):
+        return observations
+    by_id = {record.get("commandId"): record for record in records}
+    result = []
+    for item in observations:
+        if not isinstance(item, Mapping):
+            result.append(item)
+            continue
+        source = by_id.get(item.get("commandId"))
+        portable = _portable_node_test_observation_source(source) if source is not None else source
+        if (source is not None and portable is not source
+            and item.get("rawObservation") == source["producerObservations"][0]
+            and item.get("producerObservationSetDigest") == source["producerObservationSetDigest"]):
+            result.append({
+                **item, "rawObservation": portable["producerObservations"][0],
+                "producerObservationSetDigest": portable["producerObservationSetDigest"],
+            })
+        else:
+            result.append(item)
+    return result
+
+
 def compare_verification_replay_claims(
     documents: Mapping[str, dict[str, Any]],
     runner: FoundationRunner,
@@ -21719,15 +22358,17 @@ def compare_verification_replay_claims(
         ]
         if comparable_evidence_records != replay_records:
             errors.append("verification replay command execution transcript mismatch")
-            diagnostic = first_replay_transcript_difference_diagnostic(
+            diagnostics = replay_transcript_difference_diagnostics(
                 comparable_evidence_records, replay_records,
                 producer_source_records=[
                     record for record in evidence_records if isinstance(record, Mapping)
                 ],
                 replay_source_records=runner.command_results,
             )
-            if diagnostic is not None:
-                errors.append("verification replay first command difference: " + diagnostic)
+            if diagnostics:
+                errors.append("verification replay first command differences: " + json.dumps(
+                    diagnostics, sort_keys=True, separators=(",", ":"),
+                ))
     if isinstance(evidence_records, list) and len(evidence_records) != transcript["commandCount"]:
         errors.append("verification replay commandCount mismatch")
     top_level_fields = (
@@ -21749,7 +22390,11 @@ def compare_verification_replay_claims(
         "actualCompletedCommandClasses"
     ):
         errors.append("verification replay completedCommandClasses mismatch")
-    if commands.get("observations") not in ([], runner.observations):
+    if _portable_replay_observations(
+        commands.get("observations"),
+        [record for record in evidence_records if isinstance(record, Mapping)]
+        if isinstance(evidence_records, list) else [],
+    ) not in ([], _portable_replay_observations(runner.observations, runner.command_results)):
         errors.append("verification replay producer observations mismatch")
     if comparison is not None:
         replay_sets = {
