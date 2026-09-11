@@ -4,7 +4,8 @@
 The runner intentionally uses only Python's standard library.  It invokes a
 small allowlist of repository validation commands, converts their output into
 scoped observations, and compares every non-pass observation with the frozen
-Phase 1 baseline.  Raw command output is never printed or persisted.
+Phase 1 baseline. Raw output is excluded from public diagnostics. Eligible
+direct Node successes retain bounded exact streams in locally validated evidence.
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import quote, unquote_to_bytes, urlsplit
@@ -255,7 +256,7 @@ WORKFLOW_JOB_PROFILE_AUTHORITY = MappingProxyType(
                 "profile": "policy",
                 "verificationProfile": "policy",
                 "artifactIdentity": "untrusted-repository-policy-${{ runner.os }}-${{ github.run_attempt }}",
-                "evidenceRoot": ".ci-untrusted/repository-policy",
+                "evidenceRoot": "${{ runner.temp }}/ci-untrusted/repository-policy",
                 "evidencePaths": EVIDENCE_FILE_NAMES,
             }
         ),
@@ -268,7 +269,7 @@ WORKFLOW_JOB_PROFILE_AUTHORITY = MappingProxyType(
                 "profile": "all",
                 "verificationProfile": "all",
                 "artifactIdentity": "untrusted-ubuntu-canonical-${{ runner.os }}-${{ github.run_attempt }}",
-                "evidenceRoot": ".ci-untrusted/ubuntu-canonical",
+                "evidenceRoot": "${{ runner.temp }}/ci-untrusted/ubuntu-canonical",
                 "evidencePaths": EVIDENCE_FILE_NAMES,
             }
         ),
@@ -281,7 +282,7 @@ WORKFLOW_JOB_PROFILE_AUTHORITY = MappingProxyType(
                 "profile": "all",
                 "verificationProfile": "all",
                 "artifactIdentity": "untrusted-windows-compatibility-${{ runner.os }}-${{ github.run_attempt }}",
-                "evidenceRoot": ".ci-untrusted/windows-compatibility",
+                "evidenceRoot": "${{ runner.temp }}/ci-untrusted/windows-compatibility",
                 "evidencePaths": EVIDENCE_FILE_NAMES,
             }
         ),
@@ -4688,6 +4689,7 @@ class CommandCapture:
     identity_stdout_raw: bytes | None = field(default=None, repr=False)
     identity_stderr_raw: bytes | None = field(default=None, repr=False)
     failure_path_authority: Any | None = field(default=None, repr=False)
+    validated_static_machine_report: dict[str, Any] | None = field(default=None, repr=False)
 
     def execution_passed(self) -> bool:
         return (
@@ -4790,6 +4792,12 @@ class CommandCapture:
             )
         if failure_summary:
             record["parsedFailureSummary"] = normalized_json_value(failure_summary)
+        if self.validated_static_machine_report is not None:
+            # Preserve local machine-plan authority for independent validation;
+            # the physical stdout hash above remains exact local evidence.
+            record["validatedStaticMachineReport"] = copy.deepcopy(
+                self.validated_static_machine_report
+            )
         return record
 
     def authoritative_stdout_bytes(self) -> bytes:
@@ -5662,6 +5670,7 @@ class TrustedBashLease:
             raise ctypes.WinError(ctypes.get_last_error())
         self.handle = handle
         self.path = str(canonical)
+        self.git_path = str(Path(git_path).resolve(strict=True))
         self.trusted_git_root = str(git_root.resolve(strict=True))
         try:
             self._initial_info = self._information(self.handle)
@@ -5729,15 +5738,38 @@ class TrustedBashLease:
                 return False, f"trusted Git Bash path drifted: {reason}"
             if str(path.resolve(strict=True)) != self.path:
                 return False, "trusted Git Bash canonical path drifted"
+            git_root, root_error = _trusted_git_installation_root(Path(self.git_path))
+            if git_root is None or str(git_root.resolve(strict=True)) != self.trusted_git_root:
+                return False, root_error or "trusted Git Bash installation relationship drifted"
+            if (
+                _trusted_git_bash_candidate_position(path, git_root, windows=True) is None
+                or not _non_reparse_directory_chain(path.parent, git_root)
+            ):
+                return False, "trusted Git Bash installation topology drifted"
             handle_info = self._information(self.handle)
             path_info = self._open_path_identity()
             if handle_info != self._initial_info or path_info != self._initial_info:
                 return False, "trusted Git Bash stable file identity drifted"
             if _sha256_file(path) != self.expected_sha256:
                 return False, "trusted Git Bash SHA-256 drifted"
+            if self.identity != {
+                "canonicalPath": self.path,
+                "trustedGitRoot": self.trusted_git_root,
+                **self._initial_info,
+                "sha256": self.expected_sha256,
+            }:
+                return False, "trusted Git Bash recorded lease identity drifted"
         except OSError as exc:
             return False, f"trusted Git Bash lease verification failed: {type(exc).__name__}"
         return True, None
+
+    def validated_identity(self) -> dict[str, Any]:
+        """Snapshot physical authority only while the locally held lease verifies."""
+
+        okay, error = self.verify()
+        if not okay:
+            raise OSError(error or "trusted Git Bash lease verification failed")
+        return dict(self.identity)
 
     def close(self) -> None:
         handle = getattr(self, "handle", None)
@@ -7154,9 +7186,28 @@ printf 'CI_TRUSTED_NPM_ENTRY=%s\\n' "$(realpath "$npm_path")" >> "$GITHUB_ENV"''
 LINUX_RUNTIME_CAPTURE_FRESH = LINUX_RUNTIME_CAPTURE + '''
 printf 'CI_FRESH_DEPENDENCY_INSTALL=1\\n' >> "$GITHUB_ENV"'''
 WINDOWS_RUNTIME_CAPTURE = '''$pythonPath = (Resolve-Path -LiteralPath (Join-Path $env:pythonLocation 'python.exe')).Path
-$nodePath = (Get-Command node.exe -CommandType Application).Source
-$npmEntry = (Resolve-Path -LiteralPath (Join-Path (Split-Path $nodePath -Parent) 'node_modules\\npm\\bin\\npm-cli.js')).Path
 if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) { throw 'trusted Python is unavailable' }
+$runtimeCapture = @'
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, 'developer/tests/ci')
+import run_ci_foundation as ci
+source = dict(os.environ)
+tools, errors = ci.resolve_trusted_tools({'node'}, source_environment=source)
+if errors:
+    raise SystemExit('trusted Node capture rejected by tool authority')
+source['CI_TRUSTED_NODE'] = tools['node']
+source['CI_TRUSTED_NPM_ENTRY'] = str(Path(tools['node']).parent / 'node_modules' / 'npm' / 'bin' / 'npm-cli.js')
+tools, errors = ci.resolve_trusted_tools({'node', 'npm'}, source_environment=source)
+if errors:
+    raise SystemExit('trusted Node/npm capture rejected by tool authority')
+print(json.dumps({'node': tools['node'], 'npmEntry': tools['npm']}))
+'@
+$runtimeJson = & $pythonPath -B -c $runtimeCapture
+if ($LASTEXITCODE -ne 0) { throw 'trusted Node/npm capture failed' }
+$runtimePaths = $runtimeJson | ConvertFrom-Json
+$nodePath = [string]$runtimePaths.node
+$npmEntry = [string]$runtimePaths.npmEntry
 if (-not (Test-Path -LiteralPath $nodePath -PathType Leaf)) { throw 'trusted Node is unavailable' }
 if (-not (Test-Path -LiteralPath $npmEntry -PathType Leaf)) { throw 'trusted npm entry is unavailable' }
 "CI_TRUSTED_PYTHON=$pythonPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -7174,7 +7225,7 @@ FINAL_VERIFIER_COMMANDS = MappingProxyType(
             "--verify-evidence --expected-profile policy "
             "--expected-producer-job repository-policy-producer "
             "--expected-verifier-job repository-policy --expected-runner-os Linux "
-            "--untrusted-evidence-root .ci-untrusted/repository-policy "
+            '--untrusted-evidence-root "$RUNNER_TEMP/ci-untrusted/repository-policy" '
             "--require-linux-containment-self-test"
         ),
         "ubuntu-canonical": (
@@ -7182,7 +7233,7 @@ FINAL_VERIFIER_COMMANDS = MappingProxyType(
             "--verify-evidence --expected-profile all "
             "--expected-producer-job ubuntu-canonical-producer "
             "--expected-verifier-job ubuntu-canonical --expected-runner-os Linux "
-            "--untrusted-evidence-root .ci-untrusted/ubuntu-canonical "
+            '--untrusted-evidence-root "$RUNNER_TEMP/ci-untrusted/ubuntu-canonical" '
             "--require-linux-containment-self-test --require-fresh-runtime-closure"
         ),
         "windows-compatibility": (
@@ -7190,7 +7241,7 @@ FINAL_VERIFIER_COMMANDS = MappingProxyType(
             "--verify-evidence --expected-profile all "
             "--expected-producer-job windows-compatibility-producer "
             "--expected-verifier-job windows-compatibility --expected-runner-os Windows "
-            "--untrusted-evidence-root .ci-untrusted/windows-compatibility "
+            '--untrusted-evidence-root "$env:RUNNER_TEMP/ci-untrusted/windows-compatibility" '
             "--require-fresh-runtime-closure"
         ),
     }
@@ -7438,7 +7489,7 @@ def _validate_workflow_steps(job_name: str, steps: Any, errors: list[str]) -> No
 
     setup_node = by_name.get("Set up Node.js", {})
     if job_name != "final-result":
-        if tuple(setup_node) != ("name", "uses", "with") or setup_node.get("with") != {"node-version": "24.x"}:
+        if tuple(setup_node) != ("name", "uses", "with") or setup_node.get("with") != {"node-version": "24.20.0"}:
             errors.append(f"{job_name} Node setup is not exact")
         if setup_node.get("uses") != f"actions/setup-node@{APPROVED_ACTIONS['actions/setup-node']['sha']}":
             errors.append(f"{job_name} Node action pin is not exact")
@@ -9200,7 +9251,7 @@ def parse_static_machine_report(
         return None, ["static machine report top-level schema is not exact"]
     if value.get("documentKind") != STATIC_MACHINE_DOCUMENT_KIND:
         errors.append("static machine report documentKind is invalid")
-    if value.get("schemaVersion") != STATIC_MACHINE_SCHEMA_VERSION:
+    if type(value.get("schemaVersion")) is not int or value.get("schemaVersion") != STATIC_MACHINE_SCHEMA_VERSION:
         errors.append("static machine report schemaVersion is invalid")
     if value.get("invocationId") != expected_invocation_id:
         errors.append("static machine report invocationId does not match the parent invocation")
@@ -9263,11 +9314,18 @@ def parse_static_machine_report(
         if not isinstance(record, dict) or set(record) != command_required:
             errors.append(f"{label} schema is not exact")
             continue
-        if record.get("ordinal") != index:
+        if type(record.get("ordinal")) is not int or record.get("ordinal") != index:
             errors.append(f"{label} ordinal is invalid")
         if record.get("required") is not True or record.get("started") is not True or record.get("executed") is not True:
             errors.append(f"{label} did not execute as required")
-        if record.get("exitCode") not in record.get("allowedExecutionExits", []):
+        allowed_exits = record.get("allowedExecutionExits")
+        if (
+            not isinstance(allowed_exits, list)
+            or not allowed_exits
+            or any(type(exit_code) is not int for exit_code in allowed_exits)
+            or type(record.get("exitCode")) is not int
+            or record.get("exitCode") not in allowed_exits
+        ):
             errors.append(f"{label} exitCode is outside immutable authority")
         if record.get("timeoutStatus") != "within-limit" or record.get("outputLimitStatus") != "within-limit":
             errors.append(f"{label} has an execution-limit failure")
@@ -9747,14 +9805,140 @@ def syntax_failure_signature(scope: str, stderr: str, stdout: str) -> str:
 
 
 def command_output_digest(record: Mapping[str, Any]) -> str:
+    static_identity = _validated_static_machine_output_identity(record)
+    stdout_identity = static_identity if static_identity is not None else record
     return canonical_failure_digest(
         {
-            "stdoutSha256": record.get("stdoutSha256"),
+            "stdoutSha256": stdout_identity.get("stdoutSha256"),
             "stderrSha256": record.get("stderrSha256"),
-            "stdoutBytesObserved": record.get("stdoutBytesObserved"),
+            "stdoutBytesObserved": stdout_identity.get("stdoutBytesObserved"),
             "stderrBytesObserved": record.get("stderrBytesObserved"),
         }
     )
+
+
+def _validated_static_machine_output_identity(
+    record: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Project only a completed static machine report bound to local authority.
+
+    Raw stream hashes remain in execution evidence. A report cannot authorize
+    semantic stream identity merely by supplying a digest: reconstruct its
+    exact local producer plan from the independently verified parent command.
+    """
+
+    report = record.get("validatedStaticMachineReport")
+    if (
+        not isinstance(report, Mapping)
+        or record.get("commandId") != "static-suite"
+        or record.get("commandClass") != "static-suite"
+        or record.get("resultSemantics") != "machine-v2-complete-execution"
+        or record.get("executed") is not True
+        or record.get("started") is not True
+        or record.get("setupFailure") is not False
+        or record.get("exitCode") != 0
+        or record.get("timeoutStatus") != "within-limit"
+        or record.get("outputLimitStatus") != "within-limit"
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("processTreeError") is not None
+        or record.get("descendantsSurviving") != 0
+    ):
+        return None
+    invocation_id = report.get("invocationId")
+    argv = [
+        record.get("resolvedExecutablePath"), "-B", STATIC_SUITE_RELATIVE_PATH,
+        "--ci-machine-json-stdout", "--ci-invocation-id", invocation_id,
+    ]
+    if (
+        not isinstance(invocation_id, str)
+        or any(record.get(key) != argv for key in (
+            "argv", "logicalArgv", "executionArgv", "actualExecutionArgv",
+        ))
+        or record.get("toolRole") != "python-static-producer"
+    ):
+        return None
+    targets = record.get("targets")
+    if not isinstance(targets, list):
+        return None
+    protected = record.get("protectedTargetBundle")
+    if (
+        record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or not isinstance(protected, Mapping)
+        or protected.get("mutationDetected") is not False
+        or protected.get("cleanupState") != "closed"
+    ):
+        return None
+    pre = protected.get("preExecutionIdentities")
+    post = protected.get("postExecutionIdentities")
+    valid_full_identities = (
+        pre == post
+        and _full_protected_identity_array_matches_authority(record, pre)
+        and _full_protected_identity_array_matches_authority(record, post)
+    )
+    valid_compact_identities = (
+        bool(targets)
+        and all(protected.get(key) == [] for key in _PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS)
+        and pre == _protected_bundle_compact_identity_digests(record, phase="pre")
+        and post == _protected_bundle_compact_identity_digests(record, phase="post")
+    )
+    if not valid_full_identities and not valid_compact_identities:
+        return None
+    static_targets = [
+        target for target in targets
+        if isinstance(target, Mapping) and target.get("path") == STATIC_SUITE_RELATIVE_PATH
+    ]
+    if len(static_targets) != 1:
+        return None
+    static_target = static_targets[0]
+    expected_plan = [{
+        "commandId": "static-check-registry",
+        "ordinal": 0,
+        "commandClass": "static-machine-producer",
+        "required": True,
+        "profile": "static",
+        "platform": record.get("platform"),
+        "argv": argv,
+        "cwd": ".",
+        "toolRole": "python-static-producer",
+        "resolvedExecutablePath": record.get("resolvedExecutablePath"),
+        "resolvedExecutableSize": record.get("resolvedExecutableSize"),
+        "resolvedExecutableSha256": record.get("resolvedExecutableSha256"),
+        "targets": [{key: static_target.get(key) for key in ("path", "size", "sha256")}],
+        "resultSemantics": "complete-registry-execution-with-native-observations",
+        "allowedExecutionExits": [0],
+    }]
+    try:
+        validated, errors = parse_static_machine_report(
+            _json_bytes(report), expected_invocation_id=invocation_id,
+        )
+        if validated is None or errors:
+            return None
+        authority_keys = set(expected_plan[0])
+        reported_plan = [
+            {key: value for key, value in result.items() if key in authority_keys}
+            for result in validated["commandResults"]
+        ]
+        if (
+            reported_plan != expected_plan
+            or validated["commandPlanDigest"] != static_machine_command_plan_digest(expected_plan)
+        ):
+            return None
+        semantic_report = copy.deepcopy(validated)
+        # The local nested plan was checked exactly above. Bind the same tool
+        # bytes/targets/argv through the established portable plan projection.
+        semantic_report["commandResults"] = _portable_command_plan_value(
+            validated["commandResults"]
+        )
+        semantic_report["commandPlanDigest"] = command_plan_digest(expected_plan)
+        semantic_report = normalized_json_value(semantic_report)
+        canonical = _json_bytes(semantic_report)
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    return {
+        "stdoutSha256": hashlib.sha256(canonical).hexdigest(),
+        "stdoutBytesObserved": len(canonical),
+        "validatedStaticMachineReport": semantic_report,
+    }
 
 
 def command_capture_output_digest(capture: CommandCapture) -> str:
@@ -10015,6 +10199,12 @@ def derive_canonical_failure_material(
 ) -> dict[str, Any]:
     """Build baseline-blind failure material from command facts and one raw observation."""
 
+    portable_source = _portable_node_test_observation_source(validated_command_record)
+    if portable_source is not validated_command_record:
+        raw_set = validated_command_record.get("producerObservations", [])
+        if any(validated_raw_observation == raw for raw in raw_set):
+            validated_raw_observation = portable_source["producerObservations"][0]
+            validated_command_record = _canonical_transcript_record(validated_command_record)
     targets = []
     for target in validated_command_record.get("targets", []):
         if isinstance(target, Mapping):
@@ -10772,6 +10962,183 @@ def _command_execution_completed(record: Mapping[str, Any]) -> bool:
     )
 
 
+def _validated_portable_static_containment(
+    record: Mapping[str, Any],
+    *,
+    protected_bundle_valid: bool,
+) -> dict[str, str] | None:
+    """Project only proven Linux static-suite natural-reap count telemetry.
+
+    The supervisor's sampled registry can observe different numbers of transient
+    children in independent executions. Its exact local reap/death proof remains
+    mandatory. The bounded projection preserves the backend, disposition, zero
+    survivors/terminations, and every execution/cleanup/watcher fact in the
+    surrounding record; no other command or successful disposition is changed.
+    """
+
+    if (
+        protected_bundle_valid is not True
+        or record.get("commandId") != "static-suite"
+        or record.get("commandClass") != "static-suite"
+        or record.get("commandRole") != "observation-producing"
+        or record.get("toolRole") != "python-static-producer"
+        or record.get("profile") not in ("static", "all")
+        or record.get("platform") != "ubuntu"
+        or record.get("resultSemantics") != "machine-v2-complete-execution"
+        or record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or record.get("required") is not True
+        or record.get("executed") is not True
+        or record.get("started") is not True
+        or record.get("setupFailure") is not False
+        or type(record.get("exitCode")) is not int
+        or record.get("exitCode") != 0
+        or record.get("allowedExecutionExits") != [0]
+        or record.get("timeoutStatus") != "within-limit"
+        or record.get("outputLimitStatus") != "within-limit"
+        or record.get("containment") != "linux-subreaper-pidfd-proc-supervisor"
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("containmentDisposition") != "natural-exit-reaped"
+        or any(record.get(key) not in (None, "") for key in (
+            "error", "processTreeError", "limitReason",
+        ))
+        # Static-suite currently has no dependency watcher. Retain any future
+        # watcher evidence exactly until its successful projection is justified.
+        or record.get("dependencyBacked") is not False
+        or any(record.get(key) is not None for key in (
+            "runtimeClosureGuard", "closureWatcherActive", "closureMutationState",
+        ))
+    ):
+        return None
+    counts = {
+        key: record.get(key)
+        for key in (
+            "descendantsObserved", "descendantsReaped",
+            "descendantsTerminated", "descendantsSurviving",
+        )
+    }
+    if (
+        any(type(value) is not int or not 0 <= value <= 4096 for value in counts.values())
+        or counts["descendantsObserved"] == 0
+        or counts["descendantsObserved"] != counts["descendantsReaped"]
+        or counts["descendantsTerminated"] != 0
+        or counts["descendantsSurviving"] != 0
+    ):
+        return None
+    return {
+        "descendantsObserved": "<VALIDATED-NATURALLY-REAPED-COUNT>",
+        "descendantsReaped": "<VALIDATED-NATURALLY-REAPED-COUNT>",
+    }
+
+
+def _validated_portable_successful_external_test_containment(
+    record: Mapping[str, Any],
+    *,
+    protected_bundle_valid: bool,
+    node_test_semantics_valid: bool,
+) -> dict[str, str] | None:
+    """Project only natural-reap counts after independent Node success proof.
+
+    The caller derives ``node_test_semantics_valid`` from the validated raw
+    reporter and immutable direct-Node authority, never from a producer claim.
+    All containment and applicable dependency-guard evidence remains exact;
+    these two counts alone describe non-authoritative supervisor sampling.
+    Existing static-suite projection is deliberately kept separate and intact.
+    """
+
+    command_id = record.get("commandId")
+    if not isinstance(command_id, str):
+        return None
+    security_ids = {
+        f"frontend-security:{Path(relative).name}" for relative in SECURITY_GUARD_FILES
+    }
+    approved_command = (
+        command_id == "learner-focused"
+        and record.get("commandClass") == "learner-focused"
+        and record.get("toolRole") == "node-test"
+    ) or (
+        command_id in security_ids
+        and record.get("commandClass") == "frontend-security"
+        and record.get("toolRole") == "node-security-test"
+    ) or (
+        command_id == "frontend-security:messageOriginGuard.test.js"
+        and record.get("commandClass") == "frontend-security"
+        and record.get("toolRole") == "node-builtin-security-test"
+    )
+    if (
+        node_test_semantics_valid is not True
+        or protected_bundle_valid is not True
+        or not approved_command
+        or record.get("commandRole") != "observation-producing"
+        or record.get("profile") not in ("frontend", "all")
+        or record.get("platform") != "ubuntu"
+        or record.get("resultSemantics") != "exit-zero-pass-exit-one-classified-observation"
+        or record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or record.get("required") is not True
+        or not _command_execution_completed(record)
+        or type(record.get("exitCode")) is not int
+        or record.get("exitCode") != 0
+        or record.get("allowedExecutionExits") != [0, 1]
+        or record.get("containment") != "linux-subreaper-pidfd-proc-supervisor"
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("containmentDisposition") != "natural-exit-reaped"
+        or any(record.get(key) not in (None, "") for key in (
+            "error", "processTreeError", "limitReason",
+        ))
+    ):
+        return None
+    counts = {
+        key: record.get(key)
+        for key in (
+            "descendantsObserved", "descendantsReaped",
+            "descendantsTerminated", "descendantsSurviving",
+        )
+    }
+    if (
+        any(type(value) is not int or not 0 <= value <= 4096 for value in counts.values())
+        or counts["descendantsObserved"] == 0
+        or counts["descendantsObserved"] != counts["descendantsReaped"]
+        or counts["descendantsTerminated"] != 0
+        or counts["descendantsSurviving"] != 0
+    ):
+        return None
+    dependency_backed = record.get("toolRole") != "node-builtin-security-test"
+    if record.get("dependencyBacked") is not dependency_backed:
+        return None
+    guard = record.get("runtimeClosureGuard")
+    if dependency_backed:
+        if (
+            not isinstance(guard, dict)
+            or guard.get("active") is not False
+            or type(guard.get("guardSchemaVersion")) is not int
+            or guard.get("watcherBackend") != "_InotifyMutationWatcher"
+            or guard.get("activeDuringReplay") is not True
+            or guard.get("mutationState") != "clean"
+            or guard.get("queueOverflow") is not False
+            or type(guard.get("mutationEventCount")) is not int
+            or guard.get("mutationEventCount") != 0
+            or record.get("closureWatcherActive") is not True
+            or record.get("closureMutationState") != "clean"
+        ):
+            return None
+    elif any(record.get(key) is not None for key in (
+        "runtimeClosureGuard", "closureWatcherActive", "closureMutationState",
+    )):
+        return None
+    errors: list[str] = []
+    try:
+        if _validated_portable_protected_input_bundle_digest(record) is None:
+            return None
+        hard_failure = _validate_command_record(dict(record), 0, errors, expected_record=record)
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+        return None
+    if errors or hard_failure:
+        return None
+    return {
+        "descendantsObserved": "<VALIDATED-NATURALLY-REAPED-COUNT>",
+        "descendantsReaped": "<VALIDATED-NATURALLY-REAPED-COUNT>",
+    }
+
+
 def _plan_command_requires_completion(record: Mapping[str, Any]) -> bool:
     return bool(record.get("required")) or record.get("commandRole") == "observation-producing"
 
@@ -10840,7 +11207,8 @@ def producer_observation_universe(
             "producerObservations": copy.deepcopy(record.get("producerObservations", [])),
             "producerObservationSetDigest": record.get("producerObservationSetDigest"),
         }
-        for record in command_records
+        for raw_record in command_records
+        for record in (_portable_node_test_observation_source(raw_record),)
     ]
 
 
@@ -10885,6 +11253,93 @@ def _canonical_replay_value(value: Any) -> Any:
                 )
         return normalized
     return value
+
+
+def _git_bash_execution_lease_valid(record: Mapping[str, Any]) -> bool:
+    """Validate portable evidence without resolving another runner's local paths."""
+
+    lease = record.get("executionLease")
+    if (
+        record.get("commandId") != "git-bash-version"
+        or record.get("toolRole") != "git-bash-runtime"
+        or record.get("platform") != "windows"
+        or not isinstance(lease, dict)
+        or set(lease) != {
+            "canonicalPath", "trustedGitRoot", "size", "volumeSerial", "fileIndex",
+            "links", "creationTime", "writeTime", "reparsePoint", "sha256",
+        }
+        or lease.get("reparsePoint") is not False
+        or type(lease.get("links")) is not int
+        or lease["links"] != 1
+        or type(lease.get("size")) is not int
+        or not 0 <= lease["size"] < 2**64
+        or lease["size"] != record.get("resolvedExecutableSize")
+        or not isinstance(lease.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", lease["sha256"])
+        or lease["sha256"] != record.get("resolvedExecutableSha256")
+        or lease.get("canonicalPath") != record.get("resolvedExecutablePath")
+        or any(
+            not isinstance(lease.get(key), str)
+            or not re.fullmatch(r"[0-9]{1,20}", lease[key])
+            or int(lease[key]) >= 2**64
+            for key in ("volumeSerial", "fileIndex", "creationTime", "writeTime")
+        )
+        or any(
+            not isinstance(lease.get(key), str) or not lease[key] or "\x00" in lease[key]
+            for key in ("canonicalPath", "trustedGitRoot")
+        )
+    ):
+        return False
+    executable = PureWindowsPath(lease["canonicalPath"])
+    git_root = PureWindowsPath(lease["trustedGitRoot"])
+    if (
+        not executable.is_absolute()
+        or not git_root.is_absolute()
+        or ".." in executable.parts
+        or ".." in git_root.parts
+    ):
+        return False
+    try:
+        candidate = tuple(part.casefold() for part in executable.relative_to(git_root).parts)
+    except ValueError:
+        return False
+    return candidate in WINDOWS_GIT_BASH_CANDIDATE_SUFFIXES
+
+
+def _validated_portable_git_bash_execution_lease(
+    record: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Project a locally verified successful lease; failed physical evidence stays exact.
+
+    TrustedBashLease constructs the held identity and verifies it before the plan
+    snapshot and both sides of execution. Those checks remain local authority;
+    this projection is only the cross-job identity of their successful record.
+    """
+
+    if (
+        not _git_bash_execution_lease_valid(record)
+        or not _required_command_execution_passed(record)
+        or record.get("containment") != "windows-job-object"
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("descendantsSurviving") != 0
+        or any(record.get(key) is not None for key in ("error", "processTreeError", "limitReason"))
+    ):
+        return None
+    errors: list[str] = []
+    _validate_command_record(dict(record), 0, errors, expected_record=record)
+    if errors:
+        return None
+    lease = record["executionLease"]
+    return {
+        "leaseKind": "windows-git-bash-executable-v1",
+        "tool": "git-bash",
+        "size": lease["size"],
+        "sha256": lease["sha256"],
+        "reparsePoint": False,
+        "links": 1,
+        "trustedProductRelationship": "fixed-candidate-in-trusted-git-installation",
+        "nonReparseDirectoryChain": True,
+    }
 
 
 _PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS = (
@@ -10978,24 +11433,22 @@ def _canonical_protected_execution_inputs(
     return copy.deepcopy(inputs)
 
 
-def _protected_bundle_compact_identity_digests(
+def _portable_protected_bundle_authority(
     command: Mapping[str, Any],
-    *,
-    phase: str,
-) -> list[str]:
-    """Derive compact bundle identities from portable command-plan authority.
+) -> dict[str, Any] | None:
+    """Derive the shared portable bundle authority from the ordered target plan.
 
     The preimage deliberately excludes checkout-local canonical paths, inode/file
     indexes, and timestamps: a fresh verifier checkout has different values.
     Those values remain protected by each producer/replay TargetExecutionLease.
     The portable semantic identity instead binds the ordered path/content/input
     plan, the command association, the bundle version/adapter, and the pre/post
-    phase, all of which the verifier reconstructs without trusting these digests.
+    phase for compact leaves, all reconstructed without trusting these digests.
     """
 
     targets = command.get("targets")
     if not isinstance(targets, list) or not targets:
-        return []
+        return None
     execution_adapter = command.get("executionInputMode")
     ordered_authority = [
         {
@@ -11010,7 +11463,7 @@ def _protected_bundle_compact_identity_digests(
         if isinstance(target, Mapping)
     ]
     if len(ordered_authority) != len(targets):
-        return []
+        return None
     portable_input_digest = hashlib.sha256(
         _canonical_frame(
             {
@@ -11023,7 +11476,7 @@ def _protected_bundle_compact_identity_digests(
             }
         )
     ).hexdigest()
-    bundle_authority = {
+    return {
         "digestDomain": _PROTECTED_BUNDLE_COMPACT_IDENTITY_DOMAIN,
         "bundleVersion": PROTECTED_TARGET_BUNDLE_VERSION,
         "executionAdapter": execution_adapter,
@@ -11038,6 +11491,19 @@ def _protected_bundle_compact_identity_digests(
         "orderedTargetAndInputAuthority": ordered_authority,
         "portableExecutionInputBundleDigest": portable_input_digest,
     }
+
+
+def _protected_bundle_compact_identity_digests(
+    command: Mapping[str, Any],
+    *,
+    phase: str,
+) -> list[str]:
+    """Bind each phase and target to the shared portable bundle authority."""
+
+    bundle_authority = _portable_protected_bundle_authority(command)
+    if bundle_authority is None:
+        return []
+    ordered_authority = bundle_authority["orderedTargetAndInputAuthority"]
     bundle_authority_digest = hashlib.sha256(
         _canonical_frame(bundle_authority)
     ).hexdigest()
@@ -11055,7 +11521,7 @@ def _protected_bundle_compact_identity_digests(
                 }
             )
         ).hexdigest()
-        for index in range(len(targets))
+        for index in range(len(ordered_authority))
     ]
 
 
@@ -11161,6 +11627,8 @@ def _compact_command_record_for_evidence(
         return copy.deepcopy(source)
     if pre != post:
         return copy.deepcopy(source)
+    if _validated_portable_protected_input_bundle_digest(source) is None:
+        return copy.deepcopy(source)
     pre_digests = _protected_bundle_compact_identity_digests(source, phase="pre")
     post_digests = _protected_bundle_compact_identity_digests(source, phase="post")
     compact = {
@@ -11187,12 +11655,820 @@ def _compact_command_record_for_evidence(
     return compact
 
 
+def _validated_portable_protected_input_bundle_digest(
+    record: Mapping[str, Any],
+) -> str | None:
+    """Portableize only after raw evidence passes this job's local authority.
+
+    The ordinary validator checks full physical evidence or reconstructs compact
+    references, including the raw input digest, before any fields are removed.
+    Using the retained record here checks local consistency only: verification
+    still independently compares it with the freshly rebuilt command plan.
+    """
+
+    targets = record.get("targets")
+    if (
+        record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or record.get("executed") is not True
+        or not isinstance(targets, list)
+        or not targets
+        or any(
+            not isinstance(target, dict)
+            or target.get("modeType") != "regular-file"
+            or target.get("reparsePoint") is not False
+            for target in targets
+        )
+    ):
+        return None
+    errors: list[str] = []
+    _validate_command_record(dict(record), 0, errors, expected_record=record)
+    if errors:
+        return None
+    for target in targets:
+        stable = target.get("fileIdentity")
+        if (
+            type(target.get("size")) is not int
+            or not 0 <= target["size"] <= MAX_SCANNED_FILE_BYTES
+            or not isinstance(target.get("sha256"), str)
+            or not isinstance(target.get("canonicalSourcePath"), str)
+            or not isinstance(stable, Mapping)
+            or set(stable) != {
+                "deviceOrVolume", "inodeOrFileIndex", "creationOrChangeTimeNs",
+                "writeTimeNs", "reparsePoint",
+            }
+            or stable.get("reparsePoint") is not False
+            or any(
+                not isinstance(stable.get(key), str)
+                or not re.fullmatch(r"-?[0-9]+", stable[key])
+                for key in (
+                    "deviceOrVolume", "inodeOrFileIndex", "creationOrChangeTimeNs",
+                    "writeTimeNs",
+                )
+            )
+        ):
+            return None
+    # Full evidence retains the held lease identity. POSIX uses the same stable
+    # identity as the path; Windows captures a separate handle-information shape.
+    bundle = record["protectedTargetBundle"]
+    for target, identity in zip(targets, bundle["preExecutionIdentities"]):
+        if not isinstance(identity, Mapping):
+            continue  # Compact phase digests were independently checked above.
+        held = identity["heldStableIdentity"]
+        if held == target.get("fileIdentity"):
+            continue
+        if (
+            set(held) != {
+                "volumeSerial", "fileIndex", "size", "creationTime", "writeTime",
+                "linkCount", "reparsePoint",
+            }
+            or type(held.get("size")) is not int
+            or held.get("size") != target.get("size")
+            or type(held.get("linkCount")) is not int
+            or held["linkCount"] < 1
+            or any(
+                not isinstance(held.get(key), str)
+                or not re.fullmatch(r"[0-9]+", held[key])
+                for key in ("volumeSerial", "fileIndex", "creationTime", "writeTime")
+            )
+        ):
+            return None
+    authority = _portable_protected_bundle_authority(record)
+    if authority is None:
+        return None
+    return hashlib.sha256(_canonical_frame(authority)).hexdigest()
+
+
+def _validated_portable_target_stdin_input_authority(
+    record: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Project a single immutable stdin input only after complete local validation.
+
+    Retain all physical evidence in the raw record. The successful projection
+    shares the protected-bundle byte representation and binds the closed lease,
+    command association, and target ordering in a distinct digest domain.
+    """
+
+    if record.get("executionInputMode") != "TARGET-BYTES-STDIN":
+        return None
+    errors: list[str] = []
+    try:
+        hard_failure = _validate_command_record(dict(record), 0, errors, expected_record=record)
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+        return None
+    if (
+        errors or hard_failure or not _command_execution_completed(record)
+        or (record.get("platform"), record.get("containment")) not in {
+            ("windows", "windows-job-object"), ("ubuntu", "linux-subreaper-pidfd-proc-supervisor"),
+        }
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("descendantsSurviving") != 0
+        or any(record.get(key) is not None for key in ("error", "processTreeError", "limitReason"))
+    ):
+        return None
+    target = record["targets"][0]
+    lease = record["targetExecutionLease"]
+    execution_input = record["executionInputs"][0]
+    stable = target.get("fileIdentity")
+    if (
+        type(target.get("size")) is not int
+        or not 0 <= target["size"] <= MAX_SCANNED_FILE_BYTES
+        or not isinstance(target.get("sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", target["sha256"]) is None
+        or not isinstance(target.get("canonicalSourcePath"), str)
+        or not Path(target["canonicalSourcePath"]).is_absolute()
+        or target.get("modeType") != "regular-file"
+        or target.get("reparsePoint") is not False
+        or lease.get("reparsePoint") is not False
+        or type(lease.get("leaseVersion")) is not int
+        or lease["leaseVersion"] != TARGET_EXECUTION_LEASE_VERSION
+        or any(
+            type(value) is not int or value != target["size"]
+            for value in (
+                record.get("executionInputSize"), record.get("actualExecutionInputSize"),
+                lease.get("plannedByteLength"), lease.get("executedInputByteLength"),
+                execution_input.get("plannedByteLength"), execution_input.get("actualByteLength"),
+            )
+        )
+        or not isinstance(stable, Mapping)
+        or set(stable) != {
+            "deviceOrVolume", "inodeOrFileIndex", "creationOrChangeTimeNs", "writeTimeNs", "reparsePoint",
+        }
+        or stable.get("reparsePoint") is not False
+        or any(
+            not isinstance(stable.get(key), str) or re.fullmatch(r"-?[0-9]+", stable[key]) is None
+            for key in ("deviceOrVolume", "inodeOrFileIndex", "creationOrChangeTimeNs", "writeTimeNs")
+        )
+    ):
+        return None
+    relative = target["path"]
+    if (
+        Path(relative).is_absolute() or "\\" in relative
+        or any(part in {"", ".", ".."} for part in relative.split("/"))
+    ):
+        return None
+    pre = lease["preExecutionSourceIdentity"]
+    post = lease["postExecutionSourceIdentity"]
+    # The ordinary stdin validator requires snapshots to exist; this projection
+    # additionally proves their full physical content before discarding it.
+    try:
+        snapshots_match = (
+            _protected_source_identity_matches_target(pre, target)
+            and _protected_source_identity_matches_target(post, target)
+            and _json_bytes(pre) == _json_bytes(post)
+            and _json_bytes(pre["pathStableIdentity"]) == _json_bytes(stable)
+            and _json_bytes(lease["plannedStableFileIdentity"]) == _json_bytes(stable)
+            and _json_bytes(execution_input["plannedStableIdentity"]) == _json_bytes(stable)
+        )
+    except (KeyError, TypeError, ValueError, UnicodeError):
+        return None
+    if not snapshots_match:
+        return None
+    held = pre["heldStableIdentity"]
+    if record["platform"] == "windows":
+        if (
+            set(held) != {
+                "volumeSerial", "fileIndex", "size", "creationTime", "writeTime", "linkCount", "reparsePoint",
+            }
+            or type(held.get("size")) is not int or held["size"] != target["size"]
+            or type(held.get("linkCount")) is not int or not 1 <= held["linkCount"] < 2**32
+            or held.get("reparsePoint") is not False
+            or any(
+                not isinstance(held.get(key), str)
+                or re.fullmatch(r"[0-9]{1,20}", held[key]) is None
+                or int(held[key]) >= 2**width
+                for key, width in (
+                    ("volumeSerial", 32), ("fileIndex", 64), ("creationTime", 64), ("writeTime", 64),
+                )
+            )
+        ):
+            return None
+    elif _json_bytes(held) != _json_bytes(stable):
+        return None
+    portable_input = _portable_protected_execution_input_authority(target, "TARGET-BYTES-STDIN")
+    portable_lease = {
+        "leaseVersion": lease["leaseVersion"],
+        "logicalTargetPath": portable_input["logicalPath"],
+        "executionAdapter": portable_input["inputMode"],
+        "plannedByteLength": portable_input["plannedByteLength"],
+        "plannedSha256": portable_input["plannedSha256"],
+        "executedInputByteLength": portable_input["actualByteLength"],
+        "executedInputSha256": portable_input["actualSha256"],
+        "modeType": target["modeType"],
+        "reparsePoint": False,
+        "mutationDetected": False,
+        "cleanupState": "closed",
+        "targetIndex": 0,
+        "commandAssociation": {
+            key: record[key] for key in ("commandId", "ordinal", "commandClass", "profile", "toolRole")
+        },
+    }
+    portable_digest = hashlib.sha256(_canonical_frame({
+        "digestDomain": "ieltmps-target-bytes-stdin-portable-input-v1",
+        "targetExecutionLease": portable_lease,
+        "orderedExecutionInputs": [portable_input],
+    })).hexdigest()
+    return {
+        "executionInputs": [portable_input],
+        "executionInputBundleDigest": portable_digest,
+        "targetExecutionLease": portable_lease,
+    }
+
+
+def _validated_bundle_normalization_success_output_identity(
+    record: Mapping[str, Any],
+    *,
+    protected_bundle_valid: bool,
+) -> dict[str, Any] | None:
+    """Project this one exit-zero contract after its local evidence validates.
+
+    Node's successful test reporter is telemetry for bundle-normalization. Its
+    raw streams, hashes, and lengths remain local evidence; only the cross-job
+    transcript receives a freshly derived semantic stdout identity. Immutable
+    plan/trusted-tool comparison still binds the surrounding command authority.
+    """
+
+    if (
+        protected_bundle_valid is not True
+        or record.get("commandId") != "bundle-normalization"
+        or record.get("commandClass") != "bundle-parity"
+        or record.get("commandRole") != "required-execution"
+        or record.get("resultSemantics") != "exit-zero-required"
+        or record.get("toolRole") != "node-test"
+        or record.get("profile") not in ("frontend", "all")
+        or record.get("required") is not True
+        or not _command_execution_completed(record)
+        or type(record.get("exitCode")) is not int
+        or record.get("exitCode") != 0
+        or record.get("allowedExecutionExits") != [0]
+        or record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or (record.get("platform"), record.get("containment")) not in {
+            ("ubuntu", "linux-subreaper-pidfd-proc-supervisor"),
+            ("windows", "windows-job-object"),
+        }
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("descendantsSurviving") != 0
+        or any(record.get(key) is not None for key in (
+            "error", "processTreeError", "limitReason",
+        ))
+        or record.get("producerObservations") != []
+        or record.get("dependencyBacked") is not True
+    ):
+        return None
+    errors: list[str] = []
+    try:
+        hard_failure = _validate_command_record(dict(record), 0, errors, expected_record=record)
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+        return None
+    if errors or hard_failure:
+        return None
+    guard = record["runtimeClosureGuard"]
+    if (
+        guard.get("active") is not False
+        or type(guard.get("guardSchemaVersion")) is not int
+        or type(guard.get("mutationEventCount")) is not int
+        or (record["platform"], guard.get("watcherBackend")) not in {
+            ("ubuntu", "_InotifyMutationWatcher"),
+            ("windows", "_WindowsDirectoryMutationWatcher"),
+        }
+    ):
+        return None
+    executable = record.get("resolvedExecutablePath")
+    stable = record.get("resolvedExecutableFileIdentity")
+    target_path = "developer/tests/js/bundleNormalization.test.js"
+    argv = [executable, "--test", target_path]
+    if (
+        not isinstance(executable, str)
+        or not Path(executable).is_absolute()
+        or record["resolvedExecutableSize"] <= 0
+        or record.get("resolvedTestRunnerEntrypoint") != executable
+        or record.get("resolvedTestRunnerSha256") != record.get("resolvedExecutableSha256")
+        or any(record.get(key) != argv for key in (
+            "argv", "logicalArgv", "executionArgv", "actualExecutionArgv",
+        ))
+        or sum(target.get("path") == target_path for target in record["targets"]) != 1
+        or record.get("cwd") != "."
+        or not isinstance(stable, Mapping)
+        or stable.get("reparsePoint") is not False
+        or any(
+            not isinstance(stable.get(key), str)
+            or re.fullmatch(r"-?[0-9]+", stable[key]) is None
+            for key in (
+                "deviceOrVolume", "inodeOrFileIndex", "creationOrChangeTimeNs", "writeTimeNs",
+            )
+        )
+    ):
+        return None
+    canonical = _canonical_frame({
+        "digestDomain": "ieltmps-exit-zero-required-success-output-v1",
+        "commandId": record["commandId"],
+        "resultSemantics": record["resultSemantics"],
+        "exitCode": record["exitCode"],
+    })
+    return {
+        "stdoutSha256": hashlib.sha256(canonical).hexdigest(),
+        "stdoutBytesObserved": len(canonical),
+    }
+
+
+_NODE_TEST_MAX_STDOUT_BYTES = 256 * 1024
+_NODE_TEST_MAX_TESTS = 1024
+_NODE_TEST_MAX_NAME_LENGTH = 2048
+_NODE_TEST_MAX_PAYLOAD_BYTES = 16 * 1024
+_NODE_TEST_DURATION_PATTERN = r"(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?"
+_NODE_TEST_SUMMARY_KEYS = (
+    "tests", "suites", "pass", "fail", "cancelled", "skipped", "todo",
+)
+_NODE_TEST_LEARNER_PATHS = (
+    "developer/tests/js/learnerPalette.test.js",
+    "developer/tests/js/learnerUiRuntimeStabilization.test.js",
+)
+_NODE_TEST_SECURITY_JSON_DETAILS = {
+    "appActionsExportGuard.test.js": "app actions markdown export step-up guard passed",
+    "dataManagementPanel.test.js": "data management panel export and stale file read guard tests passed",
+    "examActionsExportGuard.test.js": "exam actions fallback export guard passed",
+    "examSessionReplayCloneGuard.test.js": "exam session replay clone guard passed",
+    "localDataRenderingGuard.test.js": "local data rendering guard tests passed",
+    "practiceRecordExportServerGuard.test.js": "server-owned practice-record export guard tests passed",
+    "remotePracticeDataSource.test.js": "remote practice data source tests passed",
+    "resourceCoreProbeBypassGuard.test.js": "resource core probe bypass guard passed",
+    "secureIdentifierGuard.test.js": "secure identifier guard tests passed",
+    "suiteBackGuardSecurity.test.js": "suite back guard history state sanitization tests passed",
+    "vocabSessionExportGuard.test.js": "vocab session export step-up guard passed",
+}
+
+
+def _node_test_geometry_valid(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"left", "top", "width", "height"}
+        and all(
+            type(number) in (int, float)
+            and abs(number) <= 1_000_000_000
+            and math.isfinite(number)
+            for number in value.values()
+        )
+        and value["width"] >= 0
+        and value["height"] >= 0
+    )
+
+
+def _node_test_learner_payload_valid(payload: Any) -> bool:
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"status", "detail", "tests", "evidence"}
+        or payload["status"] != "pass"
+        or payload["detail"] != "learner UI runtime stabilization regression tests passed"
+        or payload["tests"] != {
+            "practiceSummaryToggle": "pass",
+            "practiceBeforeBrowse": "pass",
+            "paletteLayoutStability": "pass",
+        }
+    ):
+        return False
+    evidence = payload["evidence"]
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != {
+            "expandedToggle", "collapsedToggle", "practiceFirstCalls", "widgetClicks",
+        }
+        or not _node_test_geometry_valid(evidence["expandedToggle"])
+        or not _node_test_geometry_valid(evidence["collapsedToggle"])
+        or type(evidence["widgetClicks"]) is not int
+        or not 0 <= evidence["widgetClicks"] <= 1_000_000
+    ):
+        return False
+    calls = evidence["practiceFirstCalls"]
+    return (
+        isinstance(calls, list)
+        and 1 <= len(calls) <= 128
+        and all(
+            isinstance(call, str)
+            and re.fullmatch(
+                r"ensure-browse|ensure-practice-suite|update:(?:true|false):(?:true|false)",
+                call,
+            ) is not None
+            for call in calls
+        )
+    )
+
+
+def _node_test_payload_valid(payload: Any, command_id: str) -> bool:
+    if command_id == "learner-focused":
+        return _node_test_learner_payload_valid(payload)
+    basename = command_id.removeprefix("frontend-security:")
+    detail = _NODE_TEST_SECURITY_JSON_DETAILS.get(basename)
+    return (
+        detail is not None
+        and isinstance(payload, dict)
+        and set(payload) == {"status", "detail"}
+        and payload["status"] == "pass"
+        and payload["detail"] == detail
+    )
+
+
+def _node_test_authorized_reporter_path(name: str, paths: tuple[str, ...]) -> str | None:
+    for path in paths:
+        if re.fullmatch(re.escape(path).replace("/", r"[/\\]"), name) is not None:
+            return path
+    return None
+
+
+def parse_node_test_semantic_result(
+    stdout: str,
+    *,
+    command_id: str,
+    authorized_test_paths: Sequence[str],
+) -> dict[str, Any] | None:
+    """Derive NodeTestSemanticResultV1, never accepting a producer digest.
+
+    Exact repository identifiers come solely from caller-validated immutable
+    argv/target authority. A slash or backslash spelling is normalized only
+    when an entire reporter test name equals that identifier. All other test
+    names and all structured payload values retain their semantic content.
+    """
+    if (
+        not isinstance(stdout, str)
+        or not stdout
+        or len(stdout) > _NODE_TEST_MAX_STDOUT_BYTES
+        or not isinstance(command_id, str)
+        or isinstance(authorized_test_paths, (str, bytes))
+        or not isinstance(authorized_test_paths, Sequence)
+        or not 1 <= len(authorized_test_paths) <= 2
+    ):
+        return None
+    try:
+        if len(stdout.encode("utf-8")) > _NODE_TEST_MAX_STDOUT_BYTES:
+            return None
+    except UnicodeError:
+        return None
+    # Node's captured spec reporter writes LF on both authorized platforms.
+    # Do not broaden normalization to ANSI escapes or arbitrary whitespace.
+    if not stdout.endswith("\n") or any(
+        ord(character) < 32 and character != "\n" or ord(character) == 127
+        for character in stdout
+    ):
+        return None
+    paths = tuple(authorized_test_paths)
+    if any(
+        not isinstance(path, str)
+        or re.fullmatch(r"developer/tests/js/[A-Za-z0-9_-]+\.test\.js", path) is None
+        for path in paths
+    ) or len(set(paths)) != len(paths):
+        return None
+    if command_id == "learner-focused":
+        if paths != _NODE_TEST_LEARNER_PATHS:
+            return None
+        payload_kind = "learner-runtime"
+        payload_path = paths[1]
+    elif command_id.startswith("frontend-security:"):
+        basename = command_id.removeprefix("frontend-security:")
+        if len(paths) != 1 or basename != paths[0].rsplit("/", 1)[1]:
+            return None
+        payload_path = paths[0]
+        if basename in _NODE_TEST_SECURITY_JSON_DETAILS:
+            payload_kind = "security-result"
+        elif basename == "adminFrontendGuard.test.js":
+            payload_kind = "security-success-line"
+        else:
+            payload_kind = None
+    else:
+        return None
+    lines = stdout[:-1].split("\n")
+    if not 9 <= len(lines) <= _NODE_TEST_MAX_TESTS + 256:
+        return None
+    summary_lines = lines[-8:]
+    counts: dict[str, int] = {}
+    for key, line in zip(_NODE_TEST_SUMMARY_KEYS, summary_lines[:7]):
+        match = re.fullmatch(rf"ℹ {key} (0|[1-9][0-9]{{0,3}})", line)
+        if match is None:
+            return None
+        counts[key] = int(match[1])
+    if (
+        re.fullmatch(rf"ℹ duration_ms {_NODE_TEST_DURATION_PATTERN}", summary_lines[-1]) is None
+        or not 1 <= counts["tests"] <= _NODE_TEST_MAX_TESTS
+        or counts["pass"] != counts["tests"]
+        or any(counts[key] != 0 for key in ("suites", "fail", "cancelled", "skipped", "todo"))
+    ):
+        return None
+    body = lines[:-8]
+    tests: list[dict[str, Any]] = []
+    payloads: list[dict[str, Any]] = []
+    index = 0
+    while index < len(body):
+        line = body[index]
+        test_match = re.fullmatch(rf"✔ (.+) \({_NODE_TEST_DURATION_PATTERN}ms\)", line)
+        if test_match is not None:
+            name = test_match[1]
+            if (
+                len(name) > _NODE_TEST_MAX_NAME_LENGTH
+                or name != name.strip()
+                or len(tests) >= _NODE_TEST_MAX_TESTS
+            ):
+                return None
+            normalized_name = _node_test_authorized_reporter_path(name, paths) or name
+            tests.append({"ordinal": len(tests) + 1, "name": normalized_name, "status": "pass"})
+            index += 1
+            continue
+        if payload_kind is None or payloads:
+            return None
+        if payload_kind == "security-success-line":
+            if line != "adminFrontendGuard.test.js passed":
+                return None
+            payload: Any = {"status": "pass", "detail": line}
+            index += 1
+        else:
+            if line != "{":
+                return None
+            # JSON.stringify(..., null, 2) emits one top-level closing brace
+            # on a line of its own. No arbitrary leading/trailing text passes.
+            closing = next((i for i in range(index + 1, len(body)) if body[i] == "}"), None)
+            if closing is None:
+                return None
+            payload_text = "\n".join(body[index:closing + 1])
+            if len(payload_text.encode("utf-8")) > _NODE_TEST_MAX_PAYLOAD_BYTES:
+                return None
+            try:
+                payload = strict_json_loads(payload_text, label="direct Node test payload")
+            except (ValueError, RecursionError, OverflowError):
+                return None
+            if not _node_test_payload_valid(payload, command_id):
+                return None
+            index = closing + 1
+        # Payload is emitted by the script whose immediately following file
+        # result closes the reporter body. Association and placement matter.
+        if index != len(body) - 1:
+            return None
+        associated_test = re.fullmatch(
+            rf"✔ (.+) \({_NODE_TEST_DURATION_PATTERN}ms\)", body[index],
+        )
+        if (
+            associated_test is None
+            or _node_test_authorized_reporter_path(associated_test[1], paths) != payload_path
+        ):
+            return None
+        payloads.append({"testOrdinal": len(tests) + 1, "kind": payload_kind, "value": payload})
+    if (
+        len(tests) != counts["tests"]
+        or bool(payloads) != (payload_kind is not None)
+        or (payload_kind is not None and command_id != "learner-focused" and len(tests) != 1)
+    ):
+        return None
+    return {
+        "schema": "NodeTestSemanticResultV1",
+        "commandId": command_id,
+        "authorizedTestPaths": list(paths),
+        "tests": tests,
+        "counts": counts,
+        "payloads": payloads,
+    }
+
+
+def _direct_node_test_authorized_paths(record: Mapping[str, Any]) -> tuple[str, ...] | None:
+    """Recognize only the immutable direct-test adapters in the frontend plan."""
+    command_id = record.get("commandId")
+    if command_id == "learner-focused":
+        command_class, role = "learner-focused", "node-test"
+        paths = (
+            "developer/tests/js/learnerPalette.test.js",
+            "developer/tests/js/learnerUiRuntimeStabilization.test.js",
+        )
+    elif command_id == "frontend-security:messageOriginGuard.test.js":
+        command_class, role = "frontend-security", "node-builtin-security-test"
+        paths = (MESSAGE_ORIGIN_SECURITY_GUARD,)
+    else:
+        matching = [path for path in SECURITY_GUARD_FILES
+                    if command_id == f"frontend-security:{Path(path).name}"]
+        if len(matching) != 1:
+            return None
+        command_class, role = "frontend-security", "node-security-test"
+        paths = tuple(matching)
+    executable = record.get("resolvedExecutablePath")
+    argv = [executable, "--test", *paths]
+    if (
+        record.get("commandClass") != command_class
+        or record.get("toolRole") != role
+        or record.get("commandRole") != "observation-producing"
+        or record.get("resultSemantics") != "exit-zero-pass-exit-one-classified-observation"
+        or record.get("profile") not in {"frontend", "all"}
+        or record.get("allowedExecutionExits") != [0, 1]
+        or record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or record.get("required") is not True
+        or record.get("cwd") != "."
+        or not isinstance(executable, str) or not Path(executable).is_absolute()
+        or any(record.get(key) != argv for key in ("argv", "logicalArgv", "executionArgv"))
+    ):
+        return None
+    return paths
+
+
+def _direct_node_test_raw_stream_errors(record: Mapping[str, Any]) -> list[str]:
+    """Validate exact retained streams independently of sanitized observations."""
+    streams = record.get("directNodeTestRawStreams")
+    if (
+        _direct_node_test_authorized_paths(record) is None
+        or type(record.get("exitCode")) is not int or record.get("exitCode") != 0
+        or not isinstance(streams, dict) or set(streams) != {"stdout", "stderr"}
+    ):
+        return ["direct Node test raw stream authority/schema is invalid"]
+    for name in ("stdout", "stderr"):
+        value = streams[name]
+        if not isinstance(value, str):
+            return ["direct Node test raw stream must be UTF-8 text"]
+        try:
+            data = value.encode("utf-8", errors="strict")
+        except UnicodeError:
+            return ["direct Node test raw stream must be UTF-8 text"]
+        if (len(data) > MAX_RECORDED_STREAM_BYTES
+            or len(data) != record.get(name + "BytesObserved")
+            or hashlib.sha256(data).hexdigest() != record.get(name + "Sha256")):
+            return ["direct Node test raw stream differs from observed bytes"]
+    return []
+
+
+def _validated_direct_node_test_semantic_projection(
+    record: Mapping[str, Any], *, protected_bundle_valid: bool,
+) -> dict[str, Any] | None:
+    """Derive a portable result only after the complete raw success proof."""
+    paths = _direct_node_test_authorized_paths(record)
+    if (
+        paths is None or protected_bundle_valid is not True
+        or not _command_execution_completed(record)
+        or type(record.get("exitCode")) is not int or record.get("exitCode") != 0
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("descendantsSurviving") != 0
+        or record.get("descendantsTerminated") != 0
+        or record.get("containmentDisposition") not in {"no-descendants", "natural-exit-reaped"}
+        or any(record.get(key) is not None for key in ("error", "processTreeError", "limitReason"))
+        or (record.get("platform"), record.get("containment")) not in {
+            ("ubuntu", "linux-subreaper-pidfd-proc-supervisor"),
+            ("windows", "windows-job-object"),
+        }
+        or _direct_node_test_raw_stream_errors(record)
+    ):
+        return None
+    try:
+        errors: list[str] = []
+        if _validate_command_record(dict(record), 0, errors, expected_record=record) or errors:
+            return None
+        if _validated_portable_protected_input_bundle_digest(record) is None:
+            return None
+        if any(sum(target.get("path") == path for target in record["targets"]) != 1 for path in paths):
+            return None
+        if record["actualExecutionArgv"] != record["logicalArgv"]:
+            return None
+        if record["resolvedExecutableSize"] <= 0:
+            return None
+        stable = record["resolvedExecutableFileIdentity"]
+        if stable.get("reparsePoint") is not False or any(
+            not isinstance(stable.get(key), str) or re.fullmatch(r"-?[0-9]+", stable[key]) is None
+            for key in ("deviceOrVolume", "inodeOrFileIndex", "creationOrChangeTimeNs", "writeTimeNs")
+        ):
+            return None
+        if record.get("dependencyBacked") is True:
+            guard = record["runtimeClosureGuard"]
+            if (
+                record.get("resolvedTestRunnerEntrypoint") != record["resolvedExecutablePath"]
+                or record.get("resolvedTestRunnerSha256") != record["resolvedExecutableSha256"]
+                or guard.get("active") is not False
+                or type(guard.get("guardSchemaVersion")) is not int
+                or type(guard.get("mutationEventCount")) is not int
+                or (record["platform"], guard.get("watcherBackend")) not in {
+                    ("ubuntu", "_InotifyMutationWatcher"),
+                    ("windows", "_WindowsDirectoryMutationWatcher"),
+                }
+            ):
+                return None
+        elif (record.get("toolRole") != "node-builtin-security-test"
+              or record.get("dependencyBacked") is not False
+              or any(record.get(key) is not None for key in (
+                  "runtimeClosureGuard", "closureWatcherActive", "closureMutationState"))):
+            return None
+        observed, reaped = record["descendantsObserved"], record["descendantsReaped"]
+        if (record["containmentDisposition"] == "no-descendants" and (observed or reaped)
+            or record["containmentDisposition"] == "natural-exit-reaped"
+            and (observed <= 0 or observed != reaped)):
+            return None
+        producer = record["producerObservations"]
+        if len(producer) != 1:
+            return None
+        raw = producer[0]
+        if _validate_raw_observation(raw, label="direct-node-test", source=record):
+            return None
+        expected_scope = ("command:learner-focused-runtime" if record["commandId"] == "learner-focused"
+                          else f"file:{paths[0]}")
+        streams = record["directNodeTestRawStreams"]
+        expected_fields = raw_observation_json_value({
+            "executed": True, "exitCode": 0, "stdout": streams["stdout"],
+            "stderr": streams["stderr"], "error": None,
+        })
+        if (raw["observationOrdinal"] != 0 or raw["occurrences"] != 1
+            or raw["sourceResultId"] != expected_scope or raw["sourcePath"] != paths[0]
+            or raw["rawStructuredFields"] != expected_fields):
+            return None
+        semantic = parse_node_test_semantic_result(
+            streams["stdout"], command_id=record["commandId"], authorized_test_paths=paths,
+        )
+        if semantic is None:
+            return None
+        # Preserve exact test-name/payload Unicode too: the general frame's NFC
+        # string normalization is not an authorized reporter transformation.
+        semantic_bytes = json.dumps(
+            semantic, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8", errors="strict")
+        canonical = _canonical_frame({
+            "digestDomain": "ieltmps-direct-node-test-semantic-result-v1", "resultUtf8": semantic_bytes,
+        })
+        output_identity = {
+            "stdoutSha256": hashlib.sha256(canonical).hexdigest(),
+            "stdoutBytesObserved": len(canonical),
+        }
+        semantic_source_digest = canonical_failure_digest({
+            "digestDomain": "ieltmps-direct-node-test-semantic-source-output-v1",
+            "resultUtf8": semantic_bytes, "stderrSha256": record["stderrSha256"],
+            "stderrBytesObserved": record["stderrBytesObserved"],
+        })
+        portable_raw = copy.deepcopy(raw)
+        portable_raw["rawStructuredFields"]["stdout"] = semantic
+        portable_raw["sourceOutputDigest"] = semantic_source_digest
+        portable_raw["producerRecordDigest"] = _producer_record_digest({
+            key: value for key, value in portable_raw.items() if key != "producerRecordDigest"
+        })
+        return {
+            **output_identity, "semanticSourceOutputDigest": semantic_source_digest,
+            "producerObservations": [portable_raw],
+            "producerObservationSetDigest": producer_observation_set_digest([portable_raw]),
+        }
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+        return None
+
+
+def _portable_node_test_observation_source(record: Mapping[str, Any]) -> Mapping[str, Any]:
+    if _direct_node_test_authorized_paths(record) is None or record.get("exitCode") != 0:
+        return record
+    projection = _validated_direct_node_test_semantic_projection(
+        record, protected_bundle_valid=_validated_portable_protected_input_bundle_digest(record) is not None,
+    )
+    return {**record, **projection} if projection is not None else record
+
+
 def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
     source = dict(record)
-    if "executionInputs" in source:
+    portable_stdin_authority = _validated_portable_target_stdin_input_authority(record)
+    invalid_stdin_authority = (
+        record.get("executionInputMode") == "TARGET-BYTES-STDIN"
+        or record.get("targetExecutionLease") is not None
+    ) and portable_stdin_authority is None
+    if invalid_stdin_authority:
+        source["invalidTargetStdinLocalEvidence"] = True
+    if source.get("executionLease") is not None:
+        portable_bash_lease = _validated_portable_git_bash_execution_lease(record)
+        if portable_bash_lease is None:
+            source["invalidGitBashLeaseLocalEvidence"] = True
+        else:
+            source["executionLease"] = portable_bash_lease
+    portable_bundle_digest = _validated_portable_protected_input_bundle_digest(source)
+    portable_containment = _validated_portable_static_containment(
+        record, protected_bundle_valid=portable_bundle_digest is not None,
+    )
+    if portable_containment is not None:
+        source.update(portable_containment)
+    invalid_protected_bundle = (
+        source.get("executionInputMode") == "PROTECTED-TARGET-BUNDLE"
+        or source.get("protectedTargetBundle") is not None
+    ) and portable_bundle_digest is None
+    bundle_output_identity = _validated_bundle_normalization_success_output_identity(
+        record, protected_bundle_valid=portable_bundle_digest is not None,
+    )
+    if bundle_output_identity is not None:
+        source.update(bundle_output_identity)
+    node_projection = _validated_direct_node_test_semantic_projection(
+        record, protected_bundle_valid=portable_bundle_digest is not None,
+    )
+    if node_projection is not None:
+        source.update(node_projection)
+        source.pop("directNodeTestRawStreams", None)
+        external_containment = _validated_portable_successful_external_test_containment(
+            record, protected_bundle_valid=True, node_test_semantics_valid=True,
+        )
+        if external_containment is not None:
+            source.update(external_containment)
+    if "validatedStaticMachineReport" in source:
+        static_output_identity = (
+            _validated_static_machine_output_identity(record)
+            if portable_bundle_digest is not None else None
+        )
+        if static_output_identity is None:
+            source["invalidStaticMachineLocalEvidence"] = True
+        else:
+            source.update(static_output_identity)
+    if invalid_protected_bundle:
+        # Even a forged raw digest equal to the portable digest cannot make
+        # invalid physical evidence indistinguishable from a valid transcript.
+        source["invalidProtectedBundleLocalEvidence"] = True
+    if "executionInputs" in source and not (invalid_protected_bundle or invalid_stdin_authority):
         source["executionInputs"] = _canonical_protected_execution_inputs(source)
     protected_source = source.get("protectedTargetBundle")
-    if isinstance(protected_source, Mapping):
+    if isinstance(protected_source, Mapping) and not invalid_protected_bundle:
         source = {
             key: copy.deepcopy(value)
             for key, value in source.items()
@@ -11224,7 +12500,12 @@ def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
                 phase="post",
             )
         )
+        source["executionInputBundleDigest"] = portable_bundle_digest
+        protected_projection["executionInputBundleDigest"] = portable_bundle_digest
         source["protectedTargetBundle"] = protected_projection
+    if portable_stdin_authority is not None:
+        source.update(portable_stdin_authority)
+    invalid_input_authority = invalid_protected_bundle or invalid_stdin_authority
     canonical = _canonical_replay_value(source)
     canonical.pop("durationSeconds", None)
     tool_role = str(canonical.get("toolRole", "unknown"))
@@ -11244,16 +12525,19 @@ def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
         canonical["resolvedTestRunnerEntrypoint"] = (
             f"<TRUSTED-TOOL:{tool_role}>"
         )
-    for target in canonical.get("targets", []):
+    for target in ([] if invalid_input_authority else canonical.get("targets", [])):
         if isinstance(target, dict):
             target["canonicalSourcePath"] = None
             target["fileIdentity"] = None
-    for execution_input in canonical.get("executionInputs", []):
+    for execution_input in (
+        [] if invalid_input_authority or portable_stdin_authority is not None
+        else canonical.get("executionInputs", [])
+    ):
         if isinstance(execution_input, dict):
             execution_input["canonicalSourcePath"] = None
             execution_input["plannedStableIdentity"] = None
     lease = canonical.get("targetExecutionLease")
-    if isinstance(lease, dict):
+    if isinstance(lease, dict) and not invalid_input_authority and portable_stdin_authority is None:
         for key in (
             "canonicalSourcePath",
             "plannedStableFileIdentity",
@@ -11262,7 +12546,7 @@ def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
             if key in lease:
                 lease[key] = None
     protected = canonical.get("protectedTargetBundle")
-    if isinstance(protected, dict):
+    if isinstance(protected, dict) and not invalid_protected_bundle:
         for key in _PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS:
             protected[key] = []
     canonical["executionDurationClass"] = record.get("executionDurationClass")
@@ -11418,6 +12702,7 @@ def _command_authority_violations(
     observations: Sequence[Mapping[str, Any]],
     *,
     expected_plan: Sequence[Mapping[str, Any]] | None = None,
+    cross_job: bool = False,
 ) -> list[dict[str, Any]]:
     if (
         len(command_records) == 1
@@ -11446,7 +12731,14 @@ def _command_authority_violations(
         for record in command_records
     ]
     violations: list[dict[str, Any]] = []
-    if actual != expected:
+    # Physical identities are exact within an execution domain. Across jobs,
+    # bind producer records to the independently rebuilt verifier plan through
+    # the same portable projection used for commandAuthority and plan digests.
+    authority_matches = (
+        _portable_command_plan_value(actual) == _portable_command_plan_value(expected)
+        if cross_job else actual == expected
+    )
+    if not authority_matches:
         violations.append(
             {
                 "id": "COMMAND-AUTHORITY-MISMATCH",
@@ -11466,7 +12758,12 @@ def _command_authority_violations(
         authority = expected_by_id.get(command_id)
         if authority is None:
             continue
-        if record.get("actualExecutionArgv") != authority.get("executionArgv"):
+        # Cross-job semantic equality above binds executionArgv to the verifier.
+        # Actual argv must still exactly match the producer's own local argv.
+        execution_argv = (
+            record.get("executionArgv") if cross_job else authority.get("executionArgv")
+        )
+        if record.get("actualExecutionArgv") != execution_argv:
             violations.append(
                 {"id": "EXECUTION-ARGV-MISMATCH", "commandId": command_id}
             )
@@ -11693,6 +12990,7 @@ def _validate_raw_observation(
     *,
     label: str,
     source: Mapping[str, Any] | None,
+    source_output_digest: str | None = None,
 ) -> list[str]:
     expected_keys = {
         "schemaVersion",
@@ -11766,7 +13064,12 @@ def _validate_raw_observation(
             errors.append(f"{label}: commandId does not bind the source command")
         if raw.get("commandOrdinal") != source.get("ordinal"):
             errors.append(f"{label}: commandOrdinal does not bind the source command")
-        if raw.get("sourceOutputDigest") != command_output_digest(source):
+        expected_output_digest = (
+            source_output_digest
+            if source_output_digest is not None
+            else command_output_digest(source)
+        )
+        if raw.get("sourceOutputDigest") != expected_output_digest:
             errors.append(f"{label}: sourceOutputDigest does not bind the producer command streams")
     return errors
 
@@ -11823,6 +13126,7 @@ def _validate_observation_record(
     command_by_id: Mapping[str, Mapping[str, Any]],
     *,
     authorization_context_binding_digest_value: str | None = None,
+    source_output_digests: Mapping[int, str] | None = None,
 ) -> list[str]:
     label = f"command-results.json.observations[{index}]"
     expected_keys = {
@@ -11901,7 +13205,15 @@ def _validate_observation_record(
         errors.append(f"{label}: source command did not execute successfully enough to emit observations")
     else:
         raw = item.get("rawObservation")
-        errors.extend(_validate_raw_observation(raw, label=f"{label}.rawObservation", source=source))
+        errors.extend(_validate_raw_observation(
+            raw,
+            label=f"{label}.rawObservation",
+            source=source,
+            source_output_digest=(
+                source_output_digests.get(id(source))
+                if source_output_digests is not None else None
+            ),
+        ))
         if isinstance(raw, dict):
             command_class = str(item.get("commandClass", ""))
             scope = str(item.get("testOrPathScope", ""))
@@ -11999,6 +13311,7 @@ def derive_authoritative_evidence(
     authorization_context_binding_digest_value: str | None = None,
     *,
     release_gate_required: bool,
+    cross_job: bool = False,
 ) -> dict[str, Any]:
     """Recompute all semantic evidence from commands and the frozen baseline map."""
 
@@ -12014,6 +13327,12 @@ def derive_authoritative_evidence(
         if not command_id or command_id in command_by_id:
             continue
         command_by_id[command_id] = record
+    # This operation does not mutate command evidence. Validate structured
+    # source-output authority once per command, then reuse it for its records.
+    source_output_digests = {
+        id(record): command_output_digest(record)
+        for record in command_records
+    }
     valid_observations: list[Mapping[str, Any]] = []
     for index, item in enumerate(observations):
         item_errors = _validate_observation_record(
@@ -12023,6 +13342,7 @@ def derive_authoritative_evidence(
             authorization_context_binding_digest_value=(
                 authorization_context_binding_digest_value
             ),
+            source_output_digests=source_output_digests,
         )
         if item_errors:
             derivation_violations.extend(
@@ -12057,6 +13377,7 @@ def derive_authoritative_evidence(
                 raw,
                 label=f"command:{command_id}.producerObservations[{index}]",
                 source=record,
+                source_output_digest=source_output_digests.get(id(record)),
             )
             if raw_errors:
                 derivation_violations.extend(
@@ -12125,6 +13446,7 @@ def derive_authoritative_evidence(
             command_records,
             valid_observations,
             expected_plan=command_plan,
+            cross_job=cross_job,
         )
     )
     comparison["violations"].extend(derivation_violations)
@@ -13712,7 +15034,7 @@ def build_profile_command_plan(
                 "resolvedExecutableSha256": executable_hash,
                 "resolvedExecutableFileIdentity": executable_identity,
                 "executionLease": (
-                    dict(bash_lease.identity)
+                    bash_lease.validated_identity()
                     if command_id == "git-bash-version" and bash_lease is not None
                     else None
                 ),
@@ -16740,6 +18062,18 @@ class FoundationRunner:
     ) -> dict[str, Any]:
         """Bind one process result to its command's raw output identity."""
 
+        if (_direct_node_test_authorized_paths(command_record) is not None
+            and capture.exit_code == 0 and capture.stdout_raw is not None
+            and capture.stderr_raw is not None and isinstance(command_record, dict)):
+            try:
+                command_record["directNodeTestRawStreams"] = {
+                    "stdout": capture.stdout_raw.decode("utf-8", errors="strict"),
+                    "stderr": capture.stderr_raw.decode("utf-8", errors="strict"),
+                }
+            except UnicodeError:
+                # Exact decoding is necessary for this protocol. The ordinary
+                # execution/observation evidence still records the raw failure.
+                pass
         raw_fields: Any = {
             "executed": capture.executed,
             "exitCode": capture.exit_code,
@@ -17340,7 +18674,7 @@ class FoundationRunner:
             report_errors.append("static machine invocation argv identity is not exact")
         canonical_report: dict[str, Any] | None = None
         canonical_observation_bindings: list[Mapping[str, Any] | None] = []
-        if report is not None and not report_errors:
+        if report is not None and not report_errors and capture.execution_passed():
             canonical_report = copy.deepcopy(report)
             canonical_results: list[Any] = []
             for result in report["observations"]:
@@ -17369,6 +18703,7 @@ class FoundationRunner:
                 canonical_observation_bindings.append(binding)
             canonical_report["observations"] = canonical_results
             _canonicalize_static_machine_capture(capture, canonical_report)
+            capture.validated_static_machine_report = copy.deepcopy(canonical_report)
         static_command_record = self.add_command(capture)
         static_command_record["executionInputs"] = copy.deepcopy(
             protected_bundle["executionInputs"]
@@ -17397,6 +18732,7 @@ class FoundationRunner:
             self.add_hard_gate("STATIC-SUITE-RESULT", False, "; ".join(detail_parts))
         else:
             assert canonical_report is not None
+            static_source_output_digest = command_output_digest(static_command_record)
             release_scopes = {
                 entry["testOrPathScope"] for entry in self.baseline.get("releaseOnlySkips", [])
             }
@@ -17429,7 +18765,7 @@ class FoundationRunner:
                     str(result["name"]),
                     STATIC_SUITE_RELATIVE_PATH,
                     result,
-                    command_output_digest(static_command_record),
+                    static_source_output_digest,
                     failure_path_authority=path_binding,
                 )
                 self.add_observation(
@@ -18150,6 +19486,726 @@ def write_json(path: Path, value: Any, *, repo_root: Path = REPO_ROOT) -> None:
     _exclusive_write(path, _json_bytes(value), repo_root=repo_root)
 
 
+_DIAGNOSTIC_COMMAND_IDS = frozenset({
+    "baseline-schema", "node-version", "npm-version", "git-bash-version",
+    "git-candidate-paths", "git-tracked-paths", "git-diff-check",
+    "git-cached-diff-check", "git-stage-modes", "git-dir",
+    "tracked-private-resource-scan", "tracked-secret-scan",
+    "license-governance-consistency", "workflow-self-policy", "static-suite",
+    "python-source-syntax", "bundle-normalization", "learner-focused",
+    "backend-canonical", "standalone-packaging", "standalone-membership-audit",
+    "lockfile-integrity", "command-results-size-limit",
+})
+_DIAGNOSTIC_DERIVED_VIOLATION_TYPES = frozenset({
+    "MALFORMED-OBSERVATION", "UNKNOWN-NONPASS", "BASELINE-OCCURRENCE-LIMIT",
+    "REQUIRED-COMMAND-UNAVAILABLE", "RELEASE-ONLY-SKIP-IN-REQUIRED-GATE",
+    "BASELINE-SOURCE-COMMAND-SPLIT", "KNOWN-SCOPE-NOT-OBSERVED",
+    "RESOLVED-CANDIDATE-SOURCE-INVALID", "REQUIRED-POLICY-SCOPE-NOT-OBSERVED",
+    "COMMAND-RESULT-JSON-LIMIT", "COMMAND-AUTHORITY-MISMATCH",
+    "DUPLICATE-COMMAND-ID", "EXECUTION-ARGV-MISMATCH",
+    "EXECUTION-INPUT-MODE-MISMATCH", "EXECUTION-INPUT-IDENTITY-MISMATCH",
+    "REQUIRED-COMMAND-EXECUTION", "COMMAND-EXIT-OUTSIDE-AUTHORITY",
+    "REQUIRED-COMMAND-NONZERO", "NONZERO-COMMAND-WITHOUT-OBSERVATION",
+    "MALFORMED-COMMAND-OBSERVATION", "MALFORMED-PRODUCER-OBSERVATION-SET",
+    "PRODUCER-OBSERVATION-SET-DIGEST-MISMATCH", "MALFORMED-PRODUCER-OBSERVATION",
+    "DUPLICATE-PRODUCER-OBSERVATION", "PRODUCER-OBSERVATION-ORDINAL-GAP",
+    "UNAUTHORIZED-PRODUCER-OBSERVATION", "PRODUCER-OBSERVATION-COMPLETENESS",
+    "MALFORMED-COMPLETED-COMMAND-CLASS",
+    "RESOLVED-CANDIDATE-WITHOUT-SUCCESSFUL-SCOPE",
+})
+_DIAGNOSTIC_AUTHORITY_FIELDS = frozenset({
+    "commandId", "ordinal", "commandClass", "commandRole", "required",
+    "profile", "platform", "argv", "logicalArgv", "executionArgv",
+    "executionInputMode", "executionInputSize", "executionInputSha256", "cwd",
+    "toolRole", "resolvedExecutablePath", "resolvedExecutableSize",
+    "resolvedExecutableSha256", "resolvedExecutableFileIdentity", "executionLease",
+    "targets", "resultSemantics", "allowedExecutionExits",
+})
+_MAX_DIAGNOSTIC_AUTHORITY_FIELDS = 4
+
+
+# Diagnostic values mirror the immutable build_profile_command_plan registry.
+# Only classes registered by trusted runner code can appear in output.
+_REPLAY_DIAGNOSTIC_COMMAND_CLASSES = frozenset({
+    "baseline-policy", "runtime-identity", "repository-boundary",
+    "private-resource-exclusion", "secret-operational-artifact-exclusion",
+    "license-governance", "workflow-policy", "static-suite", "direct-syntax",
+    "bundle-parity", "learner-focused", "frontend-security", "backend-canonical",
+    "standalone-packaging", "standalone-membership", "lockfile-integrity",
+    "evidence-size-limit",
+})
+_REPLAY_DIAGNOSTIC_COMMAND_FAMILIES = frozenset({
+    "node-check", "frontend-security", "fixed-command", "other",
+})
+_REPLAY_DIAGNOSTIC_TARGET_INPUT_FIELDS = {
+    "targets": frozenset({"targets"}),
+    "executionInputs": frozenset({"executionInputs"}),
+    "actualExecutionInputIdentity": frozenset({
+        "actualExecutionInputMode", "actualExecutionInputSize", "actualExecutionInputSha256",
+    }),
+    "targetExecutionLease": frozenset({"targetExecutionLease"}),
+    "protectedTargetBundle": frozenset({"protectedTargetBundle"}),
+    "executionInputBundleDigest": frozenset({"executionInputBundleDigest"}),
+    "other": frozenset({
+        "executionLease", "invalidGitBashLeaseLocalEvidence", "executionInputMode",
+        "executionInputSize", "executionInputSha256", "fileScans",
+    }),
+}
+
+
+def _replay_producer_observation_context_categories(
+    producer: Mapping[str, Any], replay: Mapping[str, Any],
+    *, producer_source: Mapping[str, Any] | None = None,
+    replay_source: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Describe context differences without inferring unproved source causality.
+
+    Inputs are canonical command records. Optional original records only supply
+    digest preimages after their canonical context is checked against the input.
+    This diagnostic neither validates nor changes replay authority. A changed
+    self-checking digest is downstream only when it recomputes from both records;
+    changed raw facts remain ``other`` and are diagnosed separately in the
+    validated machine report. This list alone never proves source-only change.
+    """
+
+    profile_fields = frozenset({
+        "producerObservationUniverseDigest", "producerTranscriptDigest",
+        "profileCompletedCommandClassSetDigest", "authorizationContextBindingDigest",
+    })
+    failure_fields = frozenset({
+        "failureIdentity", "failureIdentityHash", "derivedFailureMembers",
+        "canonicalFailureMaterialVersion", "legacyBaselineComparisonDigest",
+        "signature",
+    })
+    # extract_failure_identity supplies these direct parsedFailureSummary keys;
+    # make_internal_result instead supplies status/diagnostic. Status already
+    # belongs to execution-status; diagnostic and unknown members remain other.
+    summary_failure_fields = failure_fields | frozenset({
+        "scope", "testIds", "fileLocations", "assertionNames", "expectedValues",
+        "observedValues", "errorClasses", "errorMessages", "structuredFailureSet",
+        "pathAuthority",
+    })
+    categories: set[str] = set()
+
+    def member_equal(left: Mapping[str, Any], right: Mapping[str, Any], key: str) -> bool:
+        try:
+            return _canonical_frame({"present": key in left, "value": left.get(key)}) == _canonical_frame({
+                "present": key in right, "value": right.get(key),
+            })
+        except (TypeError, ValueError, UnicodeError):
+            return False
+
+    def record_digest_valid(record: Mapping[str, Any]) -> bool:
+        try:
+            return record.get("producerRecordDigest") == _producer_record_digest({
+                key: value for key, value in record.items() if key != "producerRecordDigest"
+            })
+        except (TypeError, ValueError, UnicodeError):
+            return False
+
+    for key in profile_fields | failure_fields:
+        if not member_equal(producer, replay, key):
+            categories.add("profileContext" if key in profile_fields else "failureIdentity")
+    if not member_equal(producer, replay, "diagnosticPreview"):
+        categories.add("other")
+    if not member_equal(producer, replay, "parsedFailureSummary"):
+        left_summary = producer.get("parsedFailureSummary")
+        right_summary = replay.get("parsedFailureSummary")
+        if isinstance(left_summary, Mapping) and isinstance(right_summary, Mapping):
+            for key in left_summary.keys() | right_summary.keys():
+                if key == "status" or member_equal(left_summary, right_summary, key):
+                    continue
+                categories.add(
+                    "profileContext" if key in profile_fields
+                    else "failureIdentity" if key in summary_failure_fields
+                    else "other"
+                )
+        else:
+            categories.add("other")
+
+    observations_changed = not member_equal(producer, replay, "producerObservations")
+    set_digest_changed = not member_equal(producer, replay, "producerObservationSetDigest")
+    if set_digest_changed:
+        categories.add("producerObservationSetDigest")
+    digest_observations: list[list[Any] | None] = [None, None]
+    if observations_changed or set_digest_changed:
+        for side, (command, original) in enumerate((
+            (producer, producer_source), (replay, replay_source),
+        )):
+            digest_command: Mapping[str, Any] | None = command
+            if original is not None:
+                # Raw constructor normalization is component-boundary-aware;
+                # replay substitution can still alter embedded root literals.
+                # Check correspondence before using the original digest bytes.
+                context_keys = (
+                    "commandId", "commandClass", "ordinal",
+                    "producerObservations", "producerObservationSetDigest",
+                )
+                if isinstance(original, Mapping) and isinstance(original.get("producerObservations"), list):
+                    original_context = _canonical_replay_value({
+                        key: original[key] for key in context_keys if key in original
+                    })
+                    if all(member_equal(command, original_context, key) for key in context_keys):
+                        digest_command = original
+                    else:
+                        digest_command = None
+                else:
+                    digest_command = None
+            observations = (
+                digest_command.get("producerObservations")
+                if digest_command is not None else None
+            )
+            try:
+                valid_set_digest = (
+                    isinstance(observations, list)
+                    and len(observations) <= MAX_EVIDENCE_COLLECTION_ITEMS
+                    and digest_command is not None
+                    and digest_command.get("producerObservationSetDigest") == producer_observation_set_digest(observations)
+                )
+            except (TypeError, ValueError, UnicodeError):
+                valid_set_digest = False
+            if not valid_set_digest:
+                categories.add("other")
+            if isinstance(observations, list):
+                digest_observations[side] = observations
+    if observations_changed:
+        left_observations = producer.get("producerObservations")
+        right_observations = replay.get("producerObservations")
+        if (
+            not isinstance(left_observations, list)
+            or not isinstance(right_observations, list)
+            or max(len(left_observations), len(right_observations)) > MAX_EVIDENCE_COLLECTION_ITEMS
+        ):
+            categories.add("other")
+        else:
+            if len(left_observations) != len(right_observations):
+                categories.add("other")
+            for index, (left_raw, right_raw) in enumerate(zip(left_observations, right_observations)):
+                if not isinstance(left_raw, Mapping) or not isinstance(right_raw, Mapping):
+                    categories.add("other")
+                    continue
+                changed = {
+                    key for key in left_raw.keys() | right_raw.keys()
+                    if not member_equal(left_raw, right_raw, key)
+                }
+                if not changed:
+                    continue
+                if "sourceOutputDigest" in changed:
+                    categories.add("sourceOutputDigest")
+                if changed - {"sourceOutputDigest", "producerRecordDigest"}:
+                    categories.add("other")
+                for originals in digest_observations:
+                    if (
+                        originals is None or index >= len(originals)
+                        or not isinstance(originals[index], Mapping)
+                        or not record_digest_valid(originals[index])
+                    ):
+                        categories.add("other")
+    return sorted(categories)
+
+
+_REPLAY_DIAGNOSTIC_FIELD_CATEGORIES = {
+    "executionDurationClass": frozenset({"executionDurationClass"}),
+    "stdout-identity": frozenset({
+        "stdoutSha256", "stdoutBytesObserved", "stdoutByteLimit",
+        "validatedStaticMachineReport", "invalidStaticMachineLocalEvidence",
+        "directNodeTestRawStreams",
+    }),
+    "stderr-identity": frozenset({
+        "stderrSha256", "stderrBytesObserved", "stderrByteLimit",
+    }),
+    "execution-status": frozenset({
+        "executed", "started", "setupFailure", "exitCode", "timeoutStatus",
+        "outputLimitStatus", "completedCommandClass", "error", "limitReason",
+    }),
+    "process-containment": frozenset({
+        "containment", "processTreeStatus", "processTreeError",
+        "descendantsTerminated", "descendantsObserved", "descendantsReaped",
+        "descendantsSurviving", "containmentDisposition",
+    }),
+    "target-input-authority": frozenset({
+        "targets", "executionInputs", "executionLease", "targetExecutionLease",
+        "invalidGitBashLeaseLocalEvidence",
+        "executionInputMode", "executionInputSize", "executionInputSha256",
+        "actualExecutionInputMode", "actualExecutionInputSize",
+        "actualExecutionInputSha256", "fileScans",
+    }),
+    "executionInputBundleDigest": frozenset({"executionInputBundleDigest"}),
+    "runtime-closure": frozenset({
+        "dependencyBacked", "runtimeClosureDigest", "dependencyClosureDigest",
+        "nodePath", "resolvedTestRunnerEntrypoint", "resolvedTestRunnerSha256",
+        "closureWatcherActive", "closureMutationState", "runtimeClosureGuard",
+        "toolRole", "resolvedExecutablePath", "resolvedExecutableSize",
+        "resolvedExecutableSha256", "resolvedExecutableFileIdentity",
+    }),
+    "producer-observation-context": frozenset({
+        "producerObservations", "producerObservationSetDigest", "diagnosticPreview",
+        "semanticSourceOutputDigest",
+    }),
+    "command-membership": frozenset({"commandId", "ordinal"}),
+}
+_REPLAY_DIAGNOSTIC_NESTED_CATEGORIES = {
+    "parsedFailureSummary": (
+        "producer-observation-context", {"status": "execution-status"},
+    ),
+    "protectedTargetBundle": (
+        "target-input-authority", {
+            "executionInputBundleDigest": "protectedTargetBundle.executionInputBundleDigest",
+            "cleanupState": "process-containment",
+            "mutationDetected": "process-containment",
+        },
+    ),
+}
+_REPLAY_DIAGNOSTIC_CATEGORIES = frozenset({
+    *_REPLAY_DIAGNOSTIC_FIELD_CATEGORIES,
+    "protectedTargetBundle.executionInputBundleDigest",
+    "other-authorized-fixed-category",
+})
+_REPLAY_DIAGNOSTIC_HARD_GATE_IDS = frozenset({
+    *HARD_GATE_AUTHORITY,
+    "DIRECT-JAVASCRIPT-SYNTAX-EXECUTION", "DIRECT-PYTHON-SYNTAX",
+    "GIT-BASH-TRUSTED-RUNTIME", "IMMUTABLE-COMMAND-AUTHORITY",
+    "NODE-CI-FAMILY", "NPM-REQUIRED", "PYTHON-CI-FAMILY",
+    "RUNTIME-DEPENDENCY-CLOSURE", "RUNTIME-DEPENDENCY-CLOSURE-FINAL",
+    "RUNTIME-DEPENDENCY-CLOSURE-SETUP", "STATIC-SUITE-EXECUTION",
+    "STATIC-SUITE-RESULT", "TARGET-EXECUTION-SOURCE-INTEGRITY",
+    "TRUSTED-EXECUTABLE-RESOLUTION", "TRUSTED-FILE-MANIFEST",
+    *(
+        f"{prefix}-{phase}"
+        for prefix in (
+            "TRUSTED-TOOL-AUTHORITY", "TRUSTED-FILE-INTEGRITY",
+            "RUNTIME-DEPENDENCY-CLOSURE",
+        )
+        for phase in (
+            "RUNTIME", "POLICY", "STATIC", "FRONTEND", "BACKEND",
+            "STANDALONE", "LOCKFILE-CHECK", "POST-EXECUTION",
+        )
+    ),
+})
+_REPLAY_DIAGNOSTIC_VIOLATION_IDS = frozenset({
+    *_REPLAY_DIAGNOSTIC_HARD_GATE_IDS, *_DIAGNOSTIC_DERIVED_VIOLATION_TYPES,
+    "CI-RUNNER-ERROR", "RUNTIME-CLOSURE-PRECONDITION",
+})
+_MAX_REPLAY_FAILURE_DIAGNOSTICS = 8
+_MAX_REPLAY_TRANSCRIPT_DIAGNOSTICS = 8
+
+
+def _replay_changed_field_categories(
+    producer: Mapping[str, Any], replay: Mapping[str, Any],
+) -> list[str]:
+    """Classify differences with fixed vocabulary, never record keys or values."""
+
+    categories: set[str] = set()
+    missing = object()
+    for key in producer.keys() | replay.keys():
+        left, right = producer.get(key, missing), replay.get(key, missing)
+        if left == right:
+            continue
+        if key in _REPLAY_DIAGNOSTIC_NESTED_CATEGORIES:
+            fallback, nested = _REPLAY_DIAGNOSTIC_NESTED_CATEGORIES[key]
+            if isinstance(left, Mapping) and isinstance(right, Mapping):
+                for child in left.keys() | right.keys():
+                    if left.get(child, missing) != right.get(child, missing):
+                        categories.add(nested.get(child, fallback))
+            else:
+                categories.add(fallback)
+        else:
+            categories.add(next(
+                (category for category, fields in _REPLAY_DIAGNOSTIC_FIELD_CATEGORIES.items()
+                 if key in fields),
+                "other-authorized-fixed-category",
+            ))
+    return sorted(categories & _REPLAY_DIAGNOSTIC_CATEGORIES)
+
+
+def _replay_diagnostic_command_identity(
+    record: Mapping[str, Any], *, source_record: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Describe the command with fixed labels and its exact UTF-8 identity digest."""
+
+    command_id = record.get("commandId")
+    digest_command_id = command_id
+    if isinstance(source_record, Mapping) and isinstance(source_record.get("commandId"), str):
+        try:
+            # Replay may replace root spellings embedded in dynamic IDs. Use
+            # exact original UTF-8 bytes only after full canonical correspondence;
+            # this must not let a different source record relabel the diagnostic.
+            if _json_bytes(_canonical_transcript_record(source_record)) == _json_bytes(dict(record)):
+                digest_command_id = source_record["commandId"]
+        except (KeyError, TypeError, ValueError, UnicodeError, OSError):
+            pass
+    command_class = record.get("commandClass")
+    ordinal = record.get("ordinal")
+    family = "other"
+    if isinstance(command_id, str):
+        if command_id in _DIAGNOSTIC_COMMAND_IDS:
+            family = "fixed-command"
+        elif re.fullmatch(r"node-check:[^\x00-\x1f\x7f]+\.(?i:js|mjs)", command_id):
+            family = "node-check"
+        elif re.fullmatch(r"frontend-security:[^/\\\x00-\x1f\x7f]+\.js", command_id):
+            family = "frontend-security"
+    return {
+        "commandId": command_id if isinstance(command_id, str) and command_id in _DIAGNOSTIC_COMMAND_IDS else "OTHER",
+        "ordinal": ordinal if type(ordinal) is int and 0 <= ordinal < MAX_PROFILE_COMMANDS else None,
+        "commandClass": (
+            command_class if isinstance(command_class, str)
+            and command_class in _REPLAY_DIAGNOSTIC_COMMAND_CLASSES else None
+        ),
+        "commandFamily": family,
+        "commandIdDigest": (
+            "sha256:" + hashlib.sha256(digest_command_id.encode("utf-8")).hexdigest()
+            if isinstance(digest_command_id, str) else None
+        ),
+    }
+
+
+def _replay_target_input_difference_subcategories(
+    producer: Mapping[str, Any], replay: Mapping[str, Any],
+) -> list[str]:
+    """Name only differing fixed target/input categories, without their contents."""
+
+    missing = object()
+    categories: set[str] = set()
+    for category, fields in _REPLAY_DIAGNOSTIC_TARGET_INPUT_FIELDS.items():
+        for field in fields:
+            if producer.get(field, missing) == replay.get(field, missing):
+                continue
+            if field == "protectedTargetBundle" and not (
+                set(_replay_changed_field_categories(
+                    {field: producer[field]} if field in producer else {},
+                    {field: replay[field]} if field in replay else {},
+                )) & {"target-input-authority", "protectedTargetBundle.executionInputBundleDigest"}
+            ):
+                continue
+            categories.add(category)
+    return sorted(categories)
+
+
+def replay_transcript_difference_diagnostics(
+    producer_records: Sequence[Mapping[str, Any]],
+    replay_records: Sequence[Mapping[str, Any]],
+    *,
+    producer_source_records: Sequence[Mapping[str, Any]] | None = None,
+    replay_source_records: Sequence[Mapping[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Describe at most eight unequal canonical records; never authorize replay."""
+
+    diagnostics: list[dict[str, Any]] = []
+    for index in range(max(len(producer_records), len(replay_records))):
+        producer = producer_records[index] if index < len(producer_records) else None
+        replay = replay_records[index] if index < len(replay_records) else None
+        if producer == replay:
+            continue
+        identity_record = replay if replay is not None else producer
+        identity_sources = replay_source_records if replay is not None else producer_source_records
+        identity_source = (
+            identity_sources[index]
+            if identity_sources is not None and index < len(identity_sources) else None
+        )
+        diagnostic = {
+            **_replay_diagnostic_command_identity(identity_record, source_record=identity_source),
+            "changedFieldCategories": (
+                ["command-membership"] if producer is None or replay is None
+                else _replay_changed_field_categories(producer, replay)
+            ),
+            "producerRecordDigest": canonical_failure_digest(producer),
+            "replayRecordDigest": canonical_failure_digest(replay),
+        }
+        if producer is not None and replay is not None:
+            target_categories = _replay_target_input_difference_subcategories(producer, replay)
+            if target_categories:
+                diagnostic["targetInputSubcategories"] = target_categories
+            diagnostic.update(_replay_static_machine_difference_diagnostic(
+                producer, replay,
+                producer_source=(
+                    producer_source_records[index]
+                    if producer_source_records is not None and index < len(producer_source_records)
+                    else None
+                ),
+                replay_source=(
+                    replay_source_records[index]
+                    if replay_source_records is not None and index < len(replay_source_records)
+                    else None
+                ),
+            ))
+        diagnostics.append(diagnostic)
+        if len(diagnostics) == _MAX_REPLAY_TRANSCRIPT_DIAGNOSTICS:
+            break
+    return diagnostics
+
+
+def first_replay_transcript_difference_diagnostic(
+    producer_records: Sequence[Mapping[str, Any]],
+    replay_records: Sequence[Mapping[str, Any]],
+    *,
+    producer_source_records: Sequence[Mapping[str, Any]] | None = None,
+    replay_source_records: Sequence[Mapping[str, Any]] | None = None,
+) -> str | None:
+    """Retain the single-record diagnostic interface for existing consumers."""
+
+    diagnostics = replay_transcript_difference_diagnostics(
+        producer_records, replay_records,
+        producer_source_records=producer_source_records,
+        replay_source_records=replay_source_records,
+    )
+    return json.dumps(diagnostics[0], sort_keys=True, separators=(",", ":")) if diagnostics else None
+
+
+_STATIC_REPORT_DIAGNOSTIC_FIELDS = {
+    "documentKind": "document/schema",
+    "schemaVersion": "document/schema",
+    "invocationId": "invocation",
+    "executionStatus": "execution-status",
+    "internalRunnerFailures": "execution-status",
+    "commandPlanDigest": "command-plan",
+    "commandResults": "command-results",
+    "observations": "observations",
+    "nativeNonPassCount": "summary/counts",
+}
+_STATIC_OBSERVATION_DIAGNOSTIC_FIELDS = {
+    "name": "identity", "status": "status", "detail": "detail",
+}
+
+
+def _replay_static_changed_categories(
+    producer: Mapping[str, Any], replay: Mapping[str, Any],
+    field_categories: Mapping[str, str],
+) -> list[str]:
+    """Compare JSON types and presence exactly; emit only fixed categories."""
+
+    return sorted({
+        field_categories.get(key, "other")
+        for key in producer.keys() | replay.keys()
+        if (key not in producer or key not in replay
+            or canonical_failure_digest(producer[key]) != canonical_failure_digest(replay[key]))
+    })
+
+
+def _replay_validated_static_report(
+    canonical: Mapping[str, Any], source: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Recheck original local authority before inspecting its existing projection."""
+
+    if not isinstance(source, Mapping) or source.get("commandId") != "static-suite":
+        return None
+    try:
+        if _validated_portable_protected_input_bundle_digest(source) is None:
+            return None
+        identity = _validated_static_machine_output_identity(source)
+        if identity is None:
+            return None
+        report = identity["validatedStaticMachineReport"]
+        if (
+            canonical.get("invalidStaticMachineLocalEvidence") is True
+            or canonical.get("invalidProtectedBundleLocalEvidence") is True
+            or canonical_failure_digest(canonical.get("validatedStaticMachineReport"))
+            != canonical_failure_digest(report)
+        ):
+            return None
+    except (KeyError, TypeError, ValueError, UnicodeError):
+        return None
+    return report
+
+
+def _replay_static_machine_difference_diagnostic(
+    producer: Mapping[str, Any], replay: Mapping[str, Any],
+    *, producer_source: Mapping[str, Any] | None = None,
+    replay_source: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Describe validated static facts without changing comparison or authority."""
+
+    if producer.get("commandId") != "static-suite" or replay.get("commandId") != "static-suite":
+        return {}
+    diagnostic: dict[str, Any] = {}
+    context_categories = _replay_producer_observation_context_categories(
+        producer, replay, producer_source=producer_source, replay_source=replay_source,
+    )
+    if context_categories:
+        diagnostic["producerObservationContextCategories"] = context_categories
+    if not any("validatedStaticMachineReport" in record for record in (producer, replay)):
+        return diagnostic
+    left = _replay_validated_static_report(producer, producer_source)
+    right = _replay_validated_static_report(replay, replay_source)
+    if left is None or right is None:
+        diagnostic["staticMachineReport"] = {
+            "validationStatus": (
+                "both-unavailable" if left is None and right is None
+                else "producer-unavailable" if left is None else "replay-unavailable"
+            ),
+            "changedCategories": ["other"],
+        }
+        return diagnostic
+    report_diagnostic: dict[str, Any] = {
+        "validationStatus": "both-validated",
+        "changedCategories": _replay_static_changed_categories(
+            left, right, _STATIC_REPORT_DIAGNOSTIC_FIELDS,
+        ),
+    }
+    diagnostic["staticMachineReport"] = report_diagnostic
+    if "observations" not in report_diagnostic["changedCategories"]:
+        return diagnostic
+    left_observations, right_observations = left["observations"], right["observations"]
+    # Existing report validation bounds each list to 10,000 entries. Keep the
+    # diagnostic ordinal independently bounded and include only its first change.
+    for index in range(min(10_000, max(len(left_observations), len(right_observations)))):
+        left_item = left_observations[index] if index < len(left_observations) else None
+        right_item = right_observations[index] if index < len(right_observations) else None
+        if canonical_failure_digest(left_item) == canonical_failure_digest(right_item):
+            continue
+        report_diagnostic["firstObservationDifference"] = {
+            "ordinal": index,
+            "producerObservationIdentityDigest": (
+                "sha256:" + hashlib.sha256(left_item["name"].encode("utf-8")).hexdigest()
+                if left_item is not None else None
+            ),
+            "replayObservationIdentityDigest": (
+                "sha256:" + hashlib.sha256(right_item["name"].encode("utf-8")).hexdigest()
+                if right_item is not None else None
+            ),
+            "changedSemanticCategories": (
+                ["membership"] if left_item is None or right_item is None
+                else _replay_static_changed_categories(
+                    left_item, right_item, _STATIC_OBSERVATION_DIAGNOSTIC_FIELDS,
+                )
+            ),
+            "producerObservationDigest": canonical_failure_digest(left_item),
+            "replayObservationDigest": canonical_failure_digest(right_item),
+        }
+        break
+    return diagnostic
+
+
+def replay_failure_diagnostics(
+    hard_failures: Sequence[Mapping[str, Any]],
+    violations: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Bound rejection details to eight identities per kind and canonical digests."""
+
+    diagnostics: list[str] = []
+    for records, id_key, allowed_ids, prefix in (
+        (hard_failures, "hardGateId", _REPLAY_DIAGNOSTIC_HARD_GATE_IDS,
+         "verification replay failed hard gate: "),
+        (violations, "violationId", _REPLAY_DIAGNOSTIC_VIOLATION_IDS,
+         "verification replay violation: "),
+    ):
+        for record in records[:_MAX_REPLAY_FAILURE_DIAGNOSTICS]:
+            record_id = record.get("id")
+            diagnostic = {
+                id_key: (record_id if isinstance(record_id, str) and record_id in allowed_ids
+                         else "OTHER"),
+                "diagnosticDigest": canonical_failure_digest(record),
+            }
+            command_id = record.get("commandId")
+            if (id_key == "violationId" and isinstance(command_id, str)
+                    and command_id in _DIAGNOSTIC_COMMAND_IDS):
+                diagnostic["commandId"] = command_id
+            diagnostics.append(prefix + json.dumps(
+                diagnostic, sort_keys=True, separators=(",", ":"),
+            ))
+    return diagnostics
+
+
+def _first_authority_mismatch_diagnostic(
+    command_records: Sequence[Mapping[str, Any]],
+    expected_authority: Sequence[Mapping[str, Any]],
+    *,
+    cross_job: bool = False,
+) -> tuple[Any, list[str]]:
+    """Locate the first unequal authority projection; return no raw values."""
+
+    if expected_authority and not isinstance(expected_authority[0], Mapping):
+        return None, ["OTHER"]
+    authority_fields = set(expected_authority[0]) if expected_authority else set()
+    for index in range(max(len(command_records), len(expected_authority))):
+        expected = expected_authority[index] if index < len(expected_authority) else {}
+        observed = command_records[index] if index < len(command_records) else {}
+        if not isinstance(expected, Mapping) or not isinstance(observed, Mapping):
+            return None, ["OTHER"]
+        command_id = expected.get("commandId", observed.get("commandId"))
+        if index >= len(command_records) or index >= len(expected_authority):
+            return command_id, ["command-membership"]
+        actual = {key: observed.get(key) for key in authority_fields}
+        if cross_job:
+            actual = _portable_command_plan_value([actual])[0]
+            expected = _portable_command_plan_value([expected])[0]
+        if actual == expected:
+            continue
+        categories: set[str] = set()
+        for key in set(actual) | set(expected):
+            if key in actual and key in expected and actual[key] == expected[key]:
+                continue
+            category = key if key in _DIAGNOSTIC_AUTHORITY_FIELDS else "OTHER"
+            if key == "targets":
+                left, right = actual.get(key), expected.get(key)
+                if (
+                    isinstance(left, list) and isinstance(right, list)
+                    and len(left) == len(right)
+                    and all(isinstance(item, Mapping) for item in [*left, *right])
+                    and [dict(item, fileIdentity=None) for item in left]
+                    == [dict(item, fileIdentity=None) for item in right]
+                ):
+                    category = "targets.fileIdentity"
+            categories.add(category)
+        fields = sorted(categories)
+        if len(fields) > _MAX_DIAGNOSTIC_AUTHORITY_FIELDS:
+            fields = fields[:_MAX_DIAGNOSTIC_AUTHORITY_FIELDS - 1] + ["additional-fields"]
+        return command_id, fields or ["OTHER"]
+    return None, ["OTHER"]
+
+
+def missing_derived_violation_diagnostic(
+    violation: Mapping[str, Any],
+    *,
+    command_records: Sequence[Mapping[str, Any]] | None = None,
+    expected_authority: Sequence[Mapping[str, Any]] | None = None,
+    cross_job: bool = False,
+) -> str:
+    """Identify a rejected claim without rendering producer-controlled content.
+
+    The digest uses the exact canonical JSON used by the membership check.
+    Command IDs with candidate-controlled suffixes (including paths) are hashed;
+    only fixed, path-free vocabulary is rendered verbatim. This projection is
+    diagnostic only and is never used to compare or authorize evidence.
+    """
+
+    canonical = json.dumps(
+        violation, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    command_id = violation.get("commandId")
+    mismatch_fields: list[str] | None = None
+    if (
+        violation.get("id") == "COMMAND-AUTHORITY-MISMATCH"
+        and command_records is not None and expected_authority is not None
+    ):
+        command_id, mismatch_fields = _first_authority_mismatch_diagnostic(
+            command_records, expected_authority, cross_job=cross_job
+        )
+    if isinstance(command_id, str) and command_id not in _DIAGNOSTIC_COMMAND_IDS:
+        command_id = "sha256:" + hashlib.sha256(
+            command_id.encode("utf-8", errors="surrogatepass")
+        ).hexdigest()
+    elif not isinstance(command_id, str):
+        command_id = None
+    violation_type = violation.get("id")
+    if (
+        not isinstance(violation_type, str)
+        or violation_type not in _DIAGNOSTIC_DERIVED_VIOLATION_TYPES
+    ):
+        violation_type = "OTHER"
+    return json.dumps(
+        {
+            "commandId": command_id,
+            "violationType": violation_type,
+            "violationDigest": "sha256:" + hashlib.sha256(
+                canonical.encode("utf-8", errors="surrogatepass")
+            ).hexdigest(),
+            **({"authorityFields": mismatch_fields} if mismatch_fields is not None else {}),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def verify_evidence_file_set(
     output_dir: Path = OUTPUT_DIR,
     *,
@@ -18848,12 +20904,22 @@ def _validate_command_record(
         "closureWatcherActive",
         "closureMutationState",
         "runtimeClosureGuard",
+        "validatedStaticMachineReport",
+        "directNodeTestRawStreams",
     }
     if not isinstance(record, dict):
         errors.append(f"{label}: record must be an object")
         return True
     if not required.issubset(record) or set(record) - required - optional:
         errors.append(f"{label}: command record keys are not valid")
+    if "directNodeTestRawStreams" in record:
+        stream_errors = _direct_node_test_raw_stream_errors(record)
+        errors.extend(f"{label}: {error}" for error in stream_errors)
+        if not stream_errors and parse_node_test_semantic_result(
+            record["directNodeTestRawStreams"]["stdout"], command_id=record["commandId"],
+            authorized_test_paths=_direct_node_test_authorized_paths(record),
+        ) is None:
+            errors.append(f"{label}: successful direct Node test reporter/payload is invalid")
     if (
         not isinstance(record.get("commandId"), str)
         or not isinstance(record.get("commandClass"), str)
@@ -18981,31 +21047,8 @@ def _validate_command_record(
         }
         if not isinstance(executable_identity, dict) or set(executable_identity) != identity_keys:
             errors.append(f"{label}: executable stable identity is invalid")
-    if execution_lease is not None:
-        lease_keys = {
-            "canonicalPath",
-            "trustedGitRoot",
-            "size",
-            "volumeSerial",
-            "fileIndex",
-            "links",
-            "creationTime",
-            "writeTime",
-            "reparsePoint",
-            "sha256",
-        }
-        if (
-            record.get("commandId") != "git-bash-version"
-            or not isinstance(execution_lease, dict)
-            or set(execution_lease) != lease_keys
-            or execution_lease.get("reparsePoint") is not False
-            or execution_lease.get("links") != 1
-            or execution_lease.get("canonicalPath") != resolved_executable
-            or execution_lease.get("size") != executable_size
-            or execution_lease.get("sha256") != executable_hash
-            or not re.fullmatch(r"[0-9a-f]{64}", str(execution_lease.get("sha256", "")))
-        ):
-            errors.append(f"{label}: trusted Bash execution lease is invalid")
+    if execution_lease is not None and not _git_bash_execution_lease_valid(record):
+        errors.append(f"{label}: trusted Bash execution lease is invalid")
     targets = record.get("targets")
     if not isinstance(targets, list) or len(targets) > MAX_EVIDENCE_COLLECTION_ITEMS:
         errors.append(f"{label}: targets must be a bounded array")
@@ -19324,6 +21367,18 @@ def _validate_command_record(
         errors.append(f"{label}: producerObservations must be a bounded array")
     elif record.get("producerObservationSetDigest") != producer_observation_set_digest(producer):
         errors.append(f"{label}: producerObservationSetDigest is invalid")
+    if "validatedStaticMachineReport" in record:
+        static_identity = _validated_static_machine_output_identity(record)
+        if static_identity is None:
+            errors.append(f"{label}: validated static machine report does not bind local execution authority")
+        elif isinstance(producer, list) and [
+            raw.get("rawStructuredFields") if isinstance(raw, Mapping) else None
+            for raw in producer
+        ] != [
+            raw_observation_json_value(result)
+            for result in record["validatedStaticMachineReport"]["observations"]
+        ]:
+            errors.append(f"{label}: static machine observations are incomplete or differ from validated output")
     if not isinstance(record.get("resultSemantics"), str) or not record.get("resultSemantics"):
         errors.append(f"{label}: resultSemantics is invalid")
     allowed_exits = record.get("allowedExecutionExits")
@@ -20028,6 +22083,7 @@ def _validate_evidence_semantics(
                 expected_authority,
                 authorization_context_binding_digest_value,
                 release_gate_required=authoritative_release_gate_required,
+                cross_job=True,
             )
             derived_sets = {
                 "knownDebtsObserved": derived["observedDebts"],
@@ -20048,7 +22104,15 @@ def _validate_evidence_semantics(
             for violation in derived["violations"]:
                 key = json.dumps(violation, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
                 if key not in policy_keys:
-                    errors.append("summary.json: derived command/baseline violation is missing")
+                    errors.append(
+                        "summary.json: derived command/baseline violation is missing: "
+                        + missing_derived_violation_diagnostic(
+                            violation,
+                            command_records=command_records,
+                            expected_authority=expected_authority,
+                            cross_job=True,
+                        )
+                    )
 
     manifest = summary.get("evidenceManifest")
     if not isinstance(manifest, list) or len(manifest) != len(EVIDENCE_MANIFEST_FILE_NAMES):
@@ -20188,6 +22252,32 @@ def _read_evidence_documents_for_replay(
     return documents, snapshots, sorted(set(errors))
 
 
+def _portable_replay_observations(
+    observations: Any, records: Sequence[Mapping[str, Any]],
+) -> Any:
+    """Project only reconstructed observation sources; keep claimed derived fields."""
+    if not isinstance(observations, list):
+        return observations
+    by_id = {record.get("commandId"): record for record in records}
+    result = []
+    for item in observations:
+        if not isinstance(item, Mapping):
+            result.append(item)
+            continue
+        source = by_id.get(item.get("commandId"))
+        portable = _portable_node_test_observation_source(source) if source is not None else source
+        if (source is not None and portable is not source
+            and item.get("rawObservation") == source["producerObservations"][0]
+            and item.get("producerObservationSetDigest") == source["producerObservationSetDigest"]):
+            result.append({
+                **item, "rawObservation": portable["producerObservations"][0],
+                "producerObservationSetDigest": portable["producerObservationSetDigest"],
+            })
+        else:
+            result.append(item)
+    return result
+
+
 def compare_verification_replay_claims(
     documents: Mapping[str, dict[str, Any]],
     runner: FoundationRunner,
@@ -20221,6 +22311,7 @@ def compare_verification_replay_claims(
             "verification replay profile is non-PASS: "
             f"hardFailures={len(hard_failures)} violations={len(runner.violations)}"
         )
+        errors.extend(replay_failure_diagnostics(hard_failures, runner.violations))
 
     if summary.get("profile") != runner.profile or transcript.get("profile") != runner.profile:
         errors.append("verification replay profile selector mismatch")
@@ -20267,6 +22358,17 @@ def compare_verification_replay_claims(
         ]
         if comparable_evidence_records != replay_records:
             errors.append("verification replay command execution transcript mismatch")
+            diagnostics = replay_transcript_difference_diagnostics(
+                comparable_evidence_records, replay_records,
+                producer_source_records=[
+                    record for record in evidence_records if isinstance(record, Mapping)
+                ],
+                replay_source_records=runner.command_results,
+            )
+            if diagnostics:
+                errors.append("verification replay first command differences: " + json.dumps(
+                    diagnostics, sort_keys=True, separators=(",", ":"),
+                ))
     if isinstance(evidence_records, list) and len(evidence_records) != transcript["commandCount"]:
         errors.append("verification replay commandCount mismatch")
     top_level_fields = (
@@ -20288,7 +22390,11 @@ def compare_verification_replay_claims(
         "actualCompletedCommandClasses"
     ):
         errors.append("verification replay completedCommandClasses mismatch")
-    if commands.get("observations") not in ([], runner.observations):
+    if _portable_replay_observations(
+        commands.get("observations"),
+        [record for record in evidence_records if isinstance(record, Mapping)]
+        if isinstance(evidence_records, list) else [],
+    ) not in ([], _portable_replay_observations(runner.observations, runner.command_results)):
         errors.append("verification replay producer observations mismatch")
     if comparison is not None:
         replay_sets = {
