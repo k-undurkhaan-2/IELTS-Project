@@ -23469,6 +23469,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-runner-os", choices=("Linux", "Windows"))
     parser.add_argument("--expected-invocation-id")
     parser.add_argument("--untrusted-evidence-root")
+    parser.add_argument("--issue13-diagnostic-root", help="private diagnostic-only destination; never verification authority")
+    parser.add_argument("--issue13-diagnostic-transaction", help="32 lowercase hex characters for diagnostic pairing only")
     parser.add_argument("--require-linux-containment-self-test", action="store_true")
     parser.add_argument("--require-fresh-runtime-closure", action="store_true")
     try:
@@ -23604,6 +23606,50 @@ def prepare_verification_authority(
     return context, runner
 
 
+def _write_issue13_diagnostics(args: argparse.Namespace, runner: FoundationRunner, phase: str) -> None:
+    """Terminal observer only; helper bytes are pinned without extending LC trust."""
+    if (getattr(args, "issue13_diagnostic_root", None) is None
+        and getattr(args, "issue13_diagnostic_transaction", None) is None):
+        return
+    module_bindings = (
+        ("issue13_diagnostic_reporters", ("c86dd42dfe59f2a32805cd9e847ecb6bbb70214d666ca587c8dde4fa3d7cf7e8", "137e5dedeffc318c2dc2135f483de9a5e10cd66e9290bd2199f66ae85fc53a09")),
+        ("issue13_diagnostic_capture", ("d127ec9087172909b33c50ad1d698a47709c176a22cf4747f75e53885dbf5112", "409488e03180dcf7c0c1d5338a97e7b52f70a1bfdf9fbac955d966bb620c7b2c")),
+    )
+    saved_modules: dict[str, Any] = {}
+    try:
+        from types import ModuleType
+        verified_sources = []
+        for name, expected_sha256 in module_bindings:
+            path = Path(__file__).resolve().parent / (name + ".py")
+            metadata = path.lstat()
+            if (_is_reparse_point(metadata) or stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 262_144):
+                raise ValueError("diagnostic source unavailable")
+            with path.open("rb") as source:
+                data = source.read(262_145)
+            if hashlib.sha256(data).hexdigest() not in expected_sha256:
+                raise ValueError("diagnostic source identity mismatch")
+            verified_sources.append((name, path, data))
+        for name, path, data in verified_sources:
+            saved_modules[name] = sys.modules.get(name)
+            module = ModuleType(name)
+            module.__file__ = str(path)
+            sys.modules[name] = module
+            exec(compile(data, str(path), "exec", dont_inherit=True), module.__dict__)
+        module.capture_from_cli(sys.modules[__name__], args, runner, phase)
+    except Exception:
+        try:
+            print("NON-AUTHORITATIVE / DIAGNOSTIC-ONLY: capture unavailable", file=sys.stderr)
+        except Exception:
+            pass  # A broken diagnostic status stream cannot change the CI result.
+    finally:
+        for name, previous in saved_modules.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = parse_args(argv)
@@ -23688,6 +23734,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         finally:
             verification_runner.cleanup_task_resources()
+            _write_issue13_diagnostics(args, verification_runner, "fresh-replay")
         if verification_errors:
             print("CI foundation evidence verification failed:", file=sys.stderr)
             for error in verification_errors:
@@ -23829,6 +23876,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_RUNNER_ERROR
     finally:
         runner.cleanup_task_resources()
+        _write_issue13_diagnostics(args, runner, "producer")
     print(f"CI foundation profile={args.profile} status={summary['status']}")
     if summary["executionBinding"]["bindingMode"] == "local":
         print(
