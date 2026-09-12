@@ -22283,6 +22283,17 @@ def compare_verification_replay_claims(
     runner: FoundationRunner,
     comparison: Mapping[str, Any] | None,
 ) -> tuple[dict[str, Any], list[str]]:
+    """Compare raw claims only; this public API has no backend portable capability."""
+    return _compare_verification_replay_claims(documents, runner, comparison)
+
+
+def _compare_verification_replay_claims(
+    documents: Mapping[str, dict[str, Any]],
+    runner: FoundationRunner,
+    comparison: Mapping[str, Any] | None,
+    *,
+    comparison_views: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
     """Compare mutable evidence claims with independently replayed facts."""
 
     errors: list[str] = []
@@ -22356,6 +22367,9 @@ def compare_verification_replay_claims(
             for record in evidence_records
             if isinstance(record, Mapping)
         ]
+        if comparison_views is not None:
+            comparable_evidence_records = comparison_views["producer"]["records"]
+            replay_records = comparison_views["replay"]["records"]
         if comparable_evidence_records != replay_records:
             errors.append("verification replay command execution transcript mismatch")
             diagnostics = replay_transcript_difference_diagnostics(
@@ -22384,7 +22398,13 @@ def compare_verification_replay_claims(
         "duplicateCommandIds",
     )
     for field_name in top_level_fields:
-        if commands.get(field_name) != transcript.get(field_name):
+        claimed_value, replay_value = commands.get(field_name), transcript.get(field_name)
+        if comparison_views is not None and field_name in (
+            "producerObservationUniverseDigest", "producerTranscriptDigest",
+        ):
+            claimed_value = comparison_views["producer"][field_name]
+            replay_value = comparison_views["replay"][field_name]
+        if claimed_value != replay_value:
             errors.append(f"verification replay {field_name} mismatch")
     if commands.get("completedCommandClasses") != transcript.get(
         "actualCompletedCommandClasses"
@@ -22461,6 +22481,28 @@ def run_verification_replay(
     verification_runner: FoundationRunner,
     repo_root: Path = REPO_ROOT,
 ) -> tuple[dict[str, Any] | None, list[str]]:
+    """Re-execute the frozen raw comparison path, without backend portability."""
+    comparison, errors = _execute_verification_replay(
+        expected_context=expected_context, verification_runner=verification_runner,
+        repo_root=repo_root,
+    )
+    if comparison is None:
+        return None, errors
+    transcript, comparison_errors = compare_verification_replay_claims(
+        documents, verification_runner, comparison,
+    )
+    errors.extend(comparison_errors)
+    return _finish_verification_replay(
+        transcript, errors, expected_context=expected_context, runner=verification_runner,
+    )
+
+
+def _execute_verification_replay(
+    *,
+    expected_context: ExternallyExpectedVerificationContext,
+    verification_runner: FoundationRunner,
+    repo_root: Path = REPO_ROOT,
+) -> tuple[dict[str, Any] | None, list[str]]:
     """Re-execute only the externally selected profile and command plan."""
 
     errors: list[str] = []
@@ -22511,12 +22553,19 @@ def run_verification_replay(
         runner.close_execution_leases()
     if comparison is None:
         return None, errors or ["verification replay did not produce a comparison"]
-    transcript, comparison_errors = compare_verification_replay_claims(
-        documents,
-        runner,
-        comparison,
+    return comparison, errors
+
+
+def _finish_verification_replay(
+    transcript: dict[str, Any],
+    errors: list[str],
+    *,
+    expected_context: ExternallyExpectedVerificationContext,
+    runner: FoundationRunner,
+) -> tuple[dict[str, Any], list[str]]:
+    expected_authorization_digest = authorization_context_binding_digest(
+        expected_context.authorization_context_binding()
     )
-    errors.extend(comparison_errors)
     try:
         replay_binding = build_verifier_replay_context_binding(
             expected_context,
@@ -22560,6 +22609,7 @@ def verify_evidence_with_replay(
     verification_runner: FoundationRunner,
     repo_root: Path = REPO_ROOT,
     evidence_authority_root: Path | None = None,
+    backend_result_evidence: Mapping[str, Any] | None = None,
 ) -> tuple[list[str], dict[str, Any] | None]:
     if verification_runner.profile != expected_context.expected_profile:
         return ["verification runner profile differs from external expected profile"], None
@@ -22581,14 +22631,63 @@ def verify_evidence_with_replay(
     documents, snapshots, snapshot_errors = _read_evidence_documents_for_replay(output_dir)
     if snapshot_errors:
         return snapshot_errors, None
+    if backend_result_evidence is not None:
+        # The replay reader takes a second snapshot. Validate the exact documents
+        # used below, not merely the earlier file-set validation's snapshots.
+        errors.extend(validate_evidence_root(output_dir, repo_root=evidence_authority_root or repo_root))
+        try:
+            if {entry.name for entry in os.scandir(output_dir)} != set(EVIDENCE_FILE_NAMES):
+                errors.append("evidence file membership changed before backend binding")
+        except OSError as exc:
+            errors.append(f"evidence directory cannot be enumerated: {type(exc).__name__}")
+        errors.extend(_validate_evidence_semantics(
+            documents, snapshots, expected_command_plan=verification_runner.command_plan,
+            expected_context=expected_context,
+        ))
+        if errors:
+            return sorted(set(errors)), None
     if documents.get("summary.json", {}).get("status") != "PASS":
         return [], None
-    transcript, replay_errors = run_verification_replay(
-        documents,
-        expected_context=expected_context,
-        verification_runner=verification_runner,
-        repo_root=repo_root,
-    )
+    bound_pair = None
+    if backend_result_evidence is None:
+        transcript, replay_errors = run_verification_replay(
+            documents, expected_context=expected_context,
+            verification_runner=verification_runner, repo_root=repo_root,
+        )
+    else:
+        import backend_canonical_portable_result as backend_portable
+
+        unavailable = "verification replay backend-canonical portable result unavailable or mismatched"
+        backend_context = backend_portable._bind_producer(
+            sys.modules[__name__], documents["command-results.json"],
+            verification_runner.command_plan, backend_result_evidence,
+        )
+        if backend_context is None:
+            return [unavailable], None
+        comparison, replay_errors = _execute_verification_replay(
+            expected_context=expected_context, verification_runner=verification_runner,
+            repo_root=repo_root,
+        )
+        transcript = None
+        if comparison is not None:
+            bound_pair = backend_portable._bind_replay(
+                sys.modules[__name__], backend_context,
+                documents["command-results.json"], verification_runner,
+            )
+            if bound_pair is None:
+                replay_errors.append(unavailable)
+            # No reporter parse or result identity exists in the eligibility view.
+            # The frozen comparisons still check every unrelated field and gate.
+            views = (backend_portable._comparison_views(sys.modules[__name__], bound_pair)
+                     if bound_pair is not None else None)
+            transcript, comparison_errors = _compare_verification_replay_claims(
+                documents, verification_runner, comparison, comparison_views=views,
+            )
+            replay_errors.extend(comparison_errors)
+            transcript, replay_errors = _finish_verification_replay(
+                transcript, replay_errors, expected_context=expected_context,
+                runner=verification_runner,
+            )
     errors.extend(replay_errors)
     if transcript is not None and transcript.get("finalAcceptance") != "PASS":
         errors.append(
@@ -22618,6 +22717,40 @@ def verify_evidence_with_replay(
             current.identity != original.identity or current.data != original.data
         ):
             errors.append(f"{name}: evidence changed during verification replay")
+    if backend_result_evidence is not None:
+        # Evidence/context/cleanup and all unrelated comparisons precede parsing.
+        try:
+            if {entry.name for entry in os.scandir(output_dir)} != set(EVIDENCE_FILE_NAMES):
+                errors.append("evidence file membership changed during verification replay")
+        except OSError as exc:
+            errors.append(f"evidence directory cannot be re-enumerated: {type(exc).__name__}")
+        if not errors and bound_pair is not None:
+            rebound = backend_portable._bind_replay(
+                sys.modules[__name__], backend_context,
+                documents["command-results.json"], verification_runner,
+            )
+            if rebound != bound_pair:
+                errors.append(unavailable)
+            else:
+                result = backend_portable._derive_equal_result(sys.modules[__name__], rebound)
+                if result is None:
+                    errors.append(unavailable)
+                else:
+                    transcript, comparison_errors = _compare_verification_replay_claims(
+                        documents, verification_runner, comparison,
+                        comparison_views=backend_portable._comparison_views(
+                            sys.modules[__name__], rebound, result),
+                    )
+                    errors.extend(comparison_errors)
+                    if not errors:
+                        transcript["backendCanonicalPortableResult"] = result
+                        transcript, errors = _finish_verification_replay(
+                            transcript, errors, expected_context=expected_context,
+                            runner=verification_runner,
+                        )
+        if errors and transcript is not None:
+            transcript.pop("backendCanonicalPortableResult", None)
+            transcript["finalAcceptance"] = "REJECT"
     return sorted(set(errors)), transcript
 
 

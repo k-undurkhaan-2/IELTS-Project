@@ -5577,9 +5577,14 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
         target_reference_count = sum(len(spec["targets"]) for spec in plan)
         self.assertEqual(len(plan), 705)
         self.assertEqual(len(command_classes), 16)
-        # Four governance files add four targets and 86 plan references.
-        self.assertEqual(len(target_universe), 908)
-        self.assertEqual(target_reference_count, 19811)
+        # Three backend portable files add three targets and 65 references.
+        self.assertEqual(len(target_universe), 911)
+        self.assertEqual(target_reference_count, 19876)
+        self.assertTrue({
+            "developer/tests/ci/backend_canonical_portable_result.py",
+            "developer/tests/ci/test_backend_canonical_portable_result.py",
+            "developer/tests/ci/ISSUE13_BACKEND_PORTABLE_RESULT.md",
+        }.issubset(target_universe))
         self.assertNotIn(
             "node-vitest-security-test",
             {spec["toolRole"] for spec in plan},
