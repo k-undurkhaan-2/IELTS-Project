@@ -67,6 +67,33 @@ JOB_CONTEXT = {
     "windows-compatibility": ("windows", "fresh-replay"),
 }
 
+# Separate opt-in contract. Historical constants and validators above/below are
+# intentionally unchanged. A's own commit ID is not an input to this contract.
+V2_PROFILE = "issue13-authority-preimage-v2"
+V2_CAPTURE_COMMIT = "06b66c51e509c9567b881d671210074e7d78c156"
+V2_CAPTURE_TREE = "c037d1d5009f662b24330564c3c2736348479ea9"
+V2_BRANCH = "refs/heads/codex/issue-13-authority-preimage-v2"
+V2_WORKFLOW = ".github/workflows/issue-13-authority-preimage-v2.yml"
+V2_AMENDMENT_PATHS = (
+    "developer/tests/ci/ISSUE13_AUTHORITY_PREIMAGE_V2.md",
+    "developer/tests/ci/issue13_acquisition_transport.py",
+    "developer/tests/ci/issue13_windows_transport_recovery.py",
+    "developer/tests/ci/test_issue13_acquisition_transport.py",
+    "developer/tests/ci/test_issue13_diagnostic_capture.py",
+    "developer/tests/ci/test_issue13_windows_transport_recovery.py",
+)
+V2_CAPTURE_PINS = {
+    "developer/tests/ci/run_ci_foundation.py": "f63e48bf98c4e2d1e66986c495faaeb44f78940bfc920c972b35bc13bbf4b469",
+    "developer/tests/ci/issue13_diagnostic_capture.py": "88ca3865d96131b31afebdc2113def6f623dcff90ce47cb7ceeba9f7c13538b9",
+    "developer/tests/ci/issue13_diagnostic_reporters.py": "c86dd42dfe59f2a32805cd9e847ecb6bbb70214d666ca587c8dde4fa3d7cf7e8",
+    PUBLIC_KEY_PATH: PUBLIC_KEY_SHA256,
+    "developer/tests/ci/issue13_gnupg_windows_runtime.json": "8bddef70da2f02cc862c775d0d2cd39cf45046eef1bc25eb590bf201473496e2",
+}
+V2_SOURCE_PATHS = tuple(sorted(set(SOURCE_PATHS) | set(V2_AMENDMENT_PATHS) | set(V2_CAPTURE_PINS) | {
+    ".github/workflows/issue-13-windows-transport-recovery.yml",
+    "developer/tests/ci/ISSUE13_WINDOWS_TRANSPORT_RECOVERY.md",
+}))
+
 
 class TransportError(ValueError):
     """Only fixed categories may leave this module."""
@@ -139,6 +166,119 @@ def source_identity(repo, expected_commit):
         rows.append({"source": name, "gitBlobSha256": digest(committed),
                      "checkoutSha256": digest(current), "checkoutBytes": len(current)})
     return {"commit": commit, "tree": tree, "captureCommit": parent, "sources": rows}
+
+
+def v2_context(environment, phase=None, *, platform_name="ubuntu"):
+    values = {key: environment.get(key, "") for key in (
+        "GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_EVENT_NAME",
+        "GITHUB_REPOSITORY", "GITHUB_REF", "GITHUB_JOB")}
+    if (values["GITHUB_REPOSITORY"] != REPOSITORY or values["GITHUB_REF"] != V2_BRANCH
+        or values["GITHUB_EVENT_NAME"] != "push" or values["GITHUB_RUN_ATTEMPT"] != "1"
+        or platform_name not in ("ubuntu", "windows")
+        or (os.name == "nt") != (platform_name == "windows")):
+        raise TransportError("run-context")
+    transaction = transaction_id(values["GITHUB_SHA"], values["GITHUB_RUN_ID"], platform_name)
+    job = values["GITHUB_JOB"]
+    if platform_name == "ubuntu" and job == "acquisition-configuration" and phase is None:
+        return {"commit": values["GITHUB_SHA"], "runId": values["GITHUB_RUN_ID"],
+                "attempt": 1, "transaction": None, "platform": None, "phase": None}
+    expected_platform, expected_phase = JOB_CONTEXT.get(job, (None, None))
+    if platform_name == "windows" and job == "windows-gnupg-preflight" and phase is None:
+        expected_platform = "windows"
+    elif (expected_platform != platform_name or phase != expected_phase) and not (
+        platform_name == "windows" and expected_platform == "windows" and phase is None):
+        raise TransportError("job-context")
+    if expected_platform != platform_name:
+        raise TransportError("job-context")
+    result = {"commit": values["GITHUB_SHA"], "runId": values["GITHUB_RUN_ID"], "attempt": 1,
+              "transaction": transaction, "platform": platform_name, "phase": expected_phase}
+    if platform_name == "windows":
+        result["job"] = job
+    return result
+
+
+def _v2_oid(repo, revision):
+    raw = git_bytes(repo, "rev-parse", revision, limit=41)
+    if re.fullmatch(rb"[0-9a-f]{40}\n", raw) is None:
+        raise TransportError("candidate-identity")
+    return raw[:-1].decode("ascii")
+
+
+def _v2_source_blob(repo, commit, name):
+    entry = git_bytes(repo, "ls-tree", "-z", commit, "--", name, limit=4096)
+    match = re.fullmatch(rb"(100644|100755) blob ([0-9a-f]{40})\t" + re.escape(name.encode("ascii")) + rb"\x00", entry)
+    if match is None:
+        raise TransportError("source-mutated")
+    value = git_bytes(repo, "cat-file", "blob", commit + ":" + name)
+    oid = hashlib.sha1(b"blob " + str(len(value)).encode("ascii") + b"\0" + value).hexdigest().encode("ascii")
+    if oid != match[2]:
+        raise TransportError("reviewed-source-identity")
+    return entry, value
+
+
+def source_identity_v2(repo, expected_commit):
+    commit = _v2_oid(repo, "HEAD")
+    tree = _v2_oid(repo, "HEAD^{tree}")
+    parent = _v2_oid(repo, "HEAD^")
+    grandparent = _v2_oid(repo, "HEAD^^")
+    if (commit != expected_commit or grandparent != V2_CAPTURE_COMMIT
+        or _v2_oid(repo, "HEAD~2^{tree}") != V2_CAPTURE_TREE
+        or len({commit, parent, grandparent}) != 3):
+        raise TransportError("candidate-identity")
+    # Exactly one parent at each new edge: merge commits and intervening commits
+    # cannot satisfy the two-edge contract, even if the anchor is an ancestor.
+    for child, ancestor in ((commit, parent), (parent, grandparent)):
+        if git_bytes(repo, "rev-list", "--parents", "-n", "1", child, limit=256) != (
+            child + " " + ancestor + "\n").encode("ascii"):
+            raise TransportError("candidate-identity")
+    for old, new, expected in (
+        (grandparent, parent, b"".join(b"M\0" + p.encode("ascii") + b"\0" for p in V2_AMENDMENT_PATHS)),
+        (parent, commit, b"A\0" + V2_WORKFLOW.encode("ascii") + b"\0"),
+    ):
+        actual = git_bytes(repo, "diff-tree", "--no-commit-id", "--no-renames", "--name-status", "-r", "-z", old, new, limit=16384)
+        if actual != expected:
+            raise TransportError("candidate-scope")
+    rows = []
+    for name in (*V2_SOURCE_PATHS, V2_WORKFLOW):
+        entry, committed = _v2_source_blob(repo, commit, name)
+        if name == V2_WORKFLOW:
+            if not entry.startswith(b"100644 "):
+                raise TransportError("source-mutated")
+        else:
+            parent_entry, inherited = _v2_source_blob(repo, parent, name)
+            anchor_entry, anchor = _v2_source_blob(repo, grandparent, name)
+            if (entry != parent_entry or committed != inherited
+                or entry[:6] != anchor_entry[:6]
+                or (name not in V2_AMENDMENT_PATHS and inherited != anchor)):
+                raise TransportError("reviewed-source-identity")
+        if name in V2_CAPTURE_PINS and digest(committed) != V2_CAPTURE_PINS[name]:
+            raise TransportError("reviewed-source-identity")
+        current = bounded_file(repo / name, 2 * MIB)
+        # Same checkout-byte allowance as the historical source validators.
+        if current not in (committed, committed.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")):
+            raise TransportError("source-mutated")
+        rows.append({"source": name, "gitBlobSha256": digest(committed),
+                     "checkoutSha256": digest(current), "checkoutBytes": len(current)})
+    if _v2_oid(repo, "HEAD") != commit:
+        raise TransportError("candidate-identity")
+    return {"schema": "Issue13V2SourceIdentity", "version": 2, "commit": commit, "tree": tree,
+            "parent": parent, "captureCommit": grandparent, "sources": rows}
+
+
+def profile_context(environment, phase=None, *, source_profile="legacy"):
+    if source_profile == "legacy":
+        return live_context(environment, phase)
+    if source_profile == V2_PROFILE:
+        return v2_context(environment, phase)
+    raise TransportError("run-context")
+
+
+def profile_source_identity(repo, expected_commit, *, source_profile="legacy"):
+    if source_profile == "legacy":
+        return source_identity(repo, expected_commit)
+    if source_profile == V2_PROFILE:
+        return source_identity_v2(repo, expected_commit)
+    raise TransportError("candidate-identity")
 
 
 def is_link(metadata):
@@ -502,11 +642,11 @@ def private_tar(files, manifest):
     return compressed
 
 
-def export_capture(repo, environment, phase, transaction, outcome):
-    context = live_context(environment, phase)
+def export_capture(repo, environment, phase, transaction, outcome, *, source_profile="legacy"):
+    context = profile_context(environment, phase, source_profile=source_profile)
     if transaction != context["transaction"] or outcome not in ("success", "failure", "cancelled"):
         raise TransportError("export-context")
-    identity = source_identity(repo, context["commit"])
+    identity = profile_source_identity(repo, context["commit"], source_profile=source_profile)
     ci, capture = load_capture_modules(repo)
     temp = Path(environment.get("RUNNER_TEMP", ""))
     leaf = "issue13-producer" if phase == "producer" else "issue13-replay"
@@ -546,6 +686,7 @@ def export_capture(repo, environment, phase, transaction, outcome):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=MARKER, allow_abbrev=False)
     parser.add_argument("mode", choices=("configure", "export"))
+    parser.add_argument("--source-profile", choices=("legacy", V2_PROFILE), default="legacy")
     parser.add_argument("--phase", choices=("producer", "fresh-replay"))
     parser.add_argument("--transaction")
     parser.add_argument("--ordinary-outcome", choices=("success", "failure", "cancelled"))
@@ -553,8 +694,8 @@ def main(argv=None):
         args = parser.parse_args(argv)
         repo = Path(__file__).resolve().parents[3]
         if args.mode == "configure":
-            context = live_context(os.environ)
-            source_identity(repo, context["commit"])
+            context = profile_context(os.environ, source_profile=args.source_profile)
+            profile_source_identity(repo, context["commit"], source_profile=args.source_profile)
             armor = git_bytes(repo, "cat-file", "blob", "HEAD:" + PUBLIC_KEY_PATH, limit=MAX_MANIFEST)
             if digest(public_armor(armor)) != PUBLIC_KEY_SHA256:
                 raise TransportError("public-key-pin")
@@ -567,7 +708,8 @@ def main(argv=None):
             with open(os.environ["GITHUB_OUTPUT"], "a", encoding="ascii", newline="\n") as stream:
                 stream.write(output)
         else:
-            export_capture(repo, os.environ, args.phase, args.transaction, args.ordinary_outcome)
+            export_capture(repo, os.environ, args.phase, args.transaction, args.ordinary_outcome,
+                           source_profile=args.source_profile)
     except Exception:
         print(MARKER + ": transport unavailable", file=sys.stderr)
         return 1

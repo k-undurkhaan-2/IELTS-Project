@@ -156,3 +156,64 @@ This is a reviewable local candidate. Existing acquisition workflows and their
 historical source/branch pins remain unchanged and do not authorize this new
 candidate for acquisition. Publishing, adapting acquisition pins, dispatching,
 and gathering new execution evidence require a subsequent explicit request.
+
+## Source/context contract amendment checkpoint A
+
+Checkpoint A adds the explicit `--source-profile issue13-authority-preimage-v2`
+option to the existing transport entry points. Omitting the option selects
+`legacy`. Both historical context/source validator bodies, constants, path sets,
+and source pins remain unchanged. The new profile does not select itself based
+on an environment variable or a branch name. Historical workflows cannot accept
+v2 by falling through to this profile.
+
+The v2 profile accepts only a future checkpoint B with exactly these two edges:
+
+```text
+06b66c51e509c9567b881d671210074e7d78c156 -> A -> B
+```
+
+The fixed anchor tree is `c037d1d5009f662b24330564c3c2736348479ea9`.
+Both A and B must have exactly one parent. A's own SHA is deliberately absent
+from this contract: A must be separately reviewed and signed before B is allowed.
+Checking ancestry alone, extra descendants, merges, and workflow-supplied parent
+or source manifests cannot satisfy the contract.
+
+The exact A diff is six modified existing files, with no added, removed, renamed,
+duplicated, or extra paths:
+
+- `developer/tests/ci/ISSUE13_AUTHORITY_PREIMAGE_V2.md`
+- `developer/tests/ci/issue13_acquisition_transport.py`
+- `developer/tests/ci/issue13_windows_transport_recovery.py`
+- `developer/tests/ci/test_issue13_acquisition_transport.py`
+- `developer/tests/ci/test_issue13_diagnostic_capture.py`
+- `developer/tests/ci/test_issue13_windows_transport_recovery.py`
+
+The capture-test amendment only permits the preflight's explicit context/source
+dispatch in its static source comparison; the remainder of that comparison and
+the capture behavior tests are unchanged. Runtime provisioning, encryption,
+capture, replay, authorization, and ordinary result handling do not change.
+
+B must add exactly `.github/workflows/issue-13-authority-preimage-v2.yml`, as a
+regular non-executable file. No other B tree change is accepted. Consequently
+every other committed source and input, including paths outside the explicit
+checkout inventory, remains identical to A. The bounded source inventory also
+checks the B and A Git blob bytes/modes, original anchor bytes for unamended
+sources, five explicit SHA-256 pins for capture/runner/reporter/certificate/runtime
+inputs, and current checkout bytes using the unchanged historical checkout-byte
+allowance. Git object IDs are rebound to blob bytes. Malformed metadata, missing
+objects, inconsistent order, mode changes, or a moved HEAD fail closed.
+
+The exact v2 branch is `refs/heads/codex/issue-13-authority-preimage-v2`. Contexts
+require the existing repository, a push, run attempt 1, a valid candidate SHA/run
+ID, and the correct platform/job/phase. Ubuntu configure/export use the base
+transport. Windows preflight/export use the reviewed pinned-runtime transport;
+the Ubuntu v2 entry point rejects Windows jobs. Producer and replay derive the
+same transaction from B's SHA, run ID, and their platform. The two platform
+transactions differ. Each Windows job still performs its own preflight and
+revalidates the runtime before export.
+
+Checkpoint A contains no acquisition workflow or execution authorization. The
+future B workflow must independently enforce branch creation, diagnostic-ready
+dependencies, and artifact privacy when it is separately requested and reviewed.
+Synthetic B tests supply in-memory Git metadata and source blobs; they create
+neither B commits nor workflow files and execute no hosted or ordinary workload.

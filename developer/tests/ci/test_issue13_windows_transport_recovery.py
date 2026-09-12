@@ -559,5 +559,169 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(ci.check_workflow_text((REPO / ".github/workflows/ci.yml").read_text()), [])
 
 
+WINDOWS_CONTRACT_RESULTS = {"legacyWindows": [], "v2Windows": []}
+
+
+class WindowsSourceProfileTests(unittest.TestCase):
+    """Source/context controls do not provision or execute a GnuPG runtime."""
+    @classmethod
+    def setUpClass(cls):
+        import test_issue13_acquisition_transport as source_tests
+        cls.source_tests = source_tests
+        cls.original = source_tests.checkpoint_module("issue13_windows_transport_recovery")
+        cls.original.base = source_tests.checkpoint_module("issue13_acquisition_transport")
+
+    def outcome(self, function, *args, **kwargs):
+        try:
+            return ("accept", base.json_bytes(function(*args, **kwargs)))
+        except Exception as error:
+            return ("reject", type(error).__name__, str(error))
+
+    def test_legacy_windows_context_acceptance_rejection_is_identical(self):
+        env = environment(Path("unused"))
+        for job, phase in (("windows-gnupg-preflight", None),
+                           ("windows-compatibility-producer", "producer"),
+                           ("windows-compatibility", "fresh-replay")):
+            for label, changes in (("historical", {}), ("v2-branch", {"GITHUB_REF": base.V2_BRANCH}),
+                ("ubuntu-branch", {"GITHUB_REF": base.BRANCH}), ("repository", {"GITHUB_REPOSITORY": "other/repo"}),
+                ("attempt", {"GITHUB_RUN_ATTEMPT": "2"}), ("event", {"GITHUB_EVENT_NAME": "workflow_dispatch"}),
+                ("commit", {"GITHUB_SHA": recovery.PARENT}), ("job", {"GITHUB_JOB": "unknown"})):
+                value = {**env, "GITHUB_JOB": job, **changes}
+                before = self.outcome(self.original.context, value, phase)
+                after = self.outcome(recovery.profile_context, value, phase, source_profile="legacy")
+                self.assertEqual(before, after)
+                self.assertEqual(after[0], "accept" if label == "historical" else "reject")
+                WINDOWS_CONTRACT_RESULTS["legacyWindows"].append({"case": job + ":" + label,
+                    "result": after[0], "byteEqual": True})
+
+    def test_legacy_windows_source_acceptance_rejection_is_identical(self):
+        fixture = self.source_tests.SourceContractFixture(legacy_windows=True)
+        for case in ("historical", "parent", "grandparent", "tree", "scope", "source", "checkout", "v2-tree"):
+            f = copy.deepcopy(fixture)
+            if case == "parent": f.refs["HEAD^"] = base.V2_CAPTURE_COMMIT
+            if case == "grandparent": f.refs["HEAD^^"] = base.V2_CAPTURE_COMMIT
+            if case == "tree": f.refs["HEAD^{tree}"] = "invalid"
+            if case == "scope": f.legacy_changes.append(base.V2_WORKFLOW)
+            if case == "source":
+                name = base.PUBLIC_KEY_PATH
+                f.files[f.commit][name] += b"changed"
+                f.checkout[name] = f.files[f.commit][name]
+            if case == "checkout": f.checkout[base.PUBLIC_KEY_PATH] += b"changed"
+            if case == "v2-tree": f = self.source_tests.SourceContractFixture()
+            with f.installed(), mock.patch.object(self.original.base, "git_bytes", side_effect=f.git), \
+                 mock.patch.object(self.original.base, "bounded_file", side_effect=f.file):
+                before = self.outcome(self.original.source_identity, f.repo, f.commit)
+                after = self.outcome(recovery.profile_source_identity, f.repo, f.commit)
+            self.assertEqual(before, after)
+            self.assertEqual(after[0], "accept" if case == "historical" else "reject")
+            WINDOWS_CONTRACT_RESULTS["legacyWindows"].append({"case": "source-" + case,
+                "result": after[0], "byteEqual": True})
+
+    def test_windows_v2_explicit_context_pair_and_source_contract(self):
+        env = {**environment(Path("unused")), "GITHUB_REF": base.V2_BRANCH}
+        rows = []
+        with mock.patch.object(recovery.os, "name", "nt"):
+            for job, phase in (("windows-gnupg-preflight", None),
+                               ("windows-compatibility-producer", "producer"),
+                               ("windows-compatibility", "fresh-replay")):
+                value = {**env, "GITHUB_JOB": job}
+                live = recovery.profile_context(value, phase, source_profile=base.V2_PROFILE)
+                rows.append(live)
+                self.assertEqual(live, recovery.profile_context(value, source_profile=base.V2_PROFILE))
+                with self.assertRaises(recovery.RecoveryError): recovery.profile_context(value)
+            self.assertEqual(len({row["transaction"] for row in rows}), 1)
+            for key, value in (("GITHUB_REF", recovery.BRANCH), ("GITHUB_RUN_ATTEMPT", "2"),
+                               ("GITHUB_EVENT_NAME", "pull_request"), ("GITHUB_JOB", "ubuntu-canonical")):
+                with self.assertRaises(recovery.RecoveryError):
+                    recovery.profile_context({**env, key: value}, source_profile=base.V2_PROFILE)
+        fixture = self.source_tests.SourceContractFixture()
+        with fixture.installed():
+            identity = recovery.profile_source_identity(REPO, fixture.commit, source_profile=base.V2_PROFILE)
+            self.assertEqual(identity, base.source_identity_v2(REPO, fixture.commit))
+        with self.assertRaises(recovery.RecoveryError): recovery.profile_source_identity(REPO, fixture.commit, source_profile="unknown")
+        WINDOWS_CONTRACT_RESULTS["v2Windows"].append({"case": "explicit-context-pair-and-source", "result": "accept"})
+
+    def test_windows_v2_identity_failure_stops_preflight_and_export_before_runtime(self):
+        env = {**environment(Path("unused")), "GITHUB_REF": base.V2_BRANCH,
+               "GITHUB_JOB": "windows-compatibility-producer"}
+        with mock.patch.object(recovery.os, "name", "nt"), \
+             mock.patch.object(recovery, "inspect_approved_locations", return_value=("GPG_NOT_AVAILABLE", [])), \
+             mock.patch.object(base, "source_identity_v2", side_effect=base.TransportError("candidate-identity")) as source, \
+             mock.patch.object(recovery, "provision_runtime") as provision, \
+             mock.patch.object(recovery, "validated_preflight") as proof, \
+             mock.patch.object(base, "load_capture_modules") as capture_loader, contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(recovery.RecoveryError):
+                recovery.preflight(REPO, env, source_profile=base.V2_PROFILE)
+            tx = base.transaction_id(env["GITHUB_SHA"], env["GITHUB_RUN_ID"], "windows")
+            with self.assertRaises(recovery.RecoveryError):
+                recovery.export_capture(REPO, env, "producer", tx, "failure", source_profile=base.V2_PROFILE)
+            self.assertEqual(source.call_count, 2)
+            provision.assert_not_called()
+            proof.assert_not_called()
+            capture_loader.assert_not_called()
+
+    def test_windows_cli_explicit_profile_dispatch_and_original_default(self):
+        for profile in ("legacy", base.V2_PROFILE):
+            suffix = [] if profile == "legacy" else ["--source-profile", profile]
+            with mock.patch.object(recovery, "preflight") as preflight, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(recovery.main(["preflight", *suffix]), 0)
+                self.assertEqual(preflight.call_args.kwargs, {"source_profile": profile})
+            with mock.patch.object(recovery, "export_capture") as export, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(recovery.main(["export", "--phase", "fresh-replay", "--transaction", "0" * 32,
+                                               "--ordinary-outcome", "failure", *suffix]), 0)
+                self.assertEqual(export.call_args.kwargs, {"source_profile": profile})
+
+    def test_windows_v2_context_dispatch_does_not_change_preflight_body(self):
+        env = {**environment(Path("unused")), "GITHUB_REF": base.V2_BRANCH}
+        fixture = self.source_tests.SourceContractFixture()
+        env["GITHUB_SHA"] = fixture.commit
+        config = {"runtimeDirectory": "synthetic-runtime"}
+        expected_identity = None
+        with fixture.installed():
+            expected_identity = base.source_identity_v2(REPO, fixture.commit)
+        with mock.patch.object(recovery.os, "name", "nt"), \
+             mock.patch.object(recovery, "inspect_approved_locations", return_value=("GPG_NOT_AVAILABLE", [])), \
+             mock.patch.object(base, "source_identity_v2", return_value=expected_identity), \
+             mock.patch.object(recovery, "configuration", return_value=config), \
+             mock.patch.object(recovery, "provision_runtime", return_value=Path("synthetic-runtime")), \
+             mock.patch.object(recovery, "RuntimeLease") as lease, \
+             mock.patch.object(recovery, "RecoveryKeyring") as ring, \
+             mock.patch.object(recovery, "recipient_certificate", return_value=b"public certificate"), \
+             mock.patch.object(recovery, "synthetic_preflight", return_value={"status": "PASS"}), \
+             mock.patch.object(recovery, "private_directory", return_value=Path("synthetic-proof")), \
+             mock.patch.object(recovery, "exclusive") as write, \
+             mock.patch.object(recovery, "write_github_preflight_output") as output, contextlib.redirect_stdout(io.StringIO()):
+            ring.return_value.tool = {}
+            ring.return_value.identity = {}
+            proof = recovery.preflight(REPO, env, source_profile=base.V2_PROFILE)
+            self.assertEqual(proof["candidate"], expected_identity)
+            self.assertEqual(proof["context"]["transaction"], base.transaction_id(fixture.commit, env["GITHUB_RUN_ID"], "windows"))
+            self.assertEqual(proof["synthetic"], {"status": "PASS"})
+            write.assert_called_once()
+            output.assert_called_once_with(env, proof["context"]["transaction"])
+            lease.assert_called_once()
+
+    def test_windows_legacy_functions_constants_and_nonidentity_logic_are_frozen(self):
+        name = "developer/tests/ci/issue13_windows_transport_recovery.py"
+        old = self.source_tests.history_bytes(base.V2_CAPTURE_COMMIT, name).decode().replace("\r\n", "\n")
+        new = (REPO / name).read_text("utf-8")
+        def nodes(source):
+            return {n.name: ast.get_source_segment(source, n) for n in ast.parse(source).body
+                    if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+        old_nodes, new_nodes = nodes(old), nodes(new)
+        for name in old_nodes.keys() - {"preflight", "export_capture", "main"}:
+            self.assertEqual(old_nodes[name], new_nodes[name], name)
+        for name in ("preflight", "export_capture"):
+            actual = new_nodes[name].replace(', *, source_profile="legacy"', '').replace(', source_profile="legacy"', '').replace(
+                'profile_context(environment, source_profile=source_profile)', 'context(environment)').replace(
+                'profile_context(environment, phase, source_profile=source_profile)', 'context(environment, phase)').replace(
+                'profile_source_identity(repo, live["commit"], source_profile=source_profile)', 'source_identity(repo, live["commit"])')
+            self.assertEqual(old_nodes[name], actual, name)
+        for node in ast.parse(old).body:
+            if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+                key = node.targets[0].id
+                self.assertEqual(getattr(self.original, key), getattr(recovery, key), key)
+
+
 if __name__ == "__main__":
     unittest.main()

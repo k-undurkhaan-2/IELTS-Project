@@ -676,6 +676,26 @@ def source_identity(repo, expected_commit):
             "captureCommit": base.CAPTURE_COMMIT, "sources": rows}
 
 
+def profile_context(environment, phase=None, *, source_profile="legacy"):
+    if source_profile == "legacy":
+        return context(environment, phase)
+    require(source_profile == base.V2_PROFILE, "unexpected-transport-category")
+    try:
+        return base.v2_context(environment, phase, platform_name="windows")
+    except base.TransportError:
+        raise RecoveryError("unexpected-transport-category") from None
+
+
+def profile_source_identity(repo, expected_commit, *, source_profile="legacy"):
+    if source_profile == "legacy":
+        return source_identity(repo, expected_commit)
+    require(source_profile == base.V2_PROFILE, "unexpected-transport-category")
+    try:
+        return base.source_identity_v2(repo, expected_commit)
+    except base.TransportError:
+        raise RecoveryError("unexpected-transport-category") from None
+
+
 def recipient_certificate(repo):
     armor = base.git_bytes(repo, "cat-file", "blob", "HEAD:" + base.PUBLIC_KEY_PATH, limit=base.MAX_MANIFEST)
     require(base.digest(armor) == base.PUBLIC_KEY_SHA256, "public-key-pin")
@@ -692,13 +712,13 @@ def write_github_preflight_output(environment, transaction):
         output.write("transaction=" + transaction + "\npreflight=PASS\n")
 
 
-def preflight(repo, environment, *, fetch=None):
+def preflight(repo, environment, *, fetch=None, source_profile="legacy"):
     availability, approved_indices = inspect_approved_locations()
     print(availability)  # Fixed enum only, never the inspected paths or output.
     require(availability != "GPG_RUNTIME_INVALID", "gpg-binary-integrity")
     require(os.name == "nt", "gpg-runtime-closure")
-    live = context(environment)
-    identity = source_identity(repo, live["commit"])
+    live = profile_context(environment, source_profile=source_profile)
+    identity = profile_source_identity(repo, live["commit"], source_profile=source_profile)
     config = configuration(repo)
     temp = Path(environment.get("RUNNER_TEMP", ""))
     # The reviewed recovery configuration explicitly selects the full package.
@@ -761,11 +781,11 @@ def validated_preflight(temp, live, identity):
     return proof  # Export-only scheduling evidence; never read by the verifier.
 
 
-def export_capture(repo, environment, phase, transaction, outcome):
-    live = context(environment, phase)
+def export_capture(repo, environment, phase, transaction, outcome, *, source_profile="legacy"):
+    live = profile_context(environment, phase, source_profile=source_profile)
     require(transaction == live["transaction"] and outcome in ("success", "failure", "cancelled"),
             "unexpected-transport-category")
-    identity = source_identity(repo, live["commit"])
+    identity = profile_source_identity(repo, live["commit"], source_profile=source_profile)
     config = configuration(repo)
     temp = Path(environment.get("RUNNER_TEMP", ""))
     proof = validated_preflight(temp, live, identity)
@@ -807,6 +827,7 @@ class PrivateArgumentParser(argparse.ArgumentParser):
 def main(argv=None):
     parser = PrivateArgumentParser(prog="issue13-windows-transport", description=MARKER, allow_abbrev=False)
     parser.add_argument("mode", choices=("preflight", "export"))
+    parser.add_argument("--source-profile", choices=("legacy", base.V2_PROFILE), default="legacy")
     parser.add_argument("--phase", choices=("producer", "fresh-replay"))
     parser.add_argument("--transaction")
     parser.add_argument("--ordinary-outcome", choices=("success", "failure", "cancelled"))
@@ -816,9 +837,10 @@ def main(argv=None):
         mode = args.mode
         repo = Path(__file__).resolve().parents[3]
         if mode == "preflight":
-            preflight(repo, os.environ)
+            preflight(repo, os.environ, source_profile=args.source_profile)
         else:
-            export_capture(repo, os.environ, args.phase, args.transaction, args.ordinary_outcome)
+            export_capture(repo, os.environ, args.phase, args.transaction, args.ordinary_outcome,
+                           source_profile=args.source_profile)
     except Exception as error:
         print(MARKER + ": " + category(error), file=sys.stderr)
         if mode == "preflight":

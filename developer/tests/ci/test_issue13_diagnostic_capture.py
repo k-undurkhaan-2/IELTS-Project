@@ -831,6 +831,13 @@ class AuthorityPreimageV2Tests(unittest.TestCase):
             old_nodes = {n.name: ast.get_source_segment(old, n) for n in ast.parse(old).body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
             new_nodes = {n.name: ast.get_source_segment(new, n) for n in ast.parse(new).body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
             for function in functions:
+                if function == "preflight":
+                    # Checkpoint A permits only explicit context/source profile
+                    # dispatch here; every runtime/encryption statement stays frozen.
+                    new_nodes[function] = new_nodes[function].replace(', source_profile="legacy"', '').replace(
+                        'profile_context(environment, source_profile=source_profile)', 'context(environment)').replace(
+                        'profile_source_identity(repo, live["commit"], source_profile=source_profile)',
+                        'source_identity(repo, live["commit"])')
                 self.assertEqual(old_nodes[function], new_nodes[function])
         for path in (".github/workflows/ci.yml", ".github/workflows/issue-13-acquisition.yml", ".github/workflows/issue-13-windows-transport-recovery.yml"):
             old = subprocess.check_output(["git", "cat-file", "blob", parent + ":" + path], cwd=ci.REPO_ROOT).replace(b"\r\n", b"\n")
