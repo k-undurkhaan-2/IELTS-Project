@@ -1,0 +1,489 @@
+name: NON-AUTHORITATIVE / DIAGNOSTIC-ONLY / ISSUE-13-AUTHORITY-PREIMAGE-V2
+
+# One acquisition run, only on the first push creating this exact branch.
+# Checkpoint B adds this workflow only; the explicit v2 profile freezes sources to A.
+# Capture/export is diagnostic-only. Ordinary steps retain their own exit codes.
+# The reviewed capture reader requires Ubuntu 687/695/701/702 and Windows
+# 687/692/695/701/702; incomplete preimages or overflow cannot make an export ready.
+# The unchanged Windows preflight permits only its fixed synthetic NO_SECKEY
+# rejection probe. No acquisition bundle is decrypted on a runner.
+on:
+  push:
+    branches:
+      - codex/issue-13-authority-preimage-v2
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue13-authority-preimage-v2-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  acquisition-configuration:
+    name: NON-AUTHORITATIVE / DIAGNOSTIC-ONLY / ISSUE-13-AUTHORITY-PREIMAGE-V2 configuration
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/codex/issue-13-authority-preimage-v2' && github.event.created == true && github.run_attempt == 1 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ubuntu_transaction: ${{ steps.configuration.outputs.ubuntu_transaction }}
+      windows_transaction: ${{ steps.configuration.outputs.windows_transaction }}
+    steps:
+      - name: Check out exact v2 acquisition candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+          ref: ${{ github.sha }}
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Validate acquisition identity and public-only pinned certificate
+        id: configuration
+        run: python -B developer/tests/ci/issue13_acquisition_transport.py configure --source-profile issue13-authority-preimage-v2
+
+  ubuntu-canonical-producer:
+    name: Ubuntu canonical producer (untrusted evidence)
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/codex/issue-13-authority-preimage-v2' && github.event.created == true && github.run_attempt == 1 && needs.acquisition-configuration.result == 'success' }}
+    outputs:
+      diagnostic_ready: ${{ steps.diagnostic-export.outcome == 'success' && steps.private-upload.outcome == 'success' && steps.public-upload.outcome == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    needs:
+      - acquisition-configuration
+    env:
+      ISSUE13_TRANSACTION: ${{ needs.acquisition-configuration.outputs.ubuntu_transaction }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+          ref: ${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.20.0"
+
+      - name: Install locked developer dependencies for untrusted production
+        run: npm --prefix developer ci --ignore-scripts --no-audit --no-fund
+
+      - name: Install locked backend dependencies for untrusted production
+        run: npm --prefix backend ci --ignore-scripts --no-audit --no-fund
+
+      - name: Generate untrusted Ubuntu evidence
+        id: ordinary
+        run: 'python -B developer/tests/ci/run_ci_foundation.py --profile all --issue13-diagnostic-root "$RUNNER_TEMP/issue13-producer" --issue13-diagnostic-transaction "$ISSUE13_TRANSACTION"'
+
+      - name: Upload untrusted Ubuntu evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: untrusted-ubuntu-canonical-${{ runner.os }}-${{ github.run_attempt }}
+          path: |
+            .ci-results/summary.json
+            .ci-results/summary.md
+            .ci-results/observed-debt.json
+            .ci-results/resolved-candidates.json
+            .ci-results/command-results.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: NON-AUTHORITATIVE encrypted diagnostic export
+        id: diagnostic-export
+        if: ${{ always() && steps.ordinary.outcome != 'skipped' && steps.ordinary.outcome != '' }}
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        env:
+          ISSUE13_ORDINARY_OUTCOME: ${{ steps.ordinary.outcome }}
+        run: 'python -B developer/tests/ci/issue13_acquisition_transport.py export --source-profile issue13-authority-preimage-v2 --phase producer --transaction "$ISSUE13_TRANSACTION" --ordinary-outcome "$ISSUE13_ORDINARY_OUTCOME"'
+
+      - name: Upload encrypted private diagnostic bundle only
+        id: private-upload
+        if: ${{ always() && steps.diagnostic-export.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue13-private-ubuntu-canonical-producer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/issue13-producer-export/issue13-private.tar.gz.gpg
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload separately shareable diagnostic JSON
+        id: public-upload
+        if: ${{ always() && steps.diagnostic-export.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue13-public-ubuntu-canonical-producer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/issue13-producer-export/public.json
+            ${{ runner.temp }}/issue13-producer-export/transport.json
+          if-no-files-found: error
+          retention-days: 1
+
+  ubuntu-canonical:
+    name: Ubuntu canonical validation
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/codex/issue-13-authority-preimage-v2' && github.event.created == true && github.run_attempt == 1 && needs.acquisition-configuration.result == 'success' && needs.ubuntu-canonical-producer.outputs.diagnostic_ready == 'true' }}
+    outputs:
+      diagnostic_ready: ${{ steps.diagnostic-export.outcome == 'success' && steps.private-upload.outcome == 'success' && steps.public-upload.outcome == 'success' }}
+    needs:
+      - acquisition-configuration
+      - ubuntu-canonical-producer
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    env:
+      ISSUE13_TRANSACTION: ${{ needs.acquisition-configuration.outputs.ubuntu_transaction }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+          ref: ${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.20.0"
+
+      - name: Capture trusted runtime paths
+        shell: bash
+        run: |
+          python_path="$pythonLocation/bin/python"
+          node_path="$(command -v node)"
+          npm_path="$(command -v npm)"
+          test -x "$python_path"
+          test -x "$node_path"
+          test -e "$npm_path"
+          printf 'CI_TRUSTED_PYTHON=%s\n' "$(realpath "$python_path")" >> "$GITHUB_ENV"
+          printf 'CI_TRUSTED_NODE=%s\n' "$(realpath "$node_path")" >> "$GITHUB_ENV"
+          printf 'CI_TRUSTED_NPM_ENTRY=%s\n' "$(realpath "$npm_path")" >> "$GITHUB_ENV"
+          printf 'CI_FRESH_DEPENDENCY_INSTALL=1\n' >> "$GITHUB_ENV"
+
+      - name: Require initially absent dependency roots
+        shell: bash
+        run: |
+          test ! -e developer/node_modules
+          test ! -e backend/node_modules
+
+      - name: Install fresh locked developer dependencies
+        shell: bash
+        run: '"$CI_TRUSTED_NODE" "$CI_TRUSTED_NPM_ENTRY" --prefix developer ci --ignore-scripts --no-audit --no-fund'
+
+      - name: Install fresh locked backend dependencies
+        shell: bash
+        run: '"$CI_TRUSTED_NODE" "$CI_TRUSTED_NPM_ENTRY" --prefix backend ci --ignore-scripts --no-audit --no-fund'
+
+      - name: Download untrusted Ubuntu evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: untrusted-ubuntu-canonical-${{ runner.os }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-untrusted/ubuntu-canonical
+
+      - name: Verify untrusted Ubuntu evidence by fresh replay
+        shell: bash
+        id: ordinary
+        run: '"$CI_TRUSTED_PYTHON" -B developer/tests/ci/run_ci_foundation.py --verify-evidence --expected-profile all --expected-producer-job ubuntu-canonical-producer --expected-verifier-job ubuntu-canonical --expected-runner-os Linux --untrusted-evidence-root "$RUNNER_TEMP/ci-untrusted/ubuntu-canonical" --require-linux-containment-self-test --require-fresh-runtime-closure --issue13-diagnostic-root "$RUNNER_TEMP/issue13-replay" --issue13-diagnostic-transaction "$ISSUE13_TRANSACTION"'
+
+      - name: NON-AUTHORITATIVE encrypted diagnostic export
+        id: diagnostic-export
+        if: ${{ always() && steps.ordinary.outcome != 'skipped' && steps.ordinary.outcome != '' }}
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        env:
+          ISSUE13_ORDINARY_OUTCOME: ${{ steps.ordinary.outcome }}
+        run: '"$CI_TRUSTED_PYTHON" -B developer/tests/ci/issue13_acquisition_transport.py export --source-profile issue13-authority-preimage-v2 --phase fresh-replay --transaction "$ISSUE13_TRANSACTION" --ordinary-outcome "$ISSUE13_ORDINARY_OUTCOME"'
+
+      - name: Upload encrypted private diagnostic bundle only
+        id: private-upload
+        if: ${{ always() && steps.diagnostic-export.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue13-private-ubuntu-canonical-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/issue13-replay-export/issue13-private.tar.gz.gpg
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload separately shareable diagnostic JSON
+        id: public-upload
+        if: ${{ always() && steps.diagnostic-export.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue13-public-ubuntu-canonical-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/issue13-replay-export/public.json
+            ${{ runner.temp }}/issue13-replay-export/transport.json
+          if-no-files-found: error
+          retention-days: 1
+
+  windows-gnupg-preflight:
+    name: Windows GnuPG diagnostic preflight
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/codex/issue-13-authority-preimage-v2' && github.event.created == true && github.run_attempt == 1 }}
+    runs-on: windows-latest
+    timeout-minutes: 10
+    outputs:
+      transaction: ${{ steps.preflight.outputs.transaction }}
+      preflight: ${{ steps.preflight.outputs.preflight }}
+    steps:
+      - name: Check out exact v2 acquisition candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+          ref: ${{ github.sha }}
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Validate complete pinned GnuPG runtime and synthetic encryption
+        id: preflight
+        shell: pwsh
+        run: python -B developer/tests/ci/issue13_windows_transport_recovery.py preflight --source-profile issue13-authority-preimage-v2
+
+  windows-compatibility-producer:
+    name: Windows compatibility producer (untrusted evidence)
+    runs-on: windows-latest
+    timeout-minutes: 55
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/codex/issue-13-authority-preimage-v2' && github.event.created == true && github.run_attempt == 1 && needs.windows-gnupg-preflight.outputs.preflight == 'PASS' }}
+    outputs:
+      diagnostic_ready: ${{ steps.diagnostic-export.outcome == 'success' && steps.private-upload.outcome == 'success' && steps.public-upload.outcome == 'success' }}
+    needs:
+      - windows-gnupg-preflight
+    env:
+      ISSUE13_TRANSACTION: ${{ needs.windows-gnupg-preflight.outputs.transaction }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+          ref: ${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Require local Windows GnuPG synthetic preflight
+        id: local-preflight
+        shell: pwsh
+        run: python -B developer/tests/ci/issue13_windows_transport_recovery.py preflight --source-profile issue13-authority-preimage-v2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.20.0"
+
+      - name: Install locked developer dependencies for untrusted production
+        run: npm --prefix developer ci --ignore-scripts --no-audit --no-fund
+
+      - name: Install locked backend dependencies for untrusted production
+        run: npm --prefix backend ci --ignore-scripts --no-audit --no-fund
+
+      - name: Generate untrusted Windows evidence
+        id: ordinary
+        run: 'python -B developer/tests/ci/run_ci_foundation.py --profile all --issue13-diagnostic-root "$env:RUNNER_TEMP/issue13-producer" --issue13-diagnostic-transaction "$env:ISSUE13_TRANSACTION"'
+
+      - name: Upload untrusted Windows evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: untrusted-windows-compatibility-${{ runner.os }}-${{ github.run_attempt }}
+          path: |
+            .ci-results/summary.json
+            .ci-results/summary.md
+            .ci-results/observed-debt.json
+            .ci-results/resolved-candidates.json
+            .ci-results/command-results.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: NON-AUTHORITATIVE encrypted diagnostic export
+        id: diagnostic-export
+        if: ${{ always() && steps.ordinary.outcome != 'skipped' && steps.ordinary.outcome != '' }}
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          ISSUE13_ORDINARY_OUTCOME: ${{ steps.ordinary.outcome }}
+        run: 'python -B developer/tests/ci/issue13_windows_transport_recovery.py export --source-profile issue13-authority-preimage-v2 --phase producer --transaction "$env:ISSUE13_TRANSACTION" --ordinary-outcome "$env:ISSUE13_ORDINARY_OUTCOME"'
+
+      - name: Upload encrypted private diagnostic bundle only
+        id: private-upload
+        if: ${{ always() && steps.diagnostic-export.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue13-private-windows-compatibility-producer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/issue13-producer-export/issue13-private.tar.gz.gpg
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload separately shareable diagnostic JSON
+        id: public-upload
+        if: ${{ always() && steps.diagnostic-export.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue13-public-windows-compatibility-producer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/issue13-producer-export/public.json
+            ${{ runner.temp }}/issue13-producer-export/transport.json
+          if-no-files-found: error
+          retention-days: 1
+
+  windows-compatibility:
+    name: Windows compatibility validation
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/codex/issue-13-authority-preimage-v2' && github.event.created == true && github.run_attempt == 1 && needs.windows-gnupg-preflight.outputs.preflight == 'PASS' && needs.windows-compatibility-producer.outputs.diagnostic_ready == 'true' }}
+    outputs:
+      diagnostic_ready: ${{ steps.diagnostic-export.outcome == 'success' && steps.private-upload.outcome == 'success' && steps.public-upload.outcome == 'success' }}
+    needs:
+      - windows-gnupg-preflight
+      - windows-compatibility-producer
+    runs-on: windows-latest
+    timeout-minutes: 65
+    env:
+      ISSUE13_TRANSACTION: ${{ needs.windows-gnupg-preflight.outputs.transaction }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+          ref: ${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Require local Windows GnuPG synthetic preflight
+        id: local-preflight
+        shell: pwsh
+        run: python -B developer/tests/ci/issue13_windows_transport_recovery.py preflight --source-profile issue13-authority-preimage-v2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.20.0"
+
+      - name: Capture trusted runtime paths
+        shell: pwsh
+        run: |
+          $pythonPath = (Resolve-Path -LiteralPath (Join-Path $env:pythonLocation 'python.exe')).Path
+          if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) { throw 'trusted Python is unavailable' }
+          $runtimeCapture = @'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'developer/tests/ci')
+          import run_ci_foundation as ci
+          source = dict(os.environ)
+          tools, errors = ci.resolve_trusted_tools({'node'}, source_environment=source)
+          if errors:
+              raise SystemExit('trusted Node capture rejected by tool authority')
+          source['CI_TRUSTED_NODE'] = tools['node']
+          source['CI_TRUSTED_NPM_ENTRY'] = str(Path(tools['node']).parent / 'node_modules' / 'npm' / 'bin' / 'npm-cli.js')
+          tools, errors = ci.resolve_trusted_tools({'node', 'npm'}, source_environment=source)
+          if errors:
+              raise SystemExit('trusted Node/npm capture rejected by tool authority')
+          print(json.dumps({'node': tools['node'], 'npmEntry': tools['npm']}))
+          '@
+          $runtimeJson = & $pythonPath -B -c $runtimeCapture
+          if ($LASTEXITCODE -ne 0) { throw 'trusted Node/npm capture failed' }
+          $runtimePaths = $runtimeJson | ConvertFrom-Json
+          $nodePath = [string]$runtimePaths.node
+          $npmEntry = [string]$runtimePaths.npmEntry
+          if (-not (Test-Path -LiteralPath $nodePath -PathType Leaf)) { throw 'trusted Node is unavailable' }
+          if (-not (Test-Path -LiteralPath $npmEntry -PathType Leaf)) { throw 'trusted npm entry is unavailable' }
+          "CI_TRUSTED_PYTHON=$pythonPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CI_TRUSTED_NODE=$nodePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CI_TRUSTED_NPM_ENTRY=$npmEntry" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CI_FRESH_DEPENDENCY_INSTALL=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Require initially absent dependency roots
+        shell: pwsh
+        run: |
+          if (Test-Path -LiteralPath 'developer/node_modules') { throw 'developer/node_modules was not fresh' }
+          if (Test-Path -LiteralPath 'backend/node_modules') { throw 'backend/node_modules was not fresh' }
+
+      - name: Install fresh locked developer dependencies
+        shell: pwsh
+        run: '& $env:CI_TRUSTED_NODE $env:CI_TRUSTED_NPM_ENTRY --prefix developer ci --ignore-scripts --no-audit --no-fund'
+
+      - name: Install fresh locked backend dependencies
+        shell: pwsh
+        run: '& $env:CI_TRUSTED_NODE $env:CI_TRUSTED_NPM_ENTRY --prefix backend ci --ignore-scripts --no-audit --no-fund'
+
+      - name: Download untrusted Windows evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: untrusted-windows-compatibility-${{ runner.os }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-untrusted/windows-compatibility
+
+      - name: Verify untrusted Windows evidence by fresh replay
+        shell: pwsh
+        id: ordinary
+        run: '& $env:CI_TRUSTED_PYTHON -B developer/tests/ci/run_ci_foundation.py --verify-evidence --expected-profile all --expected-producer-job windows-compatibility-producer --expected-verifier-job windows-compatibility --expected-runner-os Windows --untrusted-evidence-root "$env:RUNNER_TEMP/ci-untrusted/windows-compatibility" --require-fresh-runtime-closure --issue13-diagnostic-root "$env:RUNNER_TEMP/issue13-replay" --issue13-diagnostic-transaction "$env:ISSUE13_TRANSACTION"'
+
+      - name: NON-AUTHORITATIVE encrypted diagnostic export
+        id: diagnostic-export
+        if: ${{ always() && steps.ordinary.outcome != 'skipped' && steps.ordinary.outcome != '' }}
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          ISSUE13_ORDINARY_OUTCOME: ${{ steps.ordinary.outcome }}
+        run: '& $env:CI_TRUSTED_PYTHON -B developer/tests/ci/issue13_windows_transport_recovery.py export --source-profile issue13-authority-preimage-v2 --phase fresh-replay --transaction "$env:ISSUE13_TRANSACTION" --ordinary-outcome "$env:ISSUE13_ORDINARY_OUTCOME"'
+
+      - name: Upload encrypted private diagnostic bundle only
+        id: private-upload
+        if: ${{ always() && steps.diagnostic-export.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue13-private-windows-compatibility-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/issue13-replay-export/issue13-private.tar.gz.gpg
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload separately shareable diagnostic JSON
+        id: public-upload
+        if: ${{ always() && steps.diagnostic-export.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue13-public-windows-compatibility-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/issue13-replay-export/public.json
+            ${{ runner.temp }}/issue13-replay-export/transport.json
+          if-no-files-found: error
+          retention-days: 1
