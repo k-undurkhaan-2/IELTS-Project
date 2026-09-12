@@ -11,6 +11,7 @@ import ast
 import copy
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -20,11 +21,16 @@ import sys
 import issue13_diagnostic_reporters as reporters
 
 MARKER = "NON-AUTHORITATIVE / DIAGNOSTIC-ONLY"
-VERSION = 1
+VERSION = 2
 MAX_COMMANDS = 8
-MAX_RECORD_BYTES = 2 * 1024 * 1024
+MAX_RECORD_BYTES = 8 * 1024 * 1024
+MAX_COMMAND_RECORD_BYTES = 6 * 1024 * 1024
+MAX_TARGET_BYTES = 1024 * 1024
+MAX_INPUT_BYTES = 2 * 1024 * 1024
+MAX_AUTHORITY_ENTRIES = 2048
 MAX_PUBLIC_BYTES = 256 * 1024
-MAX_TOTAL_BYTES = MAX_COMMANDS * (2 * reporters.MAX_STREAM_BYTES + MAX_RECORD_BYTES) + MAX_PUBLIC_BYTES
+# Preserve the v1 aggregate/transport budget; larger records share this cap.
+MAX_TOTAL_BYTES = 48 * 1024 * 1024 + MAX_PUBLIC_BYTES
 MAX_COMMAND_INVENTORY = 4096
 FAMILIES = ("frontend-security", "backend-canonical", "standalone-packaging")
 FRONTEND_IDS = frozenset({
@@ -78,15 +84,18 @@ def _bounded_json(value, limit):
     def walk(item, depth):
         nonlocal nodes
         nodes += 1
-        if nodes > 60_000 or depth > 16:
+        if nodes > 400_000 or depth > 16:
             raise DiagnosticError("schema-bound")
         if item is None or type(item) is bool:
             return
         if type(item) is int:
             if not -(2 ** 31) <= item <= 2 ** 40:
                 raise DiagnosticError("schema-bound")
+        elif type(item) is float:
+            if not math.isfinite(item) or abs(item) > 2 ** 40:
+                raise DiagnosticError("schema-bound")
         elif type(item) is str:
-            if len(item.encode("utf-8")) > reporters.MAX_STREAM_BYTES:
+            if len(item) > reporters.MAX_STREAM_BYTES or len(item.encode("utf-8")) > reporters.MAX_STREAM_BYTES:
                 raise DiagnosticError("schema-bound")
         elif type(item) is list:
             if len(item) > reporters.MAX_LINES:
@@ -101,10 +110,17 @@ def _bounded_json(value, limit):
         else:
             raise DiagnosticError("schema-type")
     walk(value, 0)
-    data = _json(value)
-    if len(data) > limit:
-        raise DiagnosticError("schema-bound")
-    return data
+    # Bound encoding as well as storage; do not allocate an unbounded JSON blob
+    # before discovering that a diagnostic value exceeds its private budget.
+    chunks, total = [], 1  # final newline
+    encoder = json.JSONEncoder(ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    for chunk in encoder.iterencode(value):
+        encoded = chunk.encode("ascii")
+        total += len(encoded)
+        if total > limit:
+            raise DiagnosticError("schema-bound")
+        chunks.append(encoded)
+    return b"".join(chunks) + b"\n"
 
 
 # An exact-key public schema: no free text, arbitrary property names, raw identities,
@@ -169,6 +185,10 @@ FAILURE_SCHEMA = {
     "setBinding": BOOL, "captureObservationBinding": BOOL,
     "processSemanticDigest": _digest,
 }
+PREIMAGE_INFO_SCHEMA = {
+    "present": BOOL, "entryCount": _count, "fieldCount": _count,
+    "jsonBytes": _count, "jsonSha256": _digest, "productionDigest": _digest,
+}
 ROW_SCHEMA = {
     "ordinal": _count, "commandIdDigest": _digest, "family": _enum(*FAMILIES),
     "exitCode": EXIT, "captureExitCode": EXIT, "captureExecuted": BOOL,
@@ -201,6 +221,12 @@ ROW_SCHEMA = {
         "errorPresent": BOOL, "processTreeErrorPresent": BOOL,
     },
     "privateRecordSha256": _digest, "privateRecordBytes": _count,
+    "authorityPreimages": {
+        "schema": _enum("Issue13AuthorityPreimagesV2"),
+        "bindingDigest": _digest, "commandRecordPresent": BOOL,
+        "commandRecordBytes": _count, "expectedAuthorityPresent": BOOL,
+        "targets": PREIMAGE_INFO_SCHEMA, "executionInputBundle": PREIMAGE_INFO_SCHEMA,
+    },
 }
 PUBLIC_SCHEMA = {
     "schema": _enum("Issue13DiagnosticCapture"), "version": lambda v: type(v) is int and v == VERSION,
@@ -220,6 +246,9 @@ def validate_public(value):
     ordinals = [r["ordinal"] for r in value["records"]] + [r["ordinal"] for r in value["errors"]]
     if len(set(ordinals)) != len(ordinals):
         raise DiagnosticError("schema-duplicate")
+    for rows in (value["records"], value["errors"]):
+        if [r["ordinal"] for r in rows] != sorted(r["ordinal"] for r in rows):
+            raise DiagnosticError("schema-order")
     return _bounded_json(value, MAX_PUBLIC_BYTES)
 
 
@@ -472,17 +501,170 @@ def _observations(ci, record, capture):
     return public, derived, copy.deepcopy(raw_set)
 
 
-def build_record(ci, runner, record, expected, capture, repo_root):
+def _capture_context(runner, transaction, phase):
+    binding = getattr(runner, "execution_binding", {})
+    value = {
+        "transaction": transaction, "phase": phase, "platform": runner.platform,
+        "profile": runner.profile, "candidateCommit": binding.get("checkoutCommit"),
+        "candidateTree": binding.get("checkoutTree"),
+    }
+    _check(value, CAPTURE_CONTEXT_SCHEMA)
+    return value
+
+
+HEX40 = lambda v: type(v) is str and re.fullmatch(r"[0-9a-f]{40}", v) is not None
+HEX64 = lambda v: type(v) is str and re.fullmatch(r"[0-9a-f]{64}", v) is not None
+PRIVATE_TEXT = lambda v: type(v) is str and 0 < len(v.encode("utf-8")) <= 4096 and not any(c in v for c in "\0\r\n")
+CAPTURE_CONTEXT_SCHEMA = {
+    **{k: PUBLIC_SCHEMA[k] for k in ("transaction", "phase", "platform", "profile")},
+    "candidateCommit": HEX40, "candidateTree": HEX40,
+}
+CAPTURE_BINDING_SCHEMA = {
+    **CAPTURE_CONTEXT_SCHEMA, "commandId": PRIVATE_TEXT, "ordinal": _count,
+    "commandRecordDigest": _digest, "expectedAuthorityDigest": _digest,
+    "targetsDigest": _digest, "executionInputBundleDigest": _digest,
+    "executionInputContextDigest": _digest,
+}
+IDENTITY_SCHEMA = {
+    **{k: lambda v: type(v) is str and re.fullmatch(r"-?[0-9]{1,40}", v) is not None
+       for k in ("deviceOrVolume", "inodeOrFileIndex", "creationOrChangeTimeNs", "writeTimeNs")},
+    "reparsePoint": lambda v: v is False,
+}
+TARGET_SCHEMA = {
+    "path": PRIVATE_TEXT, "canonicalSourcePath": PRIVATE_TEXT, "size": _count,
+    "sha256": HEX64, "fileIdentity": IDENTITY_SCHEMA,
+    "modeType": _enum("regular-file"), "reparsePoint": lambda v: v is False,
+}
+INPUT_SCHEMA = {
+    "logicalPath": PRIVATE_TEXT, "canonicalSourcePath": PRIVATE_TEXT,
+    "plannedByteLength": _count, "plannedSha256": HEX64,
+    "plannedStableIdentity": IDENTITY_SCHEMA, "actualByteLength": _count,
+    "actualSha256": HEX64, "inputMode": _enum("PROTECTED-TARGET-BUNDLE"),
+}
+
+
+def _field_count(value):
+    if type(value) is dict:
+        return len(value) + sum(_field_count(v) for v in value.values())
+    if type(value) is list:
+        return sum(_field_count(v) for v in value)
+    return 0
+
+
+def _preimage_info(ci, values, limit):
+    data = _bounded_json(values, limit)
+    return {"present": True, "entryCount": len(values), "fieldCount": _field_count(values),
+            "jsonBytes": len(data), "jsonSha256": sha(data),
+            "productionDigest": ci.canonical_failure_digest(values)}
+
+
+def validate_authority_preimages(ci, value, *, row=None, summary=None):
+    """Bind full raw values using production framing, without a portable projection.
+
+    v1's input context field hashes a digest STRING, not the input array. Retain
+    both exact levels: D(inputs) == record digest; D(record digest) == context.
+    JSON hashes additionally bind the unchanged private string spellings.
+    """
+    binding = value["captureBinding"]
+    _check(binding, CAPTURE_BINDING_SCHEMA)
+    record, expected = value["commandRecord"], value["expectedAuthority"]
+    record_bytes = _bounded_json(record, MAX_COMMAND_RECORD_BYTES)
+    _bounded_json(expected, MAX_INPUT_BYTES)
+    if (type(expected) is not dict or set(expected) != set(AUTHORITY_FIELDS)
+        or type(record) is not dict or "validatedStaticMachineReport" in record):
+        raise DiagnosticError("authority-schema")
+    if (record.get("commandClass") not in FAMILIES
+        or record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or any(k not in record or _json(record[k]) != _json(expected[k]) for k in expected)):
+        raise DiagnosticError("authority-correspondence")
+    for key in ("ordinal", "commandId", "profile", "platform"):
+        if record.get(key) != binding[key]:
+            raise DiagnosticError("authority-context")
+    targets, inputs = expected["targets"], record.get("executionInputs")
+    _check(targets, _list(TARGET_SCHEMA, MAX_AUTHORITY_ENTRIES))
+    _check(inputs, _list(INPUT_SCHEMA, MAX_AUTHORITY_ENTRIES))
+    if not targets or len(inputs) != len(targets):
+        raise DiagnosticError("authority-count")
+    for values, key in ((targets, "path"), (inputs, "logicalPath")):
+        names = [v[key] for v in values]
+        # Also reject identifiers that collide under the production text codec.
+        if len(set(names)) != len(names) or len({ci.canonical_failure_digest(n) for n in names}) != len(names):
+            raise DiagnosticError("authority-duplicate")
+    target_info = _preimage_info(ci, targets, MAX_TARGET_BYTES)
+    input_info = _preimage_info(ci, inputs, MAX_INPUT_BYTES)
+    # Production derivation preserves list order; never sort or repair inputs.
+    if (ci.execution_input_bundle_digest(inputs) != record.get("executionInputBundleDigest")
+        or binding["executionInputBundleDigest"] != record["executionInputBundleDigest"]
+        or binding["executionInputContextDigest"] != ci.canonical_failure_digest(record["executionInputBundleDigest"])
+        or binding["targetsDigest"] != target_info["productionDigest"]
+        or binding["commandRecordDigest"] != ci.canonical_failure_digest(record)
+        or binding["expectedAuthorityDigest"] != ci.canonical_failure_digest(expected)):
+        raise DiagnosticError("authority-digest")
+    # Full records only. No reconstruction, compacting, normalization, or
+    # portable digest helper is reachable for this selected capture schema.
+    bundle = record.get("protectedTargetBundle")
+    if (type(bundle) is not dict or bundle.get("executionInputs") != inputs
+        or bundle.get("orderedLogicalTargetPaths") != [t["path"] for t in targets]):
+        raise DiagnosticError("authority-order")
+    for target, item in zip(targets, inputs):
+        if (item["logicalPath"] != target["path"]
+            or item["canonicalSourcePath"] != target["canonicalSourcePath"]
+            or item["plannedStableIdentity"] != target["fileIdentity"]
+            or item["plannedByteLength"] != target["size"]
+            or item["plannedSha256"] != target["sha256"]
+            or item["actualByteLength"] != item["plannedByteLength"]
+            or item["actualSha256"] != item["plannedSha256"]):
+            raise DiagnosticError("authority-order")
+    errors = []
+    ci._validate_command_record(record, record["ordinal"], errors, expected_record=expected)
+    if errors:
+        raise DiagnosticError("authority-record-schema")
+    info = {"schema": "Issue13AuthorityPreimagesV2", "bindingDigest": ci.canonical_failure_digest(binding),
+            "commandRecordPresent": True, "commandRecordBytes": len(record_bytes),
+            "expectedAuthorityPresent": True, "targets": target_info, "executionInputBundle": input_info}
+    if row is not None:
+        if (row["authorityPreimages"] != info
+            or row["commandRecordDigest"] != binding["commandRecordDigest"]
+            or row["expectedAuthorityDigest"] != binding["expectedAuthorityDigest"]
+            or row["ordinal"] != binding["ordinal"] or row["family"] != record["commandClass"]
+            or row["commandIdDigest"] != sha(binding["commandId"].encode("utf-8"))
+            or row["authorityFieldDigests"] != {k: ci.canonical_failure_digest(expected[k]) for k in AUTHORITY_FIELDS}
+            or row["contextFieldDigests"] != {k: ci.canonical_failure_digest(record.get(k)) for k in CONTEXT_FIELDS}):
+            raise DiagnosticError("authority-public-binding")
+        bundle_state = {**record, "cleanupState": bundle["cleanupState"], "mutationDetected": bundle["mutationDetected"]}
+        if row["stateFieldDigests"] != {k: ci.canonical_failure_digest(bundle_state.get(k)) for k in row["stateFieldDigests"]}:
+            raise DiagnosticError("authority-state-binding")
+        for name in ("stdout", "stderr"):
+            stream = row["streams"][name]
+            if (not stream["exact"] or stream["sha256"] != "sha256:" + record[name + "Sha256"]
+                or stream["bytesObserved"] != record[name + "BytesObserved"]):
+                raise DiagnosticError("authority-stream-binding")
+    if summary is not None and any(binding[k] != summary[k] for k in ("transaction", "phase", "platform", "profile")):
+        raise DiagnosticError("authority-context")
+    return info
+
+
+def build_record(ci, runner, record, expected, capture, repo_root, *, context):
     # All CI functions receive detached dictionaries. No function called here runs
     # commands, changes classifications, finalizes transcripts, or creates envelopes.
+    _bounded_json(record, MAX_COMMAND_RECORD_BYTES)
+    _bounded_json(expected, MAX_INPUT_BYTES)
+    if ("validatedStaticMachineReport" in record
+        or record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or not record.get("executionInputs")):
+        raise DiagnosticError("authority-schema")
+    _check(expected.get("targets"), _list(TARGET_SCHEMA, MAX_AUTHORITY_ENTRIES))
+    _check(record.get("executionInputs"), _list(INPUT_SCHEMA, MAX_AUTHORITY_ENTRIES))
     record, expected = copy.deepcopy(record), copy.deepcopy(expected)
     errors = []
     hard = ci._validate_command_record(record, record["ordinal"], errors, expected_record=expected)
-    authority_matches = ci._portable_command_plan_value([
-        {k: record.get(k) for k in expected}
-    ]) == ci._portable_command_plan_value([expected])
+    authority_matches = all(k in record and _json(record[k]) == _json(v) for k, v in expected.items())
     stdout, out_info = _stream(record, capture, "stdout")
     stderr, err_info = _stream(record, capture, "stderr")
+    if (not out_info["exact"] or not err_info["exact"] or capture.command_id != record["commandId"]
+        or capture.command_class != record["commandClass"] or capture.exit_code != record.get("exitCode")
+        or capture.executed != record.get("executed")):
+        raise DiagnosticError("capture-stream-binding")
     authority, banner, inventory = _source_authority(ci, runner, expected, record, repo_root)
     observations, facts, raw_set = _observations(ci, record, capture)
     family = record["commandClass"]
@@ -506,6 +688,13 @@ def build_record(ci, runner, record, expected, capture, repo_root):
         "schema": "Issue13PrivatePreimages", "version": VERSION, "authority": MARKER,
         "reporter": report, "failureOutputs": facts, "observationSetInputs": raw_set,
         "sourceOutputInputs": {k: record.get(k) for k in STREAM_FIELDS},
+        "commandRecord": record, "expectedAuthority": expected,
+        "captureBinding": {**context, "ordinal": record["ordinal"], "commandId": record["commandId"],
+            "commandRecordDigest": ci.canonical_failure_digest(record),
+            "expectedAuthorityDigest": ci.canonical_failure_digest(expected),
+            "targetsDigest": ci.canonical_failure_digest(expected.get("targets")),
+            "executionInputBundleDigest": record.get("executionInputBundleDigest"),
+            "executionInputContextDigest": ci.canonical_failure_digest(record.get("executionInputBundleDigest"))},
     }
     private_bytes = validate_private(ci, private)
     public_report = {k: v for k, v in report.items() if k not in ("members", "counts")}
@@ -543,8 +732,10 @@ def build_record(ci, runner, record, expected, capture, repo_root):
             "errorPresent": bool(record.get("error")), "processTreeErrorPresent": bool(record.get("processTreeError")),
         },
         "privateRecordSha256": sha(private_bytes), "privateRecordBytes": len(private_bytes),
+        "authorityPreimages": validate_authority_preimages(ci, private),
     }
     _check(row, ROW_SCHEMA)
+    validate_authority_preimages(ci, private, row=row, summary=context)
     return row, private_bytes, stdout, stderr
 
 
@@ -556,10 +747,14 @@ def validate_private(ci, value):
     kind = value.get("reporter", {}).get("kind") if type(value) is dict else None
     count_keys = reporters.PYTHON_COUNTS if kind == "python-unittest" else reporters.NODE_COUNTS
     private_report_schema["counts"] = {k: _nullable(_count) for k in count_keys}
-    if type(value) is not dict or set(value) != {"schema", "version", "authority", "reporter", "failureOutputs", "observationSetInputs", "sourceOutputInputs"}:
+    if type(value) is not dict or set(value) != {"schema", "version", "authority", "reporter", "failureOutputs", "observationSetInputs", "sourceOutputInputs", "commandRecord", "expectedAuthority", "captureBinding"}:
         raise DiagnosticError("private-schema")
     if value["schema"] != "Issue13PrivatePreimages" or type(value["version"]) is not int or value["version"] != VERSION or value["authority"] != MARKER:
         raise DiagnosticError("private-schema")
+    validate_authority_preimages(ci, value)
+    if (value["sourceOutputInputs"] != {k: value["commandRecord"].get(k) for k in STREAM_FIELDS}
+        or value["observationSetInputs"] != value["commandRecord"].get("producerObservations")):
+        raise DiagnosticError("private-command-binding")
     _check(value["reporter"], private_report_schema)
     _check(value["sourceOutputInputs"], {k: (lambda v: type(v) is str and re.fullmatch(r"[0-9a-f]{64}", v) is not None) if k.endswith("Sha256") else _count for k in STREAM_FIELDS})
     raw_set, facts = value["observationSetInputs"], value["failureOutputs"]
@@ -586,7 +781,30 @@ def relevant(record, platform_name):
     if family == "frontend-security":
         return (hashlib.sha256(str(record.get("commandId")).encode("utf-8")).hexdigest() in FRONTEND_IDS
                 or record.get("exitCode") != 0)
-    return family == "backend-canonical" or (family == "standalone-packaging" and platform_name == "ubuntu")
+    return family in ("backend-canonical", "standalone-packaging")
+
+
+def _required_all_records(platform_name):
+    records = {
+        (687, "frontend-security", "sha256:d2dfc48e671db284a5aa30caa653d3b6c1e4fbb24aedf560c23488077666cf64"),
+        (695, "frontend-security", "sha256:410b1a676541c6a2bbe516852c6186e2825df76d2ce643d57c0aa911012af089"),
+        (701, "backend-canonical", sha(b"backend-canonical")),
+        (702, "standalone-packaging", sha(b"standalone-packaging")),
+    }
+    if platform_name == "windows":
+        records.add((692, "frontend-security", "sha256:bc0f8fad69fa4449a9b1496fef3b8234ec2e47364bd3d0e88dd435ef41dd7078"))
+    return records
+
+
+def validate_exportable(summary):
+    """An incomplete diagnostic capture may exist privately, but cannot export."""
+    validate_public(summary)
+    if summary["errors"] or summary["overflowCount"]:
+        raise DiagnosticError("capture-incomplete")
+    if summary["profile"] == "all":
+        present = {(r["ordinal"], r["family"], r["commandIdDigest"]) for r in summary["records"]}
+        if not _required_all_records(summary["platform"]).issubset(present):
+            raise DiagnosticError("capture-membership")
 
 
 def capture_completed_runner(ci, runner, *, root, transaction, phase, repo_root):
@@ -597,18 +815,29 @@ def capture_completed_runner(ci, runner, *, root, transaction, phase, repo_root)
     if len(runner.command_results) > MAX_COMMAND_INVENTORY or len(runner.command_plan) > MAX_COMMAND_INVENTORY or len(runner.captures) > MAX_COMMAND_INVENTORY:
         raise DiagnosticError("command-bound")
     selected = [r for r in runner.command_results if relevant(r, runner.platform)]
-    selected.sort(key=lambda r: r["ordinal"])
+    ordinals = [r.get("ordinal") for r in selected]
+    ids = [r.get("commandId") for r in selected]
+    if (len(selected) > MAX_COMMANDS or any(not _count(n) for n in ordinals)
+        or ordinals != sorted(set(ordinals)) or len(ids) != len(set(ids))):
+        raise DiagnosticError("capture-membership")
+    if runner.profile == "all":
+        present = {(r["ordinal"], r["commandClass"], sha(r["commandId"].encode("utf-8"))) for r in selected}
+        if not _required_all_records(runner.platform).issubset(present):
+            raise DiagnosticError("capture-membership")
+    context = _capture_context(runner, transaction, phase)
     destination = PrivateDestination(root, repo_root)
     summary = {"schema": "Issue13DiagnosticCapture", "version": VERSION, "authority": MARKER,
                "transaction": transaction, "phase": phase, "platform": runner.platform, "profile": runner.profile,
-               "selectedCount": len(selected), "overflowCount": max(0, len(selected) - MAX_COMMANDS), "records": [], "errors": []}
-    for index, record in enumerate(selected[:MAX_COMMANDS]):
+               "selectedCount": len(selected), "overflowCount": 0, "records": [], "errors": []}
+    for index, record in enumerate(selected):
         try:
             expected = [r for r in runner.command_plan if r.get("commandId") == record.get("commandId") and r.get("ordinal") == record.get("ordinal")]
             captures = [c for c in runner.captures if c.command_id == record.get("commandId")]
             if len(expected) != 1 or len(captures) != 1:
                 raise DiagnosticError("capture-membership")
-            row, private, stdout, stderr = build_record(ci, runner, record, expected[0], captures[0], repo_root)
+            row, private, stdout, stderr = build_record(ci, runner, record, expected[0], captures[0], repo_root, context=context)
+            if destination.total + len(private) + len(stdout) + len(stderr) + MAX_PUBLIC_BYTES > MAX_TOTAL_BYTES:
+                raise DiagnosticError("file-bound")
             if stdout is not None:
                 destination.write(f"{index}.stdout.bin", stdout, reporters.MAX_STREAM_BYTES)
             if stderr is not None:
@@ -659,10 +888,17 @@ def read_capture(ci, root, repo_root):
     _check_parent(root, Path(repo_root).resolve(strict=True))
     if _is_reparse(root.lstat()):
         raise DiagnosticError("input-directory")
+    total = 0
     with os.scandir(root) as entries:
         for index, entry in enumerate(entries):
             if index >= MAX_COMMANDS * 3 + 1 or not re.fullmatch(r"(?:public\.json|[0-7]\.(?:json|stdout\.bin|stderr\.bin))", entry.name):
                 raise DiagnosticError("input-inventory")
+            metadata = Path(entry.path).lstat()
+            limit = MAX_PUBLIC_BYTES if entry.name == "public.json" else MAX_RECORD_BYTES if entry.name.endswith(".json") else reporters.MAX_STREAM_BYTES
+            total += metadata.st_size
+            if (_is_reparse(metadata) or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                or metadata.st_size > limit or total > MAX_TOTAL_BYTES):
+                raise DiagnosticError("input-bound")
     value = ci.strict_json_loads(_read_file(root / "public.json", MAX_PUBLIC_BYTES).decode("utf-8"), label="diagnostic")
     validate_public(value)
     indices = sorted([r["ordinal"] for r in value["records"]] + [r["ordinal"] for r in value["errors"]])
@@ -673,6 +909,7 @@ def read_capture(ci, root, repo_root):
             raise DiagnosticError("input-binding")
         private = ci.strict_json_loads(data.decode("utf-8"), label="diagnostic")
         validate_private(ci, private)
+        validate_authority_preimages(ci, private, row=row, summary=value)
         report = private["reporter"]
         expected_report = {k: v for k, v in report.items() if k not in ("members", "counts")}
         expected_report["members"] = [{"nameDigest": reporters.digest(m["name"]), "status": m["status"]} for m in report["members"]]

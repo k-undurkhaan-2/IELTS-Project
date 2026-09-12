@@ -771,7 +771,7 @@ def export_capture(repo, environment, phase, transaction, outcome):
     proof = validated_preflight(temp, live, identity)
     ci, _ = base.load_capture_modules(repo)
     leaf = "issue13-producer" if phase == "producer" else "issue13-replay"
-    summary, files = base.snapshot_capture(ci, capture, temp / leaf, repo, live)
+    summary, files = base.snapshot_capture(ci, capture, temp / leaf, repo, live, candidate=identity)
     private_manifest = {"schema": "Issue13EncryptedAcquisitionBundle", "version": 1, "authority": MARKER,
                         "context": live, "candidate": identity, "ordinaryStepOutcome": outcome,
                         "primaryFingerprint": base.PRIMARY, "encryptionSubkeyFingerprint": base.SUBKEY,

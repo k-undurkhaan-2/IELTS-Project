@@ -33,6 +33,7 @@ MAX_BINARY = 16 * MIB
 MAX_BUNDLE = 49 * MIB
 MAX_CIPHERTEXT = 50 * MIB
 MAX_MANIFEST = 64 * 1024
+MAX_PRIVATE_RECORD = 8 * MIB
 PRIMARY = "86D51BCDBC946CF1389969D530479D840D9D562B"
 SUBKEY = "670239EA1230D51EE2220DBB96327B4091754647"
 RECIPIENT = SUBKEY + "!"
@@ -167,8 +168,9 @@ def load_capture_modules(repo):
     return ci, capture
 
 
-def snapshot_capture(ci, capture, root, repo, context):
+def snapshot_capture(ci, capture, root, repo, context, *, candidate=None):
     summary = capture.read_capture(ci, root, repo)
+    capture.validate_exportable(summary)
     if any(summary[key] != context[key] for key in ("transaction", "phase", "platform")) or summary["profile"] != "all":
         raise TransportError("capture-context")
     files = {}
@@ -177,7 +179,8 @@ def snapshot_capture(ci, capture, root, repo, context):
         for index, item in enumerate(inventory):
             if index >= 25 or not re.fullmatch(r"public\.json|[0-7]\.(?:json|stdout\.bin|stderr\.bin)", item.name):
                 raise TransportError("capture-inventory")
-            limit = capture.MAX_PUBLIC_BYTES if item.name == "public.json" else 2 * MIB
+            limit = (capture.MAX_PUBLIC_BYTES if item.name == "public.json" else
+                     MAX_PRIVATE_RECORD if item.name.endswith(".json") else 2 * MIB)
             data = bounded_file(root / item.name, limit)
             total += len(data)
             if total > capture.MAX_TOTAL_BYTES:
@@ -191,7 +194,13 @@ def snapshot_capture(ci, capture, root, repo, context):
         private = files[f"{index}.json"]
         if capture.sha(private) != row["privateRecordSha256"] or len(private) != row["privateRecordBytes"]:
             raise TransportError("snapshot-binding")
-        capture.validate_private(ci, ci.strict_json_loads(private.decode("utf-8"), label="diagnostic"))
+        decoded = ci.strict_json_loads(private.decode("utf-8"), label="diagnostic")
+        capture.validate_private(ci, decoded)
+        capture.validate_authority_preimages(ci, decoded, row=row, summary=summary)
+        if context.get("commit") is not None and decoded["captureBinding"]["candidateCommit"] != context["commit"]:
+            raise TransportError("capture-context")
+        if candidate is not None and any(decoded["captureBinding"]["candidate" + k.title()] != candidate.get(k) for k in ("commit", "tree")):
+            raise TransportError("capture-context")
         for stream in ("stdout", "stderr"):
             info = row["streams"][stream]
             if info["retainedSha256"] is not None:
@@ -476,7 +485,9 @@ def private_tar(files, manifest):
         for name, data in sorted(payload.items()):
             if not re.fullmatch(r"(?:public|acquisition-manifest)\.json|[0-7]\.(?:json|stdout\.bin|stderr\.bin)", name):
                 raise TransportError("bundle-name")
-            limit = MAX_MANIFEST if name == "acquisition-manifest.json" else 256 * 1024 if name == "public.json" else 2 * MIB
+            limit = (MAX_MANIFEST if name == "acquisition-manifest.json" else
+                     256 * 1024 if name == "public.json" else
+                     MAX_PRIVATE_RECORD if name.endswith(".json") else 2 * MIB)
             if len(data) > limit:
                 raise TransportError("bundle-member-bound")
             info = tarfile.TarInfo(name)
@@ -499,7 +510,7 @@ def export_capture(repo, environment, phase, transaction, outcome):
     ci, capture = load_capture_modules(repo)
     temp = Path(environment.get("RUNNER_TEMP", ""))
     leaf = "issue13-producer" if phase == "producer" else "issue13-replay"
-    summary, files = snapshot_capture(ci, capture, temp / leaf, repo, context)
+    summary, files = snapshot_capture(ci, capture, temp / leaf, repo, context, candidate=identity)
     private_manifest = {"schema": "Issue13EncryptedAcquisitionBundle", "version": VERSION,
                         "authority": MARKER, "context": context, "candidate": identity,
                         "primaryFingerprint": PRIMARY, "encryptionSubkeyFingerprint": SUBKEY,

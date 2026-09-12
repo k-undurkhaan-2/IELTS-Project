@@ -403,14 +403,17 @@ class RecoveryTests(unittest.TestCase):
             self.reject("unexpected-transport-category", recovery.context, {**env, key: value})
 
     def fixture_capture(self, phase, family):
-        runner = fixtures.capture_fixture(family=family)
-        runner.profile = "all"
+        runner = fixtures.full_scope_fixture("windows")
         env = environment(self.root, phase)
+        env["GITHUB_SHA"] = runner.execution_binding["checkoutCommit"]
         live = recovery.context(env, phase)
         leaf = "issue13-producer" if phase == "producer" else "issue13-replay"
         summary = capture.capture_completed_runner(ci, runner, root=self.root / leaf,
             transaction=live["transaction"], phase=phase, repo_root=REPO)
         return runner, env, summary, self.root / leaf
+
+    def candidate(self, runner):
+        return {"commit": runner.execution_binding["checkoutCommit"], "tree": runner.execution_binding["checkoutTree"]}
 
     def test_paired_real_exports_preserve_capture_and_authority_byte_for_byte(self):
         self.install()
@@ -418,7 +421,7 @@ class RecoveryTests(unittest.TestCase):
             runner, env, summary, source = self.fixture_capture(phase, family)
             before = authority(runner)
             retained = {p.name: p.read_bytes() for p in source.iterdir()}
-            with mock.patch.object(recovery, "source_identity", return_value={}), \
+            with mock.patch.object(recovery, "source_identity", return_value=self.candidate(runner)), \
                  mock.patch.object(recovery, "validated_preflight", return_value={"synthetic": {"ciphertextSha256": "d" * 64}}):
                 result = recovery.export_capture(REPO, env, phase, summary["transaction"], "failure")
             self.assertEqual(before, authority(runner))
@@ -437,7 +440,7 @@ class RecoveryTests(unittest.TestCase):
         before = authority(runner)
         retained = {p.name: p.read_bytes() for p in source.iterdir()}
         for category in ("gpg-runtime-closure", "gpg-binary-integrity", "encryption-process"):
-            with mock.patch.object(recovery, "source_identity", return_value={}), \
+            with mock.patch.object(recovery, "source_identity", return_value=self.candidate(runner)), \
                  mock.patch.object(recovery, "validated_preflight", return_value={}), \
                  mock.patch.object(recovery, "RuntimeLease", side_effect=recovery.RecoveryError(category)):
                 self.reject(category, recovery.export_capture, REPO, env, "producer", summary["transaction"], "failure")
@@ -514,9 +517,11 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(source.count('"--decrypt"'), 1)
         self.assertIn('ring.encrypt(SMOKE)', ast.get_source_segment(source, functions["synthetic_preflight"]))
         for name in base.SOURCE_PATHS:
-            self.assertEqual(base.git_bytes(REPO, "cat-file", "blob", "HEAD:" + name), base.git_bytes(REPO, "cat-file", "blob", recovery.PARENT + ":" + name))
+            # These pins describe the historical recovery, not a later capture
+            # candidate. v2 separately proves current ordinary/crypto isolation.
+            self.assertEqual(base.git_bytes(REPO, "cat-file", "blob", "ddf1e597:" + name), base.git_bytes(REPO, "cat-file", "blob", recovery.PARENT + ":" + name))
         for name, digest in base.CAPTURE_SOURCES.items():
-            self.assertEqual(base.digest(base.git_bytes(REPO, "cat-file", "blob", "HEAD:" + name)), digest)
+            self.assertEqual(base.digest(base.git_bytes(REPO, "cat-file", "blob", "ddf1e597:" + name)), digest)
 
     def test_workflow_pass_only_topology_no_ubuntu_or_rerun_ordinary_results_preserved(self):
         workflow = ci.parse_canonical_workflow_yaml((REPO / recovery.RECOVERY_PATHS[0]).read_text())

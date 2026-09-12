@@ -23613,7 +23613,7 @@ def _write_issue13_diagnostics(args: argparse.Namespace, runner: FoundationRunne
         return
     module_bindings = (
         ("issue13_diagnostic_reporters", ("c86dd42dfe59f2a32805cd9e847ecb6bbb70214d666ca587c8dde4fa3d7cf7e8", "137e5dedeffc318c2dc2135f483de9a5e10cd66e9290bd2199f66ae85fc53a09")),
-        ("issue13_diagnostic_capture", ("d127ec9087172909b33c50ad1d698a47709c176a22cf4747f75e53885dbf5112", "409488e03180dcf7c0c1d5338a97e7b52f70a1bfdf9fbac955d966bb620c7b2c")),
+        ("issue13_diagnostic_capture", ("88ca3865d96131b31afebdc2113def6f623dcff90ce47cb7ceeba9f7c13538b9", "d8611662a29fd7a42831e087da9eec28ce93e7dbd49b2ff6f9a2df5d8baceca9")),
     )
     saved_modules: dict[str, Any] = {}
     try:

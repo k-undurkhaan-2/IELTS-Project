@@ -69,14 +69,18 @@ class TransportTests(unittest.TestCase):
         return transport.PublicKeyring(local_gpg(), self.root / leaf, ci.REPO_ROOT, capture, certificate())
 
     def fixture_capture(self, phase="producer", family="frontend-security"):
-        runner = fixtures.capture_fixture(family=family)
-        runner.profile = "all"
+        runner = fixtures.full_scope_fixture()
         env = environment(self.root, phase)
+        env["GITHUB_SHA"] = runner.execution_binding["checkoutCommit"]
         transaction = transport.transaction_id(env["GITHUB_SHA"], env["GITHUB_RUN_ID"], ci.platform_key())
         leaf = "issue13-producer" if phase == "producer" else "issue13-replay"
         summary = capture.capture_completed_runner(ci, runner, root=self.root / leaf,
             transaction=transaction, phase=phase, repo_root=ci.REPO_ROOT)
         return runner, env, summary, self.root / leaf
+
+    def candidate(self, runner):
+        return {"commit": runner.execution_binding["checkoutCommit"], "tree": runner.execution_binding["checkoutTree"],
+                "captureCommit": transport.CAPTURE_COMMIT, "sources": []}
 
     def test_pinned_public_certificate_and_no_secret_packets(self):
         data = certificate()
@@ -189,7 +193,7 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(archive.extractfile("0.stdout.bin").read(), files["0.stdout.bin"])
             for member in archive:
                 self.assertEqual((member.uid, member.gid, member.mtime, member.mode, member.uname, member.gname), (0, 0, 0, 0o600, "", ""))
-        for bad in ({"../private": b"x"}, {"8.json": b"x"}, {"0.json": b"x" * (2 * transport.MIB + 1)},
+        for bad in ({"../private": b"x"}, {"8.json": b"x"}, {"0.json": b"x" * (transport.MAX_PRIVATE_RECORD + 1)},
                     {str(n): b"x" for n in range(26)}):
             with self.assertRaises(transport.TransportError):
                 transport.private_tar(bad, {})
@@ -297,7 +301,7 @@ class TransportTests(unittest.TestCase):
             "transcript": ci.verification_replay_transcript(runner), "violations": runner.violations,
             "hardGates": runner.hard_gate_results, "authorization": fixtures.claims_for(runner)})
         retained = {p.name: p.read_bytes() for p in root.iterdir()}
-        fixture_identity = {"commit": env["GITHUB_SHA"], "tree": "b" * 40, "captureCommit": transport.CAPTURE_COMMIT, "sources": []}
+        fixture_identity = self.candidate(runner)
         with mock.patch.object(transport, "source_identity", return_value=fixture_identity), \
              mock.patch.object(transport, "git_bytes", return_value=certificate()), \
              mock.patch.object(transport, "find_gpg", return_value=local_gpg()):
@@ -321,7 +325,7 @@ class TransportTests(unittest.TestCase):
         before = copy.deepcopy(runner.__dict__)
         original = {p.name: p.read_bytes() for p in root.iterdir()}
         for category in ("gpg-unavailable", "gpg-process", "recipient-rejected"):
-            with mock.patch.object(transport, "source_identity", return_value={}), \
+            with mock.patch.object(transport, "source_identity", return_value=self.candidate(runner)), \
                  mock.patch.object(transport, "git_bytes", return_value=certificate()), \
                  mock.patch.object(transport, "find_gpg", side_effect=transport.TransportError(category)), \
                  self.assertRaises(transport.TransportError):
@@ -332,20 +336,20 @@ class TransportTests(unittest.TestCase):
 
     def test_paired_export_preserves_each_available_protocol_family(self):
         initial_root = self.root
-        families = ("frontend-security", "backend-canonical") if os.name == "nt" else capture.FAMILIES
-        for family in families:
+        for family in ("all",):
             self.root = initial_root / family
             self.root.mkdir()
             summaries = []
             for phase in ("producer", "fresh-replay"):
                 runner, env, summary, source = self.fixture_capture(phase=phase, family=family)
-                self.assertEqual([row["family"] for row in summary["records"]], [family])
+                self.assertEqual({row["family"] for row in summary["records"]}, set(capture.FAMILIES))
+                self.assertIn(702, [row["ordinal"] for row in summary["records"]])
                 before = ci._canonical_frame({"records": runner.command_results,
                     "canonicalReplayTranscript": ci.verification_replay_transcript(runner),
                     "violations": runner.violations, "hardGates": runner.hard_gate_results,
                     "authorizationClaims": fixtures.claims_for(runner)})
                 retained = {path.name: path.read_bytes() for path in source.iterdir()}
-                with mock.patch.object(transport, "source_identity", return_value={}), \
+                with mock.patch.object(transport, "source_identity", return_value=self.candidate(runner)), \
                      mock.patch.object(transport, "git_bytes", return_value=certificate()), \
                      mock.patch.object(transport, "find_gpg", return_value=local_gpg()):
                     result = transport.export_capture(ci.REPO_ROOT, env, phase, summary["transaction"], "failure")
