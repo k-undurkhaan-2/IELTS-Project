@@ -1934,7 +1934,9 @@ def _backend_successful_stream_observation_text(
     raw_stream: bytes | None, ordinary: str,
 ) -> str:
     """Return privacy-safe evidence text without changing raw stream authority."""
-    candidate = ordinary
+    # Missing capture is not an exact empty stream. Ordinary text must never
+    # stand in for absent bytes, even when it reproduces the recorded authority.
+    candidate = _BACKEND_STREAM_REDACTION_MARKER if raw_stream is None else ordinary
     try:
         exact = raw_stream.decode("utf-8", errors="strict") if raw_stream is not None else None
     except UnicodeError:

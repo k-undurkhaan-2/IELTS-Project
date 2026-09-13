@@ -1,9 +1,12 @@
 # Issue 13: verified backend portable result
 
-This local ordinary-evidence privacy fallback remediation is based exactly
-on `111d0869347621e584ec1e24ba4dcee368f875e0`. The parent's proven protocol
-isolation, backend diagnostic invariant, pre-parser gates, and fail-closed
-portable comparison are retained. The unresolved hosted state is represented by local synthetic
+This local raw-capture availability remediation is based exactly
+on `52677251a28f77116c2011be1ebf5a31310d102c`. The parent's proven ordinary-evidence
+privacy, raw authority preservation, exact backend portability, protocol
+isolation, and non-backend behavior are retained. The remaining blocker was
+that an absent capture could use ordinary text as exact evidence, including
+missing stderr with an empty fallback and recorded empty-stream authority.
+The unresolved hosted state is represented by local synthetic
 integration fixtures; this transaction does not run hosted CI, rerun
 34710916747, modify either PR, or push a branch.
 
@@ -57,24 +60,32 @@ The backend-specific `_backend_successful_stream_observation_text` selects each
 successful stdout/stderr observation independently, before its producer digest
 or derived copies are created:
 
-1. Attempt strict UTF-8 decoding of the original captured bytes. Exact text is
+1. If the retained raw capture is `None`, select the existing fixed marker
+   `[BACKEND STREAM REDACTED]` directly. Ordinary fallback text cannot replace
+   missing bytes, even if its byte length and SHA-256 match recorded authority.
+   Independently check the marker with the existing backend privacy guard before
+   attaching it. No empty capture is synthesized or inferred from a record.
+2. If the retained raw capture is a real bytes object, including `b""`, attempt
+   strict UTF-8 decoding of the original captured bytes. Exact text is
    eligible only when the unchanged backend privacy guard accepts it and the
    existing ordinary privacy redaction patterns leave that text unchanged.
    This privacy transformation excludes ordinary timing, whitespace, and
    line-ending normalization, preserving safe reporter bytes as required.
-2. Otherwise select the existing ordinary sanitized observation text. Independently
+3. Otherwise select the existing ordinary sanitized observation text. Independently
    run the backend privacy guard on this candidate; a sanitizer call or a change
    in text is not proof of safety.
-3. If the selected candidate is unsafe, replace it with the single fixed marker
+4. If the selected candidate is unsafe, replace it with the single fixed marker
    `[BACKEND STREAM REDACTED]`. It is 25 printable ASCII bytes, deterministic,
    contains no source-derived text, and remains unchanged under both generic
    `sanitize_text` and `raw_observation_json_value`.
-4. Check the final selected value again with the unchanged backend guard before
+5. Check the final selected value again with the unchanged backend guard before
    admitting it to the observation. A failed final check raises a fixed error
    containing no source text, including if the marker itself becomes unsafe.
 
-Missing raw bytes or strict decoding failure only disable exact eligibility;
-they never bypass the fallback check on either stream. The reviewer payload
+Missing raw bytes always take the marker path; strict decoding failure of an
+available bytes object retains the existing independently checked ordinary
+fallback path. An available `b""` decodes to exact `""` and remains portable
+when the recorded empty-stream authority matches. The reviewer payload
 `r"\tmp/private-fixture/runner-output.txt"` remains unsafe. Generic escape
 protection/restoration preserves its literal `\t`, so this candidate requires
 the fixed marker. Other mixed-separator candidates can change during generic
@@ -89,6 +100,17 @@ marker fallback therefore makes that producer stream unavailable; it cannot
 become a second authority path. The same unchanged privacy predicate in
 producer/replay binding rejects coherently forged unsafe exact observations.
 The generic sanitizer and secret/path policy are unchanged.
+
+For missing stderr recorded as zero bytes with SHA-256
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`,
+the emitted observation is the 25-byte marker. The unchanged producer binder
+therefore fails byte-length reconstruction before reporter parsing or identity
+derivation. The outer verifier reports backend unavailability; the ordinary raw
+replay retains ordinal 701 and rejects. With retained `stderr_raw=b""` and the
+same authority, the observation remains `""`, producer binding succeeds, and a
+safe duration-only pair parses twice and derives identity twice without an
+ordinal-701 mismatch. Capture availability does not expand generic assignment
+key policy, including the inherited handling of `credential=...`.
 
 The lower public signatures remain frozen:
 
@@ -309,9 +331,32 @@ Another 82 binding controls deliberately inject coherent unsafe producer/replay
 records and prove binding rejects them. Safe Unicode, LF/CRLF, and literal-escape
 controls prove exact retention remains available.
 
+The availability matrix adds ten independent five-file cases: Ubuntu and
+Windows versions of missing stdout, missing empty stderr with ordinary `""`,
+both missing captures, missing stdout with coherently rewritten fallback
+authority, and missing stdout whose empty fallback coincides with recorded
+empty authority. All use backend ordinal 701. The rewritten 25-byte stdout
+fallback also proves equal length cannot bypass the SHA-256 check. Each case
+records the actual serialized stream values, preserves original hash/length,
+requires zero parser/identity calls, reports explicit backend unavailability,
+and separately retains raw ordinal 701 with `finalAcceptance=REJECT`.
+
+Two additional hosted-shaped positive controls explicitly retain
+`stderr_raw=b""`. They require exact empty serialized stderr, no marker in any
+ordinary artifact, successful producer binding, two parser and two identity
+calls, an attached portable result, and no ordinal-701 mismatch. The existing
+Ubuntu and Windows unrelated-mismatch controls also explicitly retain empty
+stderr bytes. A focused selector control rejects an independently unsafe marker
+even with ordinary `""` and proves `None` never selects ordinary fallback text.
+
 The dedicated entry point uses the unchanged foundation inventory runner. Its
-34-method inventory contains the parent's 31 methods, with the privacy matrix
-expanded, plus three new regression methods. It names every executed method,
+37-method inventory retains all 34 parent methods and adds these three:
+
+- `test_missing_raw_capture_selection_never_uses_ordinary_fallback`
+- `test_missing_raw_capture_matrix_rejects_before_parsing`
+- `test_captured_empty_stderr_preserves_exact_portability`
+
+It names every executed method,
 including both hosted OS controls, and reports discovered/executed/passed/failed/
 error/skip and setup-blocked accounting in the same fresh log.
 

@@ -44,7 +44,7 @@ def npm_stdout(duration="1.25", total="99.5", *, names=None, newline="\n", initi
 
 
 def fixture(platform="ubuntu", *, stdout=None, stderr=b"", physical="1", ordinal=0,
-            retained_streams=("stdout", "stderr")):
+            retained_streams=("stdout", "stderr"), ordinary_streams=None):
     """Observed npm grammar/inventory size with public, synthetic preimages.
 
     Both platform labels exercise production record/bundle/closure validators.
@@ -75,8 +75,7 @@ def fixture(platform="ubuntu", *, stdout=None, stderr=b"", physical="1", ordinal
     capture = ci.CommandCapture(command_id=spec["commandId"], command_class=spec["commandClass"],
         argv=spec["executionArgv"], executed=True, exit_code=0, duration_seconds=0.125,
         stdout=stdout.decode("utf-8", errors="replace"), stderr=stderr.decode("utf-8", errors="replace"),
-        stdout_raw=stdout if "stdout" in retained_streams else None,
-        stderr_raw=stderr if "stderr" in retained_streams else None,
+        stdout_raw=stdout, stderr_raw=stderr,
         stdout_bytes=len(stdout), stderr_bytes=len(stderr),
         include_preview=False, containment="windows-job-object" if platform == "windows"
         else "linux-subreaper-pidfd-proc-supervisor", process_tree_status="contained-clean",
@@ -86,6 +85,13 @@ def fixture(platform="ubuntu", *, stdout=None, stderr=b"", physical="1", ordinal
     record.update({k: v for k, v in capture.evidence().items() if k not in (
         "executionInputs", "executionInputBundleDigest", "protectedTargetBundle", "targetExecutionLease")})
     record.pop("parsedFailureSummary", None)
+    # Establish the original measured authority before independently dropping
+    # retained capture or replacing ordinary text. Neither supplies missing bytes.
+    for stream in ("stdout", "stderr"):
+        if stream not in retained_streams:
+            setattr(capture, stream + "_raw", None)
+        if ordinary_streams is not None and stream in ordinary_streams:
+            setattr(capture, stream, ordinary_streams[stream])
     guard = {"guardSchemaVersion": ci.RUNTIME_DEPENDENCY_GUARD_SCHEMA_VERSION,
              "watcherBackend": "_WindowsDirectoryMutationWatcher" if platform == "windows"
              else "_InotifyMutationWatcher", "active": False, "activeDuringReplay": True,
@@ -505,9 +511,13 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
             stdout = stdout.replace(b"value 1000", b"value 9999", 1)
         elif backend_change == "parser failure":
             stdout += b"unknown numeric output 123\n"
-        with outer_fixture(fixture(platform, ordinal=701),
-            fixture(platform, ordinal=701, stdout=stdout, physical="9"), prefix_count=701,
+        with outer_fixture(fixture(platform, ordinal=701, stderr=b""),
+            fixture(platform, ordinal=701, stdout=stdout, stderr=b"", physical="9"), prefix_count=701,
             extra=("standalone-packaging",), hosted=True, frontend_ordinals=frontend) as case:
+            self.assertIs(type(case.runner.captures[0].stderr_raw), bytes)
+            self.assertEqual(case.runner.captures[0].stderr_raw, b"")
+            for record in (case.producer.command_record, case.replay.command_record):
+                self.assertEqual(record["producerObservations"][0]["rawStructuredFields"]["stderr"], "")
             def drift():
                 for ordinal in (*frontend, 702):
                     drift_unrelated_record(case.runner.command_results[ordinal])
@@ -1066,6 +1076,142 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                 with self.subTest(stream=stream, invalid=invalid):
                     self.assert_private_stream_evidence("invalid UTF-8 " + invalid, payload, stream,
                                                        invalid_stream=invalid)
+
+    def test_missing_raw_capture_selection_never_uses_ordinary_fallback(self):
+        marker = "[BACKEND STREAM REDACTED]"
+        for ordinary in ("", "safe ordinary output", npm_stdout().decode(),
+                         r"\tmp/private-fixture/runner-output.txt"):
+            with self.subTest(ordinary=ordinary):
+                self.assertEqual(ci._backend_successful_stream_observation_text(None, ordinary), marker)
+        self.assertEqual(ci._backend_successful_stream_observation_text(b"", "safe ordinary output"), "")
+        with mock.patch.object(ci, "_backend_exact_stream_text_is_safe", return_value=False) as guard:
+            with self.assertRaisesRegex(ValueError, "^backend stream observation failed its privacy check$"):
+                ci._backend_successful_stream_observation_text(None, "")
+            self.assertTrue(guard.call_args_list)
+            self.assertTrue(all(call.args == (marker,) for call in guard.call_args_list))
+
+    def test_missing_raw_capture_matrix_rejects_before_parsing(self):
+        marker = "[BACKEND STREAM REDACTED]"
+        rewritten = "ordinary fallback output."
+        self.assertEqual(len(rewritten.encode()), len(marker.encode()))
+        cases = (
+            ("missing stderr with empty fallback", ("stderr",), npm_stdout(), {"stderr": ""}),
+            ("missing stdout", ("stdout",), npm_stdout(), {}),
+            ("both captures missing", ("stdout", "stderr"), npm_stdout(), {}),
+            ("missing stdout with coherently rewritten authority", ("stdout",), rewritten.encode(),
+             {"stdout": rewritten}),
+            ("missing stdout with coincident empty authority", ("stdout",), b"", {"stdout": ""}),
+        )
+        for platform in ("ubuntu", "windows"):
+            for label, missing, stdout, ordinary_streams in cases:
+                with self.subTest(platform=platform, case=label):
+                    streams = {"stdout": stdout, "stderr": b""}
+                    retained = tuple(stream for stream in streams if stream not in missing)
+                    with mock.patch.object(ci, "_backend_successful_stream_observation_text",
+                        wraps=ci._backend_successful_stream_observation_text) as select:
+                        producer = fixture(platform, ordinal=701, retained_streams=retained,
+                                           ordinary_streams=ordinary_streams, **streams)
+                    self.assertEqual(select.call_count, 2)
+                    fields = producer.command_record["producerObservations"][0]["rawStructuredFields"]
+                    authority = {stream: {"bytes": len(data), "sha256": digest(data)}
+                                 for stream, data in streams.items()}
+                    fallback_matches = {}
+                    for (stream, data), call in zip(streams.items(), select.call_args_list):
+                        self.assertEqual(call.args[0], None if stream in missing else data)
+                        ordinary = ci.raw_observation_json_value(ordinary_streams.get(stream, data.decode()))
+                        self.assertEqual(call.args[1], ordinary)
+                        fallback_matches[stream] = (len(ordinary.encode()) == len(data)
+                                                    and digest(ordinary.encode()) == digest(data))
+                        self.assertEqual(fields[stream], marker if stream in missing else data.decode())
+                        self.assertTrue(ci._backend_exact_stream_text_is_safe(fields[stream]))
+                    if "empty" in label or "rewritten" in label:
+                        self.assertTrue(fallback_matches[missing[0]])
+                    replay = fixture(platform, ordinal=701, stdout=npm_stdout("90", "912"), stderr=b"")
+                    with outer_fixture(producer, replay, prefix_count=701, hosted=True) as case:
+                        self.assertEqual(set(p.name for p in case.output.iterdir()), set(ci.EVIDENCE_FILE_NAMES))
+                        self.assertEqual(ci.verify_evidence_file_set(case.output, repo_root=case.root,
+                            expected_command_plan=case.runner.command_plan, expected_context=case.context), [])
+                        serialized = (case.output / "command-results.json").read_bytes()
+                        record = json.loads(serialized)["records"][701]
+                        self.assertEqual(record["producerObservations"][0]["rawStructuredFields"], fields)
+                        for stream, original in authority.items():
+                            for observed in (producer.command_record, record):
+                                self.assertEqual(observed[stream + "Sha256"], original["sha256"])
+                                self.assertEqual(observed[stream + "BytesObserved"], original["bytes"])
+                            if stream in missing:
+                                emitted = fields[stream].encode()
+                                self.assertFalse(len(emitted) == original["bytes"]
+                                                 and digest(emitted) == original["sha256"])
+                        if "rewritten" in label:
+                            self.assertNotIn(rewritten.encode(), serialized)
+                            self.assertEqual(len(fields["stdout"].encode()), record["stdoutBytesObserved"])
+                            self.assertNotEqual(digest(fields["stdout"].encode()), record["stdoutSha256"])
+                        before_files = {p.name: p.read_bytes() for p in case.output.iterdir()}
+                        with mock.patch.object(portable, "_parse_stdout", wraps=portable._parse_stdout) as parser, \
+                             mock.patch.object(portable, "_identity", wraps=portable._identity) as identity, \
+                             mock.patch.object(portable, "_bind_side", wraps=portable._bind_side) as bind_side:
+                            self.assertIsNone(portable._bind_producer(ci, case.documents["command-results.json"],
+                                              case.runner.command_plan, case.root))
+                            bind_side.assert_not_called()
+                            exit_code, (errors, transcript), output, _ = invoke_main(case)
+                            self.assertEqual(exit_code, ci.EXIT_POLICY_VIOLATION, output)
+                            self.assertTrue(any("backend-canonical portable result unavailable" in e
+                                                for e in errors), errors)
+                            self.assertNotIn("backendCanonicalPortableResult", transcript or {})
+                            self.assertNotEqual((transcript or {}).get("finalAcceptance"), "PASS")
+                            case.runner.run.assert_not_called()
+                            raw_transcript, raw_errors = ci.run_verification_replay(case.documents,
+                                expected_context=case.context, verification_runner=case.runner, repo_root=case.root)
+                            self.assertEqual(unequal_ordinals(raw_errors), [701], raw_errors)
+                            self.assertEqual(raw_transcript["finalAcceptance"], "REJECT")
+                            self.assertNotIn("backendCanonicalPortableResult", raw_transcript)
+                            parser.assert_not_called()
+                            identity.assert_not_called()
+                            bind_side.assert_not_called()
+                        self.assertEqual({p.name: p.read_bytes() for p in case.output.iterdir()}, before_files)
+                        print("BACKEND_CAPTURE_MISSING " + json.dumps({"platform": platform, "case": label,
+                            "missing": missing, "ordinaryFallbackMatchesAuthority": fallback_matches,
+                            "serializedStreams": {stream: fields[stream] for stream in streams},
+                            "rawAuthority": authority, "originalHashAndLengthPreserved": True,
+                            "fiveFileEvidenceValid": True, "serializedStreamsPrivacySafe": True,
+                            "producerBinding": "unavailable before side binding", "parser": 0, "identity": 0,
+                            "portablePresent": False, "rawUnequalOrdinals": unequal_ordinals(raw_errors),
+                            "finalAcceptance": "REJECT"}, sort_keys=True))
+
+    def test_captured_empty_stderr_preserves_exact_portability(self):
+        for platform in ("ubuntu", "windows"):
+            with self.subTest(platform=platform):
+                with mock.patch.object(ci, "_backend_successful_stream_observation_text",
+                    wraps=ci._backend_successful_stream_observation_text) as select:
+                    producer = fixture(platform, ordinal=701, stderr=b"")
+                self.assertIs(type(select.call_args_list[1].args[0]), bytes)
+                self.assertEqual(select.call_args_list[1].args[0], b"")
+                replay = fixture(platform, ordinal=701, stdout=npm_stdout("90", "912"), stderr=b"")
+                with outer_fixture(producer, replay, prefix_count=701, hosted=True) as case:
+                    record = json.loads((case.output / "command-results.json").read_bytes())["records"][701]
+                    self.assertEqual(record["producerObservations"][0]["rawStructuredFields"]["stderr"], "")
+                    self.assertEqual(record["stderrBytesObserved"], 0)
+                    self.assertEqual(record["stderrSha256"], digest(b""))
+                    self.assertEqual(case.runner.captures[0].stderr_raw, b"")
+                    for path in case.output.iterdir():
+                        self.assertNotIn("[BACKEND STREAM REDACTED]", path.read_text(encoding="utf-8"))
+                    with mock.patch.object(portable, "_parse_stdout", wraps=portable._parse_stdout) as parser, \
+                         mock.patch.object(portable, "_identity", wraps=portable._identity) as identity:
+                        self.assertIsNotNone(portable._bind_producer(ci, case.documents["command-results.json"],
+                                             case.runner.command_plan, case.root))
+                        exit_code, (errors, transcript), output, _ = invoke_main(case)
+                    self.assertEqual((exit_code, errors), (ci.EXIT_SUCCESS, []), output)
+                    self.assertEqual(transcript["finalAcceptance"], "PASS")
+                    self.assertEqual(transcript["backendCanonicalPortableResult"]["result"]["stderr"],
+                                     {"byteLength": 0, "sha256": digest(b"")})
+                    self.assertEqual(unequal_ordinals(errors), [])
+                    self.assertEqual((parser.call_count, identity.call_count), (2, 2))
+                    case.runner.run.assert_called_once()
+                    print("BACKEND_CAPTURE_EMPTY " + json.dumps({"platform": platform, "stderrRaw": "b''",
+                        "serializedStderr": "", "stderrBytesObserved": 0, "stderrSha256": digest(b""),
+                        "markerEmitted": False, "producerBinding": "available", "parser": parser.call_count,
+                        "identity": identity.call_count, "portablePresent": True, "unequalOrdinals": [],
+                        "ordinal701Unequal": False, "finalAcceptance": transcript["finalAcceptance"]}, sort_keys=True))
 
     def test_backend_redaction_marker_is_fixed_and_final_value_must_pass_guard(self):
         marker = ci._BACKEND_STREAM_REDACTION_MARKER
