@@ -1,9 +1,10 @@
 # Issue 13: verified backend portable result
 
-This local remediation is based on frozen commit
-`75a4c7532b036202ab7a283242beb7079da62b00`. The blocked candidate
-`b241be9ab0474160893060dc1de5b42e59498fd9` supplies the reviewed reporter grammar
-as a semantic reference; it is not the branch base.
+This local hosted-CLI wiring remediation is based exactly on
+`dfcb6758095ec225b2e6de4c0ad64fa634a11d9c`. PR #14 review comment 3997121381
+and hosted run 34710916747 are accepted evidence of the missing production
+wiring. No hosted rerun, new attempt, workflow change, or private capture is
+needed for this local implementation and its synthetic integration fixtures.
 
 `BackendCanonicalPortableResult` is an optional comparison of the successful
 128-test backend npm reporter. It becomes available only inside
@@ -12,22 +13,37 @@ bindings, and replay eligibility have succeeded. It never authorizes execution.
 
 ## Public boundary
 
-Only the outer API accepts an external `backend_result_evidence` argument:
+The outer API has no `backend_result_evidence` injection argument:
 
 ```python
 verify_evidence_with_replay(
     output_dir=OUTPUT_DIR, *, expected_context, verification_runner,
     repo_root=REPO_ROOT, evidence_authority_root=None,
-    backend_result_evidence=None,
 )
 ```
 
-Its optional argument is a dictionary containing `producer` and optionally
-`replay`. Each value is `BackendCanonicalReplayEvidence`, with a full command
-record, full expected authority, original stdout/stderr bytes, package.json
-bytes, runtime, runtime closure, and runtime guard. A compact wire record is
-not a replacement for the retained full preimage. Missing streams are never
-reconstructed from previews or normalized observations.
+The production path is `main()` -> `--verify-evidence` ->
+`prepare_verification_authority()` -> `verify_evidence_with_replay()`.
+After validating the ordinary five-file snapshots, a PASS summary with an
+exit-zero backend-canonical result in the backend/all plan selects portability
+automatically. The binder requires exactly one backend record. Policy and
+plans without an eligible backend result retain the ordinary replay path.
+There is no new CLI flag, workflow input, document, or document field.
+
+The private `_OrdinaryValidatedProducer` explicitly holds the ordinary wire
+representation, including compact empty arrays and digest references. It is
+separate from `_ReplayEvidence`, which holds the fresh runner's full local facts.
+Neither is an argument of any public verifier API.
+
+Source inspection found an additional prerequisite: the base producer's generic
+`raw_observation_json_value()` normalizes process text and strips leading/final
+newlines. Successful backend observations now retain strict UTF-8 stdout/stderr
+in their existing `rawStructuredFields` entries before their producer digest is
+computed. This backend-only retention change preserves exact Unicode spelling,
+line endings, and all other bytes. The generic observation encoder and other
+command families retain their existing behavior. An older artifact with lossy
+stream text is unavailable for portability and rejects; omitted bytes are never
+guessed or restored from diagnostic previews.
 
 The lower public signatures remain frozen:
 
@@ -51,29 +67,45 @@ These APIs cannot select backend portability. They reject the additional keyword
 with `TypeError` and never obtain a capability from document fields, runner
 attributes, or mutable global state. They retain the original raw comparison,
 execution, cleanup, diagnostics, and authorization-envelope behavior. The outer
-path without the optional argument still calls public `run_verification_replay`.
+path without an eligible backend result still calls public `run_verification_replay`.
 
 ## Binding before derivation
 
-The optional outer path executes these steps in order:
+The automatically selected outer path executes these steps in order:
 
 1. Validate the exact five-file set, safe bounded reads, document schemas,
    raw records, semantic claims, and external context using the existing validator.
 2. Read replay snapshots and validate those exact documents and snapshots again.
    This closes the interval between the original validation and replay read.
    Recheck directory membership and require a PASS summary before binding.
-3. Create a private producer context. Match its full preimage exactly to the
-   actual wire record or the existing validated compact representation. Bind
+3. Create a private producer context from the validated wire record. Bind
    command, ordinal, class, role, required/profile/platform, argv, independent
    command plan, runtime/dependency/tool/guard, protected targets and inputs,
    stdout/stderr hash/length/bytes, and raw observation/set/universe/transcript
    aggregates. Independently compare the portable authority projection.
+   Reconstruct execution inputs only with
+   `_reconstructed_protected_execution_inputs()`: each ordered retained target
+   supplies logical path, canonical source path, planned byte length/hash/stable
+   identity, actual byte length/hash equal to the plan, and the recorded input
+   mode. Require exact reproduction of `executionInputBundleDigest`. The raw
+   validator checks empty protected-bundle duplicate arrays and both compact
+   phase digest arrays against independently reconstructed command authority.
+   These checks are unchanged.
+   Encode each exact process observation stream with strict UTF-8 and require
+   its retained SHA-256 and byte count. Require one process-output observation
+   and empty stderr. Read `backend/package.json` with the existing
+   `TargetExecutionLease` using the independently prepared candidate target;
+   compare its bytes with the retained producer target's exact hash and size.
+   The fresh lease is closed locally. It is not a producer lease reconstruction.
+   Bind runtime, closure, and guard directly from command-results.json.
+   The wire record stays compact: duplicate bundle arrays are not expanded,
+   and pre/post held-handle identities, file indexes, timestamps, and other
+   omitted physical lease preimages remain intentionally unreconstructed.
 4. Execute the externally selected runner once, retaining its existing
    `finally` cleanup behavior.
 5. Recheck the producer context and bind the replay to exactly one fresh command
-   result, independent plan member, and actual `CommandCapture`. An explicitly
-   supplied replay must equal these fresh facts, including exact raw capture
-   bytes. Require no stdin lease for this protected-bundle backend command.
+   result, independent plan member, and actual `CommandCapture`, including exact
+   raw capture bytes. Require no stdin lease for this protected-bundle command.
    Bind the capture's measured execution fields to the command record;
    validate fresh runtime/dependency/tool/guard, protected inputs, execution
    state, and hard gates. Compare both sides' bound non-reporter inputs,
@@ -87,7 +119,8 @@ The optional outer path executes these steps in order:
    No backend result, reporter parse, or result identity exists at this step.
 7. Validate the existing replay authorization/cleanup requirements. Rebuild the
    outer external context and recheck evidence identities, bytes, and membership.
-   Rebind both sides again and require equality with the earlier bound pair.
+   Rebind both sides again, reread the package through the candidate target lease,
+   and require equality with the earlier bound pair.
 8. Derive results from the two immutable bound sides. Parse both complete
    reporters before computing either backend result identity. Require equality
    of both complete result objects and identities.
@@ -160,8 +193,8 @@ confined dependency roots through NODE_PATH. This change does not alter that
 production behavior and does not assert that the effective backend environment
 has an empty NODE_PATH.
 
-The complete `FoundationRunner`, local canonical records/transcripts, producer
-writer, compaction, local authority validation, authorization-envelope
+The local canonical record/transcript functions, five-file writer, compaction,
+local authority validation, authorization-envelope
 constructors, workflows, and frontend-security/standalone-packaging behavior
 retain their frozen implementations. Acquisition, capture, and GPG code are not
 part of this patch. The raw replay transcript and evidence retain their original
@@ -169,11 +202,16 @@ stream hashes and aggregates; comparison views are detached private values.
 
 ## Validation
 
-`test_backend_canonical_portable_result.py` exercises the actual outer path with
-five files written by the unchanged evidence writer and validated by the real
-raw/semantic validators. The synthetic runner provides bounded fresh execution
-fixtures; external-context rebuilding is controlled by the test fixture. This
-does not claim a hosted replay or a live backend npm execution.
+`test_backend_canonical_portable_result.py` exercises the actual `main()` and
+outer verifier with five files written by the unchanged evidence writer and
+validated by the real raw/semantic validators. Its hosted-shaped plan places
+the compact backend record at ordinal 701. Duration drift passes and removes
+701 from unequal-command diagnostics, while unrelated frontend/packaging
+mismatches remain rejecting with zero backend parser/identity calls. Policy
+and plans containing only frontend/packaging commands cannot select the backend
+binder. The synthetic runner provides bounded fresh execution fixtures;
+authority preparation and external-context rebuilding are controlled by the
+fixture. This does not claim a hosted replay or a live backend npm execution.
 
 The tests instrument backend parsing and identity calls, emit the negative
 matrix and successful call order, verify lower-API confinement, and check that
@@ -195,9 +233,8 @@ python -B developer/tests/ci/test_ci_foundation.py
 
 The final foundation acceptance requires all 476 discovered tests to execute
 and pass with zero failures, errors, skips, or blocked tests. It uses no cached
-PASS receipt. The full-scale fixture retains 705 commands and 16 classes; its
-protected source inventory includes the three new files, increasing its exact
-target count from 908 to 911 and its reference count from 19,811 to 19,876.
-Only those fixture expectations change; the plan builder and fixed size limits
-remain unchanged. This transaction ends with one signed, verified local commit and
+PASS receipt. The full-scale foundation fixture retains 705 commands and 16
+classes, with 911 targets and 19,876 references. Its inventory expectations,
+plan builder, and fixed size limits remain unchanged.
+This transaction ends with one signed, verified local commit and
 stops before push, hosted CI, or any PR modification.

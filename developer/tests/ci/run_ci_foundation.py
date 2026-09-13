@@ -18116,6 +18116,21 @@ class FoundationRunner:
             command_output_digest(command_record),
             failure_path_authority=path_binding,
         )
+        if (command_record.get("commandId") == command_record.get("commandClass") == "backend-canonical"
+            and capture.exit_code == 0 and capture.stdout_raw is not None
+            and capture.stderr_raw is not None):
+            try:
+                streams = {"stdout": capture.stdout_raw.decode("utf-8", errors="strict"),
+                           "stderr": capture.stderr_raw.decode("utf-8", errors="strict")}
+            except UnicodeError:
+                # A lossy observation cannot supply portable backend stream bytes.
+                pass
+            else:
+                # Retain exact backend streams in the existing ordinary fields.
+                # In particular, normalization must not strip reporter newlines.
+                raw["rawStructuredFields"].update(streams)
+                raw["producerRecordDigest"] = _producer_record_digest({
+                    key: value for key, value in raw.items() if key != "producerRecordDigest"})
         return self.add_observation(
             {"commandId": capture.command_id, "rawObservation": raw}
         )
@@ -22609,7 +22624,6 @@ def verify_evidence_with_replay(
     verification_runner: FoundationRunner,
     repo_root: Path = REPO_ROOT,
     evidence_authority_root: Path | None = None,
-    backend_result_evidence: Mapping[str, Any] | None = None,
 ) -> tuple[list[str], dict[str, Any] | None]:
     if verification_runner.profile != expected_context.expected_profile:
         return ["verification runner profile differs from external expected profile"], None
@@ -22631,7 +22645,12 @@ def verify_evidence_with_replay(
     documents, snapshots, snapshot_errors = _read_evidence_documents_for_replay(output_dir)
     if snapshot_errors:
         return snapshot_errors, None
-    if backend_result_evidence is not None:
+    backend_plan = (
+        expected_context.expected_profile in {"backend", "all"}
+        and any(record.get("commandId") == "backend-canonical"
+                for record in verification_runner.command_plan)
+    )
+    if backend_plan:
         # The replay reader takes a second snapshot. Validate the exact documents
         # used below, not merely the earlier file-set validation's snapshots.
         errors.extend(validate_evidence_root(output_dir, repo_root=evidence_authority_root or repo_root))
@@ -22648,8 +22667,14 @@ def verify_evidence_with_replay(
             return sorted(set(errors)), None
     if documents.get("summary.json", {}).get("status") != "PASS":
         return [], None
+    # Select from validated ordinary evidence, never a caller-supplied preimage.
+    # Nonpassing backend results keep their existing exact replay comparison.
+    backend_portability = backend_plan and any(
+        record["commandId"] == "backend-canonical" and record["exitCode"] == 0
+        for record in documents["command-results.json"]["records"]
+    )
     bound_pair = None
-    if backend_result_evidence is None:
+    if not backend_portability:
         transcript, replay_errors = run_verification_replay(
             documents, expected_context=expected_context,
             verification_runner=verification_runner, repo_root=repo_root,
@@ -22660,7 +22685,7 @@ def verify_evidence_with_replay(
         unavailable = "verification replay backend-canonical portable result unavailable or mismatched"
         backend_context = backend_portable._bind_producer(
             sys.modules[__name__], documents["command-results.json"],
-            verification_runner.command_plan, backend_result_evidence,
+            verification_runner.command_plan, repo_root,
         )
         if backend_context is None:
             return [unavailable], None
@@ -22717,7 +22742,7 @@ def verify_evidence_with_replay(
             current.identity != original.identity or current.data != original.data
         ):
             errors.append(f"{name}: evidence changed during verification replay")
-    if backend_result_evidence is not None:
+    if backend_portability:
         # Evidence/context/cleanup and all unrelated comparisons precede parsing.
         try:
             if {entry.name for entry in os.scandir(output_dir)} != set(EVIDENCE_FILE_NAMES):

@@ -1,7 +1,7 @@
 """Backend-only cross-job result comparison; never local execution authority.
 
-Callers supply retained preimages separately from the unchanged raw evidence.
-No stream is reconstructed from normalized observations or diagnostic previews.
+The outer verifier binds ordinary validated producer evidence to a fresh replay.
+Exact streams come from validated process observations, never diagnostic previews.
 The diagnostic reporter is deliberately not imported as an acceptance parser.
 """
 from __future__ import annotations
@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
+from pathlib import Path
 
 
 SCHEMA = "BackendCanonicalPortableResult"
@@ -39,12 +40,26 @@ _STABLE_KEYS = frozenset({
 
 
 @dataclass(frozen=True)
-class BackendCanonicalReplayEvidence:
-    """Original, complete preimages, supplied by the retaining caller in memory.
+class _ReplayEvidence:
+    """Full local replay facts, constructed only from the completed fresh runner."""
 
-    These are inputs to verification, not a claimed portable result or a boolean
-    assertion of authority. The comparison binds them to both raw evidence and
-    the independently rebuilt replay plan/runtime before using a projection.
+    command_record: Mapping
+    expected_authority: Mapping
+    stdout: bytes
+    stderr: bytes
+    package_json: bytes
+    runtime: Mapping
+    runtime_closure: Mapping
+    runtime_guard: Mapping
+
+
+@dataclass(frozen=True)
+class _OrdinaryValidatedProducer:
+    """An ordinary wire record after exact snapshot and context validation.
+
+    This is deliberately not a full raw replay record. Compact duplicate arrays
+    and phase digest references stay intact; no omitted held identity is invented.
+    The expected authority belongs to the independently prepared verifier plan.
     """
 
     command_record: Mapping
@@ -148,8 +163,8 @@ class _BoundSide:
 class _ProducerContext:
     commands: dict
     plan: list
-    producer: BackendCanonicalReplayEvidence
-    supplied_replay: BackendCanonicalReplayEvidence | None
+    producer: _OrdinaryValidatedProducer
+    repo_root: Path
     side: _BoundSide
 
 
@@ -164,14 +179,18 @@ class _BoundPair:
 
 
 def _bind_side(ci, evidence):
-    """Validate a full side without parsing its reporter or computing a result identity."""
+    """Bind wire producer semantics or full replay facts, without reporter parsing."""
     try:
-        _require(type(evidence) is BackendCanonicalReplayEvidence)
+        _require(type(evidence) in (_ReplayEvidence, _OrdinaryValidatedProducer))
         evidence = copy.deepcopy(evidence)
         record, expected = evidence.command_record, evidence.expected_authority
         _require(isinstance(record, dict) and isinstance(expected, dict))
         _require(set(expected) == AUTHORITY_KEYS)
-        _require({key: record.get(key) for key in AUTHORITY_KEYS} == expected)
+        if type(evidence) is _OrdinaryValidatedProducer:
+            _require(ci._portable_command_plan_value([{k: record[k] for k in AUTHORITY_KEYS}])
+                     == ci._portable_command_plan_value([expected]))
+        else:
+            _require({key: record.get(key) for key in AUTHORITY_KEYS} == expected)
         _require(record["commandId"] == record["commandClass"] == "backend-canonical")
         _require(record["profile"] in ("backend", "all"))
         _require(record["toolRole"] == "npm-backend-test" and record["required"] is True)
@@ -196,9 +215,13 @@ def _bind_side(ci, evidence):
         _require(not ci._validate_command_record(record, record["ordinal"], errors,
                                                  expected_record=expected) and not errors)
         _require(0 < len(record["targets"]) <= 2048)
-        _require(len(record["executionInputs"]) == len(record["targets"]))
+        inputs = record["executionInputs"]
+        if type(evidence) is _OrdinaryValidatedProducer:
+            inputs = ci._reconstructed_protected_execution_inputs(record)
+            _require(record["executionInputs"] == [] or record["executionInputs"] == inputs)
+        _require(len(inputs) == len(record["targets"]))
         _require(record["executionInputBundleDigest"]
-                 == ci.execution_input_bundle_digest(record["executionInputs"]))
+                 == ci.execution_input_bundle_digest(inputs))
         bundle_digest = ci._validated_portable_protected_input_bundle_digest(record)
         _require(bundle_digest is not None)
         authority = ci._portable_command_plan_value([expected])
@@ -215,10 +238,10 @@ def _bind_side(ci, evidence):
         _require(raw["observationOrdinal"] == 0 and raw["occurrences"] == 1)
         _require(raw["sourceResultId"] == "command:npm --prefix backend test")
         _require(raw["sourcePath"] == "backend/package.json" and raw["failurePathAuthority"] is None)
-        _require(raw["rawStructuredFields"] == ci.raw_observation_json_value({
+        _require(raw["rawStructuredFields"] == {
             "executed": True, "exitCode": 0, "stdout": evidence.stdout.decode("utf-8"),
             "stderr": "", "error": None,
-        }))
+        })
         package_targets = [t for t in expected["targets"] if t["path"] == "backend/package.json"]
         _require(len(package_targets) == 1 and type(evidence.package_json) is bytes)
         _require(0 < len(evidence.package_json) <= 512 * 1024)
@@ -275,40 +298,57 @@ def _bind_side(ci, evidence):
         return None
 
 
-def _bind_producer(ci, commands, plan, pair):
+def _bind_producer(ci, commands, plan, repo_root):
     """Called only by the outer verifier after validating its exact raw snapshots."""
     try:
-        _require(type(pair) is dict and set(pair) in ({"producer"}, {"producer", "replay"}))
-        pair, commands, plan = copy.deepcopy((pair, commands, plan))
-        producer = pair["producer"]
-        _require(type(producer) is BackendCanonicalReplayEvidence)
-        _require("replay" not in pair or type(pair["replay"]) is BackendCanonicalReplayEvidence)
+        commands, plan = copy.deepcopy((commands, plan))
         records = commands["records"]
         backend = [r for r in records if r["commandId"] == "backend-canonical"]
         expected = [p for p in plan if p["commandId"] == "backend-canonical"]
         _require(len(backend) == len(expected) == 1)
-        # Equality binds every full field, including checkout-local identities.
-        # Compaction is the existing validated wire representation, never a new codec.
-        _require(backend[0] == producer.command_record or backend[0]
-                 == ci._compact_command_record_for_evidence(producer.command_record))
-        _require(ci._portable_command_plan_value([producer.expected_authority])
+        record = backend[0]
+        errors = []
+        _require(not ci._validate_command_record(record, record["ordinal"], errors,
+                     expected_record=expected[0]) and not errors)
+        _require(ci._portable_command_plan_value([{k: record[k] for k in AUTHORITY_KEYS}])
                  == ci._portable_command_plan_value(expected))
         _require(commands["commandAuthority"] == ci._portable_command_plan_value(plan))
         _require(commands["commandPlanDigest"] == ci.command_plan_digest(plan))
-        for key, value in (("runtime", producer.runtime),
-                           ("runtimeDependencyClosure", producer.runtime_closure),
-                           ("runtimeDependencyGuard", producer.runtime_guard)):
-            _require(commands[key] == value)
         _require(commands["producerObservationUniverseDigest"]
                  == ci.producer_observation_universe_digest(records))
         _require(commands["producerTranscriptDigest"] == ci.producer_transcript_digest(
             commands["commandPlanDigest"], records, commands["actualCompletedCommandClasses"]))
         # Existing full-context observation claims never gain a rewrite path.
         _require(commands["observations"] == [])
+        _require(len(record["producerObservations"]) == 1)
+        observation = record["producerObservations"][0]
+        _require(not ci._validate_raw_observation(observation, label="backend-portable", source=record))
+        _require(observation["observationKind"] == "process-output-v1")
+        streams = []
+        for stream in ("stdout", "stderr"):
+            value = observation["rawStructuredFields"][stream]
+            _require(type(value) is str)
+            data = value.encode("utf-8", errors="strict")
+            _require(len(data) == record[stream + "BytesObserved"])
+            _require(hashlib.sha256(data).hexdigest() == record[stream + "Sha256"])
+            streams.append(data)
+        # Read only the exact candidate's independently planned package target.
+        # This fresh local lease never replaces an omitted producer lease preimage.
+        package_targets = [t for t in expected[0]["targets"] if t["path"] == "backend/package.json"]
+        _require(len(package_targets) == 1 and 0 < package_targets[0]["size"] <= 512 * 1024)
+        lease = ci.TargetExecutionLease(package_targets[0], repo_root=repo_root,
+                                        execution_adapter="PROTECTED-TARGET-BUNDLE")
+        try:
+            package_json = lease.materialize()
+            _require(lease.verify()[0])
+        finally:
+            lease.close()
+        producer = _OrdinaryValidatedProducer(record, expected[0], *streams, package_json,
+            commands["runtime"], commands["runtimeDependencyClosure"], commands["runtimeDependencyGuard"])
         side = _bind_side(ci, producer)
         _require(side is not None)
-        return _ProducerContext(commands, plan, producer, pair.get("replay"), side)
-    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError, OverflowError):
+        return _ProducerContext(commands, plan, producer, repo_root, side)
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError, OverflowError, OSError):
         return None
 
 
@@ -319,7 +359,7 @@ def _bind_replay(ci, context, commands, runner):
         _require(commands == context.commands and runner.command_plan == context.plan)
         _require(ci.command_plan_digest(runner.command_plan) == runner.command_plan_digest
                  == commands["commandPlanDigest"])
-        rebound = _bind_producer(ci, commands, runner.command_plan, {"producer": context.producer})
+        rebound = _bind_producer(ci, commands, runner.command_plan, context.repo_root)
         _require(rebound is not None and rebound.side == context.side)
         records = [r for r in runner.command_results if r["commandId"] == "backend-canonical"]
         plans = [p for p in runner.command_plan if p["commandId"] == "backend-canonical"]
@@ -331,13 +371,11 @@ def _bind_replay(ci, context, commands, runner):
         # Capture.evidence() derives stdin inputs from this field; it must not be
         # hidden by the exclusions for bundle data later added by the runner.
         _require(capture.target_execution_lease is None)
-        fresh = BackendCanonicalReplayEvidence(
+        fresh = _ReplayEvidence(
             records[0], plans[0], capture.stdout_raw, capture.stderr_raw,
             context.producer.package_json, runner.runtime, runner.runtime_closure_document,
             runner.runtime_closure_guard_evidence,
         )
-        # An explicit replay preimage has no authority over the actual fresh capture.
-        _require(context.supplied_replay is None or context.supplied_replay == fresh)
         side = _bind_side(ci, fresh)
         _require(side is not None)
         # Self-consistent producer tool/runtime claims are not fresh authority.
