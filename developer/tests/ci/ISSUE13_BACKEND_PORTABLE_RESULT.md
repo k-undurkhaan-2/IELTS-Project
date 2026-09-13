@@ -1,11 +1,12 @@
 # Issue 13: verified backend portable result
 
-This local raw-capture availability remediation is based exactly
-on `52677251a28f77116c2011be1ebf5a31310d102c`. The parent's proven ordinary-evidence
+This local reserved-marker nonportability remediation is based exactly
+on `0c987ae704b18b31657c99db1ff935bf54f28d3a`. The parent's proven ordinary-evidence
 privacy, raw authority preservation, exact backend portability, protocol
-isolation, and non-backend behavior are retained. The remaining blocker was
-that an absent capture could use ordinary text as exact evidence, including
-missing stderr with an empty fallback and recorded empty-stream authority.
+isolation, and non-backend behavior are retained. All prior review conclusions
+remain closed except the marker-authority blocker: missing capture already
+serialized as the fixed marker, but matching recorded marker length and SHA-256
+could let that reserved value pass producer binding and reach reporter parsing.
 The unresolved hosted state is represented by local synthetic
 integration fixtures; this transaction does not run hosted CI, rerun
 34710916747, modify either PR, or push a branch.
@@ -94,17 +95,31 @@ normalization yet remain unsafe; they receive the same marker.
 Raw stream authority, ordinary display text, and portable exact availability
 remain separate. The command keeps both original stream SHA-256 values and
 observed byte lengths. Only observation text and its derived digests change.
-The unchanged producer binder strictly encodes observation text and requires
-both its byte length and SHA-256 to match the original stream. A sanitized or
-marker fallback therefore makes that producer stream unavailable; it cannot
-become a second authority path. The same unchanged privacy predicate in
+The producer binder first rejects an observation whose entire text equals
+`ci._BACKEND_STREAM_REDACTION_MARKER`, before strict UTF-8 encoding or accepting
+its byte length and SHA-256 as an exact stream. The source of truth is the
+existing private constant in `run_ci_foundation.py`; both the writer's selector
+and `backend_canonical_portable_result._bind_producer` use it directly. It is
+fixed trusted code, with no caller-controlled marker argument or artifact field.
+Hash/length equality cannot upgrade the marker into exact evidence, regardless
+of ordinary fallback contents. Other observation text still requires both its
+byte length and SHA-256 to match the original stream. The same unchanged privacy
+predicate in
 producer/replay binding rejects coherently forged unsafe exact observations.
 The generic sanitizer and secret/path policy are unchanged.
 
+This is intentional fail-closed sentinel reservation: a retained raw stdout
+whose complete value is literally `b"[BACKEND STREAM REDACTED]"` is also
+nonportable, even with matching raw authority. Rejection makes no generic claim
+that the underlying raw stream did not exist. A legitimate successful backend
+reporter is structurally much larger and must contain the complete 128-test
+grammar. Exact whole-stream sentinel equality does not reserve marker text
+embedded in a valid reporter. An available `b""` remains distinct from the marker.
+
 For missing stderr recorded as zero bytes with SHA-256
 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`,
-the emitted observation is the 25-byte marker. The unchanged producer binder
-therefore fails byte-length reconstruction before reporter parsing or identity
+the emitted observation is the 25-byte marker. The producer binder
+rejects the reserved value before reporter parsing or identity
 derivation. The outer verifier reports backend unavailability; the ordinary raw
 replay retains ordinal 701 and rejects. With retained `stderr_raw=b""` and the
 same authority, the observation remains `""`, producer binding succeeds, and a
@@ -158,7 +173,9 @@ The automatically selected outer path executes these steps in order:
    validator checks empty protected-bundle duplicate arrays and both compact
    phase digest arrays against independently reconstructed command authority.
    These checks are unchanged.
-   Encode each exact process observation stream with strict UTF-8 and require
+   Reject each whole-stream reserved marker before accepting exact producer
+   evidence, independently of recorded length and SHA-256. Encode every other
+   process observation stream with strict UTF-8 and require
    its retained SHA-256 and byte count. Require one process-output observation
    and empty stderr. Read `backend/package.json` with the existing
    `TargetExecutionLease` using the independently prepared candidate target;
@@ -329,7 +346,9 @@ raw pair: it retains ordinal 701 (or ordinal 0 in the small matrix), returns
 diagnostic check introduces no production authority or execution path.
 Another 82 binding controls deliberately inject coherent unsafe producer/replay
 records and prove binding rejects them. Safe Unicode, LF/CRLF, and literal-escape
-controls prove exact retention remains available.
+controls prove exact retention remains available. These controls also include
+the marker as a complete test name inside a valid 128-test reporter, proving
+that only whole-stream marker equality is reserved.
 
 The availability matrix adds ten independent five-file cases: Ubuntu and
 Windows versions of missing stdout, missing empty stderr with ordinary `""`,
@@ -349,12 +368,34 @@ Ubuntu and Windows unrelated-mismatch controls also explicitly retain empty
 stderr bytes. A focused selector control rejects an independently unsafe marker
 even with ordinary `""` and proves `None` never selects ordinary fallback text.
 
-The dedicated entry point uses the unchanged foundation inventory runner. Its
-37-method inventory retains all 34 parent methods and adds these three:
+The reserved-marker regressions add six independently serialized five-file
+cases: all three rows below on both Ubuntu- and Windows-shaped evidence, with
+backend ordinal 701 and retained `stderr_raw=b""`:
 
-- `test_missing_raw_capture_selection_never_uses_ordinary_fallback`
-- `test_missing_raw_capture_matrix_rejects_before_parsing`
-- `test_captured_empty_stderr_preserves_exact_portability`
+| Retained stdout | Ordinary stdout | Serialized stdout | Producer binding | Parser / identity calls |
+| --- | --- | --- | --- | --- |
+| `None` | `""` | `[BACKEND STREAM REDACTED]` | unavailable before side binding | 0 / 0 |
+| `None` | `[BACKEND STREAM REDACTED]` | `[BACKEND STREAM REDACTED]` | unavailable before side binding | 0 / 0 |
+| `b"[BACKEND STREAM REDACTED]"` | `[BACKEND STREAM REDACTED]` | `[BACKEND STREAM REDACTED]` | unavailable before side binding | 0 / 0 |
+
+Every row records and preserves `stdoutBytesObserved=25` and
+`stdoutSha256=819fd70120e7e0f1296db421669cc9291df70b0dd5e3baad731ddf844bd8f616`.
+The serialized marker exactly matches that authority, yet cannot bind. The
+selector spy checks the actual raw capture and ordinary fallback inputs; the
+real five-file validator accepts the evidence. Serialized stderr remains `""`
+with the original empty-stream authority. The outer CLI explicitly reports
+backend unavailability without running replay, parsing, or identity derivation,
+and returns no portable result or PASS. The separately exercised unchanged raw
+replay retains ordinal 701 and reports `finalAcceptance=REJECT`. All five files
+remain byte-for-byte unchanged after verification. The retained-marker case
+proves intentional sentinel reservation even when raw bytes were available.
+
+The dedicated entry point uses the unchanged foundation inventory runner. Its
+40-method inventory retains all 37 parent methods and adds these three:
+
+- `test_missing_stdout_with_marker_authority_rejects_before_parsing`
+- `test_missing_stdout_with_marker_fallback_and_authority_rejects_before_parsing`
+- `test_captured_literal_marker_is_intentionally_nonportable`
 
 It names every executed method,
 including both hosted OS controls, and reports discovered/executed/passed/failed/

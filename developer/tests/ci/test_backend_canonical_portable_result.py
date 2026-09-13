@@ -1079,7 +1079,7 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
 
     def test_missing_raw_capture_selection_never_uses_ordinary_fallback(self):
         marker = "[BACKEND STREAM REDACTED]"
-        for ordinary in ("", "safe ordinary output", npm_stdout().decode(),
+        for ordinary in ("", marker, "safe ordinary output", npm_stdout().decode(),
                          r"\tmp/private-fixture/runner-output.txt"):
             with self.subTest(ordinary=ordinary):
                 self.assertEqual(ci._backend_successful_stream_observation_text(None, ordinary), marker)
@@ -1178,6 +1178,86 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                             "portablePresent": False, "rawUnequalOrdinals": unequal_ordinals(raw_errors),
                             "finalAcceptance": "REJECT"}, sort_keys=True))
 
+    def assert_reserved_marker_nonportable(self, label, *, missing, ordinary):
+        marker = "[BACKEND STREAM REDACTED]"
+        marker_bytes = marker.encode("ascii")
+        marker_sha256 = "819fd70120e7e0f1296db421669cc9291df70b0dd5e3baad731ddf844bd8f616"
+        self.assertEqual(len(marker_bytes), 25)
+        self.assertEqual(digest(marker_bytes), marker_sha256)
+        for platform in ("ubuntu", "windows"):
+            with self.subTest(platform=platform, case=label):
+                with mock.patch.object(ci, "_backend_successful_stream_observation_text",
+                    wraps=ci._backend_successful_stream_observation_text) as select:
+                    producer = fixture(platform, ordinal=701, stdout=marker_bytes, stderr=b"",
+                        retained_streams=("stderr",) if missing else ("stdout", "stderr"),
+                        ordinary_streams={"stdout": ordinary})
+                self.assertEqual(select.call_args_list,
+                    [mock.call(None if missing else marker_bytes, ordinary), mock.call(b"", "")])
+                original_authority = {stream + suffix: producer.command_record[stream + suffix]
+                    for stream in ("stdout", "stderr") for suffix in ("BytesObserved", "Sha256")}
+                self.assertEqual(original_authority, {
+                    "stdoutBytesObserved": 25, "stdoutSha256": marker_sha256,
+                    "stderrBytesObserved": 0, "stderrSha256": digest(b"")})
+                replay = fixture(platform, ordinal=701, stdout=npm_stdout("90", "912"), stderr=b"")
+                with outer_fixture(producer, replay, prefix_count=701, hosted=True) as case:
+                    self.assertEqual(set(p.name for p in case.output.iterdir()), set(ci.EVIDENCE_FILE_NAMES))
+                    self.assertEqual(ci.verify_evidence_file_set(case.output, repo_root=case.root,
+                        expected_command_plan=case.runner.command_plan, expected_context=case.context), [])
+                    record = json.loads((case.output / "command-results.json").read_bytes())["records"][701]
+                    fields = record["producerObservations"][0]["rawStructuredFields"]
+                    self.assertEqual((fields["stdout"], fields["stderr"]), (marker, ""))
+                    # Exact marker authority must not upgrade this reserved value
+                    # into portable evidence, even when the raw capture existed.
+                    self.assertEqual(len(fields["stdout"].encode()), record["stdoutBytesObserved"])
+                    self.assertEqual(digest(fields["stdout"].encode()), record["stdoutSha256"])
+                    for observed in (producer.command_record, record):
+                        self.assertEqual({key: observed[key] for key in original_authority}, original_authority)
+                    before_files = {p.name: p.read_bytes() for p in case.output.iterdir()}
+                    with mock.patch.object(portable, "_parse_stdout", wraps=portable._parse_stdout) as parser, \
+                         mock.patch.object(portable, "_identity", wraps=portable._identity) as identity, \
+                         mock.patch.object(portable, "_bind_side", wraps=portable._bind_side) as bind_side:
+                        bound = portable._bind_producer(ci, case.documents["command-results.json"],
+                                                       case.runner.command_plan, case.root)
+                        self.assertTrue(bound is None, "reserved marker must fail before side binding")
+                        bind_side.assert_not_called()
+                        exit_code, (errors, transcript), output, _ = invoke_main(case)
+                        self.assertEqual(exit_code, ci.EXIT_POLICY_VIOLATION, output)
+                        self.assertTrue(any("backend-canonical portable result unavailable" in e
+                                            for e in errors), errors)
+                        self.assertNotIn("backendCanonicalPortableResult", transcript or {})
+                        self.assertNotEqual((transcript or {}).get("finalAcceptance"), "PASS")
+                        case.runner.run.assert_not_called()
+                        raw_transcript, raw_errors = ci.run_verification_replay(case.documents,
+                            expected_context=case.context, verification_runner=case.runner, repo_root=case.root)
+                        self.assertEqual(unequal_ordinals(raw_errors), [701], raw_errors)
+                        self.assertEqual(raw_transcript["finalAcceptance"], "REJECT")
+                        self.assertNotIn("backendCanonicalPortableResult", raw_transcript)
+                        parser.assert_not_called()
+                        identity.assert_not_called()
+                        bind_side.assert_not_called()
+                    self.assertEqual({p.name: p.read_bytes() for p in case.output.iterdir()}, before_files)
+                    print("BACKEND_RESERVED_MARKER " + json.dumps({"platform": platform, "case": label,
+                        "rawCaptureMissing": missing, "ordinaryStdout": ordinary,
+                        "serializedStdout": fields["stdout"], "serializedStderr": fields["stderr"],
+                        "rawAuthority": original_authority, "originalHashAndLengthPreserved": True,
+                        "fiveFileEvidenceValid": True, "markerAuthorityMatches": True,
+                        "producerBinding": "unavailable before side binding", "parser": parser.call_count,
+                        "identity": identity.call_count, "portablePresent": False,
+                        "backendUnavailable": True, "rawUnequalOrdinals": unequal_ordinals(raw_errors),
+                        "finalAcceptance": raw_transcript["finalAcceptance"]}, sort_keys=True))
+
+    def test_missing_stdout_with_marker_authority_rejects_before_parsing(self):
+        self.assert_reserved_marker_nonportable("missing stdout with empty fallback and marker authority",
+                                               missing=True, ordinary="")
+
+    def test_missing_stdout_with_marker_fallback_and_authority_rejects_before_parsing(self):
+        self.assert_reserved_marker_nonportable("missing stdout with marker fallback and authority",
+                                               missing=True, ordinary="[BACKEND STREAM REDACTED]")
+
+    def test_captured_literal_marker_is_intentionally_nonportable(self):
+        self.assert_reserved_marker_nonportable("retained literal marker capture with matching authority",
+                                               missing=False, ordinary="[BACKEND STREAM REDACTED]")
+
     def test_captured_empty_stderr_preserves_exact_portability(self):
         for platform in ("ubuntu", "windows"):
             with self.subTest(platform=platform):
@@ -1255,7 +1335,8 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                         "parser": 0, "identity": 0, "portability": "unavailable"}, sort_keys=True))
 
     def test_safe_exact_streams_preserve_unicode_newlines_and_literal_escapes(self):
-        names = ["caf\u00e9", "cafe\u0301", r'literal \n \u1234 {"value":123}', "timing text (42ms)", *NAMES[4:]]
+        names = ["caf\u00e9", "cafe\u0301", r'literal \n \u1234 {"value":123}', "timing text (42ms)",
+                 "[BACKEND STREAM REDACTED]", *NAMES[5:]]
         for platform in ("ubuntu", "windows"):
             for newline in ("\n", "\r\n"):
                 with self.subTest(platform=platform, newline=repr(newline)):

@@ -329,6 +329,9 @@ def _bind_producer(ci, commands, plan, repo_root):
         for stream in ("stdout", "stderr"):
             value = observation["rawStructuredFields"][stream]
             _require(type(value) is str)
+            # Reserve the writer's sentinel even when its hash/length match.
+            # Literal captured marker bytes are intentionally nonportable too.
+            _require(value != ci._BACKEND_STREAM_REDACTION_MARKER)
             data = value.encode("utf-8", errors="strict")
             _require(len(data) == record[stream + "BytesObserved"])
             _require(hashlib.sha256(data).hexdigest() == record[stream + "Sha256"])
