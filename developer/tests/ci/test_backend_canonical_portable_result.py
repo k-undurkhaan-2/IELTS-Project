@@ -145,11 +145,15 @@ def unrelated_record(spec):
     return record
 
 
-def replay_fixture(producer, replay, *, compact=False, extra=False, prefix_count=0):
+def replay_fixture(producer, replay, *, compact=False, extra=False, prefix_count=0, frontend_ordinals=()):
     prefix = [fixtures.synthetic_command_spec(f"fixture-{i}", "baseline-policy", i)
               for i in range(prefix_count)]
+    for ordinal in frontend_ordinals:
+        name = Path(ci.SECURITY_GUARD_FILES[ordinal - 687]).name
+        prefix[ordinal] = fixtures.synthetic_command_spec(
+            "frontend-security:" + name, "frontend-security", ordinal)
     specs = prefix + [copy.deepcopy(replay.expected_authority)]
-    records = [fixtures.synthetic_record_from_spec(spec) for spec in prefix] + [copy.deepcopy(replay.command_record)]
+    records = [unrelated_record(spec) for spec in prefix] + [copy.deepcopy(replay.command_record)]
     producer_records = copy.deepcopy(records[:-1]) + [copy.deepcopy(producer.command_record)]
     if extra:
         for family in extra if isinstance(extra, tuple) else ("fixture",):
@@ -194,10 +198,12 @@ def replay_fixture(producer, replay, *, compact=False, extra=False, prefix_count
 
 
 @contextlib.contextmanager
-def outer_fixture(producer=None, replay=None, *, compact=True, extra=False, prefix_count=0, hosted=False):
+def outer_fixture(producer=None, replay=None, *, compact=True, extra=False, prefix_count=0,
+                  hosted=False, frontend_ordinals=()):
     producer = fixture() if producer is None else producer
     replay = fixture(stdout=npm_stdout("90", "912"), physical="9") if replay is None else replay
-    runner, _documents, _comparison = replay_fixture(producer, replay, extra=extra, prefix_count=prefix_count)
+    runner, _documents, _comparison = replay_fixture(producer, replay, extra=extra,
+        prefix_count=prefix_count, frontend_ordinals=frontend_ordinals)
     if hosted:
         runner.execution_binding.update(bindingMode="github-actions", producerJobId=(
             "windows-compatibility-producer" if runner.platform == "windows" else "ubuntu-canonical-producer"),
@@ -325,6 +331,56 @@ def invoke_main(case):
     return exit_code, results[0], output.getvalue(), verifier.call_args
 
 
+def unequal_ordinals(errors):
+    prefix = "verification replay first command differences: "
+    return sorted({item["ordinal"] for error in errors if error.startswith(prefix)
+                   for item in json.loads(error[len(prefix):])})
+
+
+def drift_unrelated_record(record):
+    data = b"fresh unrelated result differs"
+    record.update(stdoutSha256=digest(data), stdoutBytesObserved=len(data))
+    for raw in record["producerObservations"]:
+        raw["rawStructuredFields"]["stdout"] = data.decode()
+        raw["sourceOutputDigest"] = ci.command_output_digest(record)
+        raw["producerRecordDigest"] = ci._producer_record_digest({
+            key: value for key, value in raw.items() if key != "producerRecordDigest"})
+    record["producerObservationSetDigest"] = ci.producer_observation_set_digest(record["producerObservations"])
+
+
+def unsafe_stream_cases():
+    # Public synthetic material is assembled so repository secret scanning does
+    # not mistake the regression source itself for retained operational output.
+    return {
+        "credential token": "github_" + "pat_" + "a" * 24,
+        "credential assignment": "password" + "=synthetic-value",
+        "CRLF password assignment": "password" + "\r\n=synthetic-value",
+        "CRLF token assignment": "token" + "\r\n:synthetic-value",
+        "CRLF session assignment": "sessionid" + "\r\n=synthetic-value",
+        "Authorization header": "Authorization" + ": synthetic-auth-value",
+        "Bearer text": "Bearer" + " synthetic-bearer-value",
+        "cookie material": "Cookie" + ": session=synthetic-cookie-value",
+        "Set-Cookie material": "Set-Cookie" + ": session=synthetic-cookie-value",
+        "private-key marker": "-----BEGIN " + "PRIVATE KEY-----",
+        "credential URL": "https://" + "fixture:synthetic-password@example.invalid/test",
+        "credential URL separator alias": "https:" + "\\" * 2 + "fixture:synthetic-password@example.invalid/test",
+        "database URL separator alias": "postgres:" + "\\" * 2 + "fixture:synthetic-password@example.invalid/db",
+        "Windows drive path": r"C:\private-fixture\runner-output.txt",
+        "Windows UNC path": r"\\private-fixture\share\runner-output.txt",
+        "Windows device path": r"\\?\C:\private-fixture\runner-output.txt",
+        "Windows file URI": "file:///C:/private-fixture/runner-output.txt",
+        "POSIX home path": "/home/private-fixture/runner-output.txt",
+        "POSIX task path": "/tmp/private-fixture/runner-output.txt",
+        "POSIX home separator alias": r"\home\private-fixture\runner-output.txt",
+        "POSIX opt separator alias": r"\opt\private-fixture\runner-output.txt",
+        "POSIX mixed separators": r"/home\private-fixture\runner-output.txt",
+        "terminal escape": "\x1b[31mprivate-fixture\x1b[0m",
+        "ASCII control": "private\x00fixture",
+        "bidi control": "private\u202efixture",
+        "Unicode format control": "private\u2066fixture\u2069",
+    }
+
+
 class BackendCanonicalPortableResultTest(unittest.TestCase):
     def test_policy_frontend_and_packaging_main_never_reach_backend_parser(self):
         for profile, family in (("policy", "baseline-policy"), ("all", "frontend-security"),
@@ -398,7 +454,7 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                 if mismatch:
                     def drift():
                         other = next(r for r in case.runner.command_results if r["commandClass"] == mismatch)
-                        other["stdoutSha256"] = "0" * 64
+                        drift_unrelated_record(other)
                         return case.comparison
                     case.runner.run.side_effect = drift
                 with mock.patch.object(portable, "_parse_stdout", wraps=portable._parse_stdout) as parser, \
@@ -414,7 +470,7 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                     self.assertTrue(any(mismatch in e and "stdout-identity" in e for e in errors), errors)
                     self.assertNotIn("backendCanonicalPortableResult", transcript)
                     self.assertEqual(transcript["finalAcceptance"], "REJECT")
-                    self.assertEqual((parser.call_count, identity.call_count), (0, 0))
+                    self.assertEqual((parser.call_count, identity.call_count), (2, 2))
                 else:
                     self.assertEqual((exit_code, errors), (ci.EXIT_SUCCESS, []), output)
                     self.assertEqual(transcript["finalAcceptance"], "PASS")
@@ -423,6 +479,60 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                 print("BACKEND_CLI " + json.dumps({"mismatch": mismatch, "exit": exit_code,
                     "parser": parser.call_count, "identity": identity.call_count,
                     "ordinal701Unequal": False, "acceptance": transcript["finalAcceptance"]}))
+
+    def assert_hosted_mismatches(self, platform, *, backend_change=None):
+        frontend = (687, 692, 695) if platform == "windows" else (687, 695)
+        stdout = npm_stdout("90", "912")
+        if backend_change == "semantic mutation":
+            stdout = stdout.replace(b"value 1000", b"value 9999", 1)
+        elif backend_change == "parser failure":
+            stdout += b"unknown numeric output 123\n"
+        with outer_fixture(fixture(platform, ordinal=701),
+            fixture(platform, ordinal=701, stdout=stdout, physical="9"), prefix_count=701,
+            extra=("standalone-packaging",), hosted=True, frontend_ordinals=frontend) as case:
+            def drift():
+                for ordinal in (*frontend, 702):
+                    drift_unrelated_record(case.runner.command_results[ordinal])
+                if backend_change == "unavailable":
+                    case.runner.captures.clear()
+                return case.comparison
+            case.runner.run.side_effect = drift
+            with mock.patch.object(portable, "_parse_stdout", wraps=portable._parse_stdout) as parser, \
+                 mock.patch.object(portable, "_identity", wraps=portable._identity) as identity:
+                exit_code, (errors, transcript), output, call = invoke_main(case)
+            self.assertEqual(exit_code, ci.EXIT_POLICY_VIOLATION, output)
+            self.assertEqual(transcript["finalAcceptance"], "REJECT")
+            expected = sorted([*frontend, 702] + ([701] if backend_change else []))
+            self.assertEqual(unequal_ordinals(errors), expected, errors)
+            expected_calls = ((0, 0) if backend_change == "unavailable" else
+                              (2, 0) if backend_change == "parser failure" else (2, 2))
+            self.assertEqual((parser.call_count, identity.call_count), expected_calls)
+            if backend_change:
+                self.assertTrue(any("backend-canonical portable result unavailable" in e for e in errors))
+            self.assertNotIn("backendCanonicalPortableResult", transcript)
+            self.assertNotIn("backend_result_evidence", call.kwargs)
+            case.runner.run.assert_called_once()
+            case.runner.close_execution_leases.assert_called_once()
+            case.runner.cleanup_task_resources.assert_called_once()
+            self.assertEqual(set(p.name for p in case.output.iterdir()), set(ci.EVIDENCE_FILE_NAMES))
+            print("BACKEND_HOSTED_SHAPED " + json.dumps({"platform": platform,
+                "backendChange": backend_change, "unequalOrdinals": unequal_ordinals(errors),
+                "parser": parser.call_count, "identity": identity.call_count,
+                "finalAcceptance": transcript["finalAcceptance"]}, sort_keys=True))
+
+    def test_hosted_shaped_ubuntu_main_unresolved_frontend_and_packaging(self):
+        self.assert_hosted_mismatches("ubuntu")
+
+    def test_hosted_shaped_windows_main_unresolved_frontend_and_packaging(self):
+        self.assert_hosted_mismatches("windows")
+
+    def test_hosted_shaped_backend_semantic_mutation_under_frontend_failure(self):
+        self.assert_hosted_mismatches("ubuntu", backend_change="semantic mutation")
+
+    def test_hosted_shaped_backend_unavailable_or_parser_failure_retains_701(self):
+        for change in ("unavailable", "parser failure"):
+            with self.subTest(change=change):
+                self.assert_hosted_mismatches("ubuntu", backend_change=change)
 
     def assert_rejected(self, case, label, *, parser_calls=0, identity_calls=0):
         with mock.patch.object(portable, "_parse_stdout", wraps=portable._parse_stdout) as parser, \
@@ -464,6 +574,7 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
             raw_verify = ci.verify_evidence_file_set
             semantics = ci._validate_evidence_semantics
             compare = ci._compare_verification_replay_claims
+            eligibility = ci._verification_replay_eligibility
             finish = ci._finish_verification_replay
             read_snapshot = ci._read_evidence_file_snapshot
             def raw(*args, **kwargs):
@@ -479,6 +590,9 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
             def compared(*args, **kwargs):
                 events.append("comparisons")
                 return compare(*args, **kwargs)
+            def eligible(*args, **kwargs):
+                events.append("eligibility")
+                return eligibility(*args, **kwargs)
             def finished(transcript, *args, **kwargs):
                 events.append("attached-envelope" if "backendCanonicalPortableResult" in transcript
                               else "eligibility-envelope")
@@ -497,6 +611,7 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                 stack.enter_context(mock.patch.object(ci, "verify_evidence_file_set", side_effect=raw))
                 stack.enter_context(mock.patch.object(ci, "_validate_evidence_semantics", side_effect=semantic))
                 stack.enter_context(mock.patch.object(ci, "_compare_verification_replay_claims", side_effect=compared))
+                stack.enter_context(mock.patch.object(ci, "_verification_replay_eligibility", side_effect=eligible))
                 stack.enter_context(mock.patch.object(ci, "_finish_verification_replay", side_effect=finished))
                 stack.enter_context(mock.patch.object(ci, "_read_evidence_file_snapshot", side_effect=stable))
                 stack.enter_context(mock.patch.object(ci, "rebuild_external_verification_context",
@@ -510,11 +625,13 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
             self.assertEqual(events.count("_bind_replay"), 2)
             first_parse = events.index("_parse_stdout")
             self.assertEqual(events[:first_parse].count("_bind_replay"), 2)
-            self.assertLess(events.index("comparisons"), events.index("external-context"))
+            self.assertLess(events.index("eligibility"), events.index("eligibility-envelope"))
+            self.assertLess(events.index("eligibility-envelope"), events.index("external-context"))
+            self.assertNotIn("comparisons", events[:first_parse])
             self.assertLess(events.index("external-context"), first_parse)
             self.assertEqual(sum(e.startswith("stability:") for e in events[:first_parse]), 5)
             self.assertEqual(events[first_parse:], ["_parse_stdout", "_parse_stdout", "_identity", "_identity",
-                                                   "comparisons", "attached-envelope"])
+                                                   "comparisons", "eligibility", "attached-envelope"])
             self.assertEqual({p.name: p.read_bytes() for p in case.output.iterdir()}, before_files)
             self.assertEqual(json_bytes(case.runner.command_results), before_record)
             raw_transcript = {k: v for k, v in transcript.items() if k not in (
@@ -788,7 +905,7 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                     verification_runner=case.runner, backend_result_evidence=case.pair)
             case.runner.run.assert_not_called()
 
-    def test_outer_context_evidence_and_unrelated_comparisons_precede_parser(self):
+    def test_outer_safety_precedes_parser_and_unrelated_semantics_follow(self):
         with outer_fixture() as case:
             with mock.patch.object(ci, "rebuild_external_verification_context",
                 return_value=replace(case.context, verifier_invocation_id="8" * 64)):
@@ -807,13 +924,109 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
             self.assert_rejected(case, "evidence membership changed during replay")
         with outer_fixture() as case:
             case.runner.run.return_value = {**case.comparison, "resolvedCandidates": [{"unrelated": True}]}
-            self.assert_rejected(case, "unrelated summary comparison")
+            self.assert_rejected(case, "unrelated summary comparison", parser_calls=2, identity_calls=2)
         with outer_fixture(extra=True) as case:
             def other_command():
                 case.runner.command_results[-1]["stdoutSha256"] = "0" * 64
                 return case.comparison
             case.runner.run.side_effect = other_command
-            self.assert_rejected(case, "unrelated command comparison")
+            self.assert_rejected(case, "unrelated command comparison", parser_calls=2, identity_calls=2)
+
+    def test_unrelated_execution_state_and_authority_fail_before_parser(self):
+        def coherent_binding(runner, key):
+            runner.execution_binding[key] = "9" * 64
+            runner.authorization_context_binding = ci.authorization_context_binding_from_execution_binding(
+                runner.execution_binding)
+            runner.authorization_context_binding_digest = ci.authorization_context_binding_digest(
+                runner.authorization_context_binding)
+        changes = {
+            "profile selector": lambda r: setattr(r, "profile", "backend"),
+            "execution binding": lambda r: coherent_binding(r, "producerInvocationId"),
+            "authorization binding": lambda r: coherent_binding(r, "trustFileDigest"),
+            "command membership": lambda r: r.command_results.pop(),
+            "duplicate command": lambda r: r.command_results.append(copy.deepcopy(r.command_results[-1])),
+            "incomplete unrelated command": lambda r: r.command_results[-1].update(exitCode=1),
+            "unrelated command authority": lambda r: r.command_results[-1].update(commandRole="observation-producing"),
+            "unrelated raw execution": lambda r: r.command_results[-1].update(actualExecutionArgv=["unbound"]),
+            "unrelated raw stream schema": lambda r: r.command_results[-1].update(stdoutBytesObserved=-1),
+        }
+        for label, change in changes.items():
+            with self.subTest(case=label), outer_fixture(extra=True) as case:
+                case.runner.run.side_effect = lambda: (change(case.runner) or case.comparison)
+                self.assert_rejected(case, label)
+
+    def test_exact_stream_privacy_matrix_never_writes_unsafe_retained_bytes(self):
+        for label, payload in unsafe_stream_cases().items():
+            for stream in ("stdout", "stderr"):
+                with self.subTest(case=label, stream=stream):
+                    data = npm_stdout(names=[payload, *NAMES[1:]]) if stream == "stdout" else payload.encode()
+                    producer = fixture(**{stream: data})
+                    fields = producer.command_record["producerObservations"][0]["rawStructuredFields"]
+                    self.assertFalse(ci._backend_exact_stream_text_is_safe(data.decode()))
+                    self.assertEqual(fields[stream], ci.raw_observation_json_value(data.decode()))
+                    self.assertNotEqual(fields[stream].encode(), data)
+                    self.assertEqual(producer.command_record[stream + "Sha256"], digest(data))
+                    self.assertEqual(producer.command_record[stream + "BytesObserved"], len(data))
+                    with outer_fixture(producer=producer) as case:
+                        self.assertEqual(ci.verify_evidence_file_set(case.output, repo_root=case.root,
+                            expected_command_plan=case.runner.command_plan, expected_context=case.context), [])
+                        on_disk = case.documents["command-results.json"]["records"][0]
+                        self.assertEqual(on_disk["producerObservations"][0]["rawStructuredFields"], fields)
+                        for path in case.output.iterdir():
+                            text = path.read_text(encoding="utf-8")
+                            self.assertNotIn(payload, text)
+                            self.assertNotIn(json.dumps(payload, ensure_ascii=False)[1:-1], text)
+                        self.assert_rejected(case, label + " " + stream)
+                        case.runner.run.assert_not_called()
+                    print("BACKEND_PRIVACY " + json.dumps({"case": label, "stream": stream,
+                        "unsafeExactRetained": False, "ordinarySanitization": True,
+                        "originalHashAndLengthPreserved": True, "portability": "unavailable"}, sort_keys=True))
+
+    def test_coherent_unsafe_exact_producer_and_replay_streams_fail_binding(self):
+        for label, payload in unsafe_stream_cases().items():
+            data = npm_stdout(names=[payload, *NAMES[1:]])
+            for side in ("producer", "replay"):
+                with self.subTest(case=label, side=side), outer_fixture() as case:
+                    record = (case.documents["command-results.json"]["records"][0] if side == "producer"
+                              else case.runner.command_results[0])
+                    record.update(stdoutSha256=digest(data), stdoutBytesObserved=len(data))
+                    raw = record["producerObservations"][0]
+                    raw["rawStructuredFields"]["stdout"] = data.decode()
+                    if side == "producer":
+                        reseal_producer(case)
+                    else:
+                        raw["sourceOutputDigest"] = ci.command_output_digest(record)
+                        raw["producerRecordDigest"] = ci._producer_record_digest({
+                            k: v for k, v in raw.items() if k != "producerRecordDigest"})
+                        record["producerObservationSetDigest"] = ci.producer_observation_set_digest([raw])
+                        case.runner.captures[0].stdout = data.decode()
+                        case.runner.captures[0].stdout_raw = data
+                        case.runner.captures[0].stdout_bytes = len(data)
+                    self.assert_rejected(case, "coherent unsafe " + side + " " + label)
+                    if side == "producer":
+                        case.runner.run.assert_not_called()
+                    else:
+                        case.runner.run.assert_called_once()
+                    print("BACKEND_PRIVACY_BINDING " + json.dumps({"case": label, "side": side,
+                        "parser": 0, "identity": 0, "portability": "unavailable"}, sort_keys=True))
+
+    def test_safe_exact_streams_preserve_unicode_newlines_and_literal_escapes(self):
+        names = ["caf\u00e9", "cafe\u0301", r'literal \n \u1234 {"value":123}', "timing text (42ms)", *NAMES[4:]]
+        for platform in ("ubuntu", "windows"):
+            for newline in ("\n", "\r\n"):
+                with self.subTest(platform=platform, newline=repr(newline)):
+                    producer = fixture(platform, stdout=npm_stdout(names=names, newline=newline))
+                    replay = fixture(platform, stdout=npm_stdout("90", "912", names=names, newline=newline))
+                    for side in (producer, replay):
+                        self.assertTrue(ci._backend_exact_stream_text_is_safe(side.stdout.decode()))
+                        self.assertEqual(side.command_record["producerObservations"][0]
+                                         ["rawStructuredFields"]["stdout"].encode(), side.stdout)
+                    with outer_fixture(producer, replay) as case:
+                        errors, transcript = verify(case)
+                        self.assertEqual(errors, [])
+                        self.assertEqual(transcript["finalAcceptance"], "PASS")
+                    print("BACKEND_PRIVACY_SAFE " + json.dumps({"platform": platform,
+                        "newline": repr(newline), "exactRetained": True, "finalAcceptance": "PASS"}))
 
     def test_reporter_failure_has_zero_identity_calls(self):
         for side in ("producer", "replay"):
@@ -1018,4 +1231,4 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=2, testRunner=fixtures.InventoryTextTestRunner)

@@ -1,10 +1,10 @@
 # Issue 13: verified backend portable result
 
-This local hosted-CLI wiring remediation is based exactly on
-`dfcb6758095ec225b2e6de4c0ad64fa634a11d9c`. PR #14 review comment 3997121381
-and hosted run 34710916747 are accepted evidence of the missing production
-wiring. No hosted rerun, new attempt, workflow change, or private capture is
-needed for this local implementation and its synthetic integration fixtures.
+This local semantic-isolation and evidence-safety remediation is based exactly
+on `0ad94d3fa18b829a7349286cf1cf6dfee15babea`. Its production CLI wiring is
+retained. The unresolved hosted state is represented by local synthetic
+integration fixtures; this transaction does not run hosted CI, rerun
+34710916747, modify either PR, or push a branch.
 
 `BackendCanonicalPortableResult` is an optional comparison of the successful
 128-test backend npm reporter. It becomes available only inside
@@ -35,7 +35,7 @@ representation, including compact empty arrays and digest references. It is
 separate from `_ReplayEvidence`, which holds the fresh runner's full local facts.
 Neither is an argument of any public verifier API.
 
-Source inspection found an additional prerequisite: the base producer's generic
+The producer's generic
 `raw_observation_json_value()` normalizes process text and strips leading/final
 newlines. Successful backend observations now retain strict UTF-8 stdout/stderr
 in their existing `rawStructuredFields` entries before their producer digest is
@@ -44,6 +44,21 @@ line endings, and all other bytes. The generic observation encoder and other
 command families retain their existing behavior. An older artifact with lossy
 stream text is unavailable for portability and rejects; omitted bytes are never
 guessed or restored from diagnostic previews.
+
+Exact retention first checks the existing privacy rules for both streams:
+terminal/Unicode format controls, authorized-root and absolute-path handling,
+credential redaction, and high-confidence secrets. Privacy inspection also
+covers the CRLF/separator-normalized representation used by the ordinary sanitizer.
+This inspection never changes retained bytes. Safe LF/CRLF presentation,
+Unicode spelling, whitespace, and literal escapes remain exact.
+
+If either stream violates those rules, both ordinary stream fields retain the
+existing sanitizer's output, while the command keeps its original observed
+hashes and lengths. Exact reconstruction therefore fails closed. Sanitized text
+is never claimed to be exact, and the producer writer receives no new unsafe
+stream copy. The same predicate in producer/replay binding rejects coherently
+forged unsafe exact observations. The generic sanitizer and secret/path policy
+are unchanged.
 
 The lower public signatures remain frozen:
 
@@ -103,7 +118,9 @@ The automatically selected outer path executes these steps in order:
    omitted physical lease preimages remain intentionally unreconstructed.
 4. Execute the externally selected runner once, retaining its existing
    `finally` cleanup behavior.
-5. Recheck the producer context and bind the replay to exactly one fresh command
+5. Validate every fresh command record against the existing raw validators and
+   independent local command authority, including unrelated commands' execution
+   state and protected inputs. Recheck the producer context and bind the replay to exactly one fresh command
    result, independent plan member, and actual `CommandCapture`, including exact
    raw capture bytes. Require no stdin lease for this protected-bundle command.
    Bind the capture's measured execution fields to the command record;
@@ -112,11 +129,10 @@ The automatically selected outer path executes these steps in order:
    including npm hash, size, and version, before parsing. Self-consistent
    producer authority cannot substitute for independently measured fresh
    authority. Recompute the plan digest from the actual plan.
-6. Check all unrelated replay comparisons using private eligibility views.
-   Those views defer only backend stdout hash/length and its two derived raw
-   observation fields. Every other field and every other command remains exact.
-   Recompute aggregate comparison views from already validated raw records.
-   No backend result, reporter parse, or result identity exists at this step.
+6. Check claimed replay fields, hard gates, profile,
+   execution/authorization bindings, plan, command membership, and completed
+   class eligibility. No command semantic equality is collected at this step,
+   and no incomplete backend comparison view exists.
 7. Validate the existing replay authorization/cleanup requirements. Rebuild the
    outer external context and recheck evidence identities, bytes, and membership.
    Rebind both sides again, reread the package through the candidate target lease,
@@ -124,7 +140,11 @@ The automatically selected outer path executes these steps in order:
 8. Derive results from the two immutable bound sides. Parse both complete
    reporters before computing either backend result identity. Require equality
    of both complete result objects and identities.
-9. Repeat the complete comparisons with actual portable result views. Attach
+9. Collect the complete comparisons once. Use portable backend views only when
+   both complete results and identities were actually derived and equal;
+   otherwise retain the raw backend record and emit the explicit unavailable
+   backend error. Every unrelated command keeps its existing comparison.
+   Aggregate command, observation, transcript, and summary differences. Attach
    `backendCanonicalPortableResult` only when there are no errors, then derive
    the final replay envelope over the transcript including that result.
 
@@ -132,8 +152,11 @@ Every binding failure has zero backend parser and identity calls. A producer
 reporter parse failure has one parser call and zero identity calls; a replay
 reporter parse failure has two parser calls and zero identity calls. An identity
 mismatch has two parser calls and two identity calls. All of these failures
-return no portable field and cannot yield a final PASS. Cleanup, unrelated
-comparison, and outer evidence/context failures also precede parsing. A failure
+return no portable field and cannot yield a final PASS. Cleanup, raw authority,
+execution eligibility, and outer evidence/context failures precede parsing.
+Unrelated semantic mismatches do not block derivation, but still reject final
+acceptance. An unavailable derivation never silently removes raw ordinal 701.
+A failure
 while finishing the final envelope removes the result and returns REJECT.
 
 ## Strict reporter and identity
@@ -194,9 +217,9 @@ production behavior and does not assert that the effective backend environment
 has an empty NODE_PATH.
 
 The local canonical record/transcript functions, five-file writer, compaction,
-local authority validation, authorization-envelope
-constructors, workflows, and frontend-security/standalone-packaging behavior
-retain their frozen implementations. Acquisition, capture, and GPG code are not
+local authority validators, authorization-envelope constructors, workflows, and
+frontend-security/standalone-packaging result semantics retain their existing
+implementations. Acquisition, capture, and GPG code are not
 part of this patch. The raw replay transcript and evidence retain their original
 stream hashes and aggregates; comparison views are detached private values.
 
@@ -205,13 +228,42 @@ stream hashes and aggregates; comparison views are detached private values.
 `test_backend_canonical_portable_result.py` exercises the actual `main()` and
 outer verifier with five files written by the unchanged evidence writer and
 validated by the real raw/semantic validators. Its hosted-shaped plan places
-the compact backend record at ordinal 701. Duration drift passes and removes
-701 from unequal-command diagnostics, while unrelated frontend/packaging
-mismatches remain rejecting with zero backend parser/identity calls. Policy
+the compact backend record at ordinal 701. The two separately named hosted
+controls have these unresolved differences after backend duration derivation:
+
+| Fixture | Unequal ordinals | Backend parser calls | Backend identity calls | Final acceptance |
+| --- | --- | --- | --- | --- |
+| Ubuntu | 687, 695, 702 | 2 | 2 | REJECT |
+| Windows | 687, 692, 695, 702 | 2 | 2 | REJECT |
+| Ubuntu with backend semantic mutation | 687, 695, 701, 702 | 2 | 2 | REJECT |
+| Ubuntu with backend reporter failure | 687, 695, 701, 702 | 2 | 0 | REJECT |
+| Ubuntu with unavailable backend capture | 687, 695, 701, 702 | 0 | 0 | REJECT |
+
+An equal backend result removes 701 only after actual derivation. Policy
 and plans containing only frontend/packaging commands cannot select the backend
 binder. The synthetic runner provides bounded fresh execution fixtures;
 authority preparation and external-context rebuilding are controlled by the
 fixture. This does not claim a hosted replay or a live backend npm execution.
+
+The exact-stream privacy matrix covers 26 synthetic payloads in both stdout and
+stderr: token and credential assignments, including CRLF splits; Authorization/Bearer; Cookie and
+Set-Cookie; private-key markers; credential HTTP and database URL separator
+aliases; Windows drive, UNC, device, and file-URI paths; POSIX home/task paths
+and mixed/backslash aliases; ANSI, ASCII, bidi, and other Unicode format
+controls. All 52 producer cases
+check the ordinary sanitizer output on disk, unchanged original hash/length,
+zero backend parsing/identity, and unavailable portability. Another 52 binding
+controls inject coherent unsafe producer/replay records. Safe Unicode,
+LF/CRLF, and literal-escape controls prove exact retention remains available.
+
+The supplied earlier log reports 22 executed tests, while fresh discovery at
+the required parent finds 23 methods. That log does not substantiate 23
+executions. The final dedicated entry point uses the foundation inventory
+runner: it discovers 31 methods, names every executed method (including both
+hosted OS controls), and reports discovered/executed/passed/failed/error/skip
+and setup-blocked accounting in the same fresh log. The 31-method inventory
+contains the parent's 23 methods, with updated expectations and one renamed
+safety-order method, plus eight new regression methods.
 
 The tests instrument backend parsing and identity calls, emit the negative
 matrix and successful call order, verify lower-API confinement, and check that

@@ -230,6 +230,7 @@ def _bind_side(ci, evidence):
             _require(type(raw) is bytes and len(raw) <= MAX_STREAM_BYTES)
             _require(len(raw) == record[stream + "BytesObserved"])
             _require(hashlib.sha256(raw).hexdigest() == record[stream + "Sha256"])
+            _require(ci._backend_exact_stream_text_is_safe(raw.decode("utf-8", errors="strict")))
         _require(evidence.stderr == b"")
         _require(len(record["producerObservations"]) == 1)
         raw = record["producerObservations"][0]
@@ -359,6 +360,17 @@ def _bind_replay(ci, context, commands, runner):
         _require(commands == context.commands and runner.command_plan == context.plan)
         _require(ci.command_plan_digest(runner.command_plan) == runner.command_plan_digest
                  == commands["commandPlanDigest"])
+        # Deferring unrelated result equality must not defer raw replay authority
+        # or execution eligibility for those commands. Use the existing local
+        # validators, including each command's protected inputs and observations.
+        _require(not ci._command_authority_violations(
+            runner.profile, runner.command_results, runner.observations,
+            expected_plan=runner.command_plan))
+        _require(len(runner.command_results) == len(runner.command_plan))
+        for index, (record, expected) in enumerate(zip(runner.command_results, runner.command_plan)):
+            errors = []
+            _require(not ci._validate_command_record(record, index, errors,
+                         expected_record=expected) and not errors)
         rebound = _bind_producer(ci, commands, runner.command_plan, context.repo_root)
         _require(rebound is not None and rebound.side == context.side)
         records = [r for r in runner.command_results if r["commandId"] == "backend-canonical"]
@@ -404,13 +416,6 @@ def _bind_replay(ci, context, commands, runner):
 def _project_record(ci, record, result):
     """Detached comparison values; never input to a raw/local authority function."""
     projected = ci._canonical_transcript_record(record)
-    if result is None:
-        # Eligibility only: defer the four reporter-dependent fields while every
-        # other field and every other command still undergoes exact comparison.
-        for key in ("stdoutSha256", "stdoutBytesObserved", "producerObservations",
-                    "producerObservationSetDigest"):
-            projected.pop(key)
-        return projected
     encoded = _json_bytes(result["result"])
     projected["stdoutSha256"] = hashlib.sha256(encoded).hexdigest()
     projected["stdoutBytesObserved"] = len(encoded)
@@ -431,10 +436,7 @@ def _comparison_view(ci, records, plan_digest, classes, result):
     for item, record in zip(universe, projected):
         if record["commandId"] == "backend-canonical":
             for key in ("producerObservations", "producerObservationSetDigest"):
-                if result is None:
-                    item.pop(key)
-                else:
-                    item[key] = record[key]
+                item[key] = record[key]
     universe_digest = ci.canonical_failure_digest(universe)
     transcript_digest = ci.canonical_failure_digest({
         "commandPlanDigest": plan_digest, "orderedCommandTranscript": projected,
@@ -447,8 +449,8 @@ def _comparison_view(ci, records, plan_digest, classes, result):
             "producerTranscriptDigest": transcript_digest}
 
 
-def _comparison_views(ci, pair, result=None):
-    _require(type(pair) is _BoundPair)
+def _comparison_views(ci, pair, result):
+    _require(type(pair) is _BoundPair and result is not None)
     return {side: _comparison_view(ci, records, pair.plan_digest, pair.classes, result)
             for side, records in (("producer", pair.producer_records), ("replay", pair.replay_records))}
 

@@ -1832,6 +1832,25 @@ def contains_high_confidence_secret(value: str) -> list[str]:
     return sorted(set(hits))
 
 
+def _backend_exact_stream_text_is_safe(value: str) -> bool:
+    """Inspect existing privacy rules without sanitizing retained stream bytes."""
+    # CRLF is reporter presentation, but all other removed controls (including
+    # bidi formatting) make exact retention unavailable. Preserve the original.
+    line_view = value.replace("\r\n", "\n")
+    if strip_terminal_controls(line_view) != line_view:
+        return False
+    if normalize_authorized_path_text(value) != value:
+        return False
+    # The ordinary sanitizer also recognizes paths and credential URLs after
+    # separator normalization. Inspect that view without rewriting the stream.
+    privacy_view = line_view.replace("\\", "/")
+    if normalize_authorized_path_text(privacy_view) != privacy_view:
+        return False
+    return not contains_high_confidence_secret(privacy_view) and not any(
+        pattern.search(privacy_view) for pattern in REDACTION_PATTERNS
+    )
+
+
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -18126,11 +18145,13 @@ class FoundationRunner:
                 # A lossy observation cannot supply portable backend stream bytes.
                 pass
             else:
-                # Retain exact backend streams in the existing ordinary fields.
-                # In particular, normalization must not strip reporter newlines.
-                raw["rawStructuredFields"].update(streams)
-                raw["producerRecordDigest"] = _producer_record_digest({
-                    key: value for key, value in raw.items() if key != "producerRecordDigest"})
+                # Exact retention must not bypass ordinary evidence privacy.
+                # Unsafe streams keep the existing sanitized observation; its
+                # bytes cannot satisfy the original stream hash/length binding.
+                if all(_backend_exact_stream_text_is_safe(value) for value in streams.values()):
+                    raw["rawStructuredFields"].update(streams)
+                    raw["producerRecordDigest"] = _producer_record_digest({
+                        key: value for key, value in raw.items() if key != "producerRecordDigest"})
         return self.add_observation(
             {"commandId": capture.command_id, "rawObservation": raw}
         )
@@ -22302,14 +22323,12 @@ def compare_verification_replay_claims(
     return _compare_verification_replay_claims(documents, runner, comparison)
 
 
-def _compare_verification_replay_claims(
+def _verification_replay_eligibility(
     documents: Mapping[str, dict[str, Any]],
     runner: FoundationRunner,
     comparison: Mapping[str, Any] | None,
-    *,
-    comparison_views: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
-    """Compare mutable evidence claims with independently replayed facts."""
+    """Check safety, authority and execution state before result derivation."""
 
     errors: list[str] = []
     summary = documents.get("summary.json", {})
@@ -22373,6 +22392,40 @@ def _compare_verification_replay_claims(
     if commands.get("commandPlanDigest") != transcript["commandPlanDigest"]:
         errors.append("verification replay commandPlanDigest mismatch")
     evidence_records = commands.get("records")
+    if not isinstance(evidence_records, list):
+        errors.append("verification replay evidence command records are unavailable")
+    elif len(evidence_records) != transcript["commandCount"]:
+        errors.append("verification replay commandCount mismatch")
+    for field_name in (
+        "expectedCompletedCommandClasses",
+        "actualCompletedCommandClasses",
+        "expectedCompletedCommandClassSetDigest",
+        "completedCommandClassSetDigest",
+        "missingCommandIds",
+        "extraCommandIds",
+        "duplicateCommandIds",
+    ):
+        if commands.get(field_name) != transcript.get(field_name):
+            errors.append(f"verification replay {field_name} mismatch")
+    if commands.get("completedCommandClasses") != transcript.get(
+        "actualCompletedCommandClasses"
+    ):
+        errors.append("verification replay completedCommandClasses mismatch")
+    return transcript, sorted(set(errors))
+
+
+def _compare_verification_replay_claims(
+    documents: Mapping[str, dict[str, Any]],
+    runner: FoundationRunner,
+    comparison: Mapping[str, Any] | None,
+    *,
+    comparison_views: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Aggregate exact command differences, with only proven portable views."""
+    transcript, errors = _verification_replay_eligibility(documents, runner, comparison)
+    summary = documents.get("summary.json", {})
+    commands = documents.get("command-results.json", {})
+    evidence_records = commands.get("records")
     replay_records = transcript["records"]
     if not isinstance(evidence_records, list):
         errors.append("verification replay evidence command records are unavailable")
@@ -22398,19 +22451,10 @@ def _compare_verification_replay_claims(
                 errors.append("verification replay first command differences: " + json.dumps(
                     diagnostics, sort_keys=True, separators=(",", ":"),
                 ))
-    if isinstance(evidence_records, list) and len(evidence_records) != transcript["commandCount"]:
-        errors.append("verification replay commandCount mismatch")
     top_level_fields = (
-        "expectedCompletedCommandClasses",
-        "actualCompletedCommandClasses",
-        "expectedCompletedCommandClassSetDigest",
-        "completedCommandClassSetDigest",
         "producerObservationCount",
         "producerObservationUniverseDigest",
         "producerTranscriptDigest",
-        "missingCommandIds",
-        "extraCommandIds",
-        "duplicateCommandIds",
     )
     for field_name in top_level_fields:
         claimed_value, replay_value = commands.get(field_name), transcript.get(field_name)
@@ -22421,10 +22465,6 @@ def _compare_verification_replay_claims(
             replay_value = comparison_views["replay"][field_name]
         if claimed_value != replay_value:
             errors.append(f"verification replay {field_name} mismatch")
-    if commands.get("completedCommandClasses") != transcript.get(
-        "actualCompletedCommandClasses"
-    ):
-        errors.append("verification replay completedCommandClasses mismatch")
     if _portable_replay_observations(
         commands.get("observations"),
         [record for record in evidence_records if isinstance(record, Mapping)]
@@ -22701,12 +22741,10 @@ def verify_evidence_with_replay(
             )
             if bound_pair is None:
                 replay_errors.append(unavailable)
-            # No reporter parse or result identity exists in the eligibility view.
-            # The frozen comparisons still check every unrelated field and gate.
-            views = (backend_portable._comparison_views(sys.modules[__name__], bound_pair)
-                     if bound_pair is not None else None)
-            transcript, comparison_errors = _compare_verification_replay_claims(
-                documents, verification_runner, comparison, comparison_views=views,
+            # Authority, execution state and cleanup remain ahead of parsing.
+            # Semantic inequality in another command is collected afterward.
+            transcript, comparison_errors = _verification_replay_eligibility(
+                documents, verification_runner, comparison,
             )
             replay_errors.extend(comparison_errors)
             transcript, replay_errors = _finish_verification_replay(
@@ -22743,12 +22781,13 @@ def verify_evidence_with_replay(
         ):
             errors.append(f"{name}: evidence changed during verification replay")
     if backend_portability:
-        # Evidence/context/cleanup and all unrelated comparisons precede parsing.
+        # Evidence/context/cleanup and authority eligibility precede parsing.
         try:
             if {entry.name for entry in os.scandir(output_dir)} != set(EVIDENCE_FILE_NAMES):
                 errors.append("evidence file membership changed during verification replay")
         except OSError as exc:
             errors.append(f"evidence directory cannot be re-enumerated: {type(exc).__name__}")
+        result = None
         if not errors and bound_pair is not None:
             rebound = backend_portable._bind_replay(
                 sys.modules[__name__], backend_context,
@@ -22760,19 +22799,22 @@ def verify_evidence_with_replay(
                 result = backend_portable._derive_equal_result(sys.modules[__name__], rebound)
                 if result is None:
                     errors.append(unavailable)
-                else:
-                    transcript, comparison_errors = _compare_verification_replay_claims(
-                        documents, verification_runner, comparison,
-                        comparison_views=backend_portable._comparison_views(
-                            sys.modules[__name__], rebound, result),
-                    )
-                    errors.extend(comparison_errors)
-                    if not errors:
-                        transcript["backendCanonicalPortableResult"] = result
-                        transcript, errors = _finish_verification_replay(
-                            transcript, errors, expected_context=expected_context,
-                            runner=verification_runner,
-                        )
+        if comparison is not None:
+            # A backend record loses its raw difference only after both full
+            # results were derived and compared equal. Every unavailable or
+            # unequal result retains the raw comparison, even on another error.
+            views = (backend_portable._comparison_views(sys.modules[__name__], rebound, result)
+                     if result is not None else None)
+            transcript, comparison_errors = _compare_verification_replay_claims(
+                documents, verification_runner, comparison, comparison_views=views,
+            )
+            errors.extend(comparison_errors)
+            if result is not None and not errors:
+                transcript["backendCanonicalPortableResult"] = result
+            transcript, errors = _finish_verification_replay(
+                transcript, errors, expected_context=expected_context,
+                runner=verification_runner,
+            )
         if errors and transcript is not None:
             transcript.pop("backendCanonicalPortableResult", None)
             transcript["finalAcceptance"] = "REJECT"
