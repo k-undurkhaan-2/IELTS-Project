@@ -1927,6 +1927,37 @@ def raw_observation_json_value(value: Any) -> Any:
     return normalized
 
 
+_BACKEND_STREAM_REDACTION_MARKER = "[BACKEND STREAM REDACTED]"
+
+
+def _backend_successful_stream_observation_text(
+    raw_stream: bytes | None, ordinary: str,
+) -> str:
+    """Return privacy-safe evidence text without changing raw stream authority."""
+    candidate = ordinary
+    try:
+        exact = raw_stream.decode("utf-8", errors="strict") if raw_stream is not None else None
+    except UnicodeError:
+        exact = None
+    if exact is not None and _backend_exact_stream_text_is_safe(exact):
+        # Keep safe reporter presentation byte-exact. Apply the ordinary privacy
+        # redactions, without its unrelated timing/whitespace normalization.
+        redacted = exact
+        for pattern in REDACTION_PATTERNS:
+            redacted = pattern.sub("[REDACTED]", redacted)
+        if redacted == exact:
+            candidate = exact
+    # Escape protection/restoration can leave an ordinary sanitized candidate
+    # unsafe. Neither changed text nor successful sanitization proves privacy.
+    if not _backend_exact_stream_text_is_safe(candidate):
+        candidate = _BACKEND_STREAM_REDACTION_MARKER
+    # Check the final value, including the fixed marker, before it can enter an
+    # observation or its derived copies. Never include source text in the error.
+    if not _backend_exact_stream_text_is_safe(candidate):
+        raise ValueError("backend stream observation failed its privacy check")
+    return candidate
+
+
 def structured_signature(value: Any) -> str:
     canonical = json.dumps(
         normalized_json_value(value),
@@ -18136,22 +18167,14 @@ class FoundationRunner:
             failure_path_authority=path_binding,
         )
         if (command_record.get("commandId") == command_record.get("commandClass") == "backend-canonical"
-            and capture.exit_code == 0 and capture.stdout_raw is not None
-            and capture.stderr_raw is not None):
-            try:
-                streams = {"stdout": capture.stdout_raw.decode("utf-8", errors="strict"),
-                           "stderr": capture.stderr_raw.decode("utf-8", errors="strict")}
-            except UnicodeError:
-                # A lossy observation cannot supply portable backend stream bytes.
-                pass
-            else:
-                # Exact retention must not bypass ordinary evidence privacy.
-                # Unsafe streams keep the existing sanitized observation; its
-                # bytes cannot satisfy the original stream hash/length binding.
-                if all(_backend_exact_stream_text_is_safe(value) for value in streams.values()):
-                    raw["rawStructuredFields"].update(streams)
-                    raw["producerRecordDigest"] = _producer_record_digest({
-                        key: value for key, value in raw.items() if key != "producerRecordDigest"})
+            and capture.exit_code == 0):
+            for stream in ("stdout", "stderr"):
+                raw["rawStructuredFields"][stream] = _backend_successful_stream_observation_text(
+                    getattr(capture, stream + "_raw"), raw["rawStructuredFields"][stream])
+            # Only observation text/digests change. The original command stream
+            # hashes and byte lengths remain the binder's sole byte authority.
+            raw["producerRecordDigest"] = _producer_record_digest({
+                key: value for key, value in raw.items() if key != "producerRecordDigest"})
         return self.add_observation(
             {"commandId": capture.command_id, "rawObservation": raw}
         )

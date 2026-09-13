@@ -43,7 +43,8 @@ def npm_stdout(duration="1.25", total="99.5", *, names=None, newline="\n", initi
     return (newline.join(lines) + newline + f"ℹ duration_ms {total}" + newline).encode()
 
 
-def fixture(platform="ubuntu", *, stdout=None, stderr=b"", physical="1", ordinal=0):
+def fixture(platform="ubuntu", *, stdout=None, stderr=b"", physical="1", ordinal=0,
+            retained_streams=("stdout", "stderr")):
     """Observed npm grammar/inventory size with public, synthetic preimages.
 
     Both platform labels exercise production record/bundle/closure validators.
@@ -74,7 +75,9 @@ def fixture(platform="ubuntu", *, stdout=None, stderr=b"", physical="1", ordinal
     capture = ci.CommandCapture(command_id=spec["commandId"], command_class=spec["commandClass"],
         argv=spec["executionArgv"], executed=True, exit_code=0, duration_seconds=0.125,
         stdout=stdout.decode("utf-8", errors="replace"), stderr=stderr.decode("utf-8", errors="replace"),
-        stdout_raw=stdout, stderr_raw=stderr, stdout_bytes=len(stdout), stderr_bytes=len(stderr),
+        stdout_raw=stdout if "stdout" in retained_streams else None,
+        stderr_raw=stderr if "stderr" in retained_streams else None,
+        stdout_bytes=len(stdout), stderr_bytes=len(stderr),
         include_preview=False, containment="windows-job-object" if platform == "windows"
         else "linux-subreaper-pidfd-proc-supervisor", process_tree_status="contained-clean",
         containment_disposition="natural-exit-reaped", descendants_observed=1, descendants_reaped=1,
@@ -374,6 +377,21 @@ def unsafe_stream_cases():
         "POSIX home separator alias": r"\home\private-fixture\runner-output.txt",
         "POSIX opt separator alias": r"\opt\private-fixture\runner-output.txt",
         "POSIX mixed separators": r"/home\private-fixture\runner-output.txt",
+        "reviewer literal t prefix": r"\tmp/private-fixture/runner-output.txt",
+        "literal t mixed root": r"\tmp\private-fixture/runner-output.txt",
+        "literal n prefix": r"\n \tmp/private-fixture/runner-output.txt",
+        "literal r prefix": r"\r \tmp/private-fixture/runner-output.txt",
+        "changed unsafe literal n suffix": r"\tmp/private-fixture/\notes.txt",
+        "changed unsafe literal r suffix": r"\tmp/private-fixture/\runner-output.txt",
+        "Windows mixed t prefix": r"C:\tmp/private-fixture\runner-output.txt",
+        "Windows mixed n prefix": r"C:\new/private-fixture\runner-output.txt",
+        "Windows mixed r prefix": r"C:\runner/private-fixture\runner-output.txt",
+        "UNC mixed t prefix": r"\\tmp/private-fixture\runner-output.txt",
+        "UNC mixed n prefix": r"\\new/private-fixture\runner-output.txt",
+        "UNC mixed r prefix": r"\\runner/private-fixture\runner-output.txt",
+        "file URI mixed t prefix": r"file:\\tmp/private-fixture\runner-output.txt",
+        "file URI mixed n prefix": r"file:\\new/private-fixture\runner-output.txt",
+        "file URI mixed r prefix": r"file:\\runner/private-fixture\runner-output.txt",
         "terminal escape": "\x1b[31mprivate-fixture\x1b[0m",
         "ASCII control": "private\x00fixture",
         "bidi control": "private\u202efixture",
@@ -955,32 +973,112 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                 case.runner.run.side_effect = lambda: (change(case.runner) or case.comparison)
                 self.assert_rejected(case, label)
 
+    def assert_private_stream_evidence(self, label, payload, placement, *, platform="ubuntu", ordinal=0,
+                                       retained_streams=("stdout", "stderr"), invalid_stream=None):
+        stream = "stderr" if placement == "stderr" else "stdout"
+        streams = {"stdout": npm_stdout(), "stderr": b""}
+        streams[stream] = (npm_stdout(names=[payload, *NAMES[1:]])
+                           if placement == "reporter-name" else payload.encode())
+        if invalid_stream is not None:
+            streams[invalid_stream] += b"\xff"
+        producer = fixture(platform, ordinal=ordinal, retained_streams=retained_streams, **streams)
+        fields = producer.command_record["producerObservations"][0]["rawStructuredFields"]
+        original = streams[stream].decode("utf-8", errors="replace")
+        self.assertFalse(ci._backend_exact_stream_text_is_safe(original))
+        ordinary = ci.raw_observation_json_value(original)
+        expected = ordinary if ci._backend_exact_stream_text_is_safe(ordinary) else "[BACKEND STREAM REDACTED]"
+        self.assertEqual(fields[stream], expected)
+        self.assertTrue(all(ci._backend_exact_stream_text_is_safe(fields[s]) for s in streams))
+        self.assertNotEqual(fields[stream].encode(), streams[stream])
+        with outer_fixture(producer, fixture(platform, ordinal=ordinal, stdout=npm_stdout("90", "912")),
+                           prefix_count=ordinal, hosted=ordinal == 701) as case:
+            self.assertEqual(set(p.name for p in case.output.iterdir()), set(ci.EVIDENCE_FILE_NAMES))
+            self.assertEqual(ci.verify_evidence_file_set(case.output, repo_root=case.root,
+                expected_command_plan=case.runner.command_plan, expected_context=case.context), [])
+            serialized = (case.output / "command-results.json").read_bytes()
+            on_disk = json.loads(serialized)["records"][ordinal]
+            self.assertEqual(on_disk["producerObservations"][0]["rawStructuredFields"], fields)
+            self.assertNotIn(payload.encode(), serialized)
+            self.assertNotIn(json.dumps(payload, ensure_ascii=False)[1:-1].encode(), serialized)
+            for path in case.output.iterdir():
+                text = path.read_text(encoding="utf-8")
+                self.assertNotIn(payload, text)
+                self.assertNotIn(json.dumps(payload, ensure_ascii=False)[1:-1], text)
+            for name, data in streams.items():
+                for record in (producer.command_record, on_disk):
+                    self.assertEqual(record[name + "Sha256"], digest(data))
+                    self.assertEqual(record[name + "BytesObserved"], len(data))
+            encoded = fields[stream].encode()
+            self.assertFalse(len(encoded) == on_disk[stream + "BytesObserved"]
+                             and digest(encoded) == on_disk[stream + "Sha256"])
+            with mock.patch.object(portable, "_parse_stdout", wraps=portable._parse_stdout) as parser, \
+                 mock.patch.object(portable, "_identity", wraps=portable._identity) as identity:
+                self.assertIsNone(portable._bind_producer(ci, case.documents["command-results.json"],
+                                  case.runner.command_plan, case.root))
+                exit_code, (errors, transcript), output, _ = invoke_main(case)
+                self.assertEqual(exit_code, ci.EXIT_POLICY_VIOLATION, output)
+                self.assertTrue(any("backend-canonical portable result unavailable" in e for e in errors), errors)
+                self.assertNotIn("backendCanonicalPortableResult", transcript or {})
+                self.assertNotEqual((transcript or {}).get("finalAcceptance"), "PASS")
+                case.runner.run.assert_not_called()
+                # The unchanged lower API compares the independently captured raw
+                # pair. Sanitized observation equality cannot remove its ordinal.
+                raw_transcript, raw_errors = ci.run_verification_replay(case.documents,
+                    expected_context=case.context, verification_runner=case.runner, repo_root=case.root)
+                self.assertEqual(unequal_ordinals(raw_errors), [ordinal], raw_errors)
+                self.assertEqual(raw_transcript["finalAcceptance"], "REJECT")
+                self.assertNotIn("backendCanonicalPortableResult", raw_transcript)
+                parser.assert_not_called()
+                identity.assert_not_called()
+            print("BACKEND_PRIVACY " + json.dumps({"case": label, "placement": placement,
+                "platform": platform, "ordinal": ordinal, "fallback": "ordinary" if expected == ordinary else "marker",
+                "serializedOriginalAbsent": True, "serializedEscapedOriginalAbsent": True,
+                "fiveFileEvidenceValid": True, "originalHashAndLengthPreserved": True,
+                "producerExactStream": "unavailable", "parser": 0, "identity": 0,
+                "rawUnequalOrdinals": unequal_ordinals(raw_errors), "finalAcceptance": "REJECT"}, sort_keys=True))
+
     def test_exact_stream_privacy_matrix_never_writes_unsafe_retained_bytes(self):
         for label, payload in unsafe_stream_cases().items():
-            for stream in ("stdout", "stderr"):
-                with self.subTest(case=label, stream=stream):
-                    data = npm_stdout(names=[payload, *NAMES[1:]]) if stream == "stdout" else payload.encode()
-                    producer = fixture(**{stream: data})
-                    fields = producer.command_record["producerObservations"][0]["rawStructuredFields"]
-                    self.assertFalse(ci._backend_exact_stream_text_is_safe(data.decode()))
-                    self.assertEqual(fields[stream], ci.raw_observation_json_value(data.decode()))
-                    self.assertNotEqual(fields[stream].encode(), data)
-                    self.assertEqual(producer.command_record[stream + "Sha256"], digest(data))
-                    self.assertEqual(producer.command_record[stream + "BytesObserved"], len(data))
-                    with outer_fixture(producer=producer) as case:
-                        self.assertEqual(ci.verify_evidence_file_set(case.output, repo_root=case.root,
-                            expected_command_plan=case.runner.command_plan, expected_context=case.context), [])
-                        on_disk = case.documents["command-results.json"]["records"][0]
-                        self.assertEqual(on_disk["producerObservations"][0]["rawStructuredFields"], fields)
-                        for path in case.output.iterdir():
-                            text = path.read_text(encoding="utf-8")
-                            self.assertNotIn(payload, text)
-                            self.assertNotIn(json.dumps(payload, ensure_ascii=False)[1:-1], text)
-                        self.assert_rejected(case, label + " " + stream)
-                        case.runner.run.assert_not_called()
-                    print("BACKEND_PRIVACY " + json.dumps({"case": label, "stream": stream,
-                        "unsafeExactRetained": False, "ordinarySanitization": True,
-                        "originalHashAndLengthPreserved": True, "portability": "unavailable"}, sort_keys=True))
+            for placement in ("stdout", "stderr", "reporter-name"):
+                with self.subTest(case=label, placement=placement):
+                    self.assert_private_stream_evidence(label, payload, placement)
+
+    def test_reviewer_counterexample_retains_raw_701_and_rejects_without_parsing(self):
+        payload = r"\tmp/private-fixture/runner-output.txt"
+        reporter = npm_stdout(names=[payload, *NAMES[1:]])
+        members, _segments = portable._parse_stdout(reporter, json.loads(PACKAGE))
+        self.assertEqual(len(members), 128)
+        self.assertEqual(members[0]["name"], payload)
+        for platform in ("ubuntu", "windows"):
+            for placement in ("stdout", "stderr", "reporter-name"):
+                with self.subTest(platform=platform, placement=placement):
+                    self.assert_private_stream_evidence("reviewer counterexample", payload, placement,
+                                                       platform=platform, ordinal=701)
+
+    def test_missing_and_undecodable_raw_streams_still_check_ordinary_evidence(self):
+        payload = r"\tmp/private-fixture/runner-output.txt"
+        for stream in ("stdout", "stderr"):
+            for missing in ("stdout", "stderr"):
+                with self.subTest(stream=stream, missing=missing):
+                    self.assert_private_stream_evidence("missing " + missing, payload, stream,
+                        retained_streams=tuple(s for s in ("stdout", "stderr") if s != missing))
+            for invalid in ("stdout", "stderr"):
+                with self.subTest(stream=stream, invalid=invalid):
+                    self.assert_private_stream_evidence("invalid UTF-8 " + invalid, payload, stream,
+                                                       invalid_stream=invalid)
+
+    def test_backend_redaction_marker_is_fixed_and_final_value_must_pass_guard(self):
+        marker = ci._BACKEND_STREAM_REDACTION_MARKER
+        self.assertEqual(marker, "[BACKEND STREAM REDACTED]")
+        self.assertEqual(len(marker.encode("ascii")), 25)
+        self.assertTrue(all(0x20 <= ord(character) <= 0x7e for character in marker))
+        self.assertEqual(ci.sanitize_text(marker), marker)
+        self.assertEqual(ci.raw_observation_json_value(marker), marker)
+        self.assertTrue(ci._backend_exact_stream_text_is_safe(marker))
+        payload = r"\tmp/private-fixture/runner-output.txt"
+        with mock.patch.object(ci, "_BACKEND_STREAM_REDACTION_MARKER", payload):
+            with self.assertRaisesRegex(ValueError, "^backend stream observation failed its privacy check$"):
+                fixture(stdout=payload.encode())
 
     def test_coherent_unsafe_exact_producer_and_replay_streams_fail_binding(self):
         for label, payload in unsafe_stream_cases().items():

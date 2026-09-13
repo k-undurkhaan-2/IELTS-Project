@@ -1,8 +1,9 @@
 # Issue 13: verified backend portable result
 
-This local semantic-isolation and evidence-safety remediation is based exactly
-on `0ad94d3fa18b829a7349286cf1cf6dfee15babea`. Its production CLI wiring is
-retained. The unresolved hosted state is represented by local synthetic
+This local ordinary-evidence privacy fallback remediation is based exactly
+on `111d0869347621e584ec1e24ba4dcee368f875e0`. The parent's proven protocol
+isolation, backend diagnostic invariant, pre-parser gates, and fail-closed
+portable comparison are retained. The unresolved hosted state is represented by local synthetic
 integration fixtures; this transaction does not run hosted CI, rerun
 34710916747, modify either PR, or push a branch.
 
@@ -52,13 +53,42 @@ covers the CRLF/separator-normalized representation used by the ordinary sanitiz
 This inspection never changes retained bytes. Safe LF/CRLF presentation,
 Unicode spelling, whitespace, and literal escapes remain exact.
 
-If either stream violates those rules, both ordinary stream fields retain the
-existing sanitizer's output, while the command keeps its original observed
-hashes and lengths. Exact reconstruction therefore fails closed. Sanitized text
-is never claimed to be exact, and the producer writer receives no new unsafe
-stream copy. The same predicate in producer/replay binding rejects coherently
-forged unsafe exact observations. The generic sanitizer and secret/path policy
-are unchanged.
+The backend-specific `_backend_successful_stream_observation_text` selects each
+successful stdout/stderr observation independently, before its producer digest
+or derived copies are created:
+
+1. Attempt strict UTF-8 decoding of the original captured bytes. Exact text is
+   eligible only when the unchanged backend privacy guard accepts it and the
+   existing ordinary privacy redaction patterns leave that text unchanged.
+   This privacy transformation excludes ordinary timing, whitespace, and
+   line-ending normalization, preserving safe reporter bytes as required.
+2. Otherwise select the existing ordinary sanitized observation text. Independently
+   run the backend privacy guard on this candidate; a sanitizer call or a change
+   in text is not proof of safety.
+3. If the selected candidate is unsafe, replace it with the single fixed marker
+   `[BACKEND STREAM REDACTED]`. It is 25 printable ASCII bytes, deterministic,
+   contains no source-derived text, and remains unchanged under both generic
+   `sanitize_text` and `raw_observation_json_value`.
+4. Check the final selected value again with the unchanged backend guard before
+   admitting it to the observation. A failed final check raises a fixed error
+   containing no source text, including if the marker itself becomes unsafe.
+
+Missing raw bytes or strict decoding failure only disable exact eligibility;
+they never bypass the fallback check on either stream. The reviewer payload
+`r"\tmp/private-fixture/runner-output.txt"` remains unsafe. Generic escape
+protection/restoration preserves its literal `\t`, so this candidate requires
+the fixed marker. Other mixed-separator candidates can change during generic
+normalization yet remain unsafe; they receive the same marker.
+
+Raw stream authority, ordinary display text, and portable exact availability
+remain separate. The command keeps both original stream SHA-256 values and
+observed byte lengths. Only observation text and its derived digests change.
+The unchanged producer binder strictly encodes observation text and requires
+both its byte length and SHA-256 to match the original stream. A sanitized or
+marker fallback therefore makes that producer stream unavailable; it cannot
+become a second authority path. The same unchanged privacy predicate in
+producer/replay binding rejects coherently forged unsafe exact observations.
+The generic sanitizer and secret/path policy are unchanged.
 
 The lower public signatures remain frozen:
 
@@ -245,25 +275,45 @@ binder. The synthetic runner provides bounded fresh execution fixtures;
 authority preparation and external-context rebuilding are controlled by the
 fixture. This does not claim a hosted replay or a live backend npm execution.
 
-The exact-stream privacy matrix covers 26 synthetic payloads in both stdout and
-stderr: token and credential assignments, including CRLF splits; Authorization/Bearer; Cookie and
+The exact-stream privacy matrix retains all 26 previous synthetic payloads and
+adds 15 escape-prefix and mixed-separator variants, for 41 payloads. Each is
+tested as entire stdout, entire stderr, and a backend reporter test name:
+token and credential assignments, including CRLF splits; Authorization/Bearer; Cookie and
 Set-Cookie; private-key markers; credential HTTP and database URL separator
 aliases; Windows drive, UNC, device, and file-URI paths; POSIX home/task paths
 and mixed/backslash aliases; ANSI, ASCII, bidi, and other Unicode format
-controls. All 52 producer cases
-check the ordinary sanitizer output on disk, unchanged original hash/length,
-zero backend parsing/identity, and unavailable portability. Another 52 binding
-controls inject coherent unsafe producer/replay records. Safe Unicode,
-LF/CRLF, and literal-escape controls prove exact retention remains available.
+controls. The additions include literal `\t`, `\n`, and `\r` prefixes,
+Windows/UNC/file-URI variants, and two transformed-but-still-unsafe candidates.
+All 123 producer cases inspect actual serialized `command-results.json` bytes
+and each of the five ordinary artifacts. Both the original substring and its
+JSON-escaped representation must be absent. They validate the ordinary five-file
+set and check unchanged SHA-256/length for both original streams on disk and in
+memory, unavailable producer binding, zero parsing/identity calls, and raw
+replay rejection with the backend ordinal retained.
 
-The supplied earlier log reports 22 executed tests, while fresh discovery at
-the required parent finds 23 methods. That log does not substantiate 23
-executions. The final dedicated entry point uses the foundation inventory
-runner: it discovers 31 methods, names every executed method (including both
-hosted OS controls), and reports discovered/executed/passed/failed/error/skip
-and setup-blocked accounting in the same fresh log. The 31-method inventory
-contains the parent's 23 methods, with updated expectations and one renamed
-safety-order method, plus eight new regression methods.
+The exact reviewer counterexample has six additional cases: all three placements
+on Ubuntu and Windows fixtures with backend ordinal 701. The embedded case is
+independently parsed once as a syntactically complete 128-test reporter before
+the zero-call verifier instrumentation begins. Eight further serialized-artifact
+cases cover absent or invalid UTF-8 raw captures on either stream, including an
+unsafe companion stream. The fixed-marker test checks its printable ASCII
+length, sanitizer stability, guard acceptance, and refusal to admit an unsafe
+replacement marker.
+
+For unsafe producers, the outer CLI rejects before running the replay fixture.
+The unchanged lower replay API is then separately exercised with the captured
+raw pair: it retains ordinal 701 (or ordinal 0 in the small matrix), returns
+`finalAcceptance=REJECT`, and never calls backend parsing or identity. This
+diagnostic check introduces no production authority or execution path.
+Another 82 binding controls deliberately inject coherent unsafe producer/replay
+records and prove binding rejects them. Safe Unicode, LF/CRLF, and literal-escape
+controls prove exact retention remains available.
+
+The dedicated entry point uses the unchanged foundation inventory runner. Its
+34-method inventory contains the parent's 31 methods, with the privacy matrix
+expanded, plus three new regression methods. It names every executed method,
+including both hosted OS controls, and reports discovered/executed/passed/failed/
+error/skip and setup-blocked accounting in the same fresh log.
 
 The tests instrument backend parsing and identity calls, emit the negative
 matrix and successful call order, verify lower-API confinement, and check that
@@ -279,7 +329,9 @@ Run the dedicated backend tests, focused replay/governance/security tests,
 
 ```text
 python -B developer/tests/ci/test_backend_canonical_portable_result.py
+python -B developer/tests/ci/test_ci_foundation.py CI6ReplayVerificationTest P52CompactIdentitySecurityTest CI7ExternalAuthorityBindingTest CI8FreshVerifierTrustDomainTest
 python -B developer/tests/ci/test_governance_state.py
+git diff --check
 python -B developer/tests/ci/test_ci_foundation.py
 ```
 
