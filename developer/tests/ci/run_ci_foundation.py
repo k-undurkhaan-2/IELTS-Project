@@ -37,6 +37,7 @@ import time
 import tokenize
 import unicodedata
 import uuid
+import weakref
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -8612,7 +8613,7 @@ def capture_live_external_authority(
         values[name] = value
     if values["RUNNER_OS"] != _canonical_runner_os():
         raise ValueError("live external authority runner OS differs from the process platform")
-    return ExecutionExternalAuthority(
+    authority = ExecutionExternalAuthority(
         source_kind="live",
         binding_mode="github-actions",
         runner_os=values["RUNNER_OS"],
@@ -8623,6 +8624,10 @@ def capture_live_external_authority(
         repository=values["GITHUB_REPOSITORY"],
         checkout_sha=values["GITHUB_SHA"],
     )
+
+    if source_environment is None:
+        _remember_live_observation_capture(authority, _observation_bytes(vars(authority)))
+    return authority
 
 
 def select_generation_evidence_output(
@@ -9095,7 +9100,7 @@ def build_externally_expected_verification_context(
             role="verifier",
         )
 
-    return ExternallyExpectedVerificationContext(
+    context = ExternallyExpectedVerificationContext(
         binding_mode=binding_mode,
         expected_profile=expected_profile,
         release_gate_required=release_gate_required,
@@ -9116,6 +9121,12 @@ def build_externally_expected_verification_context(
         fresh_runtime_closure_digest=fresh_runtime_closure_digest,
         verifier_invocation_id=verifier_invocation_id,
     )
+
+    if _live_observation_capture_matches(external_authority):
+        _remember_prepared_observation_context(
+            context, (weakref.ref(external_authority), _observation_bytes(vars(context)))
+        )
+    return context
 
 
 def _runner_required_tool(runner: Any, name: str, *, phase: str) -> str:
@@ -9213,11 +9224,14 @@ def build_generation_execution_binding(
 
     if external_authority.source_kind != "live":
         raise ValueError("synthetic external authority is forbidden in production binding")
-    return _build_generation_execution_binding(
+    binding = _build_generation_execution_binding(
         runner,
         external_authority=external_authority,
         repo_root=repo_root,
     )
+
+    _prepare_generation_observation_authority(runner, external_authority, binding)
+    return binding
 
 
 def build_synthetic_generation_execution_binding(
@@ -12709,6 +12723,7 @@ def finalize_evidence_transcript(runner: Any) -> dict[str, Any]:
         "profileCompletedCommandClassSetDigest": class_digest,
         "authorizationContextBindingDigest": authorization_digest,
     }
+    admissions = _runner_observation_admissions(runner)
     rebound: list[dict[str, Any]] = []
     by_id = {
         str(record.get("commandId", "")): record
@@ -12724,7 +12739,7 @@ def finalize_evidence_transcript(runner: Any) -> dict[str, Any]:
         ) or str(raw.get("commandId", "") if isinstance(raw, Mapping) else "")
         source = by_id.get(command_id)
         rebound.append(
-            _rederive_observation_record(item, source, profile_context=context)
+            _reconstruct_observation_with_admission(item, source, profile_context=context, admissions=admissions)
             if source is not None and isinstance(item, Mapping)
             else copy.deepcopy(dict(item))
         )
@@ -13004,6 +13019,397 @@ def _validate_failure_path_authority(
     return errors
 
 
+
+def _observation_identity_registry():
+    """Identity membership, never dataclass equality or a deserialized seal.
+
+    These process-local registries are not wire authority. Private orchestration
+    is trusted Python code; arbitrary in-process code execution is not a sandbox.
+    Weak references avoid retaining completed invocations or admitting reused IDs.
+    """
+    entries = {}
+
+    def remember(value, binding):
+        identity = id(value)
+        entries[identity] = (weakref.ref(value, lambda _ref: entries.pop(identity, None)), binding)
+
+    def lookup(value):
+        entry = entries.get(id(value))
+        return entry[1] if entry is not None and entry[0]() is value else None
+
+    return remember, lookup
+
+
+_remember_live_observation_capture, _lookup_live_observation_capture = _observation_identity_registry()
+_remember_prepared_observation_context, _lookup_prepared_observation_context = _observation_identity_registry()
+_remember_observation_authority, _lookup_observation_authority = _observation_identity_registry()
+_remember_observation_admission, _lookup_observation_admission = _observation_identity_registry()
+
+
+def _observation_bytes(value: Any) -> bytes:
+    # Do not NFC-fold strings or omit duration/stream bytes in an admission seal.
+    return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"), allow_nan=False).encode("utf-8", errors="strict")
+
+
+def _live_observation_capture_matches(authority: Any) -> bool:
+    return (type(authority) is ExecutionExternalAuthority
+            and authority.source_kind == "live"
+            and _lookup_live_observation_capture(authority) == _observation_bytes(vars(authority)))
+
+
+@dataclass(frozen=True, eq=False)
+class _ObservationAuthority:
+    issuance: str
+    execution_binding: bytes
+    authorization_binding: bytes
+    verifier_binding: bytes
+    command_plan: bytes
+    external_capture: bytes
+    expected_context: bytes
+
+
+@dataclass(frozen=True, eq=False)
+class _ObservationAdmission:
+    """Immutable exact-byte seal; possession without private registration fails."""
+    source: bytes
+    observation: bytes
+    validation: bytes
+
+
+@dataclass(frozen=True)
+class _ObservationValidation:
+    """Live inputs retained privately so a seal can be checked again on use."""
+    runner: Any
+    context: ExternallyExpectedVerificationContext | None
+    records: Sequence[Mapping[str, Any]]
+    plan: Sequence[Mapping[str, Any]]
+    documents: Mapping[str, dict[str, Any]] | None = None
+    snapshots: Mapping[str, _FileSnapshot] | None = None
+    output_dir: Path | None = None
+
+
+def _bind_observation_authority(runner, context, external, binding, issuance):
+    if (binding.get("bindingMode") != "github-actions"
+            or binding.get("producerJobId") != "windows-compatibility-producer"
+            or binding.get("producerRunnerOS") != "Windows"
+            or binding.get("producerProfile") != "all"
+            or runner.profile != "all" or runner.platform != "windows"
+            or external.binding_mode != "github-actions" or external.runner_os != "Windows"
+            or external.job_id != ("windows-compatibility" if context is not None
+                                   else "windows-compatibility-producer")):
+        return None
+    if context is not None and (context.verifier_job_id != "windows-compatibility"
+                               or context.evidence_binding() != binding):
+        return None
+    if any(binding.get(key) != value for key, value in (
+        ("runId", external.run_id), ("runAttempt", external.run_attempt),
+        ("eventName", external.event_name), ("repository", external.repository),
+        ("checkoutCommit", external.checkout_sha),
+        ("commandPlanDigest", command_plan_digest(runner.command_plan)),
+        ("releaseGateRequired", runner.release_gate_required),
+    )):
+        return None
+    errors = []
+    _validate_execution_binding(binding, execution_binding_digest(binding),
+                                label="observation authority", errors=errors)
+    if errors:
+        return None
+    authorization = (context.authorization_context_binding() if context is not None
+                     else authorization_context_binding_from_execution_binding(binding))
+    verifier = context.verifier_binding() if context is not None else None
+    capability = _ObservationAuthority(
+        issuance, _observation_bytes(binding), _observation_bytes(authorization),
+        _observation_bytes(verifier), _observation_bytes(runner.command_plan),
+        _observation_bytes(vars(external)),
+        _observation_bytes(vars(context) if context is not None else None),
+    )
+    _remember_observation_authority(capability, (
+        weakref.ref(runner), weakref.ref(context) if context is not None else None,
+        weakref.ref(external), tuple(vars(capability).values()),
+    ))
+    runner._observation_authority = capability
+    return capability
+
+
+def _prepare_generation_observation_authority(runner, external, binding):
+    # Called only after the generation builder has checked checkout/trust/plan.
+    if type(runner) is FoundationRunner and _live_observation_capture_matches(external):
+        return _bind_observation_authority(runner, None, external, binding, "live-producer")
+    return None
+
+
+def _prepare_verifier_observation_authority(runner, context, external):
+    # A handmade matching context is absent from this preparation registry.
+    prepared = _lookup_prepared_observation_context(context)
+    if (type(runner) is FoundationRunner and _live_observation_capture_matches(external)
+            and prepared is not None and prepared[0]() is external
+            and prepared[1] == _observation_bytes(vars(context))
+            and runner.execution_binding == context.evidence_binding()
+            and runner.verifier_execution_binding == context.verifier_binding()
+            and runner.command_plan_digest == context.command_plan_digest
+            and runner.runtime_closure_digest == context.fresh_runtime_closure_digest):
+        return _bind_observation_authority(runner, context, external,
+                                          context.evidence_binding(), "live-verifier")
+    return None
+
+
+def _issue_synthetic_observation_authority_for_test(runner, context=None):
+    """Explicit test-only issuance. No CLI, claim, or production preparer selects it."""
+    external = runner.execution_external_authority
+    if type(external) is not ExecutionExternalAuthority or external.source_kind != "synthetic-test":
+        raise ValueError("observation test issuance requires explicit synthetic external authority")
+    return _bind_observation_authority(runner, context, external,
+                                      runner.execution_binding, "synthetic-test")
+
+
+def _observation_authority_for_runner(runner, context=None):
+    capability = getattr(runner, "_observation_authority", None)
+    held = _lookup_observation_authority(capability)
+    if type(capability) is not _ObservationAuthority or held is None or held[0]() is not runner:
+        return None
+    external = held[2]()
+    if (external is None or getattr(runner, "execution_external_authority", None) is not external
+            or tuple(vars(capability).values()) != held[3]
+            or capability.external_capture != _observation_bytes(vars(external))
+            or capability.command_plan != _observation_bytes(runner.command_plan)
+            or capability.execution_binding != _observation_bytes(runner.execution_binding)
+            or runner.profile != "all" or runner.platform != "windows"
+            or runner.release_gate_required is not runner.execution_binding.get("releaseGateRequired")
+            or runner.command_plan_digest != command_plan_digest(runner.command_plan)):
+        return None
+    if held[1] is not None:
+        if (held[1]() is not context or context is None
+                or capability.expected_context != _observation_bytes(vars(context))
+                or runner.verifier_execution_binding != context.verifier_binding()
+                or runner.runtime_closure_digest != context.fresh_runtime_closure_digest):
+            return None
+    elif context is not None:
+        return None
+    binding = authorization_context_binding_from_execution_binding(runner.execution_binding)
+    if (capability.authorization_binding != _observation_bytes(binding)
+            or getattr(runner, "authorization_context_binding", binding) != binding
+            or getattr(runner, "authorization_context_binding_digest", authorization_context_binding_digest(binding))
+               != authorization_context_binding_digest(binding)):
+        return None
+    return capability
+
+
+def _standalone_observation_candidate(source, raw):
+    source = source if isinstance(source, Mapping) else {}
+    raw = raw if isinstance(raw, Mapping) else {}
+    return (source.get("commandId") == "standalone-packaging"
+            or source.get("commandClass") == "standalone-packaging"
+            or raw.get("commandId") == "standalone-packaging"
+            # Names and paths remain data for other existing observation kinds.
+            or (raw.get("observationKind") == "process-output-v1" and (
+                raw.get("sourceResultId") == "command:standalone-packaging"
+                or raw.get("sourcePath") == "developer/tests/ci/test_standalone_packaging.py")))
+
+
+def _has_standalone_observation(records, observations=(), command_plan=()):
+    return (any(_standalone_observation_candidate(record, raw)
+                for record in records if isinstance(record, Mapping)
+                for raw in (record.get("producerObservations") or ()))
+            or any(_standalone_observation_candidate(item, item.get("rawObservation"))
+                   for item in observations if isinstance(item, Mapping))
+            or any(_standalone_observation_candidate(planned, {})
+                   and index < len(records) and isinstance(records[index], Mapping)
+                   and bool(records[index].get("producerObservations"))
+                   for index, planned in enumerate(command_plan)))
+
+
+def _observation_validation_digest(validation):
+    capability = _observation_authority_for_runner(validation.runner, validation.context)
+    if capability is None or capability.command_plan != _observation_bytes(validation.plan):
+        raise ValueError("standalone observation lacks held external authority")
+    material = [capability.execution_binding, capability.authorization_binding,
+                capability.verifier_binding, capability.expected_context, capability.command_plan,
+                _observation_bytes(validation.records)]
+    if validation.documents is None:
+        material.append(_observation_bytes(getattr(validation.runner, "observations", [])))
+    else:
+        documents, snapshots = validation.documents, validation.snapshots
+        if set(documents) != set(EVIDENCE_FILE_NAMES) - {"summary.md"} or set(snapshots or {}) != set(EVIDENCE_FILE_NAMES):
+            raise ValueError("standalone observation snapshot membership changed")
+        if documents["command-results.json"]["records"] != validation.records:
+            raise ValueError("standalone observation snapshot records changed")
+        for name in EVIDENCE_FILE_NAMES:
+            snapshot = snapshots[name]
+            if name != "summary.md":
+                decoded, errors = _decode_evidence_json(name, snapshot.data)
+                if errors or decoded != documents[name]:
+                    raise ValueError("standalone observation snapshot bytes changed")
+            material.extend((snapshot.data, _observation_bytes(snapshot.identity)))
+        summary = documents["summary.json"]
+        if (capability.execution_binding != _observation_bytes(summary.get("executionBinding"))
+                or capability.authorization_binding != _observation_bytes(summary.get("authorizationContextBinding"))
+                or snapshots["summary.md"].data != render_summary_markdown(summary).encode("utf-8")):
+            raise ValueError("standalone observation snapshot context changed")
+        manifest = summary.get("evidenceManifest")
+        expected_manifest = [{"relativeFilename": name, "byteLength": len(snapshots[name].data),
+                              "sha256": hashlib.sha256(snapshots[name].data).hexdigest(),
+                              "documentKind": EVIDENCE_DOCUMENT_KINDS[name]}
+                             for name in EVIDENCE_MANIFEST_FILE_NAMES]
+        if manifest != expected_manifest:
+            raise ValueError("standalone observation snapshot manifest changed")
+        if validation.output_dir is not None:
+            root = validation.output_dir
+            if {entry.name for entry in os.scandir(root)} != set(EVIDENCE_FILE_NAMES):
+                raise ValueError("standalone observation live membership changed")
+            for name, snapshot in snapshots.items():
+                fresh, errors = _read_evidence_file_snapshot(root / name, output_dir=root,
+                                                            byte_limit=EVIDENCE_FILE_BYTE_LIMITS[name])
+                if errors or fresh != snapshot:
+                    raise ValueError("standalone observation live snapshot changed")
+            if {entry.name for entry in os.scandir(root)} != set(EVIDENCE_FILE_NAMES):
+                raise ValueError("standalone observation live membership changed")
+            material.append(_observation_bytes(str(root.resolve(strict=True))))
+            material.append(_observation_bytes(_stat_identity(root.lstat())))
+    digest = hashlib.sha256()
+    for item in material:
+        digest.update(len(item).to_bytes(8, "big"))
+        digest.update(item)
+    return digest.digest()
+
+
+def _admit_standalone_observations(validation):
+    """Stage 1: structural binding. Stage 2: independently held authority."""
+    records, plan = validation.records, validation.plan
+    if not _has_standalone_observation(records, getattr(validation.runner, "observations", []), plan):
+        return ()
+    errors, candidates = [], []
+    if len(records) != len(plan):
+        errors.append("standalone observation command membership differs from the plan")
+    for index, source in enumerate(records):
+        expected = plan[index] if index < len(plan) else None
+        _validate_command_record(source, index, errors, expected_record=expected)
+        if not isinstance(source, Mapping):
+            continue
+        if (expected is None or source.get("ordinal") != index
+                or _portable_command_plan_value([{key: source.get(key) for key in expected}])
+                   != _portable_command_plan_value([expected])):
+            errors.append("standalone observation command does not bind the prepared plan")
+        producer = source.get("producerObservations")
+        if not isinstance(producer, list):
+            errors.append("standalone observation producer set is invalid")
+            continue
+        for ordinal, raw in enumerate(producer):
+            validator = (_validate_raw_observation_structure
+                         if _standalone_observation_candidate(source, raw) else _validate_raw_observation)
+            errors.extend(validator(raw, label="observation admission", source=source))
+            if not isinstance(raw, dict):
+                continue
+            if raw.get("observationOrdinal") != ordinal:
+                errors.append("standalone observation ordinal does not bind producer order")
+            if _standalone_observation_candidate(source, raw):
+                candidates.append((source, raw))
+        if source.get("producerObservationSetDigest") != producer_observation_set_digest(producer):
+            errors.append("standalone observation producer set digest changed")
+    if errors:
+        raise ValueError("; ".join(sorted(set(errors))))
+    projected = (validation.documents["command-results.json"].get("observations", [])
+                 if validation.documents is not None else getattr(validation.runner, "observations", []))
+    projected_candidates = []
+    for item in projected:
+        if isinstance(item, Mapping) and _standalone_observation_candidate(item, item.get("rawObservation")):
+            projected_candidates.append(item)
+            if not any(item.get("rawObservation") == raw
+                       and item.get("commandId", raw.get("commandId")) == source.get("commandId")
+                       for source, raw in candidates):
+                raise ValueError("standalone observation projection does not bind its producer")
+    if len(projected_candidates) > 1:
+        raise ValueError("standalone observation projection is duplicated")
+    validation_digest = _observation_validation_digest(validation)
+    if len(candidates) != 1:
+        raise ValueError("standalone observation must occur exactly once")
+    source, raw = candidates[0]
+    if (source.get("commandId") != "standalone-packaging"
+            or source.get("commandClass") != "standalone-packaging"
+            or source.get("toolRole") != "python-standalone-test"
+            or source.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+            or source.get("resultSemantics") != "exit-zero-required"
+            or source.get("profile") != "all" or source.get("platform") != "windows"
+            or source.get("commandRole") != "required-execution"
+            or source.get("required") is not True or source.get("allowedExecutionExits") != [0]
+            or not _required_command_execution_passed(source)
+            or _validated_portable_protected_input_bundle_digest(source) is None
+            or raw.get("observationKind") != "process-output-v1"
+            or raw.get("sourceResultId") != "command:standalone-packaging"
+            or raw.get("sourcePath") != "developer/tests/ci/test_standalone_packaging.py"
+            or raw.get("observationOrdinal") != 0 or raw.get("occurrences") != 1
+            or len(source["producerObservations"]) != 1):
+        raise ValueError("standalone observation association or execution is ineligible")
+    fields = raw.get("rawStructuredFields")
+    if (not isinstance(fields, dict) or set(fields) != {"executed", "exitCode", "stdout", "stderr", "error"}
+            or fields.get("executed") is not True or type(fields.get("exitCode")) is not int
+            or fields["exitCode"] != source["exitCode"] or fields.get("error") is not None):
+        raise ValueError("standalone observation process fields do not bind execution")
+    for stream in ("stdout", "stderr"):
+        value = fields.get(stream)
+        if not isinstance(value, str):
+            raise ValueError("standalone observation process stream is not text")
+        encoded = value.encode("utf-8", errors="strict")
+        if (len(encoded) != source.get(stream + "BytesObserved")
+                or hashlib.sha256(encoded).hexdigest() != source.get(stream + "Sha256")):
+            raise ValueError("standalone observation process stream does not bind source bytes")
+    proof = _ObservationAdmission(_observation_bytes(source), _observation_bytes(raw), validation_digest)
+    _remember_observation_admission(proof, (validation, proof.source, proof.observation, proof.validation))
+    return (proof,)
+
+
+def _matching_observation_admission(admissions, raw, source, *, records=None, plan=None):
+    for proof in admissions:
+        held = _lookup_observation_admission(proof)
+        if type(proof) is not _ObservationAdmission or held is None:
+            continue
+        validation = held[0]
+        try:
+            if (proof.source == held[1] == _observation_bytes(source)
+                    and proof.observation == held[2] == _observation_bytes(raw)
+                    and proof.validation == held[3] == _observation_validation_digest(validation)
+                    and (records is None or _observation_bytes(records) == _observation_bytes(validation.records))
+                    and (plan is None or _observation_bytes(plan) == _observation_bytes(validation.plan))):
+                return True
+        except (OSError, AttributeError, KeyError, TypeError, ValueError):
+            pass
+    return False
+
+
+def _validate_admitted_raw_observation(raw, *, label, source, source_output_digest=None, admissions=()):
+    if _standalone_observation_candidate(source, raw):
+        errors = _validate_raw_observation_structure(raw, label=label, source=source,
+                                                     source_output_digest=source_output_digest)
+        if errors or not _matching_observation_admission(admissions, raw, source):
+            return errors or [f"{label}: standalone observation lacks matching admission"]
+        return []
+    return _validate_raw_observation(raw, label=label, source=source, source_output_digest=source_output_digest)
+
+
+def _reconstruct_observation_with_admission(item, source, *, profile_context, admissions):
+    if _standalone_observation_candidate(source, item.get("rawObservation")) and not (
+        _matching_observation_admission(admissions, item.get("rawObservation"), source)
+    ):
+        raise ValueError("standalone reconstruction requires a current exact admission")
+    return _rederive_observation_record(item, source, profile_context=profile_context)
+
+
+def _runner_observation_admissions(runner):
+    context = getattr(runner, "external_verification_context", None)
+    return _admit_standalone_observations(_ObservationValidation(
+        runner, context, runner.command_results, runner.command_plan))
+
+
+def _derive_runner_authoritative_evidence(runner):
+    admissions = _runner_observation_admissions(runner)
+    operation = _derive_authoritative_evidence_with_admission if admissions else derive_authoritative_evidence
+    private = {"admissions": admissions} if admissions else {}
+    return operation(runner.profile, runner.observations, runner.completed_classes,
+                     runner.command_results, runner.baseline, runner.platform, runner.command_plan,
+                     getattr(runner, "authorization_context_binding_digest", None),
+                     release_gate_required=runner.release_gate_required, **private)
+
+
 def _source_observation_kinds(source: Mapping[str, Any]) -> frozenset[str]:
     """Return parser roles authorized by immutable source-command identity."""
 
@@ -13044,6 +13450,34 @@ def _validate_raw_observation(
     source: Mapping[str, Any] | None,
     source_output_digest: str | None = None,
 ) -> list[str]:
+    """Compatibility/source-only wrapper; structure alone grants no permission."""
+    errors = _validate_raw_observation_structure(raw, label=label, source=source,
+                                                 source_output_digest=source_output_digest)
+    if errors == [f"{label}: raw observation schema is not exact"]:
+        return errors
+    if source is not None and raw.get("observationKind") not in _source_observation_kinds(source):
+        # Preserve the compatibility wrapper's original diagnostic order as well
+        # as its source-only decision and exact-schema early return.
+        prefix_errors = {
+            f"{label}: raw observation schema version is invalid",
+            f"{label}: observationKind is not authorized",
+            *(f"{label}: {key} must be a non-empty string" for key in (
+                "commandId", "observationKind", "sourceResultId", "sourceOutputDigest", "producerRecordDigest")),
+        }
+        position = 0
+        while position < len(errors) and errors[position] in prefix_errors:
+            position += 1
+        errors.insert(position, f"{label}: observationKind is outside source command observation authority")
+    return errors
+
+
+def _validate_raw_observation_structure(
+    raw: Any,
+    *,
+    label: str,
+    source: Mapping[str, Any] | None,
+    source_output_digest: str | None = None,
+) -> list[str]:
     expected_keys = {
         "schemaVersion",
         "commandId",
@@ -13068,13 +13502,6 @@ def _validate_raw_observation(
             errors.append(f"{label}: {key} must be a non-empty string")
     if raw.get("observationKind") not in RAW_OBSERVATION_KINDS:
         errors.append(f"{label}: observationKind is not authorized")
-    if (
-        source is not None
-        and raw.get("observationKind") not in _source_observation_kinds(source)
-    ):
-        errors.append(
-            f"{label}: observationKind is outside source command observation authority"
-        )
     for key in ("commandOrdinal", "observationOrdinal"):
         if type(raw.get(key)) is not int or not 0 <= raw.get(key, -1) < MAX_EVIDENCE_COLLECTION_ITEMS:
             errors.append(f"{label}: {key} must be a bounded non-negative integer")
@@ -13179,6 +13606,7 @@ def _validate_observation_record(
     *,
     authorization_context_binding_digest_value: str | None = None,
     source_output_digests: Mapping[int, str] | None = None,
+    admissions: tuple[_ObservationAdmission, ...] = (),
 ) -> list[str]:
     label = f"command-results.json.observations[{index}]"
     expected_keys = {
@@ -13257,15 +13685,18 @@ def _validate_observation_record(
         errors.append(f"{label}: source command did not execute successfully enough to emit observations")
     else:
         raw = item.get("rawObservation")
-        errors.extend(_validate_raw_observation(
+        errors.extend(_validate_admitted_raw_observation(
             raw,
             label=f"{label}.rawObservation",
             source=source,
+            admissions=admissions,
             source_output_digest=(
                 source_output_digests.get(id(source))
                 if source_output_digests is not None else None
             ),
         ))
+        if errors and _standalone_observation_candidate(source, raw):
+            return errors
         if isinstance(raw, dict):
             command_class = str(item.get("commandClass", ""))
             scope = str(item.get("testOrPathScope", ""))
@@ -13298,6 +13729,8 @@ def _validate_observation_record(
             )
             if len(matches) != 1:
                 errors.append(f"{label}: raw observation is not bound exactly once to the producer command")
+            if errors and _standalone_observation_candidate(source, raw):
+                return errors
             try:
                 derived = _rederive_observation_record(
                     item,
@@ -13365,8 +13798,88 @@ def derive_authoritative_evidence(
     release_gate_required: bool,
     cross_job: bool = False,
 ) -> dict[str, Any]:
+    """Source-only derivation; caller context strings cannot grant admission."""
+    if _has_standalone_observation(command_records, observations, command_plan or ()):
+        return {"observedDebts": [], "resolvedCandidates": [], "expectedOmissions": [],
+                "releaseOnlySkips": [], "violations": [{"id": "UNAUTHORIZED-PRODUCER-OBSERVATION",
+                                                       "commandId": "standalone-packaging"}]}
+    return _derive_authoritative_evidence(
+        profile, observations, completed_command_classes, command_records,
+        immutable_baseline_authority, current_platform, command_plan,
+        authorization_context_binding_digest_value,
+        release_gate_required=release_gate_required, cross_job=cross_job)
+
+
+def _require_current_observation_admissions(profile, observations, completed_classes,
+        records, platform, plan, authorization_digest, release_required, admissions):
+    if not _has_standalone_observation(records, observations, plan or ()):
+        return
+    candidates = [(record, raw) for record in records
+                  for raw in record.get("producerObservations", [])
+                  if _standalone_observation_candidate(record, raw)]
+    if len(candidates) != 1 or not all(
+        _matching_observation_admission(admissions, raw, record, records=records, plan=plan)
+        for record, raw in candidates
+    ):
+        raise ValueError("standalone derivation requires a current exact admission")
+    contexts = [_lookup_observation_admission(proof)[0] for proof in admissions
+                if _lookup_observation_admission(proof) is not None]
+    if not any(profile == context.runner.profile and platform == context.runner.platform
+               and release_required is context.runner.release_gate_required
+               and authorization_digest == context.runner.authorization_context_binding_digest
+               and sorted(set(completed_classes)) == actual_completed_command_classes(plan, records)
+               for context in contexts):
+        raise ValueError("standalone derivation invocation differs from admission")
+    for item in observations:
+        if _standalone_observation_candidate(item, item.get("rawObservation")):
+            if item.get("rawObservation") != candidates[0][1] or item.get("commandId") != "standalone-packaging":
+                raise ValueError("standalone derivation observation differs from admission")
+
+
+def _derive_authoritative_evidence_with_admission(
+    profile: str,
+    observations: Sequence[Mapping[str, Any]],
+    completed_command_classes: Iterable[str],
+    command_records: Sequence[Mapping[str, Any]],
+    immutable_baseline_authority: Mapping[str, Any],
+    current_platform: str,
+    command_plan: Sequence[Mapping[str, Any]] | None = None,
+    authorization_context_binding_digest_value: str | None = None,
+    *,
+    release_gate_required: bool,
+    cross_job: bool = False,
+    admissions: tuple[_ObservationAdmission, ...] = (),
+) -> dict[str, Any]:
+    """Consume a matching seal before entering authoritative derivation."""
+    _require_current_observation_admissions(profile, observations, completed_command_classes,
+        command_records, current_platform, command_plan, authorization_context_binding_digest_value,
+        release_gate_required, admissions)
+    return _derive_authoritative_evidence(
+        profile, observations, completed_command_classes, command_records,
+        immutable_baseline_authority, current_platform, command_plan,
+        authorization_context_binding_digest_value,
+        release_gate_required=release_gate_required, cross_job=cross_job, admissions=admissions)
+
+
+def _derive_authoritative_evidence(
+    profile: str,
+    observations: Sequence[Mapping[str, Any]],
+    completed_command_classes: Iterable[str],
+    command_records: Sequence[Mapping[str, Any]],
+    immutable_baseline_authority: Mapping[str, Any],
+    current_platform: str,
+    command_plan: Sequence[Mapping[str, Any]] | None = None,
+    authorization_context_binding_digest_value: str | None = None,
+    *,
+    release_gate_required: bool,
+    cross_job: bool = False,
+    admissions: tuple[_ObservationAdmission, ...] = (),
+) -> dict[str, Any]:
     """Recompute all semantic evidence from commands and the frozen baseline map."""
 
+    _require_current_observation_admissions(profile, observations, completed_command_classes,
+        command_records, current_platform, command_plan, authorization_context_binding_digest_value,
+        release_gate_required, admissions)
     release_gate_required = _require_resolved_release_gate_required(
         profile,
         release_gate_required,
@@ -13395,6 +13908,7 @@ def derive_authoritative_evidence(
                 authorization_context_binding_digest_value
             ),
             source_output_digests=source_output_digests,
+            admissions=admissions,
         )
         if item_errors:
             derivation_violations.extend(
@@ -13425,10 +13939,11 @@ def derive_authoritative_evidence(
             )
         observed_ordinals: list[int] = []
         for index, raw in enumerate(records):
-            raw_errors = _validate_raw_observation(
+            raw_errors = _validate_admitted_raw_observation(
                 raw,
                 label=f"command:{command_id}.producerObservations[{index}]",
                 source=record,
+                admissions=admissions,
                 source_output_digest=source_output_digests.get(id(record)),
             )
             if raw_errors:
@@ -13456,7 +13971,9 @@ def derive_authoritative_evidence(
             derivation_violations.append(
                 {"id": "PRODUCER-OBSERVATION-ORDINAL-GAP", "commandId": command_id}
             )
-        if not _source_observation_kinds(record) and records:
+        if not _source_observation_kinds(record) and records and not all(
+            _matching_observation_admission(admissions, raw, record) for raw in records
+        ):
             derivation_violations.append(
                 {"id": "UNAUTHORIZED-PRODUCER-OBSERVATION", "commandId": command_id}
             )
@@ -19411,17 +19928,7 @@ class FoundationRunner:
         self.verify_trusted_integrity("lockfile-check")
         self.close_execution_leases()
         finalize_evidence_transcript(self)
-        comparison = derive_authoritative_evidence(
-            self.profile,
-            self.observations,
-            self.completed_classes,
-            self.command_results,
-            self.baseline,
-            self.platform,
-            self.command_plan,
-            getattr(self, "authorization_context_binding_digest", None),
-            release_gate_required=self.release_gate_required,
-        )
+        comparison = _derive_runner_authoritative_evidence(self)
         self.violations.extend(comparison["violations"])
         if self.profile in {"static", "all"}:
             prior_hard_failures = [
@@ -20274,6 +20781,18 @@ def verify_evidence_file_set(
     expected_command_plan: Sequence[Mapping[str, Any]] | None = None,
     expected_context: ExternallyExpectedVerificationContext | None = None,
 ) -> list[str]:
+    return _verify_evidence_file_set(output_dir, repo_root=repo_root,
+        expected_command_plan=expected_command_plan, expected_context=expected_context)
+
+
+def _verify_evidence_file_set(
+    output_dir: Path = OUTPUT_DIR,
+    *,
+    repo_root: Path = REPO_ROOT,
+    expected_command_plan: Sequence[Mapping[str, Any]] | None = None,
+    expected_context: ExternallyExpectedVerificationContext | None = None,
+    observation_runner: Any | None = None,
+) -> list[str]:
     errors = validate_evidence_root(output_dir, repo_root=repo_root)
     if errors:
         return errors
@@ -20310,14 +20829,12 @@ def verify_evidence_file_set(
             documents[name] = document
     if errors:
         return sorted(set(errors))
-    errors.extend(
-        _validate_evidence_semantics(
-            documents,
-            snapshots,
-            expected_command_plan=expected_command_plan,
-            expected_context=expected_context,
-        )
-    )
+    semantic_verifier = (_validate_evidence_semantics_with_authority
+                         if observation_runner is not None else _validate_evidence_semantics)
+    private = ({"observation_runner": observation_runner, "observation_root": output_dir}
+               if observation_runner is not None else {})
+    errors.extend(semantic_verifier(documents, snapshots,
+        expected_command_plan=expected_command_plan, expected_context=expected_context, **private))
 
     try:
         final_entries = list(os.scandir(output_dir))
@@ -21645,6 +22162,19 @@ def _validate_evidence_semantics(
     expected_command_plan: Sequence[Mapping[str, Any]] | None = None,
     expected_context: ExternallyExpectedVerificationContext | None = None,
 ) -> list[str]:
+    return _validate_evidence_semantics_with_authority(documents, snapshots,
+        expected_command_plan=expected_command_plan, expected_context=expected_context)
+
+
+def _validate_evidence_semantics_with_authority(
+    documents: Mapping[str, dict[str, Any]],
+    snapshots: Mapping[str, _FileSnapshot],
+    *,
+    expected_command_plan: Sequence[Mapping[str, Any]] | None = None,
+    expected_context: ExternallyExpectedVerificationContext | None = None,
+    observation_runner: Any | None = None,
+    observation_root: Path | None = None,
+) -> list[str]:
     errors: list[str] = []
     summary = documents["summary.json"]
     observed = documents["observed-debt.json"]
@@ -21983,6 +22513,21 @@ def _validate_evidence_semantics(
         errors.append(
             "command-results.json: PASS transcript has missing, extra, or duplicate command IDs"
         )
+    admissions = ()
+    authority_sensitive = _has_standalone_observation(valid_command_records, command_observations, expected_authority)
+    if authority_sensitive:
+        if errors:
+            return sorted(set(errors))
+        if observation_runner is None:
+            return ["standalone observation lacks independently prepared execution authority"]
+        try:
+            admissions = _admit_standalone_observations(_ObservationValidation(
+                observation_runner, expected_context, valid_command_records,
+                expected_authority, documents, snapshots, observation_root))
+        except (OSError, AttributeError, KeyError, TypeError, ValueError) as exc:
+            return [f"standalone observation admission failed: {exc}"]
+        if not admissions:
+            return ["standalone observation has no admission"]
     reconstructed_command_observations: list[dict[str, Any]] = []
     observation_context = {
         "producerObservationUniverseDigest": universe_digest,
@@ -22001,10 +22546,11 @@ def _validate_evidence_semantics(
                 continue
             try:
                 reconstructed_command_observations.append(
-                    _rederive_observation_record(
+                    _reconstruct_observation_with_admission(
                         {"rawObservation": raw},
                         record,
                         profile_context=observation_context,
+                        admissions=admissions,
                     )
                 )
             except (TypeError, ValueError) as exc:
@@ -22126,6 +22672,8 @@ def _validate_evidence_semantics(
     if command_hard_failure and summary.get("status") == "PASS":
         errors.append("summary.json reports PASS while command-results records an execution failure")
 
+    if authority_sensitive and errors:
+        return sorted(set(errors))
     try:
         baseline = read_json(BASELINE_PATH)
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
@@ -22134,7 +22682,9 @@ def _validate_evidence_semantics(
         baseline_errors = validate_baseline_document(baseline)
         errors.extend(f"immutable baseline authority: {error}" for error in baseline_errors)
         if not baseline_errors:
-            derived = derive_authoritative_evidence(
+            operation = _derive_authoritative_evidence_with_admission if admissions else derive_authoritative_evidence
+            private = {"admissions": admissions} if admissions else {}
+            derived = operation(
                 authority_profile,
                 command_observations,
                 completed_command_classes,
@@ -22145,6 +22695,7 @@ def _validate_evidence_semantics(
                 authorization_context_binding_digest_value,
                 release_gate_required=authoritative_release_gate_required,
                 cross_job=True,
+                **private,
             )
             derived_sets = {
                 "knownDebtsObserved": derived["observedDebts"],
@@ -22561,7 +23112,21 @@ def run_verification_replay(
     verification_runner: FoundationRunner,
     repo_root: Path = REPO_ROOT,
 ) -> tuple[dict[str, Any] | None, list[str]]:
-    """Re-execute the frozen raw comparison path, without backend portability."""
+    """Source-only raw replay; prepared packaging admission stays private."""
+    commands = documents.get("command-results.json", {})
+    if _has_standalone_observation(commands.get("records", []), commands.get("observations", []), verification_runner.command_plan):
+        return None, ["standalone observation is unauthorized in source-only replay"]
+    return _run_verification_replay(documents, expected_context=expected_context,
+        verification_runner=verification_runner, repo_root=repo_root)
+
+
+def _run_verification_replay(
+    documents: Mapping[str, dict[str, Any]],
+    *,
+    expected_context: ExternallyExpectedVerificationContext,
+    verification_runner: FoundationRunner,
+    repo_root: Path = REPO_ROOT,
+) -> tuple[dict[str, Any] | None, list[str]]:
     comparison, errors = _execute_verification_replay(
         expected_context=expected_context, verification_runner=verification_runner,
         repo_root=repo_root,
@@ -22699,11 +23264,15 @@ def verify_evidence_with_replay(
         return ["verification runner release authority differs from external expected context"], None
     if verification_runner.command_plan_digest != expected_context.command_plan_digest:
         return ["verification runner command plan differs from external expected context"], None
-    errors = verify_evidence_file_set(
+    observation_authority = _observation_authority_for_runner(verification_runner, expected_context)
+    file_verifier = _verify_evidence_file_set if observation_authority is not None else verify_evidence_file_set
+    private = {"observation_runner": verification_runner} if observation_authority is not None else {}
+    errors = file_verifier(
         output_dir,
         repo_root=evidence_authority_root or repo_root,
         expected_command_plan=verification_runner.command_plan,
         expected_context=expected_context,
+        **private,
     )
     if errors:
         return errors, None
@@ -22715,7 +23284,9 @@ def verify_evidence_with_replay(
         and any(record.get("commandId") == "backend-canonical"
                 for record in verification_runner.command_plan)
     )
-    if backend_plan:
+    if backend_plan or observation_authority is not None or _has_standalone_observation(
+            documents["command-results.json"].get("records", []),
+            documents["command-results.json"].get("observations", [])):
         # The replay reader takes a second snapshot. Validate the exact documents
         # used below, not merely the earlier file-set validation's snapshots.
         errors.extend(validate_evidence_root(output_dir, repo_root=evidence_authority_root or repo_root))
@@ -22724,10 +23295,15 @@ def verify_evidence_with_replay(
                 errors.append("evidence file membership changed before backend binding")
         except OSError as exc:
             errors.append(f"evidence directory cannot be enumerated: {type(exc).__name__}")
-        errors.extend(_validate_evidence_semantics(
-            documents, snapshots, expected_command_plan=verification_runner.command_plan,
-            expected_context=expected_context,
-        ))
+        if errors:
+            return sorted(set(errors)), None
+        semantic_verifier = (_validate_evidence_semantics_with_authority
+                             if observation_authority is not None else _validate_evidence_semantics)
+        private = ({"observation_runner": verification_runner, "observation_root": output_dir}
+                   if observation_authority is not None else {})
+        errors.extend(semantic_verifier(documents, snapshots,
+            expected_command_plan=verification_runner.command_plan,
+            expected_context=expected_context, **private))
         if errors:
             return sorted(set(errors)), None
     if documents.get("summary.json", {}).get("status") != "PASS":
@@ -22740,7 +23316,8 @@ def verify_evidence_with_replay(
     )
     bound_pair = None
     if not backend_portability:
-        transcript, replay_errors = run_verification_replay(
+        replay_operation = _run_verification_replay if observation_authority is not None else run_verification_replay
+        transcript, replay_errors = replay_operation(
             documents, expected_context=expected_context,
             verification_runner=verification_runner, repo_root=repo_root,
         )
@@ -23142,17 +23719,7 @@ def write_evidence(
         raise RuntimeError("; ".join(sorted(set(binding_errors))))
     observations = list(getattr(runner, "observations", []))
     completed_command_classes = sorted(set(getattr(runner, "completed_classes", set())))
-    comparison = derive_authoritative_evidence(
-        runner.profile,
-        observations,
-        completed_command_classes,
-        runner.command_results,
-        runner.baseline,
-        runner.platform,
-        runner.command_plan,
-        getattr(runner, "authorization_context_binding_digest", None),
-        release_gate_required=runner.release_gate_required,
-    )
+    comparison = _derive_runner_authoritative_evidence(runner)
     existing_violation_keys = {
         json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         for item in runner.violations
@@ -23474,10 +24041,13 @@ def write_evidence(
         )
     if active_containment_count() != 0:
         raise RuntimeError("repository-controlled process containment became active before evidence verification")
-    verification_errors = verify_evidence_file_set(
-        output_dir,
-        repo_root=evidence_authority_root,
-        expected_command_plan=runner.command_plan,
+    context = getattr(runner, "external_verification_context", None)
+    capability = _observation_authority_for_runner(runner, context)
+    file_verifier = _verify_evidence_file_set if capability is not None else verify_evidence_file_set
+    private = {"observation_runner": runner, "expected_context": context} if capability is not None else {}
+    verification_errors = file_verifier(
+        output_dir, repo_root=evidence_authority_root,
+        expected_command_plan=runner.command_plan, **private,
     )
     if verification_errors:
         raise RuntimeError("; ".join(verification_errors))
@@ -23826,6 +24396,7 @@ def prepare_verification_authority(
     runner.authorization_context_binding_digest = authorization_context_binding_digest(
         runner.authorization_context_binding
     )
+    _prepare_verifier_observation_authority(runner, context, external_authority)
     return context, runner
 
 
@@ -23842,7 +24413,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_SUCCESS
     source_environment = dict(os.environ)
     try:
-        external_authority = capture_live_external_authority(source_environment)
+        external_authority = capture_live_external_authority()
     except ValueError as exc:
         print(
             "CI foundation external-authority configuration error: "

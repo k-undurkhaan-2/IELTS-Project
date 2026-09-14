@@ -5577,13 +5577,15 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
         target_reference_count = sum(len(spec["targets"]) for spec in plan)
         self.assertEqual(len(plan), 705)
         self.assertEqual(len(command_classes), 16)
-        # Three backend portable files add three targets and 65 references.
-        self.assertEqual(len(target_universe), 911)
-        self.assertEqual(target_reference_count, 19876)
+        # The dedicated W702 authority module adds one protected target and
+        # 22 references; the 705 commands and 476-test inventory are unchanged.
+        self.assertEqual(len(target_universe), 912)
+        self.assertEqual(target_reference_count, 19898)
         self.assertTrue({
             "developer/tests/ci/backend_canonical_portable_result.py",
             "developer/tests/ci/test_backend_canonical_portable_result.py",
             "developer/tests/ci/ISSUE13_BACKEND_PORTABLE_RESULT.md",
+            "developer/tests/ci/test_standalone_observation_authority.py",
         }.issubset(target_universe))
         self.assertNotIn(
             "node-vitest-security-test",
