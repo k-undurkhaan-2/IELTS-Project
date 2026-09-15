@@ -1,7 +1,7 @@
-"""W702-A2/E1 authority and exact retention, outside the 476-test inventory.
+"""W702-A2/E1/E2 authority, retention and portability, outside the 476-test inventory.
 
 Hosted-shaped contexts use explicit fixtures. E1 retains exact safe Windows
-process bytes without a standalone reporter parser or portable identity.
+process bytes. E2 parses them only inside the fully authorized outer verifier.
 """
 from __future__ import annotations
 
@@ -1218,8 +1218,8 @@ def prepare_retention_verifier(template, root, *, platform=None):
 
 @contextlib.contextmanager
 def retention_counters():
-    # There is no standalone semantic implementation to mock. Inspect the real
-    # production call frames too, so a future parser/identity cannot go unnoticed.
+    # E1 retention must never invoke E2. Observe real production call frames
+    # as well as mocks so accidental parser/identity calls cannot go unnoticed.
     semantic = {"standalone_parser_calls": 0, "standalone_semantic_identity_calls": 0}
     previous = sys.getprofile()
     def trace(frame, event, arg):
@@ -1714,6 +1714,530 @@ class StandaloneRetentionProductionTest(unittest.TestCase):
                     "finalAcceptance": transcript["finalAcceptance"], "backend_parser_calls": calls.backend_parser.call_count,
                     "backend_identity_calls": identity.call_count, "packaging_streams_to_backend_parser": 0, **calls.semantic}))
 
+
+
+# E2 fixtures are synthetic production-shaped bytes, never private acquisition
+# data. Their independent fixed inventory is also checked against the real suite.
+PACKAGING_METHODS = (
+    "test_archive_entries_are_unique_portable_relative_and_not_symlinks",
+    "test_archive_list_verifier_rejects_duplicate_and_unsafe_entries",
+    "test_authorized_reading_has_real_windows_unix_parity_and_hashes",
+    "test_clean_no_git_source_archive_still_releases_safely",
+    "test_default_windows_and_unix_release_use_one_positive_manifest",
+    "test_extracted_payload_is_self_contained_and_serves_required_styles",
+    "test_git_manifest_and_payload_dirty_changes_fail_closed",
+    "test_main_manifest_missing_malformed_schema_and_paths_fail_closed",
+    "test_manifest_listed_path_reparse_fails_closed",
+    "test_private_listening_switch_fails_and_root_is_not_scanned",
+    "test_reading_file_and_external_manifest_reparse_fail_closed",
+    "test_reading_hash_missing_duplicate_and_unsafe_paths_fail_closed",
+    "test_reading_root_requires_explicit_manifest",
+    "test_reading_unknown_and_hidden_files_fail_closed",
+    "test_required_and_manifest_listed_files_fail_closed_when_missing",
+    "test_required_root_fails_before_zip_on_windows_and_unix",
+    "test_scripts_consume_only_the_shared_manifest_helper_staging_contract",
+    "test_unknown_files_in_every_managed_root_fail_before_staging",
+)
+PACKAGING_DURATIONS = (("0.000", "0.001"), ("1.000", "9.999"), ("9.999", "10.000"),
+                       ("69.940", "76.421"), ("71.630", "100.000"))
+
+
+def packaging_reporter(duration="69.940"):
+    return (b"".join(f"{method} (__main__.StandalonePackagingTest.{method}) ... ok\r\n".encode()
+                    for method in PACKAGING_METHODS)
+            + b"\r\n" + b"-" * 70 + b"\r\nRan 18 tests in " + duration.encode()
+            + b"s\r\n\r\nOK\r\n")
+
+
+def packaging_reporter_mutations():
+    good = packaging_reporter()
+    lines = good.split(b"\r\n")
+    first = PACKAGING_METHODS[0].encode()
+    cases = {
+        "method-name": good.replace(first, b"test_changed"),
+        "fully-qualified-id": good.replace(b"." + first + b")", b".test_changed)", 1),
+        "class-name": good.replace(b"StandalonePackagingTest", b"OtherPackagingTest", 1),
+        "module-name": good.replace(b"__main__", b"alternate", 1),
+        "left-right-disagree": good.replace(first, b"test_changed", 1),
+        "missing-method": b"\r\n".join(lines[1:]),
+        "additional-method": lines[0] + b"\r\n" + good,
+        "duplicate-method": b"\r\n".join([lines[0], *lines]),
+        "reordered-methods": b"\r\n".join([lines[1], lines[0], *lines[2:]]),
+        "17-tests": good.replace(b"18 tests", b"17 tests"),
+        "19-tests": good.replace(b"18 tests", b"19 tests"),
+        "separator-69": good.replace(b"-" * 70, b"-" * 69),
+        "separator-71": good.replace(b"-" * 70, b"-" * 71),
+        "separator-character": good.replace(b"-" * 70, b"-" * 35 + b"=" + b"-" * 34),
+        "missing-blank-before-separator": good.replace(b"\r\n\r\n---", b"\r\n---"),
+        "extra-blank-before-separator": good.replace(b"\r\n\r\n---", b"\r\n\r\n\r\n---"),
+        "missing-blank-before-OK": good.replace(b"s\r\n\r\nOK", b"s\r\nOK"),
+        "extra-blank-before-OK": good.replace(b"s\r\n\r\nOK", b"s\r\n\r\n\r\nOK"),
+        "Ran-literal": good.replace(b"Ran ", b"ran "),
+        "tests-literal": good.replace(b"18 tests", b"18 Tests"),
+        "in-literal": good.replace(b" in ", b" at "),
+        "missing-s": good.replace(b"69.940s", b"69.940"),
+        "OK-literal": good.replace(b"\r\nOK\r\n", b"\r\nok\r\n"),
+        "suffix-text": good + b"extra\r\n",
+        "prefix-text": b"extra\r\n" + good,
+        "warning": good.replace(b"\r\n\r\n---", b"\r\nwarning\r\n\r\n---"),
+        "traceback": good.replace(b"\r\n\r\n---", b"\r\nTraceback (most recent call last):\r\n\r\n---"),
+        "LF-only": good.replace(b"\r\n", b"\n"),
+        "mixed-line-endings": good.replace(b"\r\n", b"\n", 1),
+        "missing-final-CRLF": good[:-2],
+        "trailing-spaces": good.replace(b" ... ok\r\n", b" ... ok \r\n", 1),
+        "leading-spaces": b" " + good,
+        "unicode-outside-duration": good.replace(b"test_archive", "test_archiv\u00e9".encode(), 1),
+        "invalid-UTF8": b"\xff" + good[1:],
+        "per-test-duration": good.replace(b" ... ok\r\n", b" ... ok (0.123s)\r\n", 1),
+        "extra-final-blank": good + b"\r\n",
+        "dots-mechanism": b"." * 18 + b"\r\n" + b"-" * 70 + b"\r\nRan 18 tests in 0.125s\r\n\r\nOK\r\n",
+    }
+    for status in ("skipped", "expected failure", "unexpected success", "FAIL", "ERROR",
+                   "OK", "Ok", "oK", "success"):
+        cases["status-" + status] = good.replace(b" ... ok\r\n", b" ... " + status.encode() + b"\r\n", 1)
+    for name, value in (("integer", "1"), ("fraction-1", "1.0"), ("fraction-2", "1.00"),
+                        ("fraction-4", "1.0000"), ("exponent", "1e3"),
+                        ("negative", "-1.000"), ("plus", "+1.000"),
+                        ("whitespace", "1 .000"), ("non-ASCII-digit", "\u0661.000")):
+        cases["duration-" + name] = good.replace(b"69.940", value.encode())
+    return cases
+
+
+def packaging_python_authority(evidence):
+    size, sha, identity = ci._measured_file_authority(Path(sys.executable))
+    evidence.runtime_closure["pythonExecutable"].update(
+        canonicalPath=str(Path(sys.executable).resolve()), size=size, sha256=sha, stableIdentity=identity)
+    closure = evidence.runtime_closure
+    closure["closureDigest"] = hashlib.sha256(ci._canonical_frame({
+        key: value for key, value in closure.items() if key != "closureDigest"})).hexdigest()
+    evidence.runtime["runtimeClosureDigest"] = closure["closureDigest"]
+    evidence.command_record["runtimeClosureDigest"] = closure["closureDigest"]
+
+
+@contextlib.contextmanager
+def packaging_replay_fixture(platform="windows", *, producer_stderr=None, replay_stderr=None,
+                             producer_stdout=b"", replay_stdout=b""):
+    frontend = (687, 692, 695) if platform == "windows" else (687, 695)
+    producer_backend = backend.fixture(platform, ordinal=701)
+    replay_backend = backend.fixture(platform, ordinal=701, stdout=backend.npm_stdout("90", "912"), physical="9")
+    for evidence in (producer_backend, replay_backend):
+        packaging_python_authority(evidence)
+    with backend.outer_fixture(producer_backend, replay_backend, prefix_count=701,
+            extra=("standalone-packaging",), hosted=True, frontend_ordinals=frontend) as outer:
+        standalone, template_capture = runner_fixture(outer.root, platform)
+        standalone.command_plan[0]["ordinal"] = standalone.command_results[0]["ordinal"] = 702
+        runners = []
+        streams = ((producer_stdout, packaging_reporter() if producer_stderr is None else producer_stderr),
+                   (replay_stdout, packaging_reporter("76.421") if replay_stderr is None else replay_stderr))
+        for stdout, stderr in streams:
+            runner = object.__new__(ci.FoundationRunner)
+            runner.__dict__.update(copy.deepcopy(vars(outer.runner)))
+            runner.child_environment = {}
+            runner.command_plan[702] = copy.deepcopy(standalone.command_plan[0])
+            runner.command_results[702] = copy.deepcopy(standalone.command_results[0])
+            capture = copy.deepcopy(template_capture)
+            capture.containment_disposition = "no-descendants"
+            capture.descendants_observed = capture.descendants_reaped = 0
+            source = runner.command_results[702]
+            source.update(containmentDisposition="no-descendants", descendantsObserved=0, descendantsReaped=0)
+            retention_streams(source, capture, stdout=stdout, stderr=stderr)
+            runner.captures.append(capture)
+            runners.append(runner)
+        producer, template = runners
+        producer.command_plan[701] = copy.deepcopy(producer_backend.expected_authority)
+        producer.command_results[701] = copy.deepcopy(producer_backend.command_record)
+        producer.runtime = copy.deepcopy(producer_backend.runtime)
+        producer.runtime_closure_document = copy.deepcopy(producer_backend.runtime_closure)
+        producer.runtime_closure_digest = producer_backend.runtime_closure["closureDigest"]
+        producer.runtime_closure_guard_evidence = copy.deepcopy(producer_backend.runtime_guard)
+        for runner in runners:
+            runner.observations = [{"commandId": record["commandId"], "rawObservation": raw}
+                for record in runner.command_results for raw in record["producerObservations"]]
+            retention_rebind(runner)
+        live_retention_producer(producer, outer.root)
+        context, replay = prepare_retention_verifier(template, outer.root)
+        for runner in (producer, replay):
+            runner._retain_standalone_process_observation(runner.command_results[702], runner.captures[-1])
+        case = SimpleNamespace(root=outer.root, runner=producer)
+        summary = write_retention(case, "e2-evidence")
+        if summary["status"] != "PASS":
+            raise AssertionError(summary["policyViolations"])
+        comparison = {key: summary[field] for key, field in (
+            ("observedDebts", "knownDebtsObserved"), ("resolvedCandidates", "resolvedCandidates"),
+            ("expectedOmissions", "expectedOmissions"), ("releaseOnlySkips", "releaseOnlySkips"))}
+        for ordinal in frontend:
+            backend.drift_unrelated_record(replay.command_results[ordinal])
+        replay.run = mock.Mock(return_value=comparison)
+        case.producer, case.runner, case.context = producer, replay, context
+        case.frontend, case.comparison = list(frontend), comparison
+        with mock.patch.object(ci, "rebuild_external_verification_context", return_value=context):
+            yield case
+
+
+@contextlib.contextmanager
+def packaging_counters():
+    with mock.patch.object(ci, "_parse_standalone_packaging_stderr",
+                           wraps=ci._parse_standalone_packaging_stderr) as parser, \
+         mock.patch.object(ci, "_standalone_packaging_semantic_identity",
+                           wraps=ci._standalone_packaging_semantic_identity) as identity, \
+         mock.patch.object(backend.portable, "_parse_stdout", wraps=backend.portable._parse_stdout) as backend_parser, \
+         mock.patch.object(backend.portable, "_identity", wraps=backend.portable._identity) as backend_identity:
+        yield SimpleNamespace(parser=parser, identity=identity, backend_parser=backend_parser, backend_identity=backend_identity)
+
+
+class StandalonePackagingPortableParserTest(unittest.TestCase):
+    def test_exact_production_inventory_and_verbose_entrypoint(self):
+        import ast
+        tree = ast.parse((Path(__file__).parent / "test_standalone_packaging.py").read_text(encoding="utf-8"))
+        suite, = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "StandalonePackagingTest"]
+        self.assertEqual(tuple(sorted(node.name for node in suite.body
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"))), PACKAGING_METHODS)
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute) and node.func.attr == "main"
+                 and isinstance(node.func.value, ast.Name) and node.func.value.id == "unittest"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([(kw.arg, ast.literal_eval(kw.value)) for kw in calls[0].keywords], [("verbosity", 2)])
+
+    def test_structural_variable_length_duration_pairs_and_exact_retained_bytes(self):
+        for left, right in PACKAGING_DURATIONS:
+            with self.subTest(left=left, right=right), packaging_counters() as calls:
+                data = [packaging_reporter(value) for value in (left, right)]
+                pair = ci._StandalonePortablePair(702, *data, b"isolated-parser-unit")
+                result = ci._derive_standalone_packaging_equal_result(pair)
+                self.assertIsNotNone(result)
+                self.assertEqual((calls.parser.call_count, calls.identity.call_count), (2, 2))
+                spans = []
+                for value in data:
+                    parsed = ci._parse_standalone_packaging_stderr(value)
+                    start, end = parsed.duration_span
+                    self.assertEqual(value[:start] + value[end:], parsed.prefix + parsed.suffix)
+                    self.assertEqual(bytes.fromhex(result["prefixHex"]), value[:start])
+                    self.assertEqual(bytes.fromhex(result["suffixHex"]), value[end:])
+                    self.assertEqual(len(parsed.prefix) + len(parsed.suffix), 3039)
+                    spans.append({"excluded": [start, end], "retained": [[0, start], [end, len(value)]]})
+                print("W702_E2_POSITIVE_SPANS " + json.dumps({"durations": [left, right], "spans": spans}))
+
+    def test_reporter_negative_matrix_both_sides_has_zero_identity_calls(self):
+        mutations = packaging_reporter_mutations()
+        for name, bad in mutations.items():
+            for side in ("producer", "replay"):
+                with self.subTest(name=name, side=side), packaging_counters() as calls:
+                    streams = (bad, packaging_reporter()) if side == "producer" else (packaging_reporter(), bad)
+                    self.assertIsNone(ci._derive_standalone_packaging_equal_result(
+                        ci._StandalonePortablePair(702, *streams, b"isolated-parser-unit")))
+                    self.assertEqual(calls.identity.call_count, 0)
+                    self.assertEqual(calls.parser.call_count, 1 if side == "producer" else 2)
+        print("W702_E2_REPORTER_MATRIX " + json.dumps({"cases": sorted(mutations),
+            "mutations": len(mutations), "both_sides": 2 * len(mutations), "identity_calls": 0}))
+
+    def test_every_retained_byte_position_rejects_ascii_and_unicode_mutations(self):
+        good = packaging_reporter()
+        start, end = ci._parse_standalone_packaging_stderr(good).duration_span
+        positions = [*range(start), *range(end, len(good))]
+        with mock.patch.object(ci, "_standalone_packaging_semantic_identity",
+                               wraps=ci._standalone_packaging_semantic_identity) as identity:
+            for index in positions:
+                for replacement in (bytes([good[index] ^ 1]), "\u00e9".encode()):
+                    bad = good[:index] + replacement + good[index + 1:]
+                    self.assertIsNone(ci._derive_standalone_packaging_equal_result(
+                        ci._StandalonePortablePair(702, good, bad, b"isolated-parser-unit")), index)
+            self.assertEqual(identity.call_count, 0)
+        print("W702_E2_BYTE_MATRIX " + json.dumps({"retained_positions": len(positions),
+            "mutations": len(positions) * 2, "identity_calls": 0}))
+
+
+
+
+class StandalonePackagingFixtureTestBase(unittest.TestCase):
+    """Reuse synthetic setup only; every case reruns the complete real verifier."""
+    @classmethod
+    def setUpClass(cls):
+        cls._fixture_stack = contextlib.ExitStack()
+        cls._fixture_cases = {}
+        padding_comparisons = {}
+        canonical_record = ci._canonical_transcript_record
+        def canonical_with_identical_padding(record):
+            # Memoize only deterministic comparisons of exact synthetic padding.
+            # Every authority check and every 687/692/695/701/702 projection uses
+            # production code afresh. This is neither evidence nor a test receipt.
+            if (record.get("commandClass") == "baseline-policy"
+                    and record.get("commandId", "").startswith("fixture-")
+                    and record.get("targets") == [] and record.get("producerObservations") == []
+                    and record.get("executionInputMode") == "NONE"):
+                key = (str(ci.REPO_ROOT), tempfile.gettempdir(), ci._observation_bytes(record))
+                if key not in padding_comparisons:
+                    padding_comparisons[key] = canonical_record(record)
+                return copy.deepcopy(padding_comparisons[key])
+            return canonical_record(record)
+        cls._fixture_stack.enter_context(mock.patch.object(
+            ci, "_canonical_transcript_record", new=canonical_with_identical_padding))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._fixture_stack.close()
+
+    @contextlib.contextmanager
+    def fixture(self, platform="windows", *, producer_stderr=None, replay_stderr=None,
+                producer_stdout=b"", replay_stdout=b""):
+        if producer_stdout or (producer_stderr is not None and producer_stderr != packaging_reporter()):
+            # A changed producer must rebuild all baseline-bound summary fields
+            # through the ordinary writer, not merely reseal the raw record.
+            with packaging_replay_fixture(platform, producer_stderr=producer_stderr,
+                    replay_stderr=replay_stderr, producer_stdout=producer_stdout,
+                    replay_stdout=replay_stdout) as case:
+                yield case
+            return
+        cache = type(self)._fixture_cases
+        if platform not in cache:
+            case = type(self)._fixture_stack.enter_context(packaging_replay_fixture(platform))
+            held_keys = {"_observation_authority", "execution_external_authority", "external_verification_context"}
+            held = {key: value for key, value in vars(case.runner).items() if key in held_keys}
+            state = copy.deepcopy({key: value for key, value in vars(case.runner).items() if key not in held_keys})
+            cache[platform] = (case, held, state, copy.deepcopy(case.documents), copy.deepcopy(vars(case.context)))
+        case, held, state, documents, context_fields = cache[platform]
+        case.runner.__dict__.clear()
+        case.runner.__dict__.update(copy.deepcopy(state))
+        case.runner.__dict__.update(held)
+        for key, value in context_fields.items():
+            object.__setattr__(case.context, key, copy.deepcopy(value))
+        case.documents = copy.deepcopy(documents)
+        # This exact extra file is created solely by the membership mutation.
+        (case.output / "extra.json").unlink(missing_ok=True)
+        with mock.patch.object(ci, "REPO_ROOT", case.root), \
+             mock.patch.object(ci, "rebuild_external_verification_context", return_value=case.context):
+            source = case.documents["command-results.json"]["records"][702]
+            stdout = producer_stdout
+            stderr = packaging_reporter() if producer_stderr is None else producer_stderr
+            for stream, data in (("stdout", stdout), ("stderr", stderr)):
+                source[stream + "Sha256"] = hashlib.sha256(data).hexdigest()
+                source[stream + "BytesObserved"] = len(data)
+                if source["producerObservations"]:
+                    source["producerObservations"][0]["rawStructuredFields"][stream] = data.decode()
+            backend.reseal_producer(case)
+            record = case.runner.command_results[702]
+            record["producerObservations"] = []
+            record["producerObservationSetDigest"] = ci.producer_observation_set_digest([])
+            case.runner.observations = [item for item in case.runner.observations
+                                       if item["commandId"] != "standalone-packaging"]
+            retention_streams(record, case.runner.captures[-1], stdout=replay_stdout,
+                stderr=packaging_reporter("76.421") if replay_stderr is None else replay_stderr)
+            case.runner._retain_standalone_process_observation(record, case.runner.captures[-1])
+            yield case
+
+class StandalonePackagingPortableReplayTest(StandalonePackagingFixtureTestBase):
+    def assert_result(self, case, errors, transcript, calls, *, portable, parser_calls, identity_calls):
+        expected = case.frontend if portable else [*case.frontend, 702]
+        self.assertEqual(backend.unequal_ordinals(errors), expected, errors)
+        self.assertIsNotNone(transcript, errors)
+        self.assertEqual(transcript["finalAcceptance"], "REJECT")
+        self.assertEqual((calls.parser.call_count, calls.identity.call_count), (parser_calls, identity_calls))
+        self.assertEqual((calls.backend_parser.call_count, calls.backend_identity.call_count), (2, 2))
+        self.assertNotIn(701, backend.unequal_ordinals(errors))
+
+    def test_windows_positive_pairs_keep_frontend_reject_and_raw_evidence_unchanged(self):
+        for left, right in PACKAGING_DURATIONS:
+            with self.subTest(left=left, right=right), self.fixture(
+                    producer_stderr=packaging_reporter(left), replay_stderr=packaging_reporter(right)) as case:
+                before = {name: (case.output / name).read_bytes() for name in ci.EVIDENCE_FILE_NAMES}
+                records = ci._observation_bytes(case.runner.command_results)
+                canonical = ci._canonical_transcript_record(case.runner.command_results[702])
+                with packaging_counters() as calls:
+                    errors, transcript = backend.verify(case)
+                self.assert_result(case, errors, transcript, calls, portable=True, parser_calls=2, identity_calls=2)
+                self.assertEqual(before, {name: (case.output / name).read_bytes() for name in ci.EVIDENCE_FILE_NAMES})
+                self.assertEqual(ci._observation_bytes(case.runner.command_results), records)
+                self.assertEqual(ci._canonical_transcript_record(case.runner.command_results[702]), canonical)
+                self.assertNotEqual(transcript["records"][702]["stderrSha256"],
+                    case.documents["command-results.json"]["records"][702]["stderrSha256"])
+                print("W702_E2_HOSTED " + json.dumps({"platform": "windows", "durations": [left, right],
+                    "unequal": backend.unequal_ordinals(errors), "finalAcceptance": transcript["finalAcceptance"],
+                    "backend_parser": calls.backend_parser.call_count, "backend_identity": calls.backend_identity.call_count,
+                    "packaging_parser": calls.parser.call_count, "packaging_identity": calls.identity.call_count}))
+
+    def test_ubuntu_matching_windows_grammar_never_calls_packaging_and_stays_raw(self):
+        with self.fixture("ubuntu") as case, packaging_counters() as calls:
+            errors, transcript = backend.verify(case)
+            self.assert_result(case, errors, transcript, calls, portable=False, parser_calls=0, identity_calls=0)
+            self.assertEqual(case.documents["command-results.json"]["records"][702]["producerObservations"], [])
+            print("W702_E2_HOSTED " + json.dumps({"platform": "ubuntu", "unequal": backend.unequal_ordinals(errors),
+                "finalAcceptance": transcript["finalAcceptance"], "backend_parser": calls.backend_parser.call_count,
+                "backend_identity": calls.backend_identity.call_count, "packaging_parser": 0, "packaging_identity": 0}))
+
+    def test_every_reporter_mutation_retains_702_after_real_outer_authority(self):
+        for name, bad in packaging_reporter_mutations().items():
+            # Invalid UTF-8 cannot pass E1 retention; that case instead proves
+            # raw capture unavailability/retention denial before the parser.
+            if name == "invalid-UTF8":
+                continue
+            with self.subTest(name=name), self.fixture(replay_stderr=bad) as case, packaging_counters() as calls:
+                errors, transcript = backend.verify(case)
+                self.assert_result(case, errors, transcript, calls, portable=False, parser_calls=2, identity_calls=0)
+                print("W702_E2_OUTER_MUTATION " + json.dumps({"case": name, "unequal": backend.unequal_ordinals(errors),
+                    "parser": calls.parser.call_count, "identity": calls.identity.call_count, "finalAcceptance": "REJECT"}))
+
+    def test_parser_unavailable_and_missing_raw_captures_retain_702(self):
+        for mode in ("parser-raises", "parser-returns-none", "parser-missing", "parser-not-callable",
+                     "stdout-raw-missing", "stderr-raw-missing", "capture-missing", "duplicate-capture"):
+            with self.subTest(mode=mode), self.fixture() as case, packaging_counters() as calls, contextlib.ExitStack() as overrides:
+                if mode == "parser-raises":
+                    calls.parser.side_effect = ValueError("unavailable")
+                elif mode == "parser-returns-none":
+                    calls.parser.return_value = None
+                elif mode == "parser-missing":
+                    calls.parser.side_effect = TypeError("unavailable callable")
+                elif mode == "parser-not-callable":
+                    overrides.enter_context(mock.patch.object(ci, "_parse_standalone_packaging_stderr", None))
+                elif mode.endswith("-raw-missing"):
+                    setattr(case.runner.captures[-1], mode.split("-")[0] + "_raw", None)
+                elif mode == "capture-missing":
+                    case.runner.captures.pop()
+                elif mode == "duplicate-capture":
+                    case.runner.captures.append(copy.deepcopy(case.runner.captures[-1]))
+                errors, transcript = backend.verify(case)
+                self.assert_result(case, errors, transcript, calls, portable=False,
+                    parser_calls=(2 if mode == "parser-returns-none" else 1)
+                    if mode.startswith("parser") and mode != "parser-not-callable" else 0,
+                    identity_calls=0)
+
+    def test_nonempty_stdout_on_either_side_and_both_sides_blocks_before_parser(self):
+        for producer, replay in ((b"diagnostic", b""), (b"", b"diagnostic"), (b"diagnostic", b"diagnostic")):
+            with self.subTest(producer=producer, replay=replay), self.fixture(
+                    producer_stdout=producer, replay_stdout=replay) as case, packaging_counters() as calls:
+                errors, transcript = backend.verify(case)
+                self.assert_result(case, errors, transcript, calls, portable=False, parser_calls=0, identity_calls=0)
+
+    def test_source_only_apis_have_no_portability_or_selection_knobs(self):
+        with self.fixture() as case, packaging_counters() as calls:
+            errors, transcript = ci.compare_verification_replay_claims(
+                case.documents, case.runner, case.comparison)[::-1]
+            self.assertIn(702, backend.unequal_ordinals(errors))
+            result, errors = ci.run_verification_replay(case.documents, expected_context=case.context,
+                verification_runner=case.runner, repo_root=case.root)
+            self.assertTrue(errors)
+            self.assertIsNone(result)
+            self.assertEqual((calls.parser.call_count, calls.identity.call_count), (0, 0))
+            for api in (ci.verify_evidence_file_set, ci._validate_evidence_semantics,
+                        ci.run_verification_replay, ci.compare_verification_replay_claims,
+                        ci.verify_evidence_with_replay):
+                self.assertFalse(set(inspect.signature(api).parameters) & {
+                    "portable", "allow_packaging", "expected_os", "parser", "semantic_result"})
+
+
+class StandalonePackagingPortableAuthorityTest(StandalonePackagingFixtureTestBase):
+    def assert_preparser_reject(self, case, errors, transcript, calls):
+        self.assertTrue(errors)
+        self.assertTrue(transcript is None or transcript.get("finalAcceptance") == "REJECT")
+        self.assertEqual((calls.parser.call_count, calls.identity.call_count), (0, 0))
+        if transcript is not None:
+            self.assertIn(702, backend.unequal_ordinals(errors), errors)
+        # The persisted source/raw comparison never gains a portable projection.
+        source = case.documents["command-results.json"]["records"][702]
+        self.assertNotEqual(ci._canonical_transcript_record(source),
+                            ci._canonical_transcript_record(case.runner.command_results[702]))
+
+    def test_missing_producer_admission_retains_702_with_zero_packaging_calls(self):
+        with self.fixture() as case, packaging_counters() as calls, \
+             mock.patch.object(ci, "_bind_standalone_portable_producer", return_value=None):
+            errors, transcript = backend.verify(case)
+            self.assert_preparser_reject(case, errors, transcript, calls)
+            self.assertEqual(backend.unequal_ordinals(errors), [687, 692, 695, 702])
+            self.assertEqual((calls.backend_parser.call_count, calls.backend_identity.call_count), (2, 2))
+
+    def test_coherent_evidence_replacement_between_first_and_second_snapshots(self):
+        with self.fixture() as case, packaging_counters() as calls:
+            original = ci._verify_evidence_file_set
+            def replace_after_first(*args, **kwargs):
+                errors = original(*args, **kwargs)
+                self.assertEqual(errors, [])
+                source = case.documents["command-results.json"]["records"][702]
+                data = packaging_reporter("70.000")
+                source.update(stderrSha256=hashlib.sha256(data).hexdigest(), stderrBytesObserved=len(data))
+                source["producerObservations"][0]["rawStructuredFields"]["stderr"] = data.decode()
+                backend.reseal_producer(case)
+                return errors
+            with mock.patch.object(ci, "_verify_evidence_file_set", side_effect=replace_after_first):
+                errors, transcript = backend.verify(case)
+            self.assert_preparser_reject(case, errors, transcript, calls)
+            self.assertTrue(any("between first and second" in error for error in errors))
+            case.runner.run.assert_not_called()
+
+    def test_post_admission_and_current_authority_mutations_precede_parser(self):
+        def change_file_identity(case, producer):
+            path = case.output / "summary.md"
+            stat = path.stat()
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+        def change_capture(case, producer):
+            record = case.runner.command_results[702]
+            data = packaging_reporter("100.000")
+            retention_streams(record, case.runner.captures[-1], stderr=data)
+            raw, = record["producerObservations"]
+            raw["rawStructuredFields"]["stderr"] = data.decode()
+            raw["sourceOutputDigest"] = ci.command_output_digest(record)
+            raw["producerRecordDigest"] = ci._producer_record_digest({
+                key: value for key, value in raw.items() if key != "producerRecordDigest"})
+            record["producerObservationSetDigest"] = ci.producer_observation_set_digest([raw])
+        mutations = {
+            "producer-observation-after-admission": lambda c, p: p.validation.records[702]["producerObservations"][0]["rawStructuredFields"].update(stderr="changed"),
+            "source-record-after-admission": lambda c, p: p.validation.records[702].update(durationSeconds=99),
+            "prepared-plan": lambda c, p: c.runner.command_plan[702].update(toolRole="changed"),
+            "expected-context": lambda c, p: object.__setattr__(c.context, "run_attempt", "2"),
+            "file-identity": change_file_identity,
+            "directory-membership": lambda c, p: (c.output / "extra.json").write_bytes(b"{}"),
+            "snapshot-document": lambda c, p: p.validation.documents["summary.json"].update(status="REJECT"),
+            "snapshot-identity": lambda c, p: p.validation.snapshots.update({
+                "summary.md": replace(p.validation.snapshots["summary.md"], identity=(1, 2, 3, 4, 5))}),
+            "fresh-replay-tool-authority": lambda c, p: c.runner.command_results[702].update(resolvedExecutableSha256="c" * 64),
+            "fresh-replay-protected-input": lambda c, p: c.runner.command_results[702]["protectedTargetBundle"].update(mutationDetected=True),
+            "fresh-runtime-authority": lambda c, p: c.runner.runtime_closure_document["pythonExecutable"].update(sha256="c" * 64),
+            "fresh-runtime-guard": lambda c, p: c.runner.runtime_closure_guard_evidence.update(mutationEventCount=1),
+            "fresh-capture-consistent-new-duration": change_capture,
+            "verifier-authority-revoked": lambda c, p: c.runner.__dict__.pop("_observation_authority"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), self.fixture() as case, packaging_counters() as calls:
+                original = ci._bind_standalone_portable_replay
+                bound = []
+                def mutate_after_first(producer):
+                    value = original(producer)
+                    if not bound:
+                        self.assertIsNotNone(value, name)
+                        bound.append(value)
+                        mutate(case, producer)
+                    return value
+                with mock.patch.object(ci, "_bind_standalone_portable_replay", side_effect=mutate_after_first):
+                    errors, transcript = backend.verify(case)
+                self.assert_preparser_reject(case, errors, transcript, calls)
+                self.assertEqual(len(bound), 1)
+                print("W702_E2_AUTHORITY_MUTATION " + json.dumps({
+                    "case": name, "parser": 0, "identity": 0, "finalAcceptance": "REJECT"}))
+
+    def test_local_execution_and_capture_mutations_precede_parser(self):
+        mutations = {
+            "exit": lambda c: c.runner.command_results[702].update(exitCode=1),
+            "not-executed": lambda c: c.runner.command_results[702].update(executed=False),
+            "containment": lambda c: c.runner.command_results[702].update(containment="internal"),
+            "descendant-observed": lambda c: c.runner.command_results[702].update(descendantsObserved=1),
+            "descendant-reaped": lambda c: c.runner.command_results[702].update(descendantsReaped=1),
+            "descendant-surviving": lambda c: c.runner.command_results[702].update(descendantsSurviving=1),
+            "descendant-terminated": lambda c: c.runner.command_results[702].update(descendantsTerminated=1),
+            "stdout-length": lambda c: c.runner.captures[-1].__dict__.update(stdout_bytes=1),
+            "stderr-length": lambda c: c.runner.captures[-1].__dict__.update(stderr_bytes=1),
+            "stderr-hash": lambda c: c.runner.command_results[702].update(stderrSha256="c" * 64),
+            "capture-argv": lambda c: c.runner.captures[-1].argv.append("--changed"),
+            "capture-input-mode": lambda c: c.runner.captures[-1].__dict__.update(execution_input_mode="NONE"),
+            "capture-exit": lambda c: c.runner.captures[-1].__dict__.update(exit_code=1),
+            "capture-error": lambda c: c.runner.captures[-1].__dict__.update(error="changed"),
+            "capture-timeout": lambda c: c.runner.captures[-1].__dict__.update(timed_out=True),
+            "capture-output-limit": lambda c: c.runner.captures[-1].__dict__.update(output_limited=True),
+            "capture-UTF8": lambda c: c.runner.captures[-1].__dict__.update(stderr_raw=b"\xff"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), self.fixture() as case, packaging_counters() as calls:
+                mutate(case)
+                errors, transcript = backend.verify(case)
+                self.assert_preparser_reject(case, errors, transcript, calls)
+                print("W702_E2_EXECUTION_MUTATION " + json.dumps({
+                    "case": name, "parser": 0, "identity": 0, "finalAcceptance": "REJECT"}))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, testRunner=fixtures.InventoryTextTestRunner)

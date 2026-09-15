@@ -23374,6 +23374,304 @@ def _finish_verification_replay(
     return transcript, sorted(set(errors))
 
 
+# W702-E2 is deliberately private to the outer replay verifier. The ordinary
+# observation writer, source-only APIs and canonical record generator stay raw.
+_STANDALONE_PACKAGING_METHODS = (
+    "test_archive_entries_are_unique_portable_relative_and_not_symlinks",
+    "test_archive_list_verifier_rejects_duplicate_and_unsafe_entries",
+    "test_authorized_reading_has_real_windows_unix_parity_and_hashes",
+    "test_clean_no_git_source_archive_still_releases_safely",
+    "test_default_windows_and_unix_release_use_one_positive_manifest",
+    "test_extracted_payload_is_self_contained_and_serves_required_styles",
+    "test_git_manifest_and_payload_dirty_changes_fail_closed",
+    "test_main_manifest_missing_malformed_schema_and_paths_fail_closed",
+    "test_manifest_listed_path_reparse_fails_closed",
+    "test_private_listening_switch_fails_and_root_is_not_scanned",
+    "test_reading_file_and_external_manifest_reparse_fail_closed",
+    "test_reading_hash_missing_duplicate_and_unsafe_paths_fail_closed",
+    "test_reading_root_requires_explicit_manifest",
+    "test_reading_unknown_and_hidden_files_fail_closed",
+    "test_required_and_manifest_listed_files_fail_closed_when_missing",
+    "test_required_root_fails_before_zip_on_windows_and_unix",
+    "test_scripts_consume_only_the_shared_manifest_helper_staging_contract",
+    "test_unknown_files_in_every_managed_root_fail_before_staging",
+)
+_STANDALONE_PACKAGING_PROTOCOL = b"windows-standalone-packaging-verbose-unittest-duration-v1"
+
+
+@dataclass(frozen=True)
+class _StandalonePackagingReporter:
+    prefix: bytes
+    suffix: bytes
+    duration_span: tuple[int, int]
+
+
+def _parse_standalone_packaging_stderr(stderr):
+    """Recognize the complete, byte-exact Windows success reporter or fail."""
+    if type(stderr) is not bytes or len(stderr) > MAX_EVIDENCE_STRING_BYTES:
+        raise ValueError("standalone reporter bytes unavailable or oversized")
+    stderr.decode("utf-8", errors="strict")
+    prefix = b"".join(
+        f"{name} (__main__.StandalonePackagingTest.{name}) ... ok\r\n".encode("ascii")
+        for name in _STANDALONE_PACKAGING_METHODS
+    ) + b"\r\n" + b"-" * 70 + b"\r\nRan 18 tests in "
+    suffix = b"s\r\n\r\nOK\r\n"
+    if not stderr.startswith(prefix) or not stderr.endswith(suffix):
+        raise ValueError("standalone verbose reporter grammar differs")
+    start, end = len(prefix), len(stderr) - len(suffix)
+    # Only after exact ordered membership, framing and EOF are established is
+    # the one remaining field examined. Never substitute/search across stderr.
+    if end <= start or re.fullmatch(rb"[0-9]+\.[0-9]{3}", stderr[start:end]) is None:
+        raise ValueError("standalone footer duration grammar differs")
+    return _StandalonePackagingReporter(stderr[:start], stderr[end:], (start, end))
+
+
+def _standalone_packaging_semantic_identity(reporter):
+    """Length-frame exact retained bytes and the explicit protocol identity."""
+    if type(reporter) is not _StandalonePackagingReporter:
+        raise ValueError("standalone reporter is unavailable")
+    digest = hashlib.sha256()
+    for segment in (_STANDALONE_PACKAGING_PROTOCOL, reporter.prefix, reporter.suffix):
+        digest.update(len(segment).to_bytes(8, "big"))
+        digest.update(segment)
+    return {
+        "protocol": _STANDALONE_PACKAGING_PROTOCOL.decode("ascii"),
+        "prefixHex": reporter.prefix.hex(),
+        "suffixHex": reporter.suffix.hex(),
+        "identityDigest": "sha256:" + digest.hexdigest(),
+    }
+
+
+@dataclass(frozen=True)
+class _StandalonePortableProducer:
+    validation: _ObservationValidation
+    admissions: tuple
+    ordinal: int
+
+
+@dataclass(frozen=True)
+class _StandalonePortablePair:
+    ordinal: int
+    producer_stderr: bytes
+    replay_stderr: bytes
+    authority_seal: bytes
+
+
+def _bind_standalone_portable_producer(validation):
+    """Hold the already validated ordinary evidence; never acquire other bytes."""
+    try:
+        admissions = _admit_standalone_observations(validation)
+        slots = [index for index, item in enumerate(validation.plan)
+                 if item["commandId"] == "standalone-packaging"]
+        if len(admissions) != 1 or len(slots) != 1:
+            return None
+        return _StandalonePortableProducer(validation, admissions, slots[0])
+    except (OSError, AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _standalone_packaging_runtime_binding(closure, guard, runtime, record):
+    errors = []
+    _validate_runtime_dependency_closure(closure, guard, runtime,
+        profile="all", status="PASS", errors=errors)
+    if (errors or closure["measurementStatus"] != "measured-complete"
+            or closure["runnerOS"] != "Windows" or guard["active"] is not False
+            or guard["watcherBackend"] != "_WindowsDirectoryMutationWatcher"):
+        raise ValueError("standalone runtime closure is not current")
+    python = closure["pythonExecutable"]
+    if (python.get("role") != "python-verifier" or python.get("leaseHeld") is not True
+            or type(python.get("size")) is not int or python["size"] <= 0
+            or not isinstance(python.get("stableIdentity"), dict)
+            or python["stableIdentity"].get("reparsePoint") is not False
+            or record["resolvedExecutablePath"] != python["canonicalPath"]
+            or record["resolvedExecutableSize"] != python["size"]
+            or record["resolvedExecutableSha256"] != python["sha256"]
+            or record["executionArgv"] != [python["canonicalPath"], "-B",
+                                          "developer/tests/ci/test_standalone_packaging.py"]):
+        raise ValueError("standalone Python tool does not bind the executed command")
+    # Physical tool identities are checked locally. Existing portable command
+    # authority binds the executable content; all runtime versions/dependencies
+    # and every nonphysical tool field must additionally agree across jobs.
+    tools = {}
+    for key in ("pythonExecutable", "nodeExecutable", "npmEntrypoint", "gitExecutable"):
+        tool = closure[key]
+        if tool is None and key == "gitExecutable":
+            tools[key] = None
+            continue
+        if (not isinstance(tool, dict) or tool.get("leaseHeld") is not True
+                or type(tool.get("size")) is not int or tool["size"] <= 0
+                or not isinstance(tool.get("stableIdentity"), dict)
+                or tool["stableIdentity"].get("reparsePoint") is not False):
+            raise ValueError("standalone runtime tool lease is invalid")
+        tools[key] = {name: value for name, value in tool.items()
+                      if name not in {"canonicalPath", "stableIdentity"}}
+    return _observation_bytes({
+        "runtime": {key: value for key, value in runtime.items() if key != "runtimeClosureDigest"},
+        "tools": tools, "dependencyClosureDigest": closure["dependencyClosureDigest"],
+        "guard": guard,
+    })
+
+
+def _bind_standalone_portable_replay(producer):
+    """Recheck held admission, complete fresh authority and exact raw capture."""
+    try:
+        if type(producer) is not _StandalonePortableProducer:
+            return None
+        validation, ordinal = producer.validation, producer.ordinal
+        runner, context = validation.runner, validation.context
+        if (_observation_authority_for_runner(runner, context) is None
+                or runner.platform != "windows" or context.runner_os != "Windows"
+                or runner.runtime_closure_digest != context.fresh_runtime_closure_digest):
+            return None
+        source = validation.records[ordinal]
+        raw, = source["producerObservations"]
+        if not _matching_observation_admission(producer.admissions, raw, source,
+                records=validation.records, plan=runner.command_plan):
+            return None
+        records, errors = _preflight_command_record_positions(runner.command_results, runner.command_plan)
+        if errors or _command_authority_violations(runner.profile, records, runner.observations,
+                                                   expected_plan=runner.command_plan):
+            return None
+        for index, record in enumerate(records):
+            _validate_command_record(record, index, errors, expected_record=runner.command_plan[index])
+        if errors or runner.violations or any(r.get("status") != "pass" for r in runner.hard_gate_results):
+            return None
+        replay = records[ordinal]
+        captures = [capture for capture in runner.captures if capture.command_id == "standalone-packaging"]
+        if len(captures) != 1 or type(captures[0]) is not CommandCapture:
+            return None
+        capture = captures[0]
+        if (capture.target_execution_lease is not None or not capture.execution_passed()
+                or capture.error is not None or capture.process_tree_error is not None
+                or capture.limit_reason is not None):
+            return None
+        # Both records are still local authority, not reporter projections.
+        for record in (source, replay):
+            if (record["commandId"] != "standalone-packaging"
+                    or record["commandClass"] != "standalone-packaging"
+                    or record["toolRole"] != "python-standalone-test"
+                    or record["platform"] != "windows" or record["profile"] != "all"
+                    or record["executionInputMode"] != "PROTECTED-TARGET-BUNDLE"
+                    or record["actualExecutionInputMode"] != "PROTECTED-TARGET-BUNDLE"
+                    or not _required_command_execution_passed(record)
+                    or type(record["exitCode"]) is not int or record["exitCode"] != 0
+                    or record["containment"] != "windows-job-object"
+                    or record["processTreeStatus"] != "contained-clean"
+                    or record["containmentDisposition"] != "no-descendants"
+                    or any(record[key] != 0 for key in ("descendantsObserved", "descendantsReaped",
+                                                       "descendantsTerminated", "descendantsSurviving"))
+                    or any(record.get(key) is not None for key in ("error", "processTreeError", "limitReason"))):
+                return None
+        expected = runner.command_plan[ordinal]
+        if (_portable_command_plan_value([{key: source[key] for key in expected}])
+                != _portable_command_plan_value([expected])):
+            return None
+        source_bundle = _validated_portable_protected_input_bundle_digest(source)
+        if source_bundle is None or source_bundle != _validated_portable_protected_input_bundle_digest(replay):
+            return None
+        commands = validation.documents["command-results.json"]
+        producer_runtime = _standalone_packaging_runtime_binding(commands["runtimeDependencyClosure"],
+            commands["runtimeDependencyGuard"], commands["runtime"], source)
+        replay_runtime = _standalone_packaging_runtime_binding(runner.runtime_closure_document,
+            runner.runtime_closure_guard_evidence, runner.runtime, replay)
+        if (producer_runtime != replay_runtime
+                or runner.runtime_closure_document["closureDigest"] != runner.runtime_closure_digest
+                or runner.runtime_closure_document["dependencyClosureDigest"] != runner.dependency_closure_digest):
+            return None
+        streams = []
+        for stream in ("stdout", "stderr"):
+            exact = raw["rawStructuredFields"][stream].encode("utf-8", errors="strict")
+            fresh = getattr(capture, stream + "_raw")
+            if (type(fresh) is not bytes or len(fresh) != getattr(capture, stream + "_bytes")
+                    or len(fresh) > min(replay[stream + "ByteLimit"], MAX_EVIDENCE_STRING_BYTES)):
+                return None
+            for record, data in ((source, exact), (replay, fresh)):
+                if (len(data) != record[stream + "BytesObserved"]
+                        or hashlib.sha256(data).hexdigest() != record[stream + "Sha256"]):
+                    return None
+            if stream == "stdout" and (exact != b"" or fresh != b""):
+                return None
+            streams.append((exact, fresh))
+        replay_raw, = replay["producerObservations"]
+        if (_validate_raw_observation_structure(replay_raw, label="standalone replay", source=replay)
+                or replay_raw["rawStructuredFields"] != {
+                    "executed": True, "exitCode": 0, "stdout": "",
+                    "stderr": streams[1][1].decode("utf-8", errors="strict"), "error": None}
+                or any(replay_raw[key] != raw[key] for key in raw
+                       if key not in {"rawStructuredFields", "sourceOutputDigest", "producerRecordDigest"})):
+            return None
+        runner_added = {"executionInputs", "executionInputBundleDigest", "protectedTargetBundle",
+                        "producerObservations", "producerObservationSetDigest", "completedCommandClass"}
+        if any(replay.get(key) != value for key, value in capture.evidence().items() if key not in runner_added):
+            return None
+        seal = _observation_bytes({
+            "records": records, "observations": runner.observations,
+            "plan": runner.command_plan, "runtime": runner.runtime,
+            "closure": runner.runtime_closure_document, "guard": runner.runtime_closure_guard_evidence,
+            "capture": capture.evidence(), "context": vars(context),
+            "producerAdmission": producer.admissions[0].validation.hex(),
+        })
+        return _StandalonePortablePair(ordinal, *streams[1], seal)
+    except (OSError, AttributeError, IndexError, KeyError, TypeError, ValueError, UnicodeError, OverflowError):
+        return None
+
+
+def _derive_standalone_packaging_equal_result(pair):
+    """Parse both complete reporters before computing either semantic identity."""
+    try:
+        if type(pair) is not _StandalonePortablePair:
+            return None
+        parser = globals().get("_parse_standalone_packaging_stderr")
+        identity = globals().get("_standalone_packaging_semantic_identity")
+        if not callable(parser) or not callable(identity):
+            return None
+        reporters = [parser(data) for data in (pair.producer_stderr, pair.replay_stderr)]
+        if any(type(reporter) is not _StandalonePackagingReporter for reporter in reporters):
+            return None
+        identities = [identity(reporter) for reporter in reporters]
+        return identities[0] if identities[0] == identities[1] else None
+    except (AttributeError, TypeError, ValueError, UnicodeError, OverflowError):
+        return None
+
+
+def _standalone_packaging_comparison_views(documents, runner, prior_views, pair, result):
+    """Compose an ephemeral 702 comparison with any existing backend view."""
+    views = copy.deepcopy(prior_views) if prior_views is not None else {}
+    encoded = _observation_bytes(result)
+    for side, records in (("producer", documents["command-results.json"]["records"]),
+                          ("replay", runner.command_results)):
+        projected = (views[side]["records"] if side in views else
+                     [_canonical_transcript_record(record) for record in records])
+        record = projected[pair.ordinal]
+        record["stderrSha256"] = hashlib.sha256(encoded).hexdigest()
+        record["stderrBytesObserved"] = len(encoded)
+        observation = copy.deepcopy(records[pair.ordinal]["producerObservations"][0])
+        observation["rawStructuredFields"]["stderr"] = copy.deepcopy(result)
+        observation["sourceOutputDigest"] = result["identityDigest"]
+        observation["producerRecordDigest"] = _producer_record_digest({
+            key: value for key, value in observation.items() if key != "producerRecordDigest"})
+        record["producerObservations"] = [observation]
+        record["producerObservationSetDigest"] = producer_observation_set_digest([observation])
+        universe = producer_observation_universe(records)
+        for index, (item, command) in enumerate(zip(universe, projected)):
+            if index == pair.ordinal or (prior_views is not None
+                                          and command["commandId"] == "backend-canonical"):
+                for key in ("producerObservations", "producerObservationSetDigest"):
+                    item[key] = command[key]
+        universe_digest = canonical_failure_digest(universe)
+        classes = runner.actual_completed_command_classes
+        transcript_digest = canonical_failure_digest({
+            "commandPlanDigest": runner.command_plan_digest, "orderedCommandTranscript": projected,
+            "orderedProducerObservationUniverse": universe,
+            "producerObservationUniverseDigest": universe_digest,
+            "completedCommandClasses": sorted(set(classes)),
+            "completedCommandClassSetDigest": completed_command_class_set_digest(classes),
+        })
+        views[side] = {"records": projected, "producerObservationUniverseDigest": universe_digest,
+                       "producerTranscriptDigest": transcript_digest}
+    return views
+
+
 def verify_evidence_with_replay(
     output_dir: Path = OUTPUT_DIR,
     *,
@@ -23392,6 +23690,17 @@ def verify_evidence_with_replay(
     if verification_runner.command_plan_digest != expected_context.command_plan_digest:
         return ["verification runner command plan differs from external expected context"], None
     observation_authority = _observation_authority_for_runner(verification_runner, expected_context)
+    initial_snapshots = None
+    if observation_authority is not None:
+        # Retain the first exact snapshot across both existing validation stages.
+        # A coherently resealed replacement is still a change, not fresh authority.
+        try:
+            initial_root_identity = _stat_identity(output_dir.lstat())
+        except OSError as exc:
+            return ["evidence directory identity unavailable: " + type(exc).__name__], None
+        _, initial_snapshots, initial_errors = _read_evidence_documents_for_replay(output_dir)
+        if initial_errors:
+            return initial_errors, None
     file_verifier = _verify_evidence_file_set if observation_authority is not None else verify_evidence_file_set
     private = {"observation_runner": verification_runner} if observation_authority is not None else {}
     errors = file_verifier(
@@ -23406,6 +23715,13 @@ def verify_evidence_with_replay(
     documents, snapshots, snapshot_errors = _read_evidence_documents_for_replay(output_dir)
     if snapshot_errors:
         return snapshot_errors, None
+    if initial_snapshots is not None:
+        try:
+            root_unchanged = _stat_identity(output_dir.lstat()) == initial_root_identity
+        except OSError:
+            root_unchanged = False
+        if initial_snapshots != snapshots or not root_unchanged:
+            return ["evidence changed between first and second verification snapshots"], None
     records, positional_errors = _preflight_command_record_positions(
         documents["command-results.json"].get("records"), verification_runner.command_plan)
     if positional_errors:
@@ -23445,45 +23761,62 @@ def verify_evidence_with_replay(
         record["commandId"] == "backend-canonical" and record["exitCode"] == 0
         for record in documents["command-results.json"]["records"]
     )
-    bound_pair = None
-    if not backend_portability:
+    packaging_portability = observation_authority is not None and any(
+        planned["commandId"] == "standalone-packaging" for planned in verification_runner.command_plan)
+    packaging_context = (_bind_standalone_portable_producer(_ObservationValidation(
+        verification_runner, expected_context, records, verification_runner.command_plan,
+        documents, snapshots, output_dir)) if packaging_portability else None)
+    deferred_portability = backend_portability or packaging_portability
+    bound_pair = packaging_pair = None
+    comparison = None
+    if not deferred_portability:
         replay_operation = _run_verification_replay if observation_authority is not None else run_verification_replay
         transcript, replay_errors = replay_operation(
             documents, expected_context=expected_context,
             verification_runner=verification_runner, repo_root=repo_root,
         )
     else:
-        import backend_canonical_portable_result as backend_portable
+        if backend_portability:
+            import backend_canonical_portable_result as backend_portable
 
-        unavailable = "verification replay backend-canonical portable result unavailable or mismatched"
-        backend_context = backend_portable._bind_producer(
-            sys.modules[__name__], documents["command-results.json"],
-            verification_runner.command_plan, repo_root,
-        )
-        if backend_context is None:
-            return [unavailable], None
+            unavailable = "verification replay backend-canonical portable result unavailable or mismatched"
+            backend_context = backend_portable._bind_producer(
+                sys.modules[__name__], documents["command-results.json"],
+                verification_runner.command_plan, repo_root,
+            )
+            if backend_context is None:
+                return [unavailable], None
         comparison, replay_errors = _execute_verification_replay(
             expected_context=expected_context, verification_runner=verification_runner,
             repo_root=repo_root,
         )
         transcript = None
         if comparison is not None:
-            bound_pair = backend_portable._bind_replay(
-                sys.modules[__name__], backend_context,
-                documents["command-results.json"], verification_runner,
-            )
-            if bound_pair is None:
-                replay_errors.append(unavailable)
+            if backend_portability:
+                bound_pair = backend_portable._bind_replay(
+                    sys.modules[__name__], backend_context,
+                    documents["command-results.json"], verification_runner,
+                )
+                if bound_pair is None:
+                    replay_errors.append(unavailable)
             # Authority, execution state and cleanup remain ahead of parsing.
             # Semantic inequality in another command is collected afterward.
-            transcript, comparison_errors = _verification_replay_eligibility(
-                documents, verification_runner, comparison,
-            )
+            try:
+                transcript, comparison_errors = _verification_replay_eligibility(
+                    documents, verification_runner, comparison,
+                )
+            except (OSError, AttributeError, KeyError, TypeError, ValueError) as exc:
+                return sorted(set(replay_errors + [
+                    "verification replay authority finalization failed: " + type(exc).__name__])), None
             replay_errors.extend(comparison_errors)
             transcript, replay_errors = _finish_verification_replay(
                 transcript, replay_errors, expected_context=expected_context,
                 runner=verification_runner,
             )
+            if packaging_portability and not replay_errors:
+                # Freeze only the completed replay, after its ordinary finalizer
+                # has rebound observation context and cleanup has succeeded.
+                packaging_pair = _bind_standalone_portable_replay(packaging_context)
     errors.extend(replay_errors)
     if transcript is not None and transcript.get("finalAcceptance") != "PASS":
         errors.append(
@@ -23513,15 +23846,20 @@ def verify_evidence_with_replay(
             current.identity != original.identity or current.data != original.data
         ):
             errors.append(f"{name}: evidence changed during verification replay")
-    if backend_portability:
+    if deferred_portability:
         # Evidence/context/cleanup and authority eligibility precede parsing.
         try:
             if {entry.name for entry in os.scandir(output_dir)} != set(EVIDENCE_FILE_NAMES):
                 errors.append("evidence file membership changed during verification replay")
         except OSError as exc:
             errors.append(f"evidence directory cannot be re-enumerated: {type(exc).__name__}")
-        result = None
-        if not errors and bound_pair is not None:
+        result = packaging_result = None
+        packaging_rebound = None
+        if not errors and packaging_pair is not None:
+            packaging_rebound = _bind_standalone_portable_replay(packaging_context)
+            if packaging_rebound != packaging_pair:
+                errors.append("verification replay standalone-packaging authority changed")
+        if not errors and backend_portability and bound_pair is not None:
             rebound = backend_portable._bind_replay(
                 sys.modules[__name__], backend_context,
                 documents["command-results.json"], verification_runner,
@@ -23532,15 +23870,24 @@ def verify_evidence_with_replay(
                 result = backend_portable._derive_equal_result(sys.modules[__name__], rebound)
                 if result is None:
                     errors.append(unavailable)
+        if not errors and packaging_rebound is not None:
+            packaging_result = _derive_standalone_packaging_equal_result(packaging_rebound)
         if comparison is not None:
             # A backend record loses its raw difference only after both full
             # results were derived and compared equal. Every unavailable or
             # unequal result retains the raw comparison, even on another error.
             views = (backend_portable._comparison_views(sys.modules[__name__], rebound, result)
                      if result is not None else None)
-            transcript, comparison_errors = _compare_verification_replay_claims(
-                documents, verification_runner, comparison, comparison_views=views,
-            )
+            if packaging_result is not None:
+                views = _standalone_packaging_comparison_views(
+                    documents, verification_runner, views, packaging_rebound, packaging_result)
+            try:
+                transcript, comparison_errors = _compare_verification_replay_claims(
+                    documents, verification_runner, comparison, comparison_views=views,
+                )
+            except (OSError, AttributeError, KeyError, TypeError, ValueError) as exc:
+                return sorted(set(errors + [
+                    "verification replay comparison authority became unavailable: " + type(exc).__name__])), None
             errors.extend(comparison_errors)
             if result is not None and not errors:
                 transcript["backendCanonicalPortableResult"] = result
