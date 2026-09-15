@@ -19622,6 +19622,95 @@ class FoundationRunner:
         )
         self.completed_classes.add("backend-canonical")
 
+    def _retain_standalone_process_observation(
+        self, record: dict[str, Any], capture: CommandCapture,
+    ) -> None:
+        """Retain exact safe streams under the held Windows production authority.
+
+        Unavailable retention uses the existing empty producer set. Candidates
+        stay raw until complete-transcript A2 admission precedes reconstruction.
+        """
+        context = getattr(self, "external_verification_context", None)
+        authority = _observation_authority_for_runner(self, context)
+        if (authority is None or authority.issuance not in {"live-producer", "live-verifier"}
+                or not any(item is capture for item in self.captures)
+                or not any(item is record for item in self.command_results)
+                or capture.command_id != "standalone-packaging"
+                or capture.command_class != "standalone-packaging"
+                or not capture.execution_passed() or capture.error is not None
+                or capture.descendants_surviving != 0
+                or record.get("producerObservations") != []
+                or record.get("commandId") != "standalone-packaging"
+                or record.get("commandClass") != "standalone-packaging"
+                or record.get("toolRole") != "python-standalone-test"
+                or record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+                or record.get("resultSemantics") != "exit-zero-required"
+                or record.get("profile") != "all" or record.get("platform") != "windows"
+                or record.get("commandRole") != "required-execution"
+                or record.get("required") is not True or record.get("allowedExecutionExits") != [0]
+                or not _required_command_execution_passed(record)
+                or record.get("containment") != "windows-job-object"
+                or record.get("processTreeStatus") != "contained-clean"
+                or any(record.get(key) is not None for key in ("error", "processTreeError", "limitReason"))):
+            return
+        expected = self.command_plan_by_id.get("standalone-packaging")
+        errors: list[str] = []
+        # Completion is normally derived by the later transcript finalizer.
+        completed = {**record, "completedCommandClass": "standalone-packaging"}
+        _validate_command_record(completed, record["ordinal"], errors, expected_record=expected)
+        if errors or expected is None or _validated_portable_protected_input_bundle_digest(completed) is None:
+            return
+        streams = {}
+        for stream in ("stdout", "stderr"):
+            captured = getattr(capture, stream + "_raw")
+            # Neither ordinary text nor its hash can replace missing capture.
+            if (not isinstance(captured, bytes)
+                    or len(captured) != getattr(capture, stream + "_bytes")
+                    or len(captured) > min(record[stream + "ByteLimit"],
+                                           getattr(capture, stream + "_byte_limit"), MAX_EVIDENCE_STRING_BYTES)):
+                return
+            try:
+                exact = captured.decode("utf-8", errors="strict")
+                encoded = exact.encode("utf-8", errors="strict")
+            except UnicodeError:
+                return
+            if (encoded != captured or len(encoded) != record[stream + "BytesObserved"]
+                    or hashlib.sha256(encoded).hexdigest() != record[stream + "Sha256"]
+                    or _BACKEND_STREAM_REDACTION_MARKER in exact
+                    or not _backend_exact_stream_text_is_safe(exact)):
+                return
+            streams[stream] = exact
+        raw = make_raw_observation(
+            "standalone-packaging", record["ordinal"], 0, "process-output-v1",
+            "command:standalone-packaging", "developer/tests/ci/test_standalone_packaging.py",
+            {"executed": True, "exitCode": 0, **streams, "error": None}, command_output_digest(record),
+        )
+        # The ordinary constructor normalizes presentation. Restore only proven
+        # exact bytes, then independently inspect the final serialized values.
+        raw["rawStructuredFields"].update(streams)
+        final_fields = strict_json_loads(_json_bytes(raw).decode("utf-8"),
+                                        label="standalone retention")["rawStructuredFields"]
+        for stream in ("stdout", "stderr"):
+            final = final_fields[stream]
+            encoded = final.encode("utf-8", errors="strict")
+            if (not _backend_exact_stream_text_is_safe(final)
+                    or encoded != getattr(capture, stream + "_raw")
+                    or len(encoded) != record[stream + "BytesObserved"]
+                    or hashlib.sha256(encoded).hexdigest() != record[stream + "Sha256"]):
+                return
+        raw["producerRecordDigest"] = _producer_record_digest({
+            key: value for key, value in raw.items() if key != "producerRecordDigest"})
+        previous = record["producerObservations"], record["producerObservationSetDigest"]
+        record["producerObservations"] = [raw]
+        record["producerObservationSetDigest"] = producer_observation_set_digest([raw])
+        _, errors = _preflight_command_record_positions(self.command_results, self.command_plan)
+        if errors or _observation_authority_for_runner(self, context) is not authority:
+            record["producerObservations"], record["producerObservationSetDigest"] = previous
+            return
+        # Do not call add_observation: it reconstructs before A2 admission. The
+        # normal finalizer admits the complete raw transcript, then reconstructs.
+        self.observations.append({"commandId": "standalone-packaging", "rawObservation": raw})
+
     def run_standalone_profile(self) -> None:
         environment = self.child_environment
         plan_record = self.command_plan_by_id["standalone-packaging"]
@@ -19649,6 +19738,7 @@ class FoundationRunner:
             "executionInputBundleDigest"
         ]
         standalone_record["protectedTargetBundle"] = protected_bundle
+        self._retain_standalone_process_observation(standalone_record, capture)
 
         scope = "membership:index.html::js/siteContent.js"
         def evaluate_membership(bundle: ProtectedTargetBundle) -> tuple[bool, str, Any]:
