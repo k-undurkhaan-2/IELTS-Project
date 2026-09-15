@@ -22166,6 +22166,42 @@ def _validate_evidence_semantics(
         expected_command_plan=expected_command_plan, expected_context=expected_context)
 
 
+def _preflight_command_record_positions(records, command_plan):
+    """Validate original JSON positions without reconstructing observations."""
+    if not isinstance(records, list):
+        return None, ["command-results.json: records must be an array"]
+    for index, record in enumerate(records):
+        if not isinstance(record, Mapping):
+            return None, [f"command-results.json.records[{index}]: record must be an object"]
+    errors = []
+    portable_plan = _portable_command_plan_value(command_plan)
+    for index, record in enumerate(records):
+        if type(record.get("ordinal")) is not int or record["ordinal"] != index:
+            errors.append(f"command-results.json.records[{index}]: ordinal does not match order")
+        # Ordinary FAIL evidence may report extra zero-observation commands or
+        # replace the transcript with the existing bounded size-limit failure.
+        if record.get("commandId") == "command-results-size-limit":
+            sentinel = {
+                "commandClass": "evidence-size-limit", "commandRole": "required-execution",
+                "toolRole": "python-in-process", "resultSemantics": "bounded-evidence-failure-record",
+                "required": True, "exitCode": 125, "outputLimitStatus": "OUTPUT-LIMIT-EXCEEDED",
+                "producerObservations": [],
+            }
+            if len(records) != 1 or _observation_bytes({key: record.get(key) for key in sentinel}) != _observation_bytes(sentinel):
+                errors.append(f"command-results.json.records[{index}]: size-limit sentinel must be a single zero-observation failure record")
+        elif index >= len(command_plan):
+            if record.get("producerObservations") != []:
+                errors.append(f"command-results.json.records[{index}]: unplanned command cannot supply producer observations")
+        else:
+            projection = {key: record.get(key) for key in command_plan[index]}
+            if _observation_bytes(_portable_command_plan_value([projection])) != _observation_bytes([portable_plan[index]]):
+                errors.append(
+                    f"command-results.json.records[{index}]: execution record does not bind the immutable command authority"
+                )
+    # Return the same list, including its original length and positions.
+    return (None, errors) if errors else (records, [])
+
+
 def _validate_evidence_semantics_with_authority(
     documents: Mapping[str, dict[str, Any]],
     snapshots: Mapping[str, _FileSnapshot],
@@ -22403,11 +22439,7 @@ def _validate_evidence_semantics_with_authority(
             errors.append(f"summary.json: {field_name} must be an array")
     if not isinstance(observed.get("records"), list) or not isinstance(resolved.get("records"), list):
         errors.append("debt/candidate evidence records must be arrays")
-    if not isinstance(commands.get("records"), list):
-        errors.append("command-results.json: records must be an array")
-        command_records: list[Any] = []
-    else:
-        command_records = commands["records"]
+    command_records = commands.get("records")
     command_observations = commands.get("observations")
     if not isinstance(command_observations, list) or len(command_observations) > MAX_EVIDENCE_COLLECTION_ITEMS:
         errors.append("command-results.json: observations must be a bounded array")
@@ -22437,9 +22469,26 @@ def _validate_evidence_semantics_with_authority(
         errors.append("command-results.json: commandPlanDigest does not match the immutable profile plan")
     if isinstance(execution_binding, dict) and execution_binding.get("commandPlanDigest") != expected_plan_digest:
         errors.append("execution binding command-plan digest differs from external profile authority")
-    valid_command_records = [
-        record for record in command_records if isinstance(record, Mapping)
-    ]
+    valid_command_records, positional_errors = _preflight_command_record_positions(
+        command_records, expected_authority)
+    if positional_errors:
+        if isinstance(command_records, list) and all(isinstance(record, Mapping) for record in command_records):
+            # Preserve the existing safe diagnostic without deriving evidence.
+            violation = {
+                "id": "COMMAND-AUTHORITY-MISMATCH",
+                "expectedCommandIds": [item["commandId"] for item in expected_authority],
+                "observedCommandIds": [item.get("commandId") for item in command_records],
+            }
+            claimed = summary.get("policyViolations")
+            if not isinstance(claimed, list) or violation not in claimed:
+                errors.append(
+                    "summary.json: derived command/baseline violation is missing: "
+                    + missing_derived_violation_diagnostic(
+                        violation, command_records=command_records,
+                        expected_authority=expected_authority, cross_job=True,
+                    )
+                )
+        return sorted(set(errors + positional_errors))
     independently_expected_classes = expected_completed_command_classes(expected_authority)
     independently_actual_classes = actual_completed_command_classes(
         expected_authority,
@@ -22514,7 +22563,7 @@ def _validate_evidence_semantics_with_authority(
             "command-results.json: PASS transcript has missing, extra, or duplicate command IDs"
         )
     admissions = ()
-    authority_sensitive = _has_standalone_observation(valid_command_records, command_observations, expected_authority)
+    authority_sensitive = _has_standalone_observation(command_records, command_observations, expected_authority)
     if authority_sensitive:
         if errors:
             return sorted(set(errors))
@@ -22652,23 +22701,6 @@ def _validate_evidence_semantics_with_authority(
             errors,
             expected_record=independently_expected_record,
         )
-        if isinstance(record, dict) and record.get("ordinal") != index:
-            errors.append(f"command-results.json.records[{index}]: ordinal does not match order")
-        if (
-            isinstance(record, dict)
-            and record.get("commandId") != "command-results-size-limit"
-            and index < len(expected_authority)
-        ):
-            expected_record = expected_authority[index]
-            authority_projection = {
-                key: record.get(key) for key in expected_record
-            }
-            if _portable_command_plan_value([authority_projection]) != (
-                [portable_expected_authority[index]]
-            ):
-                errors.append(
-                    f"command-results.json.records[{index}]: execution record does not bind the immutable command authority"
-                )
     if command_hard_failure and summary.get("status") == "PASS":
         errors.append("summary.json reports PASS while command-results records an execution failure")
 
@@ -23114,7 +23146,12 @@ def run_verification_replay(
 ) -> tuple[dict[str, Any] | None, list[str]]:
     """Source-only raw replay; prepared packaging admission stays private."""
     commands = documents.get("command-results.json", {})
-    if _has_standalone_observation(commands.get("records", []), commands.get("observations", []), verification_runner.command_plan):
+    records, errors = _preflight_command_record_positions(
+        commands.get("records"), verification_runner.command_plan)
+    if errors:
+        # Retain the source-only API's rejection result without running replay.
+        return {"finalAcceptance": "REJECT"}, errors
+    if _has_standalone_observation(records, commands.get("observations", []), verification_runner.command_plan):
         return None, ["standalone observation is unauthorized in source-only replay"]
     return _run_verification_replay(documents, expected_context=expected_context,
         verification_runner=verification_runner, repo_root=repo_root)
@@ -23279,14 +23316,18 @@ def verify_evidence_with_replay(
     documents, snapshots, snapshot_errors = _read_evidence_documents_for_replay(output_dir)
     if snapshot_errors:
         return snapshot_errors, None
+    records, positional_errors = _preflight_command_record_positions(
+        documents["command-results.json"].get("records"), verification_runner.command_plan)
+    if positional_errors:
+        return positional_errors, None
     backend_plan = (
         expected_context.expected_profile in {"backend", "all"}
         and any(record.get("commandId") == "backend-canonical"
                 for record in verification_runner.command_plan)
     )
     if backend_plan or observation_authority is not None or _has_standalone_observation(
-            documents["command-results.json"].get("records", []),
-            documents["command-results.json"].get("observations", [])):
+            records, documents["command-results.json"].get("observations", []),
+            verification_runner.command_plan):
         # The replay reader takes a second snapshot. Validate the exact documents
         # used below, not merely the earlier file-set validation's snapshots.
         errors.extend(validate_evidence_root(output_dir, repo_root=evidence_authority_root or repo_root))

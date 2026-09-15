@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import contextlib
 import copy
+from collections.abc import Mapping
 from dataclasses import FrozenInstanceError, replace
+import hashlib
 import inspect
 import io
 import json
@@ -714,5 +716,391 @@ class StandaloneObservationAuthorityTest(unittest.TestCase):
             "required_categories": 17, "parser_calls": 0, "standalone_semantic_identity_calls": 0}))
 
 
+@contextlib.contextmanager
+def positional_fixture(platform="windows"):
+    """Keep standalone at its real ordinal with records on both sides."""
+    with tempfile.TemporaryDirectory(prefix="observation-positional-") as temp:
+        root = Path(temp)
+        runner, capture = runner_fixture(root, platform)
+        standalone = runner.command_plan[0]
+        source = runner.command_results[0]
+        standalone["ordinal"] = source["ordinal"] = 702
+        padding = fixtures.synthetic_command_spec("padding", "baseline-policy", 0)
+        padding.update(profile="all", platform=platform)
+        plan, records = [], []
+        for ordinal in range(705):
+            if ordinal == 702:
+                plan.append(standalone)
+                records.append(source)
+            else:
+                spec = copy.deepcopy(padding)
+                spec.update(commandId=f"padding-{ordinal}", ordinal=ordinal)
+                plan.append(spec)
+                records.append(fixtures.synthetic_record_from_spec(spec))
+        runner.command_plan, runner.command_results = plan, records
+        runner.command_plan_by_id = {spec["commandId"]: spec for spec in plan}
+        runner.command_plan_digest = ci.command_plan_digest(plan)
+        runner.execution_binding["commandPlanDigest"] = runner.command_plan_digest
+        runner.execution_binding["producerInvocationId"] = ci._github_binding_invocation_id({
+            key: value for key, value in runner.execution_binding.items() if key != "producerInvocationId"})
+        runner.__dict__.pop("authorization_context_binding", None)
+        runner.__dict__.pop("authorization_context_binding_digest", None)
+        ci.finalize_evidence_transcript(runner)
+        output = root / ".ci-results"
+        ci.create_fresh_evidence_root(output, repo_root=root)
+        summary = ci.write_evidence(runner, fixtures.empty_comparison(), output_dir=output,
+                                    evidence_authority_root=root)
+        documents, snapshots, errors = ci._read_evidence_documents_for_replay(output)
+        if errors:
+            raise AssertionError(errors)
+        context = replace(fixtures.synthetic_external_context(runner.execution_binding),
+                          fresh_runtime_closure_digest=runner.runtime_closure_digest)
+        runner.external_verification_context = context
+        runner.verifier_execution_binding = context.verifier_binding()
+        runner.execution_external_authority = external_for(runner.execution_binding, verifier=True)
+        capability = ci._issue_synthetic_observation_authority_for_test(runner, context)
+        comparison = {key: summary[field] for key, field in (
+            ("observedDebts", "knownDebtsObserved"), ("resolvedCandidates", "resolvedCandidates"),
+            ("expectedOmissions", "expectedOmissions"), ("releaseOnlySkips", "releaseOnlySkips"))}
+        runner.run = mock.Mock(return_value=comparison)
+        yield SimpleNamespace(root=root, output=output, runner=runner, context=context,
+            documents=documents, snapshots=snapshots, capability=capability, comparison=comparison,
+            capture=capture)
+
+
+def forge_positional_evidence(case, location=0, value=None, *, relabel=True):
+    """Attacker recomputes all claims; the original records array stays malformed."""
+    commands = case.documents["command-results.json"]
+    records = commands["records"]
+    source = records[702]
+    source.update(stderrSha256=ci.hashlib.sha256(STREAM).hexdigest(), stderrBytesObserved=len(STREAM))
+    source["producerObservations"] = [raw_for(source)]
+    if relabel:
+        source.update(commandId="node-check:other.js", commandClass="direct-syntax")
+        source["producerObservations"][0].update(commandId="node-check:other.js",
+                                                sourceResultId="other.js", sourcePath="other.js")
+    if location is not None:
+        records[location] = value
+    # This intentionally reproduces the attacker's compacted aggregate claims.
+    # It is never used as a positional authority sequence in the verifier.
+    claimed = [record for record in records if isinstance(record, Mapping)]
+    for record in claimed:
+        for raw in record["producerObservations"]:
+            raw["sourceOutputDigest"] = ci.command_output_digest(record)
+            raw["producerRecordDigest"] = ci._producer_record_digest({
+                key: item for key, item in raw.items() if key != "producerRecordDigest"})
+        record["producerObservationSetDigest"] = ci.producer_observation_set_digest(record["producerObservations"])
+        record["completedCommandClass"] = record["commandClass"] if ci._command_completed_for_class(record) else None
+    plan = case.runner.command_plan
+    expected = ci.expected_completed_command_classes(plan)
+    actual = ci.actual_completed_command_classes(plan, claimed)
+    commands.update(expectedCompletedCommandClasses=expected, actualCompletedCommandClasses=actual,
+        completedCommandClasses=actual,
+        expectedCompletedCommandClassSetDigest=ci.completed_command_class_set_digest(expected),
+        completedCommandClassSetDigest=ci.completed_command_class_set_digest(actual),
+        producerObservationCount=sum(len(record["producerObservations"]) for record in claimed),
+        producerObservationUniverseDigest=ci.producer_observation_universe_digest(claimed),
+        producerTranscriptDigest=ci.producer_transcript_digest(commands["commandPlanDigest"], claimed, actual))
+    missing, extra, duplicate = ci.command_id_set_differences(plan, claimed)
+    commands.update(missingCommandIds=missing, extraCommandIds=extra, duplicateCommandIds=duplicate)
+    projection_context = {
+        "producerObservationUniverseDigest": commands["producerObservationUniverseDigest"],
+        "producerTranscriptDigest": commands["producerTranscriptDigest"],
+        "profileCompletedCommandClassSetDigest": commands["completedCommandClassSetDigest"],
+        "authorizationContextBindingDigest": commands["authorizationContextBindingDigest"]}
+    observations = [ci._rederive_observation_record({"rawObservation": raw}, record,
+                    profile_context=projection_context)
+                    for record in claimed for raw in record["producerObservations"]]
+    commands["observations"] = observations
+    derived = ci.derive_authoritative_evidence("all", observations, actual, records,
+        case.runner.baseline, case.runner.platform, plan,
+        commands["authorizationContextBindingDigest"], release_gate_required=False, cross_job=True)
+    summary = case.documents["summary.json"]
+    for field, key in (("knownDebtsObserved", "observedDebts"), ("resolvedCandidates", "resolvedCandidates"),
+                       ("expectedOmissions", "expectedOmissions"), ("releaseOnlySkips", "releaseOnlySkips")):
+        summary[field] = derived[key]
+    summary["policyViolations"] = derived["violations"]
+    summary["counts"] = dict(hardGateFailures=sum(result["status"] != "pass" for result in summary["hardGateResults"]),
+        policyViolations=len(summary["policyViolations"]), knownDebtsObserved=len(summary["knownDebtsObserved"]),
+        resolvedCandidates=len(summary["resolvedCandidates"]), expectedOmissions=len(summary["expectedOmissions"]),
+        releaseOnlySkips=len(summary["releaseOnlySkips"]), commands=len(records))
+    summary["status"] = "FAIL" if summary["counts"]["hardGateFailures"] or summary["policyViolations"] else "PASS"
+    case.documents["observed-debt.json"].update(records=summary["knownDebtsObserved"],
+        expectedOmissions=summary["expectedOmissions"], releaseOnlySkips=summary["releaseOnlySkips"])
+    case.documents["resolved-candidates.json"]["records"] = summary["resolvedCandidates"]
+    backend.write_documents(case.output, case.documents)
+    case.documents, case.snapshots, errors = ci._read_evidence_documents_for_replay(case.output)
+    if errors:
+        raise AssertionError(errors)
+
+
+def call_counts(calls, admission, replay):
+    return dict(reconstruction_calls=calls.reconstruction.call_count,
+        admission_calls=admission.call_count, authoritative_derivation_calls=calls.derivation.call_count,
+        replay_execution_calls=replay.call_count, parser_calls=calls.parser.call_count,
+        backend_parser_calls=calls.backend_parser.call_count)
+
+
+
+@contextlib.contextmanager
+def positional_counters():
+    with counters() as calls, mock.patch.object(ci, "_admit_standalone_observations",
+            wraps=ci._admit_standalone_observations) as admission, mock.patch.object(ci,
+            "_execute_verification_replay", wraps=ci._execute_verification_replay) as replay:
+        calls.admission, calls.replay = admission, replay
+        yield calls
+
+
+class PositionalObservationPreflightTest(unittest.TestCase):
+    def assert_preflight_denied(self, label, operation):
+        with positional_counters() as calls:
+            errors = operation()
+        self.assertTrue(errors, label)
+        counts = call_counts(calls, calls.admission, calls.replay)
+        self.assertEqual(set(counts.values()), {0}, (label, counts, errors))
+        print("W702_POSITIONAL_DENIAL " + json.dumps(dict(case=label, result="REJECT", **counts)))
+        return errors
+
+    def assert_forged_aggregates(self, case, location):
+        commands = case.documents["command-results.json"]
+        records = commands["records"]
+        self.assertIsNone(records[location])
+        self.assertEqual(len(records), 705)
+        claimed = [record for record in records if isinstance(record, Mapping)]
+        actual = ci.actual_completed_command_classes(case.runner.command_plan, claimed)
+        self.assertEqual(commands["actualCompletedCommandClasses"], actual)
+        self.assertEqual(commands["completedCommandClasses"], actual)
+        self.assertEqual(commands["producerObservationCount"], 1)
+        self.assertEqual(commands["producerObservationUniverseDigest"], ci.producer_observation_universe_digest(claimed))
+        self.assertEqual(commands["producerTranscriptDigest"], ci.producer_transcript_digest(
+            commands["commandPlanDigest"], claimed, actual))
+        raw = records[702]["producerObservations"][0]
+        self.assertEqual(raw["commandId"], "node-check:other.js")
+        self.assertEqual((raw["sourceResultId"], raw["sourcePath"]), ("other.js", "other.js"))
+        self.assertEqual(ci._validate_raw_observation(raw, label="forged-source", source=records[702]), [])
+        self.assertEqual(raw["sourceOutputDigest"], ci.command_output_digest(records[702]))
+        self.assertEqual(raw["producerRecordDigest"], ci._producer_record_digest({
+            key: value for key, value in raw.items() if key != "producerRecordDigest"}))
+        summary = case.documents["summary.json"]
+        self.assertEqual(summary["counts"]["commands"], len(records))
+        for field, value in (("knownDebtsObserved", case.documents["observed-debt.json"]["records"]),
+                             ("resolvedCandidates", case.documents["resolved-candidates.json"]["records"]),
+                             ("expectedOmissions", case.documents["observed-debt.json"]["expectedOmissions"]),
+                             ("releaseOnlySkips", case.documents["observed-debt.json"]["releaseOnlySkips"])):
+            self.assertEqual(summary[field], value)
+            self.assertEqual(summary["counts"][field], len(value))
+        for entry in summary["evidenceManifest"]:
+            data = case.snapshots[entry["relativeFilename"]].data
+            self.assertEqual(entry["byteLength"], len(data))
+            self.assertEqual(entry["sha256"], hashlib.sha256(data).hexdigest())
+        self.assertEqual(case.snapshots["summary.md"].data, ci.render_summary_markdown(summary).encode())
+
+    def test_original_counterexample_and_positional_shift_matrix(self):
+        for platform in ("windows", "ubuntu"):
+            with self.subTest(platform=platform), positional_fixture(platform) as case:
+                ordinary = copy.deepcopy(case.documents)
+                self.assertEqual(ci.verify_evidence_file_set(case.output, repo_root=case.root,
+                    expected_command_plan=case.runner.command_plan), [])
+                self.assertEqual(semantic_verify(case), [])
+                self.assertEqual(ordinary["command-results.json"]["records"][702]["producerObservations"], [])
+                if platform == "windows":
+                    source = case.documents["command-results.json"]["records"][702]
+                    source["producerObservations"] = [raw_for(source)]
+                    reseal(case)
+                    with positional_counters() as calls:
+                        self.assertEqual(ci._verify_evidence_file_set(case.output, repo_root=case.root,
+                            expected_command_plan=case.runner.command_plan, expected_context=case.context,
+                            observation_runner=case.runner), [])
+                    self.assertGreater(calls.admission.call_count, 0)
+                    self.assertGreater(calls.reconstruction.call_count, 0)
+                print("W702_POSITIONAL_CONTROL " + json.dumps(dict(platform=platform,
+                    ordinary_file_validation="PASS", standalone_observations=[], ordinal=702)))
+                for location in (0, 686, 701, 703):
+                    with self.subTest(location=location):
+                        case.documents = copy.deepcopy(ordinary)
+                        forge_positional_evidence(case, location)
+                        self.assert_forged_aggregates(case, location)
+                        records = case.documents["command-results.json"]["records"]
+                        self.assertTrue(ci._has_standalone_observation(records, (), case.runner.command_plan))
+                        if location < 702:
+                            self.assertFalse(ci._has_standalone_observation(
+                                [record for record in records if isinstance(record, Mapping)], (), case.runner.command_plan))
+                        self.assert_preflight_denied(f"{platform} authority records[{location}]", lambda: ci._verify_evidence_file_set(
+                            case.output, repo_root=case.root, expected_command_plan=case.runner.command_plan,
+                            expected_context=case.context, observation_runner=case.runner))
+                        if platform == "windows":
+                            self.assert_preflight_denied(f"source-only records[{location}]", lambda: ci.verify_evidence_file_set(
+                                case.output, repo_root=case.root, expected_command_plan=case.runner.command_plan))
+
+    def test_second_snapshot_combined_forgery_precedes_replay(self):
+        for platform in ("windows", "ubuntu"):
+            base = backend.fixture(platform, ordinal=701)
+            with self.subTest(platform=platform), backend.outer_fixture(base, base, prefix_count=701,
+                    extra=("standalone-packaging", "fixture"), hosted=True) as case:
+                runner = object.__new__(ci.FoundationRunner)
+                runner.__dict__.update(vars(case.runner))
+                case.runner = runner
+                case.runner.external_verification_context = case.context
+                case.runner.execution_external_authority = external_for(case.runner.execution_binding, verifier=True)
+                ci._issue_synthetic_observation_authority_for_test(case.runner, case.context)
+                original = ci._verify_evidence_file_set
+                first = []
+                with positional_counters() as calls:
+                    def substitute_after_first(*args, **kwargs):
+                        errors = original(*args, **kwargs)
+                        self.assertEqual(errors, [])
+                        first.append(call_counts(calls, calls.admission, calls.replay))
+                        forge_positional_evidence(case)
+                        for spy in (calls.reconstruction, calls.derivation, calls.parser,
+                                    calls.backend_parser, calls.admission, calls.replay):
+                            spy.reset_mock()
+                        return errors
+                    with mock.patch.object(ci, "_verify_evidence_file_set", side_effect=substitute_after_first):
+                        errors, transcript = backend.verify(case)
+                self.assertEqual(len(first), 1)
+                self.assertTrue(errors)
+                self.assertIsNone(transcript)
+                counts = call_counts(calls, calls.admission, calls.replay)
+                self.assertEqual(set(counts.values()), {0}, (counts, errors))
+                case.runner.run.assert_not_called()
+                print("W702_POSITIONAL_SECOND_SNAPSHOT " + json.dumps(dict(platform=platform,
+                    first_snapshot="PASS", first_snapshot_calls=first[0], transcript=None, result="REJECT", **counts)))
+
+    def test_second_snapshot_without_backend_or_observation_capability(self):
+        with authority_fixture(platform="ubuntu", observation=False) as case:
+            original = ci._verify_evidence_file_set
+            with positional_counters() as calls:
+                def substitute_after_first(*args, **kwargs):
+                    errors = original(*args, **kwargs)
+                    self.assertEqual(errors, [])
+                    case.documents["command-results.json"]["records"][0] = None
+                    backend.write_documents(case.output, case.documents)
+                    for spy in (calls.reconstruction, calls.derivation, calls.parser,
+                                calls.backend_parser, calls.admission, calls.replay):
+                        spy.reset_mock()
+                    return errors
+                with mock.patch.object(ci, "_verify_evidence_file_set", side_effect=substitute_after_first):
+                    errors, transcript = ci.verify_evidence_with_replay(case.output, expected_context=case.context,
+                        verification_runner=case.runner, repo_root=case.root, evidence_authority_root=case.root)
+            self.assertTrue(errors)
+            self.assertIsNone(transcript)
+            counts = call_counts(calls, calls.admission, calls.replay)
+            self.assertEqual(set(counts.values()), {0})
+            case.runner.run.assert_not_called()
+            print("W702_POSITIONAL_SECOND_SNAPSHOT " + json.dumps(dict(platform="ubuntu", backend=False,
+                first_snapshot="PASS", transcript=None, result="REJECT", **counts)))
+
+    def test_non_array_and_non_object_records_fail_before_processing(self):
+        with authority_fixture(observation=False) as case:
+            ordinary = copy.deepcopy(case.documents)
+            def replay(documents):
+                transcript, errors = ci.run_verification_replay(documents,
+                    expected_context=case.context, verification_runner=case.runner, repo_root=case.root)
+                self.assertEqual(transcript, {"finalAcceptance": "REJECT"})
+                return errors
+            self.assert_preflight_denied("public replay empty documents", lambda: replay({}))
+            for value in (None, {}, "records", 1, True):
+                for entry in (False, True):
+                    if entry and isinstance(value, Mapping):
+                        continue
+                    label = f"{'record entry' if entry else 'records array'} {type(value).__name__}"
+                    with self.subTest(case=label):
+                        case.documents = copy.deepcopy(ordinary)
+                        case.documents["command-results.json"]["records"] = [value] if entry else value
+                        backend.write_documents(case.output, case.documents)
+                        self.assert_preflight_denied(label, lambda: ci.verify_evidence_file_set(case.output,
+                            repo_root=case.root, expected_command_plan=case.runner.command_plan))
+                        self.assert_preflight_denied("public replay " + label, lambda: replay(case.documents))
+            case.documents = copy.deepcopy(ordinary)
+            case.documents["command-results.json"]["records"][0] = []
+            backend.write_documents(case.output, case.documents)
+            self.assert_preflight_denied("array-valued command entry", lambda: ci.verify_evidence_file_set(
+                case.output, repo_root=case.root, expected_command_plan=case.runner.command_plan))
+
+    def test_positional_plan_disagreement_without_process_observations(self):
+        with authority_fixture(observation=False) as case:
+            ordinary = copy.deepcopy(case.documents)
+            for field, value in (("ordinal", False), ("ordinal", 1), ("commandId", "another-command"),
+                                 ("commandClass", "direct-syntax"), ("toolRole", "python-in-process"),
+                                 ("required", 1), ("allowedExecutionExits", [False])):
+                with self.subTest(field=field, value=value):
+                    case.documents = copy.deepcopy(ordinary)
+                    case.documents["command-results.json"]["records"][0][field] = value
+                    reseal(case)
+                    errors = self.assert_preflight_denied(f"zero-observation plan mismatch {field}={value}",
+                        lambda: ci.verify_evidence_file_set(case.output, repo_root=case.root,
+                            expected_command_plan=case.runner.command_plan))
+                    prefix = "summary.json: derived command/baseline violation is missing: "
+                    diagnostics = [ci.strict_json_loads(error[len(prefix):]) for error in errors
+                                   if error.startswith(prefix)]
+                    self.assertIn("COMMAND-AUTHORITY-MISMATCH", [item["violationType"] for item in diagnostics])
+
+    def test_failure_record_exceptions_cannot_supply_observation_authority(self):
+        for platform in ("ubuntu", "windows"):
+            with self.subTest(platform=platform), backend.outer_fixture(backend.fixture(platform), backend.fixture(platform)) as case:
+                ordinary = copy.deepcopy(case.documents)
+                def failure_evidence(name, runner, *, size_limit=False):
+                    root = case.root / name
+                    root.mkdir()
+                    output = root / ".ci-results"
+                    ci.create_fresh_evidence_root(output, repo_root=root)
+                    limit = 256 if size_limit else ci.MAX_COMMAND_RESULTS_JSON_BYTES
+                    with mock.patch.object(ci, "MAX_COMMAND_RESULTS_JSON_BYTES", limit):
+                        summary = ci.write_evidence(runner, fixtures.empty_comparison(), output_dir=output,
+                                                    evidence_authority_root=root)
+                    self.assertEqual(summary["status"], "FAIL")
+                    self.assertEqual(ci.verify_evidence_file_set(output, repo_root=root,
+                        expected_command_plan=case.runner.command_plan), [])
+                    return ci.strict_json_load_file(output / "command-results.json")["records"]
+                sentinel = failure_evidence("size-limit", copy.deepcopy(case.runner), size_limit=True)[0]
+                self.assertEqual(sentinel["producerObservations"], [])
+                extra_runner = copy.deepcopy(case.runner)
+                extra = fixtures.synthetic_command_spec("extra-command", "baseline-policy", 1)
+                extra.update(profile=case.runner.profile, platform=platform)
+                extra_runner.command_results.append(fixtures.synthetic_record_from_spec(extra))
+                failure_evidence("extra-failure", extra_runner)
+                for variant in ("observation-bearing sentinel", "misclassified sentinel",
+                                "sentinel with sibling", "unplanned observation source"):
+                    with self.subTest(variant=variant):
+                        case.documents = copy.deepcopy(ordinary)
+                        records = case.documents["command-results.json"]["records"]
+                        if variant == "unplanned observation source":
+                            extra_record = copy.deepcopy(records[0])
+                            extra_record.update(commandId="extra-observer", ordinal=1)
+                            records.append(extra_record)
+                        elif variant == "sentinel with sibling":
+                            sibling = copy.deepcopy(records[0])
+                            sibling["ordinal"] = 1
+                            records[:] = [copy.deepcopy(sentinel), sibling]
+                        else:
+                            records[0]["commandId"] = "command-results-size-limit"
+                            if variant == "misclassified sentinel":
+                                records[0]["producerObservations"] = []
+                        for record in records:
+                            for raw in record["producerObservations"]:
+                                raw["commandId"] = record["commandId"]
+                        backend.reseal_producer(case)
+                        self.assert_preflight_denied(f"{platform} {variant}", lambda: ci.verify_evidence_file_set(
+                            case.output, repo_root=case.root, expected_command_plan=case.runner.command_plan))
+                print("W702_FAILURE_EXCEPTION_CONTROL " + json.dumps(dict(platform=platform,
+                    size_limit_failure="PASS", extra_zero_observation_failure="PASS")))
+
+    def test_ordinary_partial_failure_and_original_sequence_are_preserved(self):
+        with authority_fixture(observation=False) as case:
+            records = case.documents["command-results.json"]["records"]
+            validated, errors = ci._preflight_command_record_positions(records, case.runner.command_plan)
+            self.assertEqual(errors, [])
+            self.assertIs(validated, records)
+            case.runner.command_results = []
+            case.runner.observations = []
+            failure_root = case.root / "partial-failure"
+            failure_root.mkdir()
+            output = failure_root / ".ci-results"
+            ci.create_fresh_evidence_root(output, repo_root=failure_root)
+            summary = ci.write_evidence(case.runner, fixtures.empty_comparison(), output_dir=output,
+                                        evidence_authority_root=failure_root)
+            self.assertEqual(summary["status"], "FAIL")
+            self.assertEqual(ci.verify_evidence_file_set(output, repo_root=failure_root,
+                expected_command_plan=case.runner.command_plan), [])
 if __name__ == "__main__":
     unittest.main(verbosity=2, testRunner=fixtures.InventoryTextTestRunner)
