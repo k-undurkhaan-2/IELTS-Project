@@ -2239,5 +2239,231 @@ class StandalonePackagingPortableAuthorityTest(StandalonePackagingFixtureTestBas
                 print("W702_E2_EXECUTION_MUTATION " + json.dumps({
                     "case": name, "parser": 0, "identity": 0, "finalAcceptance": "REJECT"}))
 
+def _r1_legacy_canonical_replay_value(value):
+    """Frozen e0f8a1e0 traversal, independent of the optimized recursion."""
+    if isinstance(value, Mapping):
+        return {str(key): _r1_legacy_canonical_replay_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_r1_legacy_canonical_replay_value(item) for item in value]
+    if isinstance(value, str):
+        temporary_root = str(ci.Path(tempfile.gettempdir()).resolve())
+        normalized = value
+        for spelling in {temporary_root, temporary_root.replace("\\", "/"),
+                         temporary_root.replace("/", "\\")}:
+            if spelling:
+                normalized = ci.re.sub(ci.re.escape(spelling), "<TASK-TEMP>", normalized,
+                                       flags=ci.re.IGNORECASE if ci.os.name == "nt" else 0)
+        repository_root = str(ci.REPO_ROOT.resolve())
+        for spelling in {repository_root, repository_root.replace("\\", "/"),
+                         repository_root.replace("/", "\\")}:
+            if spelling:
+                normalized = ci.re.sub(ci.re.escape(spelling), "<REPO>", normalized,
+                                       flags=ci.re.IGNORECASE if ci.os.name == "nt" else 0)
+        return normalized
+    return value
+
+
+@contextlib.contextmanager
+def _r1_root_resolution_counter():
+    """Count the real Path.resolve boundary only for this repository authority."""
+    original = Path.resolve
+    authority = ci.REPO_ROOT
+    calls = SimpleNamespace(count=0)
+
+    def resolve(path, *args, **kwargs):
+        if path == authority:
+            calls.count += 1
+        return original(path, *args, **kwargs)
+
+    with mock.patch.object(Path, "resolve", new=resolve):
+        yield calls
+
+
+class ReplayDiagnosticCanonicalizationPerformanceTest(StandalonePackagingFixtureTestBase):
+    @staticmethod
+    def large_record(rows=128, depth=8):
+        record = fixtures.synthetic_record_from_spec(fixtures.synthetic_command_spec(
+            "frontend-security:diagnostic-performance.js", "frontend-security", 687))
+        root = str(ci.REPO_ROOT)
+        values = [{"path": root + f"/developer/tests/fixture-{index}.js",
+                   "streams": ["public output", root.replace("\\", "/") + "/src/input.js",
+                               root.replace("/", "\\") + "\\src\\input.js"],
+                   "identity": {"sha256": "a" * 64, "state": "retained", "index": index}}
+                  for index in range(rows)]
+        for index in range(depth):
+            values = {"level": index, "records": [values], "source": root + "/source.json"}
+        record["producerObservations"] = [{
+            "commandId": record["commandId"], "commandOrdinal": 687, "occurrences": 1,
+            "rawStructuredFields": {"stdout": values, "stderr": "", "exitCode": 0},
+            "sourceOutputDigest": "sha256:" + "b" * 64,
+        }]
+        return record
+
+    def test_nested_value_root_resolution_is_constant(self):
+        for rows, depth in ((1, 1), (16, 4), (256, 12)):
+            value = self.large_record(rows, depth)
+            before_input = ci._json_bytes(value)
+            with _r1_root_resolution_counter() as before:
+                legacy = _r1_legacy_canonical_replay_value(value)
+            with _r1_root_resolution_counter() as after:
+                actual = ci._canonical_replay_value(value)
+            self.assertEqual(ci._json_bytes(actual), ci._json_bytes(legacy))
+            self.assertEqual(ci._json_bytes(value), before_input)
+            print("W702_R1_ROOT_CALLS " + json.dumps({
+                "rows": rows, "depth": depth, "before": before.count, "after": after.count,
+                "canonical_sha256": hashlib.sha256(ci._json_bytes(actual)).hexdigest(),
+            }, sort_keys=True))
+            self.assertGreater(before.count, rows)
+            self.assertEqual(after.count, 1)
+
+    def test_large_hosted_diagnostic_is_exact_and_root_resolution_is_bounded(self):
+        producer = self.large_record(1024, 12)
+        replay = copy.deepcopy(producer)
+        replay.update(stdoutSha256=hashlib.sha256(b"changed output").hexdigest(),
+                      stdoutBytesObserved=len(b"changed output"))
+        canonicalizers = (_r1_legacy_canonical_replay_value, ci._canonical_replay_value)
+        outputs, counts = [], []
+        for canonicalizer in canonicalizers:
+            with mock.patch.object(ci, "_canonical_replay_value", new=canonicalizer):
+                left = ci._canonical_transcript_record(producer)
+                right = ci._canonical_transcript_record(replay)
+                with _r1_root_resolution_counter() as calls:
+                    diagnostics = ci.replay_transcript_difference_diagnostics(
+                        [left], [right], producer_source_records=[producer],
+                        replay_source_records=[replay])
+                outputs.append(ci._json_bytes(diagnostics))
+                counts.append(calls.count)
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertEqual(json.loads(outputs[1])[0]["ordinal"], 687)
+        self.assertEqual(json.loads(outputs[1])[0]["changedFieldCategories"], ["stdout-identity"])
+        print("W702_R1_LARGE_DIAGNOSTIC " + json.dumps({
+            "rows": 1024, "before": counts[0], "after": counts[1],
+            "before_sha256": hashlib.sha256(outputs[0]).hexdigest(),
+            "after_sha256": hashlib.sha256(outputs[1]).hexdigest(),
+        }, sort_keys=True))
+        self.assertGreater(counts[0], 1024)
+        self.assertEqual(counts[1], 1)
+
+    def test_platform_path_spellings_are_byte_identical(self):
+        for model, root, temporary in (
+            ("nt", r"C:\work\reviewed-repo", r"C:\scratch\task-temp"),
+            ("nt", r"\\server\share\reviewed-repo", r"C:\scratch\task-temp"),
+            ("posix", "/srv/reviewed-repo", "/var/task-temp"),
+            # Temp substitution must still precede repository substitution.
+            ("posix", "/var/task-temp/reviewed-repo", "/var/task-temp"),
+        ):
+            spellings = (root, root.replace("\\", "/"), root.replace("/", "\\"),
+                         root.swapcase(), temporary, temporary.replace("\\", "/"),
+                         temporary.replace("/", "\\"))
+            value = {"mapping": {7: {"paths": list(spellings)}}, "tuple": (
+                "file://" + root + "/private/input.js", root + r"\mixed/separators.js",
+                "https://example.invalid/path?q=public", "urn:example:public",
+                r"C:\unrelated\private\opaque.txt", "/unrelated/private/opaque.txt",
+                "unicode-\u96ea", "", None, True, 17, 0.125)}
+            authority = SimpleNamespace(resolve=mock.Mock(return_value=root))
+            temp_path = SimpleNamespace(resolve=mock.Mock(return_value=temporary))
+            with self.subTest(model=model, root=root), \
+                 mock.patch.object(ci, "REPO_ROOT", authority), \
+                 mock.patch.object(ci, "Path", return_value=temp_path), \
+                 mock.patch.object(ci, "os", SimpleNamespace(name=model)):
+                expected = _r1_legacy_canonical_replay_value(value)
+                authority.resolve.reset_mock()
+                actual = ci._canonical_replay_value(value)
+                self.assertEqual(ci._json_bytes(actual), ci._json_bytes(expected))
+                self.assertEqual(authority.resolve.call_count, 1)
+                self.assertEqual(actual["tuple"][2:6], list(value["tuple"][2:6]))
+
+    def test_each_top_level_call_observes_replaced_repository_root(self):
+        first, second = "/authority/first-repo", "/authority/second-repo"
+        value = [first + "/a", {"path": second + "/b"}]
+        for root in (first, second, first):
+            authority = SimpleNamespace(resolve=mock.Mock(return_value=root))
+            with mock.patch.object(ci, "REPO_ROOT", authority):
+                expected = _r1_legacy_canonical_replay_value(value)
+                authority.resolve.reset_mock()
+                self.assertEqual(ci._canonical_replay_value(value), expected)
+                self.assertEqual(authority.resolve.call_count, 1)
+
+    def test_non_string_values_keep_lazy_resolution_and_errors(self):
+        value = {1: [None, True, 7, 0.125, {}, ()]}
+        authority = SimpleNamespace(resolve=mock.Mock(side_effect=OSError("unavailable")))
+        with mock.patch.object(ci, "REPO_ROOT", authority):
+            self.assertEqual(ci._canonical_replay_value(value),
+                             _r1_legacy_canonical_replay_value(value))
+            authority.resolve.assert_not_called()
+            with self.assertRaisesRegex(OSError, "unavailable"):
+                ci._canonical_replay_value([value, "requires root authority"])
+            self.assertEqual(authority.resolve.call_count, 1)
+
+    def test_diagnostic_order_membership_and_cap_are_exactly_unchanged(self):
+        ordinals = [40, 12, 33, 7, 31, 9, 21, 2, 18, 1, 15, 5]
+        producer, replay = [], []
+        for ordinal in ordinals:
+            record = self.large_record(1, 1)
+            record.update(ordinal=ordinal, commandClass="direct-syntax",
+                          commandId=f"node-check:{ci.REPO_ROOT}/private-{ordinal}.js")
+            producer.append(record)
+            changed = copy.deepcopy(record)
+            changed.update(stderrSha256="d" * 64, stderrBytesObserved=77)
+            replay.append(changed)
+        for left_source, right_source in ((producer, replay), (producer, []), ([], replay)):
+            outputs = []
+            for canonicalizer in (_r1_legacy_canonical_replay_value, ci._canonical_replay_value):
+                with mock.patch.object(ci, "_canonical_replay_value", new=canonicalizer):
+                    left = [ci._canonical_transcript_record(record) for record in left_source]
+                    right = [ci._canonical_transcript_record(record) for record in right_source]
+                    outputs.append(ci.replay_transcript_difference_diagnostics(
+                        left, right, producer_source_records=left_source,
+                        replay_source_records=right_source))
+            self.assertEqual(ci._json_bytes(outputs[0]), ci._json_bytes(outputs[1]))
+            self.assertEqual(len(outputs[1]), 8)
+            self.assertEqual([item["ordinal"] for item in outputs[1]], ordinals[:8])
+            for item, source in zip(outputs[1], (right_source or left_source)):
+                self.assertEqual(item["commandIdDigest"],
+                                 "sha256:" + hashlib.sha256(source["commandId"].encode()).hexdigest())
+            self.assertNotIn(str(ci.REPO_ROOT), json.dumps(outputs[1]))
+        self.assertEqual(ci.replay_transcript_difference_diagnostics([], []), [])
+
+    def test_hosted_e2_diagnostics_and_controls_are_exactly_unchanged(self):
+        candidate = ci._canonical_replay_value
+        for platform, mutation in (("windows", False), ("ubuntu", False), ("windows", True)):
+            outputs = []
+            stderr = packaging_reporter_mutations()["status-FAIL"] if mutation else None
+            for canonicalizer in (_r1_legacy_canonical_replay_value, candidate):
+                with self.fixture(platform, replay_stderr=stderr) as case:
+                    if platform == "ubuntu":
+                        case.runner.command_results[702].update(
+                            containmentDisposition="natural-exit-reaped",
+                            descendantsObserved=1, descendantsReaped=1)
+                        case.runner.captures[-1].containment_disposition = "natural-exit-reaped"
+                        case.runner.captures[-1].descendants_observed = 1
+                        case.runner.captures[-1].descendants_reaped = 1
+                    with mock.patch.object(ci, "_canonical_replay_value", new=canonicalizer), \
+                         packaging_counters() as calls:
+                        errors, transcript = backend.verify(case)
+                    expected = list(case.frontend)
+                    if platform == "ubuntu" or mutation:
+                        expected.append(702)
+                    self.assertEqual(backend.unequal_ordinals(errors), expected, errors)
+                    self.assertIsNotNone(transcript, errors)
+                    self.assertEqual(transcript["finalAcceptance"], "REJECT")
+                    self.assertEqual((calls.parser.call_count, calls.identity.call_count),
+                                     (0, 0) if platform == "ubuntu" else (2, 0) if mutation else (2, 2))
+                    prefix = "verification replay first command differences: "
+                    diagnostics, = [json.loads(error[len(prefix):])
+                                    for error in errors if error.startswith(prefix)]
+                    if platform == "ubuntu":
+                        self.assertEqual(diagnostics[-1]["changedFieldCategories"],
+                                         ["process-containment", "stderr-identity"])
+                    outputs.append((errors, ci._json_bytes(diagnostics)))
+            self.assertEqual(outputs[0], outputs[1])
+            print("W702_R1_HOSTED_EQUIVALENCE " + json.dumps({
+                "platform": platform, "semantic_mutation": mutation, "unequal": expected,
+                "before_sha256": hashlib.sha256(outputs[0][1]).hexdigest(),
+                "after_sha256": hashlib.sha256(outputs[1][1]).hexdigest(),
+                "categories": [item["changedFieldCategories"] for item in diagnostics],
+            }, sort_keys=True))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, testRunner=fixtures.InventoryTextTestRunner)

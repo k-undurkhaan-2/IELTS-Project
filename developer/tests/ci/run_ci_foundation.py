@@ -11285,40 +11285,49 @@ def producer_observation_universe_digest(
 
 
 def _canonical_replay_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {str(key): _canonical_replay_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_canonical_replay_value(item) for item in value]
-    if isinstance(value, str):
-        temporary_root = str(Path(tempfile.gettempdir()).resolve())
-        normalized = value
-        for spelling in {
-            temporary_root,
-            temporary_root.replace("\\", "/"),
-            temporary_root.replace("/", "\\"),
-        }:
-            if spelling:
-                normalized = re.sub(
-                    re.escape(spelling),
-                    "<TASK-TEMP>",
-                    normalized,
-                    flags=re.IGNORECASE if os.name == "nt" else 0,
-                )
-        repository_root = str(REPO_ROOT.resolve())
-        for spelling in {
-            repository_root,
-            repository_root.replace("\\", "/"),
-            repository_root.replace("/", "\\"),
-        }:
-            if spelling:
-                normalized = re.sub(
-                    re.escape(spelling),
-                    "<REPO>",
-                    normalized,
-                    flags=re.IGNORECASE if os.name == "nt" else 0,
-                )
-        return normalized
-    return value
+    # Scope the resolved authority to this traversal, never to the process.
+    # Resolve lazily so values without strings retain their filesystem-free path.
+    repository_root: str | None = None
+
+    def visit(current: Any) -> Any:
+        nonlocal repository_root
+        if isinstance(current, Mapping):
+            return {str(key): visit(item) for key, item in current.items()}
+        if isinstance(current, (list, tuple)):
+            return [visit(item) for item in current]
+        if isinstance(current, str):
+            temporary_root = str(Path(tempfile.gettempdir()).resolve())
+            normalized = current
+            for spelling in {
+                temporary_root,
+                temporary_root.replace("\\", "/"),
+                temporary_root.replace("/", "\\"),
+            }:
+                if spelling:
+                    normalized = re.sub(
+                        re.escape(spelling),
+                        "<TASK-TEMP>",
+                        normalized,
+                        flags=re.IGNORECASE if os.name == "nt" else 0,
+                    )
+            if repository_root is None:
+                repository_root = str(REPO_ROOT.resolve())
+            for spelling in {
+                repository_root,
+                repository_root.replace("\\", "/"),
+                repository_root.replace("/", "\\"),
+            }:
+                if spelling:
+                    normalized = re.sub(
+                        re.escape(spelling),
+                        "<REPO>",
+                        normalized,
+                        flags=re.IGNORECASE if os.name == "nt" else 0,
+                    )
+            return normalized
+        return current
+
+    return visit(value)
 
 
 def _git_bash_execution_lease_valid(record: Mapping[str, Any]) -> bool:
