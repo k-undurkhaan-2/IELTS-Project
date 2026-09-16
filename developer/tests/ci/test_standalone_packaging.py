@@ -1090,6 +1090,7 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
             for relative_path in ["index.html", *sorted(REQUIRED_STYLES)]:
                 with urllib.request.urlopen(base_url + relative_path, timeout=5) as response:
                     self.assertEqual(response.status, 200, relative_path)
+                    response.read()
         finally:
             server.shutdown()
             server.server_close()
