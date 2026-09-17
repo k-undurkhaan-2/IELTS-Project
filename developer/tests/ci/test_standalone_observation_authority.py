@@ -1,7 +1,7 @@
-"""W702-A2/E1/E2 authority, retention and portability, outside the 476-test inventory.
+"""Standalone authority, retention and portability, outside the 476-test inventory.
 
-Hosted-shaped contexts use explicit fixtures. E1 retains exact safe Windows
-process bytes. E2 parses them only inside the fully authorized outer verifier.
+Hosted-shaped contexts use explicit fixtures. Retention preserves exact safe
+platform bytes; parsing occurs only inside the fully authorized outer verifier.
 """
 from __future__ import annotations
 
@@ -188,10 +188,12 @@ class StandaloneObservationAuthorityTest(unittest.TestCase):
             self.assertEqual(case.runner.command_results[0]["producerObservations"], [])
             print("W702_AUTHORITY_ADMISSION Windows=PASS first_snapshot=PASS second_snapshot=PASS parser_calls=0 standalone_semantic_identity_calls=0")
 
-    def test_linux_and_context_free_denial(self):
+    def test_linux_admission_and_context_free_denial(self):
         with authority_fixture(platform="ubuntu") as case:
-            self.assertIsNone(case.capability)
-            self.assert_denied(case, "held Linux context")
+            self.assertIsNotNone(case.capability)
+            self.assertEqual(semantic_verify(case), [])
+        with authority_fixture(platform="ubuntu", authorize=False) as case:
+            self.assert_denied(case, "Linux context without held authority")
         with authority_fixture(authorize=False) as case:
             self.assert_denied(case, "caller Windows plan without external authority")
         with authority_fixture() as case:
@@ -576,7 +578,7 @@ class StandaloneObservationAuthorityTest(unittest.TestCase):
                 ci.finalize_evidence_transcript(runner)
             self.assertEqual((calls.reconstruction.call_count, calls.derivation.call_count), (0, 0))
 
-    def test_authorized_outer_replay_without_backend_capability(self):
+    def test_authorized_outer_replay_without_capture_rejects_even_equal_raw(self):
         with authority_fixture() as case:
             runner = case.runner
             record = runner.command_results[0]
@@ -590,8 +592,8 @@ class StandaloneObservationAuthorityTest(unittest.TestCase):
                  mock.patch.object(ci, "_validate_evidence_semantics_with_authority", wraps=ci._validate_evidence_semantics_with_authority) as stages:
                 errors, transcript = ci.verify_evidence_with_replay(case.output, expected_context=case.context,
                     verification_runner=runner, repo_root=case.root, evidence_authority_root=case.root)
-            self.assertEqual(errors, [])
-            self.assertEqual(transcript["finalAcceptance"], "PASS")
+            self.assertTrue(any("standalone-packaging portable result unavailable" in error for error in errors))
+            self.assertEqual(transcript["finalAcceptance"], "REJECT")
             self.assertEqual(stages.call_count, 2)
             self.assertNotIn("backendCanonicalPortableResult", transcript)
             backend_bind.assert_not_called()
@@ -1365,8 +1367,9 @@ class StandaloneExactRetentionTest(unittest.TestCase):
                 ci._issue_synthetic_observation_authority_for_test(case.runner)
                 self.assert_unavailable(case, platform + " explicit synthetic authority cannot emit")
         with retention_fixture(platform="ubuntu") as case:
-            self.assertIsNone(case.capability)
-            self.assert_unavailable(case, "held Ubuntu production context")
+            self.assertIsNotNone(case.capability)
+            retain(case)
+            self.assertEqual(len(case.source["producerObservations"]), 1)
 
     def test_exact_mutation_matrix_rejects_before_reconstruction(self):
         changes = {
@@ -1607,7 +1610,7 @@ class StandaloneRetentionProductionTest(unittest.TestCase):
                 "stderrBytesObserved": case.source["stderrBytesObserved"], "stderrSha256": case.source["stderrSha256"],
                 "authorized_reread": "PASS", **calls.semantic}))
 
-    def test_bounded_windows_differential_and_ubuntu_byte_identical_output(self):
+    def test_bounded_exact_retention_differential_on_both_platforms(self):
         # The A2 path is the same profile without the added retention call. Run
         # both writer projections from identical command/capture/time inputs.
         for platform in ("windows", "ubuntu"):
@@ -1623,20 +1626,14 @@ class StandaloneRetentionProductionTest(unittest.TestCase):
                 differences = {name: retention_json_differences(before.documents[name], case.documents[name])
                     for name in before.documents}
                 differences = {name: paths for name, paths in differences.items() if paths}
-                if platform == "ubuntu":
-                    self.assertEqual(differences, {})
-                    self.assertEqual({name: s.data for name, s in before.snapshots.items()},
-                                     {name: s.data for name, s in case.snapshots.items()})
-                    self.assertEqual(case.source["producerObservations"], [])
-                else:
-                    manifest_index = ci.EVIDENCE_MANIFEST_FILE_NAMES.index("command-results.json")
-                    self.assertEqual(differences, {
-                        "command-results.json": ["/producerObservationCount", "/producerObservationUniverseDigest",
-                            "/producerTranscriptDigest", "/records/0/producerObservationSetDigest", "/records/0/producerObservations"],
-                        "summary.json": [f"/evidenceManifest/{manifest_index}/byteLength", f"/evidenceManifest/{manifest_index}/sha256"]})
-                    self.assertEqual(before.snapshots["summary.md"].data, case.snapshots["summary.md"].data)
-                    self.assertEqual((before.documents["command-results.json"]["producerObservationCount"],
-                                      case.documents["command-results.json"]["producerObservationCount"]), (0, 1))
+                manifest_index = ci.EVIDENCE_MANIFEST_FILE_NAMES.index("command-results.json")
+                self.assertEqual(differences, {
+                    "command-results.json": ["/producerObservationCount", "/producerObservationUniverseDigest",
+                        "/producerTranscriptDigest", "/records/0/producerObservationSetDigest", "/records/0/producerObservations"],
+                    "summary.json": [f"/evidenceManifest/{manifest_index}/byteLength", f"/evidenceManifest/{manifest_index}/sha256"]})
+                self.assertEqual(before.snapshots["summary.md"].data, case.snapshots["summary.md"].data)
+                self.assertEqual((before.documents["command-results.json"]["producerObservationCount"],
+                                  case.documents["command-results.json"]["producerObservationCount"]), (0, 1))
                 print("W702_PRODUCER_DIFFERENTIAL " + json.dumps({"platform": platform, "changed": differences,
                     "unchanged_files": sorted(name for name in case.snapshots if case.snapshots[name].data == before.snapshots[name].data),
                     **calls.semantic}, sort_keys=True))
@@ -1684,7 +1681,7 @@ class StandaloneRetentionProductionTest(unittest.TestCase):
             with retention_counters() as calls:
                 for runner in (producer, replay):
                     runner._retain_standalone_process_observation(runner.command_results[702], runner.captures[-1])
-                    self.assertEqual(len(runner.command_results[702]["producerObservations"]), 1 if platform == "windows" else 0)
+                    self.assertEqual(len(runner.command_results[702]["producerObservations"]), 1)
                 producer_case = SimpleNamespace(root=outer.root, runner=producer)
                 summary = write_retention(producer_case, "e1-evidence")
                 self.assertEqual(summary["status"], "PASS", summary["policyViolations"])
@@ -1704,11 +1701,10 @@ class StandaloneRetentionProductionTest(unittest.TestCase):
                 self.assertEqual((calls.backend_parser.call_count, identity.call_count), (2, 2))
                 self.assertEqual([call.args[0] for call in calls.backend_parser.call_args_list],
                                  [producer_backend.stdout, replay_backend.stdout])
-                if platform == "windows":
-                    for runner in (producer, replay):
-                        record = runner.command_results[702]
-                        self.assertEqual(record["producerObservations"][0]["rawStructuredFields"]["stderr"].encode(),
-                                         runner.captures[-1].stderr_raw)
+                for runner in (producer, replay):
+                    record = runner.command_results[702]
+                    self.assertEqual(record["producerObservations"][0]["rawStructuredFields"]["stderr"].encode(),
+                                     runner.captures[-1].stderr_raw)
                 self.assertNotEqual(producer.captures[-1].stderr_raw, replay.captures[-1].stderr_raw)
                 print("W702_HOSTED_RAW_REPLAY " + json.dumps({"platform": platform, "unequal": backend.unequal_ordinals(errors),
                     "finalAcceptance": transcript["finalAcceptance"], "backend_parser_calls": calls.backend_parser.call_count,
@@ -1742,14 +1738,15 @@ PACKAGING_DURATIONS = (("0.000", "0.001"), ("1.000", "9.999"), ("9.999", "10.000
                        ("69.940", "76.421"), ("71.630", "100.000"))
 
 
-def packaging_reporter(duration="69.940"):
-    return (b"".join(f"{method} (__main__.StandalonePackagingTest.{method}) ... ok\r\n".encode()
+def packaging_reporter(duration="69.940", *, platform="windows"):
+    newline = {"windows": b"\r\n", "ubuntu": b"\n"}[platform]
+    return (b"".join(f"{method} (__main__.StandalonePackagingTest.{method}) ... ok".encode() + newline
                     for method in PACKAGING_METHODS)
-            + b"\r\n" + b"-" * 70 + b"\r\nRan 18 tests in " + duration.encode()
-            + b"s\r\n\r\nOK\r\n")
+            + newline + b"-" * 70 + newline + b"Ran 18 tests in " + duration.encode()
+            + b"s" + newline + newline + b"OK" + newline)
 
 
-def packaging_reporter_mutations():
+def packaging_reporter_mutations(platform="windows"):
     good = packaging_reporter()
     lines = good.split(b"\r\n")
     first = PACKAGING_METHODS[0].encode()
@@ -1798,8 +1795,15 @@ def packaging_reporter_mutations():
     for name, value in (("integer", "1"), ("fraction-1", "1.0"), ("fraction-2", "1.00"),
                         ("fraction-4", "1.0000"), ("exponent", "1e3"),
                         ("negative", "-1.000"), ("plus", "+1.000"),
-                        ("whitespace", "1 .000"), ("non-ASCII-digit", "\u0661.000")):
+                        ("whitespace", "1 .000"), ("non-ASCII-digit", "\u0661.000"),
+                        ("empty", ""), ("nan", "nan"), ("infinite", "inf")):
         cases["duration-" + name] = good.replace(b"69.940", value.encode())
+    if platform == "ubuntu":
+        cases = {name: data.replace(b"\r\n", b"\n") for name, data in cases.items()
+                 if name not in {"LF-only", "mixed-line-endings", "missing-final-CRLF"}}
+        cases.update({"CRLF-only": good,
+                      "mixed-line-endings": packaging_reporter(platform="ubuntu").replace(b"\n", b"\r\n", 1),
+                      "missing-final-LF": packaging_reporter(platform="ubuntu")[:-1]})
     return cases
 
 
@@ -1827,19 +1831,20 @@ def packaging_replay_fixture(platform="windows", *, producer_stderr=None, replay
         standalone, template_capture = runner_fixture(outer.root, platform)
         standalone.command_plan[0]["ordinal"] = standalone.command_results[0]["ordinal"] = 702
         runners = []
-        streams = ((producer_stdout, packaging_reporter() if producer_stderr is None else producer_stderr),
-                   (replay_stdout, packaging_reporter("76.421") if replay_stderr is None else replay_stderr))
-        for stdout, stderr in streams:
+        streams = ((producer_stdout, packaging_reporter(platform=platform) if producer_stderr is None else producer_stderr),
+                   (replay_stdout, packaging_reporter("76.421", platform=platform) if replay_stderr is None else replay_stderr))
+        for side, (stdout, stderr) in enumerate(streams):
             runner = object.__new__(ci.FoundationRunner)
             runner.__dict__.update(copy.deepcopy(vars(outer.runner)))
             runner.child_environment = {}
             runner.command_plan[702] = copy.deepcopy(standalone.command_plan[0])
             runner.command_results[702] = copy.deepcopy(standalone.command_results[0])
             capture = copy.deepcopy(template_capture)
-            capture.containment_disposition = "no-descendants"
-            capture.descendants_observed = capture.descendants_reaped = 0
+            capture.containment_disposition = "no-descendants" if platform == "windows" else "natural-exit-reaped"
+            capture.descendants_observed = capture.descendants_reaped = 0 if platform == "windows" else (7, 11)[side]
             source = runner.command_results[702]
-            source.update(containmentDisposition="no-descendants", descendantsObserved=0, descendantsReaped=0)
+            source.update(containmentDisposition=capture.containment_disposition,
+                          descendantsObserved=capture.descendants_observed, descendantsReaped=capture.descendants_reaped)
             retention_streams(source, capture, stdout=stdout, stderr=stderr)
             runner.captures.append(capture)
             runners.append(runner)
@@ -1979,7 +1984,7 @@ class StandalonePackagingFixtureTestBase(unittest.TestCase):
     @contextlib.contextmanager
     def fixture(self, platform="windows", *, producer_stderr=None, replay_stderr=None,
                 producer_stdout=b"", replay_stdout=b""):
-        if producer_stdout or (producer_stderr is not None and producer_stderr != packaging_reporter()):
+        if producer_stdout or (producer_stderr is not None and producer_stderr != packaging_reporter(platform=platform)):
             # A changed producer must rebuild all baseline-bound summary fields
             # through the ordinary writer, not merely reseal the raw record.
             with packaging_replay_fixture(platform, producer_stderr=producer_stderr,
@@ -2007,7 +2012,7 @@ class StandalonePackagingFixtureTestBase(unittest.TestCase):
              mock.patch.object(ci, "rebuild_external_verification_context", return_value=case.context):
             source = case.documents["command-results.json"]["records"][702]
             stdout = producer_stdout
-            stderr = packaging_reporter() if producer_stderr is None else producer_stderr
+            stderr = packaging_reporter(platform=platform) if producer_stderr is None else producer_stderr
             for stream, data in (("stdout", stdout), ("stderr", stderr)):
                 source[stream + "Sha256"] = hashlib.sha256(data).hexdigest()
                 source[stream + "BytesObserved"] = len(data)
@@ -2020,7 +2025,7 @@ class StandalonePackagingFixtureTestBase(unittest.TestCase):
             case.runner.observations = [item for item in case.runner.observations
                                        if item["commandId"] != "standalone-packaging"]
             retention_streams(record, case.runner.captures[-1], stdout=replay_stdout,
-                stderr=packaging_reporter("76.421") if replay_stderr is None else replay_stderr)
+                stderr=packaging_reporter("76.421", platform=platform) if replay_stderr is None else replay_stderr)
             case.runner._retain_standalone_process_observation(record, case.runner.captures[-1])
             yield case
 
@@ -2054,14 +2059,15 @@ class StandalonePackagingPortableReplayTest(StandalonePackagingFixtureTestBase):
                     "backend_parser": calls.backend_parser.call_count, "backend_identity": calls.backend_identity.call_count,
                     "packaging_parser": calls.parser.call_count, "packaging_identity": calls.identity.call_count}))
 
-    def test_ubuntu_matching_windows_grammar_never_calls_packaging_and_stays_raw(self):
-        with self.fixture("ubuntu") as case, packaging_counters() as calls:
+    def test_ubuntu_matching_windows_grammar_rejects_and_stays_raw(self):
+        with self.fixture("ubuntu", producer_stderr=packaging_reporter(),
+                          replay_stderr=packaging_reporter("76.421")) as case, packaging_counters() as calls:
             errors, transcript = backend.verify(case)
-            self.assert_result(case, errors, transcript, calls, portable=False, parser_calls=0, identity_calls=0)
-            self.assertEqual(case.documents["command-results.json"]["records"][702]["producerObservations"], [])
+            self.assert_result(case, errors, transcript, calls, portable=False, parser_calls=1, identity_calls=0)
+            self.assertEqual(len(case.documents["command-results.json"]["records"][702]["producerObservations"]), 1)
             print("W702_E2_HOSTED " + json.dumps({"platform": "ubuntu", "unequal": backend.unequal_ordinals(errors),
                 "finalAcceptance": transcript["finalAcceptance"], "backend_parser": calls.backend_parser.call_count,
-                "backend_identity": calls.backend_identity.call_count, "packaging_parser": 0, "packaging_identity": 0}))
+                "backend_identity": calls.backend_identity.call_count, "packaging_parser": 1, "packaging_identity": 0}))
 
     def test_every_reporter_mutation_retains_702_after_real_outer_authority(self):
         for name, bad in packaging_reporter_mutations().items():
@@ -2140,7 +2146,7 @@ class StandalonePackagingPortableAuthorityTest(StandalonePackagingFixtureTestBas
              mock.patch.object(ci, "_bind_standalone_portable_producer", return_value=None):
             errors, transcript = backend.verify(case)
             self.assert_preparser_reject(case, errors, transcript, calls)
-            self.assertEqual(backend.unequal_ordinals(errors), [687, 692, 695, 702])
+            self.assertEqual(backend.unequal_ordinals(errors), [*case.frontend, 702])
             self.assertEqual((calls.backend_parser.call_count, calls.backend_identity.call_count), (2, 2))
 
     def test_coherent_evidence_replacement_between_first_and_second_snapshots(self):
@@ -2238,6 +2244,194 @@ class StandalonePackagingPortableAuthorityTest(StandalonePackagingFixtureTestBas
                 self.assert_preparser_reject(case, errors, transcript, calls)
                 print("W702_E2_EXECUTION_MUTATION " + json.dumps({
                     "case": name, "parser": 0, "identity": 0, "finalAcceptance": "REJECT"}))
+
+class UbuntuStandalonePackagingPortableAuthorityTest(StandalonePackagingPortableAuthorityTest):
+    @contextlib.contextmanager
+    def fixture(self, platform="ubuntu", **kwargs):
+        with super().fixture(platform, **kwargs) as case:
+            yield case
+
+
+class UbuntuStandalonePackagingPortableTest(StandalonePackagingFixtureTestBase):
+    def test_explicit_platform_grammar_duration_and_every_retained_byte(self):
+        for platform, retained in (("windows", 3039), ("ubuntu", 3016)):
+            good = packaging_reporter(platform=platform)
+            parsed = ci._parse_standalone_packaging_stderr(good, platform=platform)
+            start, end = parsed.duration_span
+            self.assertEqual(len(parsed.prefix + parsed.suffix), retained)
+            for left, right in PACKAGING_DURATIONS:
+                streams = [packaging_reporter(d, platform=platform) for d in (left, right)]
+                pair = ci._StandalonePortablePair(702, *streams, b"parser-fixture", platform)
+                result = ci._derive_standalone_packaging_equal_result(pair)
+                self.assertIsNotNone(result)
+                self.assertTrue(result["protocol"].startswith(platform + "-"))
+            with packaging_counters() as calls:
+                positions = [*range(start), *range(end, len(good))]
+                for index in positions:
+                    for replacement in (bytes([good[index] ^ 1]), "\u00e9".encode()):
+                        bad = good[:index] + replacement + good[index + 1:]
+                        self.assertIsNone(ci._derive_standalone_packaging_equal_result(
+                            ci._StandalonePortablePair(702, good, bad, b"parser-fixture", platform)), index)
+                self.assertEqual(calls.identity.call_count, 0)
+            for name, bad in packaging_reporter_mutations(platform).items():
+                for streams in ((good, bad), (bad, good)):
+                    with self.subTest(platform=platform, name=name), packaging_counters() as calls:
+                        self.assertIsNone(ci._derive_standalone_packaging_equal_result(
+                            ci._StandalonePortablePair(702, *streams, b"parser-fixture", platform)))
+                        self.assertEqual(calls.identity.call_count, 0)
+        for platform in ("linux", "darwin", "", None):
+            with self.assertRaises(ValueError):
+                ci._parse_standalone_packaging_stderr(good, platform=platform)
+
+    def test_complete_outer_pass_preserves_raw_evidence_on_both_platforms(self):
+        for platform in ("ubuntu", "windows"):
+            with self.subTest(platform=platform), self.fixture(platform) as case:
+                # Remove only the deliberate unrelated drift to exercise PASS.
+                for ordinal in case.frontend:
+                    case.runner.command_results[ordinal] = copy.deepcopy(case.producer.command_results[ordinal])
+                files = {name: (case.output / name).read_bytes() for name in ci.EVIDENCE_FILE_NAMES}
+                records = ci._observation_bytes(case.runner.command_results)
+                captures = [(c.stdout_raw, c.stderr_raw, c.evidence()) for c in case.runner.captures]
+                with packaging_counters() as calls:
+                    errors, transcript = backend.verify(case)
+                self.assertEqual(errors, [])
+                self.assertEqual(transcript["finalAcceptance"], "PASS")
+                self.assertEqual((calls.parser.call_count, calls.identity.call_count), (2, 2))
+                self.assertEqual((calls.backend_parser.call_count, calls.backend_identity.call_count), (2, 2))
+                self.assertEqual(files, {name: (case.output / name).read_bytes() for name in ci.EVIDENCE_FILE_NAMES})
+                self.assertEqual(records, ci._observation_bytes(case.runner.command_results))
+                self.assertEqual(captures, [(c.stdout_raw, c.stderr_raw, c.evidence()) for c in case.runner.captures])
+                source = case.documents["command-results.json"]["records"][702]
+                replay = case.runner.command_results[702]
+                for record in (source, replay):
+                    for stream in ("stdout", "stderr"):
+                        data = record["producerObservations"][0]["rawStructuredFields"][stream].encode()
+                        self.assertEqual(record[stream + "BytesObserved"], len(data))
+                        self.assertEqual(record[stream + "Sha256"], hashlib.sha256(data).hexdigest())
+                if platform == "ubuntu":
+                    self.assertEqual((source["descendantsObserved"], replay["descendantsObserved"]), (7, 11))
+                    self.assertEqual((source["descendantsReaped"], replay["descendantsReaped"]), (7, 11))
+
+    def test_ubuntu_duration_and_count_differences_leave_unrelated_rejections_exact(self):
+        for stderr, count in ((packaging_reporter(platform="ubuntu"), 11),
+                              (packaging_reporter("101.125", platform="ubuntu"), 7),
+                              (packaging_reporter("9.999", platform="ubuntu"), 11)):
+            with self.fixture("ubuntu", replay_stderr=stderr) as case, packaging_counters() as calls:
+                record, capture = case.runner.command_results[702], case.runner.captures[-1]
+                record.update(descendantsObserved=count, descendantsReaped=count)
+                capture.descendants_observed = capture.descendants_reaped = count
+                errors, transcript = backend.verify(case)
+                self.assertEqual(backend.unequal_ordinals(errors), case.frontend, errors)
+                self.assertEqual(transcript["finalAcceptance"], "REJECT")
+                self.assertEqual((calls.parser.call_count, calls.identity.call_count), (2, 2))
+
+    def test_ubuntu_outer_reporter_mutations_reject(self):
+        for name, bad in packaging_reporter_mutations("ubuntu").items():
+            with self.subTest(name=name), self.fixture("ubuntu", replay_stderr=bad) as case, packaging_counters() as calls:
+                errors, transcript = backend.verify(case)
+                self.assertIn(702, backend.unequal_ordinals(errors), errors)
+                self.assertEqual(transcript["finalAcceptance"], "REJECT")
+                self.assertEqual(calls.identity.call_count, 0)
+                self.assertEqual(calls.parser.call_count, 0 if name == "invalid-UTF8" else 2)
+
+    def test_ubuntu_stdout_and_missing_capture_reject_even_with_equal_reporters(self):
+        good = packaging_reporter(platform="ubuntu")
+        for producer, replay in ((b"output", b""), (b"", b"output"), (b"output", b"output")):
+            with self.fixture("ubuntu", producer_stdout=producer, replay_stdout=replay,
+                              replay_stderr=good) as case, packaging_counters() as calls:
+                errors, transcript = backend.verify(case)
+                self.assertTrue(errors)
+                self.assertEqual(transcript["finalAcceptance"], "REJECT")
+                self.assertEqual((calls.parser.call_count, calls.identity.call_count), (0, 0))
+        for stream in ("stdout", "stderr"):
+            with self.fixture("ubuntu", replay_stderr=good) as case, packaging_counters() as calls:
+                setattr(case.runner.captures[-1], stream + "_raw", None)
+                errors, transcript = backend.verify(case)
+                self.assertTrue(errors)
+                self.assertEqual(transcript["finalAcceptance"], "REJECT")
+                self.assertEqual((calls.parser.call_count, calls.identity.call_count), (0, 0))
+        bad = packaging_reporter_mutations("ubuntu")["status-FAIL"]
+        with self.fixture("ubuntu", producer_stderr=bad, replay_stderr=bad) as case, packaging_counters() as calls:
+            errors, transcript = backend.verify(case)
+            self.assertTrue(errors)
+            self.assertEqual(transcript["finalAcceptance"], "REJECT")
+            self.assertEqual(calls.identity.call_count, 0)
+
+    def test_ubuntu_containment_mutations_on_each_side_precede_parser(self):
+        mutations = {
+            "root-exit": {"exitCode": 1}, "boolean-root-exit": {"exitCode": False},
+            "survivor": {"descendantsSurviving": 1}, "termination": {"descendantsTerminated": 1},
+            "cleanup-failed": {"processTreeStatus": "cleanup-failed"},
+            "TERM-or-KILL": {"containmentDisposition": "forced-terminated"},
+            "unknown-ancestry": {"containmentDisposition": "unknown-ancestry"},
+            "no-descendants": {"containmentDisposition": "no-descendants", "descendantsObserved": 0, "descendantsReaped": 0},
+            "zero-natural": {"descendantsObserved": 0, "descendantsReaped": 0},
+            "partial-reap": {"descendantsReaped": 1}, "over-bound": {"descendantsObserved": 4097, "descendantsReaped": 4097},
+            "boolean-count": {"descendantsObserved": True, "descendantsReaped": True},
+            "wrong-backend": {"containment": "windows-job-object"},
+            "process-error": {"processTreeError": "fixture error"}, "error": {"error": "fixture error"},
+            "timeout": {"timeoutStatus": "TIMED-OUT"}, "output-limit": {"outputLimitStatus": "OUTPUT-LIMIT-EXCEEDED"},
+        }
+        capture_fields = {"exitCode": "exit_code", "descendantsObserved": "descendants_observed",
+            "descendantsReaped": "descendants_reaped", "descendantsSurviving": "descendants_surviving",
+            "descendantsTerminated": "descendants_terminated", "containmentDisposition": "containment_disposition",
+            "processTreeStatus": "process_tree_status", "processTreeError": "process_tree_error",
+            "containment": "containment", "error": "error"}
+        for side in ("producer", "replay"):
+            for name, changes in mutations.items():
+                with self.subTest(side=side, name=name), self.fixture("ubuntu") as case, packaging_counters() as calls:
+                    record = (case.documents["command-results.json"]["records"][702] if side == "producer"
+                              else case.runner.command_results[702])
+                    record.update(changes)
+                    if side == "producer":
+                        backend.reseal_producer(case)
+                    else:
+                        for key, value in changes.items():
+                            if key in capture_fields:
+                                setattr(case.runner.captures[-1], capture_fields[key], value)
+                    errors, transcript = backend.verify(case)
+                    self.assertTrue(errors)
+                    self.assertTrue(transcript is None or transcript["finalAcceptance"] == "REJECT")
+                    self.assertEqual((calls.parser.call_count, calls.identity.call_count), (0, 0))
+
+    def test_linux_signal_and_cleanup_truth_cannot_enter_natural_equivalence(self):
+        state = ci.PosixContainmentStateMachine(10)
+        state.observe({20: fixtures.CI8PosixContainmentStateMachineTest.identity(20, 10)})
+        state.mark_reaped(20)
+        self.assertEqual(state.outcome()["containmentDisposition"], "natural-exit-reaped")
+        for signal in ("TERM", "KILL"):
+            outcome = state.outcome(cleanup_signal_sent=True)
+            self.assertTrue(outcome["cleanupComplete"], signal)
+            self.assertEqual(outcome["containmentDisposition"], "forced-terminated", signal)
+        state.fail("fixture cleanup failure")
+        self.assertFalse(state.outcome()["cleanupComplete"])
+        self.assertEqual(state.outcome()["containmentDisposition"], "unknown-ancestry")
+
+    def test_ubuntu_source_only_apis_cannot_select_portability(self):
+        with self.fixture("ubuntu") as case, packaging_counters() as calls:
+            _, errors = ci.compare_verification_replay_claims(case.documents, case.runner, case.comparison)
+            self.assertIn(702, backend.unequal_ordinals(errors))
+            result, errors = ci.run_verification_replay(case.documents, expected_context=case.context,
+                verification_runner=case.runner, repo_root=case.root)
+            self.assertTrue(errors)
+            self.assertIsNone(result)
+            self.assertEqual((calls.parser.call_count, calls.identity.call_count), (0, 0))
+
+    def test_ubuntu_raw_output_hash_and_count_mismatches_precede_parser(self):
+        for side in ("producer", "replay"):
+            for stream in ("stdout", "stderr"):
+                for field, value in ((stream + "Sha256", "c" * 64), (stream + "BytesObserved", 1)):
+                    with self.subTest(side=side, field=field), self.fixture("ubuntu") as case, packaging_counters() as calls:
+                        record = (case.documents["command-results.json"]["records"][702] if side == "producer"
+                                  else case.runner.command_results[702])
+                        record[field] = value
+                        if side == "producer":
+                            backend.reseal_producer(case)
+                        errors, transcript = backend.verify(case)
+                        self.assertTrue(errors)
+                        self.assertTrue(transcript is None or transcript["finalAcceptance"] == "REJECT")
+                        self.assertEqual((calls.parser.call_count, calls.identity.call_count), (0, 0))
+
 
 def _r1_legacy_canonical_replay_value(value):
     """Frozen e0f8a1e0 traversal, independent of the optimized recursion."""
@@ -2428,7 +2622,8 @@ class ReplayDiagnosticCanonicalizationPerformanceTest(StandalonePackagingFixture
         candidate = ci._canonical_replay_value
         for platform, mutation in (("windows", False), ("ubuntu", False), ("windows", True)):
             outputs = []
-            stderr = packaging_reporter_mutations()["status-FAIL"] if mutation else None
+            stderr = (packaging_reporter_mutations()["status-FAIL"] if mutation else
+                      packaging_reporter("76.421") if platform == "ubuntu" else None)
             for canonicalizer in (_r1_legacy_canonical_replay_value, candidate):
                 with self.fixture(platform, replay_stderr=stderr) as case:
                     if platform == "ubuntu":
@@ -2448,13 +2643,13 @@ class ReplayDiagnosticCanonicalizationPerformanceTest(StandalonePackagingFixture
                     self.assertIsNotNone(transcript, errors)
                     self.assertEqual(transcript["finalAcceptance"], "REJECT")
                     self.assertEqual((calls.parser.call_count, calls.identity.call_count),
-                                     (0, 0) if platform == "ubuntu" else (2, 0) if mutation else (2, 2))
+                                     (2, 0) if platform == "ubuntu" or mutation else (2, 2))
                     prefix = "verification replay first command differences: "
                     diagnostics, = [json.loads(error[len(prefix):])
                                     for error in errors if error.startswith(prefix)]
                     if platform == "ubuntu":
                         self.assertEqual(diagnostics[-1]["changedFieldCategories"],
-                                         ["process-containment", "stderr-identity"])
+                                         ["process-containment", "producer-observation-context", "stderr-identity"])
                     outputs.append((errors, ci._json_bytes(diagnostics)))
             self.assertEqual(outputs[0], outputs[1])
             print("W702_R1_HOSTED_EQUIVALENCE " + json.dumps({

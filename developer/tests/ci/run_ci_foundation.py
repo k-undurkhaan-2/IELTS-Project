@@ -13098,17 +13098,28 @@ class _ObservationValidation:
     output_dir: Path | None = None
 
 
+_STANDALONE_EXECUTION_PLATFORMS = {
+    "windows": ("Windows", "windows-compatibility-producer", "windows-compatibility",
+                "windows-job-object", "_WindowsDirectoryMutationWatcher"),
+    "ubuntu": ("Linux", "ubuntu-canonical-producer", "ubuntu-canonical",
+               "linux-subreaper-pidfd-proc-supervisor", "_InotifyMutationWatcher"),
+}
+
+
 def _bind_observation_authority(runner, context, external, binding, issuance):
-    if (binding.get("bindingMode") != "github-actions"
-            or binding.get("producerJobId") != "windows-compatibility-producer"
-            or binding.get("producerRunnerOS") != "Windows"
-            or binding.get("producerProfile") != "all"
-            or runner.profile != "all" or runner.platform != "windows"
-            or external.binding_mode != "github-actions" or external.runner_os != "Windows"
-            or external.job_id != ("windows-compatibility" if context is not None
-                                   else "windows-compatibility-producer")):
+    platform = _STANDALONE_EXECUTION_PLATFORMS.get(runner.platform)
+    if platform is None:
         return None
-    if context is not None and (context.verifier_job_id != "windows-compatibility"
+    runner_os, producer_job, verifier_job, _, _ = platform
+    if (binding.get("bindingMode") != "github-actions"
+            or binding.get("producerJobId") != producer_job
+            or binding.get("producerRunnerOS") != runner_os
+            or binding.get("producerProfile") != "all"
+            or runner.profile != "all"
+            or external.binding_mode != "github-actions" or external.runner_os != runner_os
+            or external.job_id != (verifier_job if context is not None else producer_job)):
+        return None
+    if context is not None and (context.verifier_job_id != verifier_job
                                or context.evidence_binding() != binding):
         return None
     if any(binding.get(key) != value for key, value in (
@@ -13183,7 +13194,10 @@ def _observation_authority_for_runner(runner, context=None):
             or capability.external_capture != _observation_bytes(vars(external))
             or capability.command_plan != _observation_bytes(runner.command_plan)
             or capability.execution_binding != _observation_bytes(runner.execution_binding)
-            or runner.profile != "all" or runner.platform != "windows"
+            or runner.profile != "all"
+            or runner.platform not in _STANDALONE_EXECUTION_PLATFORMS
+            or _STANDALONE_EXECUTION_PLATFORMS[runner.platform][:2] != (
+                runner.execution_binding.get("producerRunnerOS"), runner.execution_binding.get("producerJobId"))
             or runner.release_gate_required is not runner.execution_binding.get("releaseGateRequired")
             or runner.command_plan_digest != command_plan_digest(runner.command_plan)):
         return None
@@ -13338,7 +13352,7 @@ def _admit_standalone_observations(validation):
             or source.get("toolRole") != "python-standalone-test"
             or source.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
             or source.get("resultSemantics") != "exit-zero-required"
-            or source.get("profile") != "all" or source.get("platform") != "windows"
+            or source.get("profile") != "all" or source.get("platform") != validation.runner.platform
             or source.get("commandRole") != "required-execution"
             or source.get("required") is not True or source.get("allowedExecutionExits") != [0]
             or not _required_command_execution_passed(source)
@@ -19634,7 +19648,7 @@ class FoundationRunner:
     def _retain_standalone_process_observation(
         self, record: dict[str, Any], capture: CommandCapture,
     ) -> None:
-        """Retain exact safe streams under the held Windows production authority.
+        """Retain exact safe streams under the held platform/job production authority.
 
         Unavailable retention uses the existing empty producer set. Candidates
         stay raw until complete-transcript A2 admission precedes reconstruction.
@@ -19654,11 +19668,11 @@ class FoundationRunner:
                 or record.get("toolRole") != "python-standalone-test"
                 or record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
                 or record.get("resultSemantics") != "exit-zero-required"
-                or record.get("profile") != "all" or record.get("platform") != "windows"
+                or record.get("profile") != "all" or record.get("platform") != self.platform
                 or record.get("commandRole") != "required-execution"
                 or record.get("required") is not True or record.get("allowedExecutionExits") != [0]
                 or not _required_command_execution_passed(record)
-                or record.get("containment") != "windows-job-object"
+                or record.get("containment") != _STANDALONE_EXECUTION_PLATFORMS[self.platform][3]
                 or record.get("processTreeStatus") != "contained-clean"
                 or any(record.get(key) is not None for key in ("error", "processTreeError", "limitReason"))):
             return
@@ -23383,7 +23397,7 @@ def _finish_verification_replay(
     return transcript, sorted(set(errors))
 
 
-# W702-E2 is deliberately private to the outer replay verifier. The ordinary
+# Standalone portability is deliberately private to the outer replay verifier. The ordinary
 # observation writer, source-only APIs and canonical record generator stay raw.
 _STANDALONE_PACKAGING_METHODS = (
     "test_archive_entries_are_unique_portable_relative_and_not_symlinks",
@@ -23406,6 +23420,10 @@ _STANDALONE_PACKAGING_METHODS = (
     "test_unknown_files_in_every_managed_root_fail_before_staging",
 )
 _STANDALONE_PACKAGING_PROTOCOL = b"windows-standalone-packaging-verbose-unittest-duration-v1"
+_STANDALONE_PACKAGING_REPORTERS = {
+    "windows": (b"\r\n", _STANDALONE_PACKAGING_PROTOCOL),
+    "ubuntu": (b"\n", b"ubuntu-standalone-packaging-verbose-unittest-duration-v1"),
+}
 
 
 @dataclass(frozen=True)
@@ -23413,18 +23431,22 @@ class _StandalonePackagingReporter:
     prefix: bytes
     suffix: bytes
     duration_span: tuple[int, int]
+    platform: str = "windows"
 
 
-def _parse_standalone_packaging_stderr(stderr):
-    """Recognize the complete, byte-exact Windows success reporter or fail."""
+def _parse_standalone_packaging_stderr(stderr, *, platform="windows"):
+    """Recognize the complete, byte-exact reporter for the bound platform."""
     if type(stderr) is not bytes or len(stderr) > MAX_EVIDENCE_STRING_BYTES:
         raise ValueError("standalone reporter bytes unavailable or oversized")
+    if platform not in _STANDALONE_PACKAGING_REPORTERS:
+        raise ValueError("standalone reporter platform is unavailable")
+    newline, _ = _STANDALONE_PACKAGING_REPORTERS[platform]
     stderr.decode("utf-8", errors="strict")
     prefix = b"".join(
-        f"{name} (__main__.StandalonePackagingTest.{name}) ... ok\r\n".encode("ascii")
+        f"{name} (__main__.StandalonePackagingTest.{name}) ... ok".encode("ascii") + newline
         for name in _STANDALONE_PACKAGING_METHODS
-    ) + b"\r\n" + b"-" * 70 + b"\r\nRan 18 tests in "
-    suffix = b"s\r\n\r\nOK\r\n"
+    ) + newline + b"-" * 70 + newline + b"Ran 18 tests in "
+    suffix = b"s" + newline + newline + b"OK" + newline
     if not stderr.startswith(prefix) or not stderr.endswith(suffix):
         raise ValueError("standalone verbose reporter grammar differs")
     start, end = len(prefix), len(stderr) - len(suffix)
@@ -23432,19 +23454,20 @@ def _parse_standalone_packaging_stderr(stderr):
     # the one remaining field examined. Never substitute/search across stderr.
     if end <= start or re.fullmatch(rb"[0-9]+\.[0-9]{3}", stderr[start:end]) is None:
         raise ValueError("standalone footer duration grammar differs")
-    return _StandalonePackagingReporter(stderr[:start], stderr[end:], (start, end))
+    return _StandalonePackagingReporter(stderr[:start], stderr[end:], (start, end), platform)
 
 
 def _standalone_packaging_semantic_identity(reporter):
     """Length-frame exact retained bytes and the explicit protocol identity."""
     if type(reporter) is not _StandalonePackagingReporter:
         raise ValueError("standalone reporter is unavailable")
+    _, protocol = _STANDALONE_PACKAGING_REPORTERS[reporter.platform]
     digest = hashlib.sha256()
-    for segment in (_STANDALONE_PACKAGING_PROTOCOL, reporter.prefix, reporter.suffix):
+    for segment in (protocol, reporter.prefix, reporter.suffix):
         digest.update(len(segment).to_bytes(8, "big"))
         digest.update(segment)
     return {
-        "protocol": _STANDALONE_PACKAGING_PROTOCOL.decode("ascii"),
+        "protocol": protocol.decode("ascii"),
         "prefixHex": reporter.prefix.hex(),
         "suffixHex": reporter.suffix.hex(),
         "identityDigest": "sha256:" + digest.hexdigest(),
@@ -23464,6 +23487,7 @@ class _StandalonePortablePair:
     producer_stderr: bytes
     replay_stderr: bytes
     authority_seal: bytes
+    platform: str = "windows"
 
 
 def _bind_standalone_portable_producer(validation):
@@ -23483,9 +23507,10 @@ def _standalone_packaging_runtime_binding(closure, guard, runtime, record):
     errors = []
     _validate_runtime_dependency_closure(closure, guard, runtime,
         profile="all", status="PASS", errors=errors)
+    runner_os, _, _, _, watcher = _STANDALONE_EXECUTION_PLATFORMS[record["platform"]]
     if (errors or closure["measurementStatus"] != "measured-complete"
-            or closure["runnerOS"] != "Windows" or guard["active"] is not False
-            or guard["watcherBackend"] != "_WindowsDirectoryMutationWatcher"):
+            or closure["runnerOS"] != runner_os or guard["active"] is not False
+            or guard["watcherBackend"] != watcher):
         raise ValueError("standalone runtime closure is not current")
     python = closure["pythonExecutable"]
     if (python.get("role") != "python-verifier" or python.get("leaseHeld") is not True
@@ -23529,7 +23554,8 @@ def _bind_standalone_portable_replay(producer):
         validation, ordinal = producer.validation, producer.ordinal
         runner, context = validation.runner, validation.context
         if (_observation_authority_for_runner(runner, context) is None
-                or runner.platform != "windows" or context.runner_os != "Windows"
+                or runner.platform not in _STANDALONE_EXECUTION_PLATFORMS
+                or context.runner_os != _STANDALONE_EXECUTION_PLATFORMS[runner.platform][0]
                 or runner.runtime_closure_digest != context.fresh_runtime_closure_digest):
             return None
         source = validation.records[ordinal]
@@ -23559,17 +23585,30 @@ def _bind_standalone_portable_replay(producer):
             if (record["commandId"] != "standalone-packaging"
                     or record["commandClass"] != "standalone-packaging"
                     or record["toolRole"] != "python-standalone-test"
-                    or record["platform"] != "windows" or record["profile"] != "all"
+                    or record["platform"] != runner.platform or record["profile"] != "all"
                     or record["executionInputMode"] != "PROTECTED-TARGET-BUNDLE"
                     or record["actualExecutionInputMode"] != "PROTECTED-TARGET-BUNDLE"
                     or not _required_command_execution_passed(record)
                     or type(record["exitCode"]) is not int or record["exitCode"] != 0
-                    or record["containment"] != "windows-job-object"
+                    or record["containment"] != _STANDALONE_EXECUTION_PLATFORMS[runner.platform][3]
                     or record["processTreeStatus"] != "contained-clean"
-                    or record["containmentDisposition"] != "no-descendants"
-                    or any(record[key] != 0 for key in ("descendantsObserved", "descendantsReaped",
-                                                       "descendantsTerminated", "descendantsSurviving"))
+                    or any(type(record[key]) is not int or not 0 <= record[key] <= 4096
+                           for key in ("descendantsObserved", "descendantsReaped",
+                                       "descendantsTerminated", "descendantsSurviving"))
+                    or record["descendantsTerminated"] != 0 or record["descendantsSurviving"] != 0
                     or any(record.get(key) is not None for key in ("error", "processTreeError", "limitReason"))):
+                return None
+            if runner.platform == "windows":
+                if (record["containmentDisposition"] != "no-descendants"
+                        or record["descendantsObserved"] != 0 or record["descendantsReaped"] != 0):
+                    return None
+            # The trusted Linux supervisor emits natural-exit-reaped only when
+            # neither TERM nor KILL was sent. contained-clean additionally binds
+            # cleanupOk/cleanupComplete; exitCode is its unforced rootExitCode.
+            # Each execution must prove its own complete observed/reaped set.
+            elif (record["containmentDisposition"] != "natural-exit-reaped"
+                    or record["descendantsObserved"] <= 0
+                    or record["descendantsObserved"] != record["descendantsReaped"]):
                 return None
         expected = runner.command_plan[ordinal]
         if (_portable_command_plan_value([{key: source[key] for key in expected}])
@@ -23620,7 +23659,7 @@ def _bind_standalone_portable_replay(producer):
             "capture": capture.evidence(), "context": vars(context),
             "producerAdmission": producer.admissions[0].validation.hex(),
         })
-        return _StandalonePortablePair(ordinal, *streams[1], seal)
+        return _StandalonePortablePair(ordinal, *streams[1], seal, runner.platform)
     except (OSError, AttributeError, IndexError, KeyError, TypeError, ValueError, UnicodeError, OverflowError):
         return None
 
@@ -23634,7 +23673,7 @@ def _derive_standalone_packaging_equal_result(pair):
         identity = globals().get("_standalone_packaging_semantic_identity")
         if not callable(parser) or not callable(identity):
             return None
-        reporters = [parser(data) for data in (pair.producer_stderr, pair.replay_stderr)]
+        reporters = [parser(data, platform=pair.platform) for data in (pair.producer_stderr, pair.replay_stderr)]
         if any(type(reporter) is not _StandalonePackagingReporter for reporter in reporters):
             return None
         identities = [identity(reporter) for reporter in reporters]
@@ -23652,6 +23691,11 @@ def _standalone_packaging_comparison_views(documents, runner, prior_views, pair,
         projected = (views[side]["records"] if side in views else
                      [_canonical_transcript_record(record) for record in records])
         record = projected[pair.ordinal]
+        if pair.platform == "ubuntu":
+            # Only the pair bound above can reach this private comparison view.
+            # Raw sampled counts, cleanup, authority and streams remain retained.
+            for key in ("descendantsObserved", "descendantsReaped"):
+                record[key] = "<VALIDATED-NATURALLY-REAPED-COUNT>"
         record["stderrSha256"] = hashlib.sha256(encoded).hexdigest()
         record["stderrBytesObserved"] = len(encoded)
         observation = copy.deepcopy(records[pair.ordinal]["producerObservations"][0])
@@ -23881,6 +23925,8 @@ def verify_evidence_with_replay(
                     errors.append(unavailable)
         if not errors and packaging_rebound is not None:
             packaging_result = _derive_standalone_packaging_equal_result(packaging_rebound)
+        if packaging_portability and packaging_result is None:
+            errors.append("verification replay standalone-packaging portable result unavailable or mismatched")
         if comparison is not None:
             # A backend record loses its raw difference only after both full
             # results were derived and compared equal. Every unavailable or
