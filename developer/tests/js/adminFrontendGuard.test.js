@@ -58,12 +58,21 @@ class FakeElement {
 }
 
 const elements = new Map();
+const exportButtons = ['summary', 'users', 'practice-records', 'traffic'].map((exportDataset) => {
+    const button = new FakeElement();
+    button.dataset.exportDataset = exportDataset;
+    return button;
+});
 const documentStub = {
     getElementById(id) {
         if (!elements.has(id)) {
             elements.set(id, new FakeElement(id));
         }
         return elements.get(id);
+    },
+    querySelectorAll(selector) {
+        assert.equal(selector, '[data-export-dataset]', 'unexpected document selector');
+        return exportButtons;
     },
     createElement(tag) {
         return new FakeElement(tag);
@@ -84,7 +93,9 @@ const windowStub = {
     clearTimeout() {},
     document: documentStub
 };
-let fetchImpl = () => {
+let unexpectedFetches = 0;
+const fetchImpl = () => {
+    unexpectedFetches += 1;
     throw new Error('fetch should not be called in this test');
 };
 const hostJson = globalThis.JSON;
@@ -118,6 +129,17 @@ assert.equal(typeof hooks.confirmAction, 'function');
 assert.equal(typeof hooks.closeConfirm, 'function');
 assert.equal(typeof hooks.parseAdminResponseJson, 'function');
 assert.equal(typeof hooks.sanitizeStatusMessage, 'function');
+assert.equal(typeof hooks.bindEvents, 'function');
+
+hooks.bindEvents();
+assert.equal(exportButtons.length, 4);
+assert.deepEqual(exportButtons.map((button) => button.dataset.exportDataset), [
+    'summary', 'users', 'practice-records', 'traffic'
+]);
+for (const button of exportButtons) {
+    assert.equal(typeof button.listeners.get('click'), 'function', `${button.dataset.exportDataset} export must have a click listener`);
+}
+assert.equal(unexpectedFetches, 0, 'binding admin events must not fetch');
 
 {
     assert.deepEqual(hooks.parseAdminResponseJson('{"ok":true}'), { ok: true });
@@ -146,10 +168,6 @@ assert.equal(typeof hooks.sanitizeStatusMessage, 'function');
     const statusBoundary = hooks.sanitizeStatusMessage(`${'s'.repeat(236)}\uD83D\uDE00tail`);
     assert.equal(statusBoundary, `${'s'.repeat(236)}...`);
     assert(!/[\uD800-\uDFFF]/.test(statusBoundary), 'truncated admin status text must not retain unmatched surrogate halves');
-
-    const payloadBoundary = hooks.safeStringifyRecordPayload(`${'p'.repeat(19984)}\uD83D\uDE00tail${'q'.repeat(100)}`);
-    assert(payloadBoundary.endsWith('\n... truncated'));
-    assert(!/[\uD800-\uDFFF]/.test(payloadBoundary), 'truncated record payload text must not retain unmatched surrogate halves');
 }
 
 const first = hooks.confirmAction({
@@ -163,13 +181,12 @@ assert.equal(elements.get('confirm-title').textContent, 'Delete old');
 const second = hooks.confirmAction({
     title: 'Delete new',
     message: 'Second confirm',
-    confirmText: 'Delete now',
-    kind: 'normal'
+    confirmText: 'Delete now'
 });
 
 assert.equal(await first, false, 'opening a second confirmation must cancel the first pending action');
 assert.equal(elements.get('confirm-title').textContent, 'Delete new');
-assert.equal(elements.get('confirm-submit').classList.contains('delete-button'), false);
+assert.equal(elements.get('confirm-submit').textContent, 'Delete now');
 
 hooks.closeConfirm(true);
 assert.equal(await second, true);
@@ -185,125 +202,48 @@ assert(
 );
 assert(
     source.includes('function truncateAdminText') &&
-    source.includes("truncateAdminText(normalized, MAX_ADMIN_STATUS_CHARS, '...')") &&
-    source.includes("truncateAdminText(text, MAX_RECORD_DETAIL_PAYLOAD_CHARS, '\\n... truncated')"),
-    'admin UI must use Unicode-safe truncation for status and record detail text'
+    source.includes("truncateAdminText(normalized, MAX_ADMIN_STATUS_CHARS, '...')"),
+    'admin UI must use Unicode-safe truncation for status text'
 );
 
 {
-    const shared = { label: 'shared' };
-    const rendered = JSON.parse(hooks.safeStringifyRecordPayload({
-        first: shared,
-        second: shared,
-        list: [shared]
-    }));
-    assert.deepEqual(rendered.first, { label: 'shared' });
-    assert.deepEqual(rendered.second, { label: 'shared' });
-    assert.deepEqual(rendered.list[0], { label: 'shared' });
-
-    const circular = { id: 'cycle' };
-    circular.self = circular;
-    const circularRendered = JSON.parse(hooks.safeStringifyRecordPayload(circular));
-    assert.equal(circularRendered.self, '[Circular]');
-}
-
-function jsonResponse(payload) {
-    return {
-        status: 200,
-        ok: true,
-        async text() {
-            return JSON.stringify(payload);
-        }
-    };
-}
-
-function createDeferredResponse(payload) {
-    let resolve;
-    const promise = new Promise((done) => {
-        resolve = () => done(jsonResponse(payload));
-    });
-    return { promise, resolve };
+    const loadUsersSource = source.match(/    async function loadUsers\(\) \{([\s\S]*?)\n    \}/)?.[1];
+    assert(loadUsersSource, 'current user-list loader must be present');
+    assert.match(
+        loadUsersSource,
+        /^\s*const requestId = state\.users\.requestId \+ 1;\s*state\.users\.requestId = requestId;\s*state\.users\.loading = true;/,
+        'user-list requests must capture and advance the latest request ID before loading'
+    );
+    assert.match(
+        loadUsersSource,
+        /const payload = await [^\n]+;\s*if \(state\.users\.requestId !== requestId\) \{\s*return;\s*\}\s*renderUsers\(payload\);/,
+        'stale user-list responses must return before rendering'
+    );
+    assert.match(
+        loadUsersSource,
+        /\} finally \{\s*if \(state\.users\.requestId === requestId\) \{\s*state\.users\.loading = false;\s*updatePagination\(\);\s*\}\s*\}\s*$/,
+        'only the latest user-list request may clear loading and update pagination'
+    );
+    assert.equal((loadUsersSource.match(/state\.users\.loading\s*=\s*false/g) || []).length, 1);
 }
 
 {
-    const stale = createDeferredResponse({
-        records: [{ id: 'record-a', title: 'Alice stale record', updatedAt: '2026-01-01T00:00:00Z' }],
-        total: 1
-    });
-    fetchImpl = async (url) => {
-        if (String(url).includes('/user-a/practice-records')) {
-            return stale.promise;
-        }
-        if (String(url).includes('/user-b/practice-records')) {
-            return jsonResponse({
-                records: [{ id: 'record-b', title: 'Bob current record', updatedAt: '2026-01-02T00:00:00Z' }],
-                total: 1
-            });
-        }
-        throw new Error(`unexpected fetch: ${url}`);
-    };
-
-    hooks.state.selectedUser = { id: 'user-a', username: 'Alice' };
-    const firstLoad = hooks.loadRecords('user-a', 'Alice');
-    await Promise.resolve();
-    hooks.state.selectedUser = { id: 'user-b', username: 'Bob' };
-    await hooks.loadRecords('user-b', 'Bob');
-    assert.equal(elements.get('records-title').textContent, 'Bob Records');
-    assert.equal(hooks.state.records.loading, false);
-
-    stale.resolve();
-    await firstLoad;
-    assert.equal(elements.get('records-title').textContent, 'Bob Records');
-    assert.equal(hooks.state.records.loading, false);
+    const deleteUserSource = source.match(/    async function deleteSelectedUser\(\) \{([\s\S]*?)\n    \}/)?.[1];
+    assert(deleteUserSource, 'current selected-user deletion must be present');
+    assert.match(
+        deleteUserSource,
+        /^\s*const user = state\.selectedUser;\s*if \(!user \|\| user\.id === state\.currentUserId\) return;\s*const confirmed = await confirmAction\(/,
+        'user deletion must capture the selected object before asynchronous confirmation'
+    );
+    const afterConfirmation = deleteUserSource.slice(deleteUserSource.indexOf('await confirmAction('));
+    assert.match(
+        afterConfirmation,
+        /await withAdminStepUp\(\(\) => request\(`\/api\/admin\/users\/\$\{encodeURIComponent\(user\.id\)\}`, \{\s*method: 'DELETE'\s*\}\)\);/,
+        'confirmed user deletion must use the captured user ID'
+    );
+    assert(!afterConfirmation.includes('state.selectedUser'), 'user deletion must not reread the selection after confirmation');
 }
 
-{
-    const stale = createDeferredResponse({
-        user: { id: 'user-a', username: 'Alice' },
-        recordCount: 5,
-        averageScore: 90,
-        totalStudyMinutes: 120,
-        latestRecordAt: '2026-01-01T00:00:00Z',
-        byType: []
-    });
-    fetchImpl = async (url) => {
-        if (String(url).includes('/user-a/stats')) {
-            return stale.promise;
-        }
-        if (String(url).includes('/user-b/stats')) {
-            return jsonResponse({
-                user: { id: 'user-b', username: 'Bob' },
-                recordCount: 1,
-                averageScore: 80,
-                totalStudyMinutes: 30,
-                latestRecordAt: '2026-01-02T00:00:00Z',
-                byType: []
-            });
-        }
-        throw new Error(`unexpected fetch: ${url}`);
-    };
-
-    hooks.state.selectedUser = { id: 'user-a', username: 'Alice' };
-    const firstLoad = hooks.loadUserStats('user-a');
-    await Promise.resolve();
-    hooks.state.selectedUser = { id: 'user-b', username: 'Bob' };
-    await hooks.loadUserStats('user-b');
-    assert.equal(elements.get('user-stats-title').textContent, 'Bob');
-    assert.equal(elements.get('user-stat-records').textContent, '1');
-
-    stale.resolve();
-    await firstLoad;
-    assert.equal(elements.get('user-stats-title').textContent, 'Bob');
-    assert.equal(elements.get('user-stat-records').textContent, '1');
-}
-
-assert(
-    source.includes('function isSelectedUser(userId)') &&
-    source.includes('state.records.requestId !== requestId || !isSelectedUser(userId)') &&
-    source.includes('state.userStatsRequestId !== requestId || !isSelectedUser(userId)') &&
-    source.includes('const selectedUser = state.selectedUser;') &&
-    source.includes('const userId = selectedUser.id;'),
-    'admin async user/record refreshes must ignore stale responses and snapshot selected users for mutations'
-);
+assert.equal(unexpectedFetches, 0, 'admin frontend guard must not fetch');
 
 console.log('adminFrontendGuard.test.js passed');
