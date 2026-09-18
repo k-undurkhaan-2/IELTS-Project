@@ -13029,6 +13029,274 @@ class CI6ReplayVerificationTest(unittest.TestCase):
         )
         return errors
 
+    def urs_collection_fixture(self, *, platform_name="ubuntu", hosted_shape=False):
+        """Real raw derivation and collection comparison with synthetic baseline entries."""
+        import test_backend_canonical_portable_result as backend
+
+        ordinal = 701 if hosted_shape else 0
+        producer = backend.fixture(platform_name, ordinal=ordinal)
+        replay = backend.fixture(platform_name, ordinal=ordinal,
+                                 stdout=backend.npm_stdout("90", "912"), physical="9")
+        runner, documents, _comparison = backend.replay_fixture(
+            producer, replay, prefix_count=ordinal,
+            frontend_ordinals=(692,) if hosted_shape else ())
+        spec = synthetic_command_spec("static-suite", "static-suite", len(runner.command_plan),
+                                      command_role="observation-producing")
+        spec.update(profile="all", platform=platform_name)
+        source = synthetic_record_from_spec(spec)
+        for index, (name, status, detail) in enumerate((
+            ("URS known debt", "fail", {"error": "synthetic known failure"}),
+            ("URS resolved candidate", "pass", {"result": "repaired"}),
+            ("URS expected omission", "pass", {"skipped": True, "reason": "private fixture"}),
+            ("URS release skip", "pass", {"skipped": True, "reason": "release fixture"}),
+        )):
+            raw = ci.make_raw_observation("static-suite", spec["ordinal"], index,
+                "static-producer-v1", name, ci.STATIC_SUITE_RELATIVE_PATH,
+                {"name": name, "status": status, "detail": detail}, ci.command_output_digest(source))
+            source["producerObservations"].append(raw)
+        runner.command_plan.append(spec)
+        runner.command_results.append(copy.deepcopy(source))
+        documents["command-results.json"]["records"].append(copy.deepcopy(source))
+        if hosted_shape and platform_name == "windows":
+            changed = runner.command_results[692]
+            diagnostic = "Windows ordinal 692 independent diagnostic\n"
+            changed.update(stderrSha256=hashlib.sha256(diagnostic.encode()).hexdigest(),
+                           stderrBytesObserved=len(diagnostic.encode()))
+            raw = changed["producerObservations"][0]
+            raw["rawStructuredFields"]["stderr"] = diagnostic
+            raw["sourceOutputDigest"] = ci.command_output_digest(changed)
+            raw["producerRecordDigest"] = ci._producer_record_digest({
+                key: value for key, value in raw.items() if key != "producerRecordDigest"})
+        runner.execution_binding = synthetic_execution_binding(
+            "all", ci.command_plan_digest(runner.command_plan), platform_name=platform_name)
+        runner.verifier_execution_binding = synthetic_external_context(runner.execution_binding).verifier_binding()
+        runner.authorization_context_binding = None
+        runner.authorization_context_binding_digest = None
+        runner.observations = [{"rawObservation": raw} for record in runner.command_results
+                               for raw in record["producerObservations"]]
+        ci.finalize_evidence_transcript(runner)
+        transcript = ci.verification_replay_transcript(runner)
+        commands = documents["command-results.json"]
+        producer_records = commands["records"]
+        commands.update(copy.deepcopy(transcript))
+        commands.update(records=producer_records, commandAuthority=copy.deepcopy(runner.command_plan))
+        coherently_rebind_claimed_transcript(documents)
+        # The comparison API historically permits an omitted ordinary observation
+        # list. Collection records below still bind to every retained raw source.
+        commands["observations"] = []
+        for name in ("executionBinding", "executionBindingDigest", "authorizationContextBinding",
+                     "authorizationContextBindingDigest"):
+            documents["summary.json"][name] = copy.deepcopy(transcript[name])
+
+        template = ci.strict_json_load_file(ci.BASELINE_PATH)["knownDebts"][0]
+        baseline = {"knownDebts": [], "expectedOmissions": [], "releaseOnlySkips": []}
+        for index, raw in enumerate(source["producerObservations"]):
+            outputs = ci._raw_failure_outputs(raw, source)
+            entry = {**copy.deepcopy(template), "id": f"URS-SYNTHETIC-{index}",
+                     "commandClass": "static-suite", "testOrPathScope": outputs["testOrPathScope"],
+                     "expectedOutcome": "fail" if index == 1 else outputs["outcome"],
+                     "allowedNormalizedSignature": [outputs["signature"]], "platforms": ["all"]}
+            baseline[("knownDebts", "knownDebts", "expectedOmissions", "releaseOnlySkips")[index]].append(entry)
+        fields = {"knownDebtsObserved": "observedDebts", "resolvedCandidates": "resolvedCandidates",
+                  "expectedOmissions": "expectedOmissions", "releaseOnlySkips": "releaseOnlySkips"}
+        comparisons = {}
+        for side, records in (("producer", producer_records), ("replay", runner.command_results)):
+            context = {
+                "producerObservationUniverseDigest": (commands["producerObservationUniverseDigest"]
+                    if side == "producer" else runner.producer_observation_universe_digest),
+                "producerTranscriptDigest": (commands["producerTranscriptDigest"]
+                    if side == "producer" else runner.producer_transcript_digest),
+                "profileCompletedCommandClassSetDigest": runner.completed_command_class_set_digest,
+                "authorizationContextBindingDigest": runner.authorization_context_binding_digest,
+            }
+            observations = [ci._rederive_observation_record({"rawObservation": raw}, record,
+                profile_context=context) for record in records for raw in record["producerObservations"]]
+            comparisons[side] = ci.compare_observations(baseline, observations,
+                set(runner.actual_completed_command_classes), platform_name, command_records=records,
+                authorization_context_binding_digest_value=runner.authorization_context_binding_digest)
+            self.assertEqual(comparisons[side]["violations"], [])
+            for key in fields.values():
+                self.assertEqual(len(comparisons[side][key]), 1, key)
+        documents["summary.json"].update({key: comparisons["producer"][value]
+                                          for key, value in fields.items()})
+        pair = backend.portable._BoundPair(backend.portable._bind_side(ci, producer),
+            backend.portable._bind_side(ci, replay), producer_records, runner.command_results,
+            runner.command_plan_digest, runner.actual_completed_command_classes)
+        result = backend.portable._derive_equal_result(ci, pair)
+        self.assertIsNotNone(result)
+        views = backend.portable._comparison_views(ci, pair, result)
+        self.assertEqual(ci._verification_replay_eligibility(documents, runner, comparisons["replay"])[1], [])
+        if not (hosted_shape and platform_name == "windows"):
+            self.assertEqual(views["producer"], views["replay"])
+        return SimpleNamespace(documents=documents, runner=runner, comparison=comparisons["replay"],
+                               views=views, fields=fields)
+
+    def urs_compare(self, case, *, views=True):
+        selected = case.views if views else None
+        collections = ci._replay_collection_comparison_views(
+            case.documents, case.runner, case.comparison, selected)
+        return collections, ci._compare_verification_replay_claims(
+            case.documents, case.runner, case.comparison,
+            comparison_views=selected, collection_views=collections)[1]
+
+    def assert_urs_context_only_portability(self) -> None:
+        case = self.urs_collection_fixture()
+        before = copy.deepcopy((case.documents, vars(case.runner), case.comparison, case.views))
+        raw_errors = ci._compare_verification_replay_claims(case.documents, case.runner,
+            case.comparison, comparison_views=case.views)[1]
+        for collection, replay_key in case.fields.items():
+            self.assertIn(f"verification replay {collection} differs from replay-backed facts", raw_errors)
+            left = case.documents["summary.json"][collection][0]
+            right = case.comparison[replay_key][0]
+            self.assertEqual({key for key in left if left[key] != right[key]},
+                             {"derivedFailureDigest", "currentFullContextDigest"})
+        collections, errors = self.urs_compare(case)
+        self.assertIsNotNone(collections)
+        self.assertEqual(errors, [])
+        self.assertEqual(collections["producer"], collections["replay"])
+        for collection in case.fields:
+            original = case.documents["summary.json"][collection][0]
+            projected = collections["producer"][collection][0]
+            self.assertEqual(set(original), set(projected))
+            self.assertEqual({key for key in original if original[key] != projected[key]},
+                             {"derivedFailureDigest", "currentFullContextDigest"})
+            self.assertEqual(projected["derivedFailureDigest"], projected["currentFullContextDigest"])
+        self.assertEqual(before, (case.documents, vars(case.runner), case.comparison, case.views))
+
+    def assert_urs_semantic_field_mutation_matrix(self) -> None:
+        case = self.urs_collection_fixture()
+        count = 0
+        for collection, replay_key in case.fields.items():
+            for side in ("producer", "replay"):
+                items = (case.documents["summary.json"][collection] if side == "producer"
+                         else case.comparison[replay_key])
+                original = copy.deepcopy(items[0])
+                # Every existing semantic/authority field, optional status, and an
+                # unknown future field must survive the detached comparison.
+                for field in [key for key in original
+                              if key not in {"derivedFailureDigest", "currentFullContextDigest"}] + ["futureField"]:
+                    with self.subTest(collection=collection, side=side, field=field):
+                        value = original.get(field)
+                        replacement = (value + 1 if type(value) is int else [*value, "URS mutation"]
+                                       if isinstance(value, list) else str(value) + "-URS-mutation")
+                        items[0] = {**copy.deepcopy(original), field: replacement}
+                        _collections, errors = self.urs_compare(case)
+                        self.assertIn(f"verification replay {collection} differs from replay-backed facts", errors)
+                        count += 1
+                items[0] = original
+        print(f"URS_P1_SEMANTIC_MUTATIONS rejected={count} collections=4 sides=2")
+
+    def assert_urs_projection_fail_closed(self) -> None:
+        case = self.urs_collection_fixture()
+        for collection, replay_key in case.fields.items():
+            for side in ("producer", "replay"):
+                items = (case.documents["summary.json"][collection] if side == "producer"
+                         else case.comparison[replay_key])
+                original = copy.deepcopy(items[0])
+                for field in ("derivedFailureDigest", "currentFullContextDigest"):
+                    with self.subTest(collection=collection, side=side, unexplained_digest=field):
+                        items[0] = {**copy.deepcopy(original), field: "sha256:" + "f" * 64}
+                        projected, errors = self.urs_compare(case)
+                        self.assertIsNone(projected)
+                        self.assertIn(f"verification replay {collection} differs from replay-backed facts", errors)
+                items[0] = original
+        projected, errors = self.urs_compare(case, views=False)
+        self.assertIsNone(projected)
+        for collection in case.fields:
+            self.assertIn(f"verification replay {collection} differs from replay-backed facts", errors)
+        for field in ("records", "producerObservationUniverseDigest", "producerTranscriptDigest"):
+            with self.subTest(unavailable_portable_proof=field):
+                changed = copy.deepcopy(case.views)
+                changed["replay"][field] = [] if field == "records" else "sha256:" + "e" * 64
+                self.assertIsNone(ci._replay_collection_comparison_views(
+                    case.documents, case.runner, case.comparison, changed))
+        for invalid in ({}, {"producer": {}}, {"producer": {}, "replay": {}}):
+            self.assertIsNone(ci._replay_collection_comparison_views(
+                case.documents, case.runner, case.comparison, invalid))
+        duplicate = copy.deepcopy(case.documents)
+        source = duplicate["command-results.json"]["records"][-1]
+        source["producerObservations"].append(copy.deepcopy(source["producerObservations"][0]))
+        self.assertIsNone(ci._replay_collection_comparison_views(
+            duplicate, case.runner, case.comparison, case.views))
+        missing_ordinal = copy.deepcopy(case.views)
+        for view in missing_ordinal.values():
+            del view["records"][-1]["ordinal"]
+        self.assertIsNone(ci._replay_collection_comparison_views(
+            case.documents, case.runner, case.comparison, missing_ordinal))
+        missing_observation = copy.deepcopy(case.views)
+        for view in missing_observation.values():
+            view["records"][-1]["producerObservations"].pop()
+        self.assertIsNone(ci._replay_collection_comparison_views(
+            case.documents, case.runner, case.comparison, missing_observation))
+        # Raw/public comparison never gains the private portable capability.
+        raw = ci.compare_verification_replay_claims(case.documents, case.runner, case.comparison)[1]
+        self.assertTrue(any("differs from replay-backed facts" in error for error in raw))
+
+    def assert_urs_hosted_shapes(self) -> None:
+        import test_backend_canonical_portable_result as backend
+        for platform_name in ("ubuntu", "windows"):
+            with self.subTest(platform=platform_name):
+                case = self.urs_collection_fixture(platform_name=platform_name, hosted_shape=True)
+                projected, errors = self.urs_compare(case)
+                expected = [692] if platform_name == "windows" else []
+                self.assertEqual(backend.unequal_ordinals(errors), expected, errors)
+                if platform_name == "ubuntu":
+                    self.assertIsNotNone(projected)
+                    self.assertEqual(errors, [])
+                else:
+                    self.assertIsNone(projected)
+                print(f"URS_P1_HOSTED_SHAPE platform={platform_name} command_differences={expected}")
+
+    def assert_urs_verifier_gates(self) -> None:
+        import test_backend_canonical_portable_result as backend
+
+        projector = ci._replay_collection_comparison_views
+        for failure in (None, "ordinary-validation", "replay-unavailable", "command-authority"):
+            with self.subTest(gate=failure), backend.outer_fixture() as case:
+                events = []
+                original_run = case.runner.run
+                original_validator = ci.verify_evidence_file_set
+                original_eligibility = ci._verification_replay_eligibility
+
+                def validate(*args, **kwargs):
+                    events.append("ordinary-validation")
+                    return (["URS synthetic validation rejection"] if failure == "ordinary-validation"
+                            else original_validator(*args, **kwargs))
+
+                def execute():
+                    events.append("replay-executed")
+                    if failure == "replay-unavailable":
+                        raise RuntimeError("URS synthetic replay unavailable")
+                    if failure == "command-authority":
+                        case.runner.command_results[0]["commandClass"] = "unapproved-command-class"
+                    return original_run()
+
+                def project(documents, runner, comparison, views):
+                    self.assertIn("ordinary-validation", events)
+                    self.assertIn("replay-executed", events)
+                    self.assertEqual(original_eligibility(documents, runner, comparison)[1], [])
+                    self.assertIsNotNone(views)
+                    events.append("portable-collections")
+                    return projector(documents, runner, comparison, views)
+
+                with mock.patch.object(ci, "verify_evidence_file_set", side_effect=validate), \
+                     mock.patch.object(case.runner, "run", side_effect=execute), \
+                     mock.patch.object(ci, "_replay_collection_comparison_views", side_effect=project) as projection, \
+                     mock.patch.object(ci, "_compare_verification_replay_claims",
+                                       wraps=ci._compare_verification_replay_claims) as compare:
+                    errors, transcript = backend.verify(case)
+                if failure is None:
+                    self.assertEqual(errors, [])
+                    self.assertEqual(transcript["finalAcceptance"], "PASS")
+                    self.assertEqual(projection.call_count, 1)
+                    self.assertIsNotNone(compare.call_args.kwargs["collection_views"])
+                    self.assertEqual(events, ["ordinary-validation", "replay-executed", "portable-collections"])
+                else:
+                    self.assertTrue(errors)
+                    self.assertEqual(projection.call_count, 0)
+                    if failure == "ordinary-validation":
+                        self.assertEqual(events, ["ordinary-validation"])
+
     def bundle_normalization_fixture(
         self, stdout: str, *, platform_name: str = "ubuntu",
     ) -> tuple[dict, dict, ci.CommandCapture]:
@@ -13547,6 +13815,11 @@ class CI6ReplayVerificationTest(unittest.TestCase):
         return runner
 
     def test_legitimate_claims_match_independent_replay(self) -> None:
+        self.assert_urs_context_only_portability()
+        self.assert_urs_semantic_field_mutation_matrix()
+        self.assert_urs_projection_fail_closed()
+        self.assert_urs_hosted_shapes()
+        self.assert_urs_verifier_gates()
         self.assert_direct_node_test_semantic_parser_matrix()
         self.assert_direct_node_test_projection_matrix()
         self.assert_direct_node_test_replay_convergence()

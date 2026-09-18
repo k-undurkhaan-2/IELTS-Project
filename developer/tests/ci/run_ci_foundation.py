@@ -23135,15 +23135,129 @@ def _verification_replay_eligibility(
     return transcript, sorted(set(errors))
 
 
+def _replay_collection_comparison_views(documents, runner, comparison, comparison_views):
+    """Detach collection identity only from already validated portable command views.
+
+    The verifier calls this after ordinary evidence validation, completed replay,
+    authority/cleanup checks and portable result derivation. It grants no new
+    observation admission and never changes persisted or runner-derived facts.
+    Every replaced digest must first be reconstructed from its own raw source.
+    Missing, ambiguous or unequal portable authority leaves comparison exact.
+    """
+    if comparison is None or comparison_views is None:
+        return None
+    fields = {
+        "knownDebtsObserved": "observedDebts",
+        "resolvedCandidates": "resolvedCandidates",
+        "expectedOmissions": "expectedOmissions",
+        "releaseOnlySkips": "releaseOnlySkips",
+    }
+    digest_fields = {"derivedFailureDigest", "currentFullContextDigest"}
+    try:
+        producer_view, replay_view = (comparison_views[side] for side in ("producer", "replay"))
+        for key in ("records", "producerObservationUniverseDigest", "producerTranscriptDigest"):
+            if producer_view[key] != replay_view[key]:
+                return None
+        commands = documents["command-results.json"]
+        contexts = {
+            "producer": {
+                "producerObservationUniverseDigest": commands["producerObservationUniverseDigest"],
+                "producerTranscriptDigest": commands["producerTranscriptDigest"],
+                "profileCompletedCommandClassSetDigest": commands["completedCommandClassSetDigest"],
+                "authorizationContextBindingDigest": commands["authorizationContextBindingDigest"],
+            },
+            "replay": {
+                "producerObservationUniverseDigest": runner.producer_observation_universe_digest,
+                "producerTranscriptDigest": runner.producer_transcript_digest,
+                "profileCompletedCommandClassSetDigest": runner.completed_command_class_set_digest,
+                "authorizationContextBindingDigest": runner.authorization_context_binding_digest,
+            },
+        }
+        views = {}
+        for side, records in (("producer", commands["records"]), ("replay", runner.command_results)):
+            view = comparison_views[side]
+            projected_records = view["records"]
+            if not isinstance(records, list) or not isinstance(projected_records, list):
+                return None
+            if len(records) != len(projected_records):
+                return None
+            by_id = {}
+            for source, portable in zip(records, projected_records):
+                command_id = source["commandId"]
+                if (command_id in by_id or command_id != portable["commandId"]
+                    or source["ordinal"] != portable["ordinal"]):
+                    return None
+                by_id[command_id] = (source, portable)
+            portable_context = {
+                **contexts[side],
+                "producerObservationUniverseDigest": view["producerObservationUniverseDigest"],
+                "producerTranscriptDigest": view["producerTranscriptDigest"],
+            }
+            collections = {}
+            for field, replay_field in fields.items():
+                items = (documents["summary.json"][field] if side == "producer"
+                         else comparison[replay_field])
+                if not isinstance(items, list):
+                    return None
+                detached = []
+                for item in items:
+                    source, portable = by_id[item["sourceCommandId"]]
+                    matches = []
+                    for raw in source["producerObservations"]:
+                        derived = _rederive_observation_record(
+                            {"rawObservation": raw}, source, profile_context=contexts[side])
+                        if all(item[key] == derived[key] for key in digest_fields):
+                            matches.append((raw, derived))
+                    if len(matches) != 1:
+                        return None
+                    raw, derived = matches[0]
+                    for field_name, derived_field in (
+                        ("sourceCommandId", "commandId"), ("commandClass", "commandClass"),
+                        ("testOrPathScope", "testOrPathScope"), ("observedOutcome", "outcome"),
+                        ("observedSignature", "signature"),
+                        ("legacyBaselineComparisonDigest", "legacyBaselineComparisonDigest"),
+                        ("failureIdentityHash", "failureIdentityHash"),
+                        ("canonicalFailureMaterialVersion", "canonicalFailureMaterialVersion"),
+                        ("derivedFailureMembers", "derivedFailureMembers"),
+                    ):
+                        if item[field_name] != derived[derived_field]:
+                            return None
+                    portable_raw = [candidate for candidate in portable["producerObservations"]
+                                    if all(candidate[key] == raw[key] for key in
+                                           ("commandId", "commandOrdinal", "observationOrdinal"))]
+                    if len(portable_raw) != 1:
+                        return None
+                    # Keep every other field, including future/unknown fields,
+                    # exact. Aggregated occurrences and resolved status stay here.
+                    retained = {key: copy.deepcopy(value) for key, value in item.items()
+                                if key not in digest_fields}
+                    semantic_digest = canonical_failure_digest({
+                        "digestDomain": "ieltmps-replay-baseline-collection-v1",
+                        "collectionField": field,
+                        "baselineBoundFields": retained,
+                        "portableCommand": portable,
+                        "portableObservation": portable_raw[0],
+                        "portableProfileContext": portable_context,
+                    })
+                    detached.append({**retained, **{key: semantic_digest for key in digest_fields}})
+                collections[field] = detached
+            views[side] = collections
+        return views
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
 def _compare_verification_replay_claims(
     documents: Mapping[str, dict[str, Any]],
     runner: FoundationRunner,
     comparison: Mapping[str, Any] | None,
     *,
     comparison_views: Mapping[str, Any] | None = None,
+    collection_views: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Aggregate exact command differences, with only proven portable views."""
     transcript, errors = _verification_replay_eligibility(documents, runner, comparison)
+    collections_eligible = not errors and comparison_views is not None
     summary = documents.get("summary.json", {})
     commands = documents.get("command-results.json", {})
     evidence_records = commands.get("records")
@@ -23200,7 +23314,11 @@ def _compare_verification_replay_claims(
             "releaseOnlySkips": comparison.get("releaseOnlySkips", []),
         }
         for field_name, replay_value in replay_sets.items():
-            if summary.get(field_name) != replay_value:
+            claimed_value = summary.get(field_name)
+            if collections_eligible and collection_views is not None:
+                claimed_value = collection_views["producer"][field_name]
+                replay_value = collection_views["replay"][field_name]
+            if claimed_value != replay_value:
                 errors.append(
                     f"verification replay {field_name} differs from replay-backed facts"
                 )
@@ -23937,8 +24055,11 @@ def verify_evidence_with_replay(
                 views = _standalone_packaging_comparison_views(
                     documents, verification_runner, views, packaging_rebound, packaging_result)
             try:
+                collection_views = (_replay_collection_comparison_views(
+                    documents, verification_runner, comparison, views) if not errors else None)
                 transcript, comparison_errors = _compare_verification_replay_claims(
                     documents, verification_runner, comparison, comparison_views=views,
+                    collection_views=collection_views,
                 )
             except (OSError, AttributeError, KeyError, TypeError, ValueError) as exc:
                 return sorted(set(errors + [
