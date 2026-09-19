@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import quote, unquote_to_bytes, urlsplit
 
 
@@ -1833,7 +1833,7 @@ def contains_high_confidence_secret(value: str) -> list[str]:
     return sorted(set(hits))
 
 
-def _backend_exact_stream_text_is_safe(value: str) -> bool:
+def _exact_retained_evidence_text_is_safe(value: str) -> bool:
     """Inspect existing privacy rules without sanitizing retained stream bytes."""
     # CRLF is reporter presentation, but all other removed controls (including
     # bidi formatting) make exact retention unavailable. Preserve the original.
@@ -1850,6 +1850,19 @@ def _backend_exact_stream_text_is_safe(value: str) -> bool:
     return not contains_high_confidence_secret(privacy_view) and not any(
         pattern.search(privacy_view) for pattern in REDACTION_PATTERNS
     )
+
+
+def _backend_exact_stream_text_is_safe(value: str) -> bool:
+    """Preserve the backend privacy contract through the shared predicate."""
+    return _exact_retained_evidence_text_is_safe(value)
+
+
+def _direct_node_evidence_text_is_safe(value: str) -> bool:
+    """Also reject bridge material embedded in Node reporter names or payloads."""
+    return _exact_retained_evidence_text_is_safe(value) and re.search(
+        r"(?i)\bobfs4\s+\S+:\d+\s+[A-F0-9]{40}\s+cert=\S+\s+iat-mode=\d+\b",
+        value,
+    ) is None
 
 
 def sha256_text(value: str) -> str:
@@ -1929,36 +1942,76 @@ def raw_observation_json_value(value: Any) -> Any:
 
 
 _BACKEND_STREAM_REDACTION_MARKER = "[BACKEND STREAM REDACTED]"
+_DIRECT_NODE_STREAM_REDACTION_MARKER = "[DIRECT NODE STREAM REDACTED]"
+_DIRECT_NODE_OBSERVATION_PRIVACY_ERROR = "direct Node process observation failed evidence privacy admission"
 
 
-def _backend_successful_stream_observation_text(
-    raw_stream: bytes | None, ordinary: str,
+def _successful_stream_observation_text(
+    raw_stream: bytes | None, ordinary: str, *,
+    privacy_check: Callable[[str], bool], marker: str, diagnostic: str,
+    preserve_exact: bool,
 ) -> str:
     """Return privacy-safe evidence text without changing raw stream authority."""
     # Missing capture is not an exact empty stream. Ordinary text must never
     # stand in for absent bytes, even when it reproduces the recorded authority.
-    candidate = _BACKEND_STREAM_REDACTION_MARKER if raw_stream is None else ordinary
+    # Backend keeps its safe ordinary fallback; direct Node requires safe raw
+    # UTF-8 before publishing its existing normalized observation representation.
+    candidate = marker if raw_stream is None or not preserve_exact else ordinary
     try:
         exact = raw_stream.decode("utf-8", errors="strict") if raw_stream is not None else None
     except UnicodeError:
         exact = None
-    if exact is not None and _backend_exact_stream_text_is_safe(exact):
+    if exact is not None and privacy_check(exact):
         # Keep safe reporter presentation byte-exact. Apply the ordinary privacy
         # redactions, without its unrelated timing/whitespace normalization.
         redacted = exact
         for pattern in REDACTION_PATTERNS:
             redacted = pattern.sub("[REDACTED]", redacted)
         if redacted == exact:
-            candidate = exact
+            candidate = exact if preserve_exact else ordinary
     # Escape protection/restoration can leave an ordinary sanitized candidate
     # unsafe. Neither changed text nor successful sanitization proves privacy.
-    if not _backend_exact_stream_text_is_safe(candidate):
-        candidate = _BACKEND_STREAM_REDACTION_MARKER
+    if not privacy_check(candidate):
+        candidate = marker
     # Check the final value, including the fixed marker, before it can enter an
     # observation or its derived copies. Never include source text in the error.
-    if not _backend_exact_stream_text_is_safe(candidate):
-        raise ValueError("backend stream observation failed its privacy check")
+    if not privacy_check(candidate):
+        raise ValueError(diagnostic)
     return candidate
+
+
+def _backend_successful_stream_observation_text(
+    raw_stream: bytes | None, ordinary: str,
+) -> str:
+    return _successful_stream_observation_text(
+        raw_stream, ordinary, privacy_check=_backend_exact_stream_text_is_safe,
+        marker=_BACKEND_STREAM_REDACTION_MARKER,
+        diagnostic="backend stream observation failed its privacy check", preserve_exact=True,
+    )
+
+
+def _direct_node_successful_stream_observation_text(
+    raw_stream: bytes | None, ordinary: str,
+) -> str:
+    return _successful_stream_observation_text(
+        raw_stream, ordinary, privacy_check=_direct_node_evidence_text_is_safe,
+        marker=_DIRECT_NODE_STREAM_REDACTION_MARKER,
+        diagnostic=_DIRECT_NODE_OBSERVATION_PRIVACY_ERROR, preserve_exact=False,
+    )
+
+
+def _direct_node_process_observation_fields_are_safe(fields: Any) -> bool:
+    """Admit only the closed successful direct-Node process schema."""
+    if (not isinstance(fields, Mapping)
+        or set(fields) != {"executed", "exitCode", "stdout", "stderr", "error"}):
+        return False
+    return (
+        type(fields["executed"]) is bool and fields["executed"] is True
+        and type(fields["exitCode"]) is int and fields["exitCode"] == 0
+        and fields["error"] is None
+        and all(type(fields[name]) is str and _direct_node_evidence_text_is_safe(fields[name])
+                for name in ("stdout", "stderr"))
+    )
 
 
 def structured_signature(value: Any) -> str:
@@ -12357,6 +12410,8 @@ def _direct_node_test_raw_stream_errors(record: Mapping[str, Any]) -> list[str]:
             or len(data) != record.get(name + "BytesObserved")
             or hashlib.sha256(data).hexdigest() != record.get(name + "Sha256")):
             return ["direct Node test raw stream differs from observed bytes"]
+        if not _direct_node_evidence_text_is_safe(value):
+            return ["direct Node test raw stream failed its privacy check"]
     return []
 
 
@@ -13543,6 +13598,11 @@ def _validate_raw_observation_structure(
         f"{label}: {error}"
         for error in _raw_observation_forbidden_fields(raw.get("rawStructuredFields"))
     )
+    if (source is not None and _direct_node_test_authorized_paths(source) is not None
+        and type(source.get("exitCode")) is int and source.get("exitCode") == 0
+        and raw.get("observationKind") == "process-output-v1"
+        and not _direct_node_process_observation_fields_are_safe(raw.get("rawStructuredFields"))):
+        errors.append(_DIRECT_NODE_OBSERVATION_PRIVACY_ERROR)
     errors.extend(
         _validate_failure_path_authority(
             raw.get("failurePathAuthority"),
@@ -18655,17 +18715,22 @@ class FoundationRunner:
         """Bind one process result to its command's raw output identity."""
 
         if (_direct_node_test_authorized_paths(command_record) is not None
-            and capture.exit_code == 0 and capture.stdout_raw is not None
-            and capture.stderr_raw is not None and isinstance(command_record, dict)):
-            try:
-                command_record["directNodeTestRawStreams"] = {
-                    "stdout": capture.stdout_raw.decode("utf-8", errors="strict"),
-                    "stderr": capture.stderr_raw.decode("utf-8", errors="strict"),
-                }
-            except UnicodeError:
-                # Exact decoding is necessary for this protocol. The ordinary
-                # execution/observation evidence still records the raw failure.
-                pass
+            and isinstance(command_record, dict)):
+            command_record.pop("directNodeTestRawStreams", None)
+            if (capture.exit_code == 0 and capture.stdout_raw is not None
+                and capture.stderr_raw is not None):
+                try:
+                    streams = {
+                        "stdout": capture.stdout_raw.decode("utf-8", errors="strict"),
+                        "stderr": capture.stderr_raw.decode("utf-8", errors="strict"),
+                    }
+                except UnicodeError:
+                    pass
+                else:
+                    # Retain both original streams only when exact text is safe.
+                    # Ordinary sanitized observations never authorize retention.
+                    if all(_direct_node_evidence_text_is_safe(value) for value in streams.values()):
+                        command_record["directNodeTestRawStreams"] = streams
         raw_fields: Any = {
             "executed": capture.executed,
             "exitCode": capture.exit_code,
@@ -18708,11 +18773,22 @@ class FoundationRunner:
             command_output_digest(command_record),
             failure_path_authority=path_binding,
         )
-        if (command_record.get("commandId") == command_record.get("commandClass") == "backend-canonical"
-            and capture.exit_code == 0):
+        backend_success = (
+            command_record.get("commandId") == command_record.get("commandClass") == "backend-canonical"
+            and capture.exit_code == 0)
+        direct_node_success = (
+            _direct_node_test_authorized_paths(command_record) is not None
+            and capture.exit_code == 0)
+        if backend_success or direct_node_success:
+            publish_stream = (_backend_successful_stream_observation_text if backend_success
+                              else _direct_node_successful_stream_observation_text)
             for stream in ("stdout", "stderr"):
-                raw["rawStructuredFields"][stream] = _backend_successful_stream_observation_text(
+                raw["rawStructuredFields"][stream] = publish_stream(
                     getattr(capture, stream + "_raw"), raw["rawStructuredFields"][stream])
+            if direct_node_success:
+                fields = raw["rawStructuredFields"]
+                if not _direct_node_process_observation_fields_are_safe(fields):
+                    raise ValueError(_DIRECT_NODE_OBSERVATION_PRIVACY_ERROR)
             # Only observation text/digests change. The original command stream
             # hashes and byte lengths remain the binder's sole byte authority.
             raw["producerRecordDigest"] = _producer_record_digest({
@@ -22703,9 +22779,17 @@ def _validate_evidence_semantics_with_authority(
         producer_items = record.get("producerObservations")
         if not isinstance(producer_items, list):
             continue
+        direct_node_success = (
+            _direct_node_test_authorized_paths(record) is not None
+            and type(record.get("exitCode")) is int and record.get("exitCode") == 0)
         for raw in producer_items:
             if not isinstance(raw, Mapping):
                 continue
+            if (direct_node_success and raw.get("observationKind") == "process-output-v1"
+                and not _direct_node_process_observation_fields_are_safe(raw.get("rawStructuredFields"))):
+                # A declared policy violation cannot authorize this closed schema.
+                # Reject before reconstruction, without echoing attacker fields.
+                return [_DIRECT_NODE_OBSERVATION_PRIVACY_ERROR]
             try:
                 reconstructed_command_observations.append(
                     _reconstruct_observation_with_admission(

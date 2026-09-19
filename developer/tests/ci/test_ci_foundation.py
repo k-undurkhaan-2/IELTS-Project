@@ -13684,6 +13684,311 @@ class CI6ReplayVerificationTest(unittest.TestCase):
                 self.assertEqual(ci.producer_observation_universe([failed]), ci.producer_observation_universe([original]))
                 self.assertNotEqual(ci._raw_failure_outputs(raw, failed)["outcome"], "pass")
 
+    def assert_direct_node_test_privacy_gate(self) -> None:
+        import test_backend_canonical_portable_result as backend
+
+        safe_stdout = self.node_test_reporter_fixture(windows_paths=True, names=["caf\u00e9", "cafe\u0301"])
+        spec, template, template_capture = self.direct_node_test_fixture(safe_stdout)
+        raw_template = template["producerObservations"][0]
+        authority_fields = ("stdoutSha256", "stderrSha256", "stdoutBytesObserved", "stderrBytesObserved")
+        marker = "[DIRECT NODE STREAM REDACTED]"
+        privacy_error = "direct Node process observation failed evidence privacy admission"
+        publication_runner = fake_runner(ci.strict_json_load_file(ci.BASELINE_PATH))
+        publication_runner.profile, publication_runner.platform = spec["profile"], spec["platform"]
+        publication_runner.command_plan = [spec]
+        publication_runner.execution_binding = synthetic_execution_binding(
+            spec["profile"], ci.command_plan_digest([spec]), platform_name=spec["platform"])
+        # A publication fixture needs no live dependency measurement. Use the
+        # existing explicit precondition representation and real evidence writer.
+        closure, runtime_digest, dependency_digest = ci._runtime_precondition_document(
+            spec["profile"], "MEASUREMENT_FAILED")
+        publication_runner.runtime_closure_document = closure
+        publication_runner.runtime.update(runtimeClosureDigest=runtime_digest,
+                                          dependencyClosureDigest=dependency_digest, dependencyMemberCount="0")
+
+        def bind(stdout: bytes, stderr: bytes, *, missing=(), ordinary=None, stale=False, error=None):
+            record, capture = copy.deepcopy(template), copy.deepcopy(template_capture)
+            capture.error = error
+            if not stale:
+                record.pop("directNodeTestRawStreams")
+            record["producerObservations"] = []
+            record["producerObservationSetDigest"] = ci.producer_observation_set_digest([])
+            for stream, data in (("stdout", stdout), ("stderr", stderr)):
+                setattr(capture, stream, data.decode("utf-8", errors="replace"))
+                setattr(capture, stream + "_raw", None if stream in missing else data)
+                setattr(capture, stream + "_bytes", len(data))
+                record[stream + "Sha256"] = hashlib.sha256(data).hexdigest()
+                record[stream + "BytesObserved"] = len(data)
+                if ordinary is not None:
+                    setattr(capture, stream, ordinary[stream])
+            authority = {key: record[key] for key in authority_fields}
+            binder = object.__new__(ci.FoundationRunner)
+            binder.command_results, binder.observations = [record], []
+            observation = binder.add_process_observation(
+                record, capture, source_result_id=raw_template["sourceResultId"],
+                source_path=raw_template["sourcePath"],
+            )
+            self.assertEqual({key: record[key] for key in authority_fields}, authority)
+            self.assertEqual(observation["rawObservation"]["sourceOutputDigest"], ci.command_output_digest(record))
+            raw = observation["rawObservation"]
+            self.assertTrue(ci._direct_node_process_observation_fields_are_safe(raw["rawStructuredFields"]))
+            self.assertEqual(raw["producerRecordDigest"], ci._producer_record_digest({
+                key: value for key, value in raw.items() if key != "producerRecordDigest"}))
+            self.assertEqual(ci._validate_raw_observation(raw, label="direct-node-privacy", source=record), [])
+            for stream, data in (("stdout", stdout), ("stderr", stderr)):
+                self.assertEqual(record[stream + "Sha256"], hashlib.sha256(data).hexdigest())
+                self.assertEqual(record[stream + "BytesObserved"], len(data))
+            return record
+
+        def assert_forged_observation_rejected(record, fields, *, payload=None):
+            forged = copy.deepcopy(record)
+            self.assertNotIn("directNodeTestRawStreams", forged)
+            raw = forged["producerObservations"][0]
+            raw["rawStructuredFields"] = copy.deepcopy(fields)
+            raw["producerRecordDigest"] = ci._producer_record_digest({
+                key: value for key, value in raw.items() if key != "producerRecordDigest"})
+            forged["producerObservationSetDigest"] = ci.producer_observation_set_digest([raw])
+            self.assertIn(privacy_error, ci._validate_raw_observation(
+                raw, label="direct-node-forged-observation", source=forged))
+            forged_runner = copy.deepcopy(publication_runner)
+            forged_runner.command_results = [forged]
+            forged_runner.observations = [{"commandId": forged["commandId"], "rawObservation": raw}]
+            with tempfile.TemporaryDirectory(prefix="direct-node-forged-schema-") as temp:
+                root = Path(temp)
+                for declared_violation in (False, True):
+                    output = root / ("declared-violation" if declared_violation else "undeclared-violation")
+                    ci.create_fresh_evidence_root(output, repo_root=root)
+                    runner = copy.deepcopy(forged_runner)
+                    if declared_violation:
+                        # Even a coherent FAIL artifact declaring the malformed
+                        # observation must fail verifier admission independently.
+                        with self.assertRaisesRegex(RuntimeError, "^" + privacy_error + "$"):
+                            ci.write_evidence(runner, empty_comparison(), output_dir=output,
+                                              evidence_authority_root=root)
+                    else:
+                        # Construct coherent attacker-supplied aggregates and
+                        # manifests without declaring the schema violation. The
+                        # permissive control proves every other binding is valid.
+                        with mock.patch.object(ci, "_direct_node_process_observation_fields_are_safe", return_value=True):
+                            ci.write_evidence(runner, empty_comparison(), output_dir=output,
+                                              evidence_authority_root=root)
+                            self.assertEqual(ci.verify_evidence_file_set(
+                                output, repo_root=root, expected_command_plan=[spec]), [])
+                    before = {path.name: path.read_bytes() for path in output.iterdir()}
+                    document = ci.strict_json_loads(
+                        before["command-results.json"], label="direct Node forged observation schema fixture")
+                    self.assertEqual(document["records"][0], ci._compact_command_record_for_evidence(forged))
+                    self.assertEqual(document["records"][0]["producerObservations"][0]["rawStructuredFields"], fields)
+                    summary = ci.strict_json_loads(
+                        before["summary.json"], label="direct Node forged observation summary fixture")
+                    self.assertEqual(any(item.get("id") == "MALFORMED-PRODUCER-OBSERVATION"
+                                         and item.get("detail") == privacy_error
+                                         for item in summary["policyViolations"]), declared_violation)
+                    # Both rejections use the unmocked real verifier. Incoming
+                    # forged bytes remain intact; rejection never sanitizes a file.
+                    errors = ci.verify_evidence_file_set(output, repo_root=root, expected_command_plan=[spec])
+                    self.assertEqual(errors, [privacy_error])
+                    if payload is not None:
+                        self.assertIn(json.dumps(payload, ensure_ascii=False)[1:-1].encode(), before["command-results.json"])
+                        self.assertTrue(all(payload not in error for error in errors))
+                    self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, before)
+            assert_raw_authority(forged)
+
+        def publish(record, *, absent=(), forge_observations=False):
+            runner = copy.deepcopy(publication_runner)
+            runner.command_results = [copy.deepcopy(record)]
+            runner.observations = [{"commandId": record["commandId"],
+                                    "rawObservation": runner.command_results[0]["producerObservations"][0]}]
+            with tempfile.TemporaryDirectory(prefix="direct-node-privacy-") as temp:
+                root, output = Path(temp), Path(temp) / ".ci-results"
+                ci.create_fresh_evidence_root(output, repo_root=root)
+                ci.write_evidence(runner, empty_comparison(), output_dir=output, evidence_authority_root=root)
+                serialized = (output / "command-results.json").read_bytes()
+                document = ci.strict_json_loads(serialized, label="direct Node published evidence privacy fixture")
+                persisted = document["records"][0]
+                self.assertEqual(persisted, ci._compact_command_record_for_evidence(record))
+                for path in output.iterdir():
+                    data = path.read_bytes()
+                    for payload in absent:
+                        self.assertNotIn(payload.encode(), data)
+                        self.assertNotIn(json.dumps(payload, ensure_ascii=False)[1:-1].encode(), data)
+                if forge_observations:
+                    for field in ("stdout", "stderr", "error"):
+                        assert_forged_observation_rejected(persisted, {
+                            **persisted["producerObservations"][0]["rawStructuredFields"], field: absent[0],
+                        }, payload=absent[0])
+                return persisted
+
+        def assert_raw_authority(record):
+            self.assertIsNone(ci._validated_direct_node_test_semantic_projection(record, protected_bundle_valid=True))
+            canonical = ci._canonical_transcript_record(record)
+            for key in authority_fields:
+                self.assertEqual(canonical[key], record[key])
+
+        # Reuse the proven backend privacy corpus, including separator aliases
+        # that ordinary observation escape protection can leave unchanged.
+        unsafe_cases = backend.unsafe_stream_cases()
+        unsafe_cases["high-confidence onion hostname"] = "a" * 56 + ".onion"
+        unsafe_cases["obfs4 bridge"] = "obfs4 example.invalid:443 " + "A" * 40 + " cert=synthetic iat-mode=0"
+        for label, payload in unsafe_cases.items():
+            for placement in ("stdout", "stderr", "reporter-name"):
+                with self.subTest(direct_node_privacy=label, placement=placement):
+                    stdout = (safe_stdout if placement == "stderr" else
+                              self.node_test_reporter_fixture(names=[payload]) if placement == "reporter-name"
+                              else payload)
+                    stderr = payload if placement == "stderr" else ""
+                    streams = {"stdout": stdout, "stderr": stderr}
+                    # Names accepted by the unchanged reporter grammar still
+                    # need the independent privacy gate before portability.
+                    if placement == "reporter-name" and not any(ord(c) < 32 or ord(c) == 127 for c in payload):
+                        self.assertIsNotNone(ci.parse_node_test_semantic_result(
+                            stdout, command_id=spec["commandId"],
+                            authorized_test_paths=ci._direct_node_test_authorized_paths(spec),
+                        ))
+                    record = bind(stdout.encode(), stderr.encode())
+                    field = "stderr" if placement == "stderr" else "stdout"
+                    self.assertEqual(record["producerObservations"][0]["rawStructuredFields"][field], marker)
+                    for persisted in (
+                        ci.strict_json_loads(ci._json_bytes(record), label="direct Node privacy record fixture"),
+                        publish(record, absent=(payload,), forge_observations=label in {
+                            "credential token", "reviewer literal t prefix", "high-confidence onion hostname", "obfs4 bridge",
+                        }),
+                    ):
+                        self.assertNotIn("directNodeTestRawStreams", persisted)
+                        errors = []
+                        self.assertFalse(ci._validate_command_record(persisted, 0, errors, expected_record=spec), errors)
+                        self.assertEqual(errors, [])
+                        assert_raw_authority(persisted)
+
+                        # All hashes, lengths, and observation bindings match
+                        # the forged bytes; privacy must reject independently.
+                        forged = copy.deepcopy(persisted)
+                        forged["directNodeTestRawStreams"] = streams
+                        self.assertEqual(ci._direct_node_test_raw_stream_errors(forged), [
+                            "direct Node test raw stream failed its privacy check",
+                        ])
+                        errors = []
+                        ci._validate_command_record(forged, 0, errors, expected_record=spec)
+                        self.assertTrue(any("raw stream failed its privacy check" in error for error in errors), errors)
+                        self.assertTrue(all(payload not in error for error in errors))
+                        assert_raw_authority(forged)
+
+        # Exact stream retention is absent here. A coherent ordinary observation
+        # must independently reject each of the 4 payload classes x 5 schemas.
+        schema_record = publish(bind(safe_stdout.encode(), b"", missing=("stderr",)))
+        success_fields = schema_record["producerObservations"][0]["rawStructuredFields"]
+        for label in ("credential token", "reviewer literal t prefix", "high-confidence onion hostname", "obfs4 bridge"):
+            payload = unsafe_cases[label]
+            for mutation, replacement in (
+                ("error-list", {"error": [payload]}),
+                ("error-dict", {"error": {"detail": payload}}),
+                ("extra", {"extra": payload}),
+                ("exitCode-dict", {"exitCode": {"detail": payload}}),
+                ("executed-dict", {"executed": {"detail": payload}}),
+            ):
+                with self.subTest(direct_node_schema_payload=label, mutation=mutation):
+                    assert_forged_observation_rejected(schema_record, {
+                        **success_fields, **replacement,
+                    }, payload=payload)
+            with self.subTest(direct_node_schema_payload=label, mutation="payload-key"):
+                assert_forged_observation_rejected(schema_record, {
+                    **success_fields, "error": {payload: {"signature": "benign value"}},
+                }, payload=payload)
+        for label, replacement in (
+            ("extra benign field", {"extra": "benign value"}),
+            ("benign error", {"error": "benign text"}),
+            ("executed integer", {"executed": 1}),
+            ("exitCode boolean", {"exitCode": True}),
+            ("exitCode string", {"exitCode": "0"}),
+            ("stdout list", {"stdout": []}),
+            ("stderr dict", {"stderr": {}}),
+            ("executed false", {"executed": False}),
+            ("exitCode nonzero", {"exitCode": 1}),
+        ):
+            with self.subTest(direct_node_schema_control=label):
+                assert_forged_observation_rejected(schema_record, {**success_fields, **replacement})
+        for field in success_fields:
+            with self.subTest(direct_node_schema_missing=field):
+                assert_forged_observation_rejected(schema_record, {
+                    key: value for key, value in success_fields.items() if key != field
+                })
+
+        bridge = unsafe_cases["obfs4 bridge"]
+        bridge_reporter = self.node_test_reporter_fixture(names=[bridge])
+        self.assertFalse(ci._direct_node_evidence_text_is_safe(bridge_reporter))
+        self.assertTrue(ci._backend_exact_stream_text_is_safe(bridge_reporter))
+        self.assertEqual(ci._backend_successful_stream_observation_text(
+            bridge_reporter.encode(), ci.raw_observation_json_value(bridge_reporter)), bridge_reporter)
+        for stdout, stderr in ((bridge.encode(), b""), (safe_stdout.encode(), bridge.encode()),
+                               (b"private\x00stdout", b"private\x00stderr")):
+            record = bind(stdout, stderr)
+            self.assertNotIn("directNodeTestRawStreams", record)
+            assert_raw_authority(record)
+
+        # Even already-safe ordinary text or stale retained streams cannot
+        # substitute for missing, undecodable, or unsafe original captures.
+        ordinary = {"stdout": safe_stdout, "stderr": ""}
+        for stream in ("stdout", "stderr"):
+            for kind in ("missing", "invalid-utf8", "unsafe"):
+                with self.subTest(direct_node_raw_capture=kind, stream=stream):
+                    streams = {"stdout": safe_stdout.encode(), "stderr": b""}
+                    if kind != "missing":
+                        streams[stream] += b"\xff" if kind == "invalid-utf8" else b"\x00"
+                    record = bind(**streams, missing=(stream,) if kind == "missing" else (),
+                                  ordinary=ordinary, stale=True)
+                    self.assertNotIn("directNodeTestRawStreams", record)
+                    assert_raw_authority(record)
+
+        # Privacy inspection preserves safe Unicode, reporter timings, relative
+        # backslashes, and CRLF/tab presentation in stderr byte for byte.
+        safe_stderr = "safe\tUTF-8 caf\u00e9\r\n"
+        record = bind(safe_stdout.encode(), safe_stderr.encode())
+        self.assertEqual(record["directNodeTestRawStreams"], {"stdout": safe_stdout, "stderr": safe_stderr})
+        self.assertEqual(record["producerObservations"][0]["rawStructuredFields"], ci.raw_observation_json_value({
+            "executed": True, "exitCode": 0, "stdout": safe_stdout, "stderr": safe_stderr, "error": None,
+        }))
+        self.assertEqual(publish(record)["directNodeTestRawStreams"], record["directNodeTestRawStreams"])
+        self.assertEqual(ci._direct_node_test_raw_stream_errors(record), [])
+        self.assertIsNotNone(ci._validated_direct_node_test_semantic_projection(record, protected_bundle_valid=True))
+        for stream in ("stdout", "stderr"):
+            changed = copy.deepcopy(record)
+            changed["directNodeTestRawStreams"][stream] = ci.raw_observation_json_value(
+                changed["directNodeTestRawStreams"][stream])
+            self.assertEqual(ci._direct_node_test_raw_stream_errors(changed), [
+                "direct Node test raw stream differs from observed bytes",
+            ])
+            assert_raw_authority(changed)
+            surrogate = copy.deepcopy(record)
+            surrogate["directNodeTestRawStreams"][stream] += "\ud800"
+            self.assertEqual(ci._direct_node_test_raw_stream_errors(surrogate), [
+                "direct Node test raw stream must be UTF-8 text",
+            ])
+
+        # A safe raw capture cannot vouch for a different unsafe ordinary value
+        # restored by escape protection. A successful capture cannot carry error.
+        private_path = unsafe_cases["reviewer literal t prefix"]
+        record = bind(safe_stdout.encode(), b"", ordinary={"stdout": private_path, "stderr": ""})
+        self.assertEqual(record["producerObservations"][0]["rawStructuredFields"]["stdout"], marker)
+        self.assertIsNone(record["producerObservations"][0]["rawStructuredFields"]["error"])
+        assert_raw_authority(record)
+        publish(record, absent=(private_path,))
+        for error in (private_path, "benign text", [private_path], {"detail": private_path}):
+            with self.subTest(direct_node_success_error=type(error).__name__):
+                with self.assertRaisesRegex(ValueError, "^" + privacy_error + "$"):
+                    bind(safe_stdout.encode(), b"", error=error)
+        with mock.patch.object(ci, "_DIRECT_NODE_STREAM_REDACTION_MARKER", private_path):
+            with self.assertRaisesRegex(ValueError, "^" + privacy_error + "$"):
+                bind(private_path.encode(), b"")
+
+        # The shared privacy predicate accepts CRLF, while the direct-Node
+        # reporter grammar must continue to require its original LF framing.
+        crlf_record = bind(safe_stdout.replace("\n", "\r\n").encode(), b"")
+        self.assertEqual(ci._direct_node_test_raw_stream_errors(crlf_record), [])
+        errors = []
+        ci._validate_command_record(crlf_record, 0, errors, expected_record=spec)
+        self.assertTrue(any("reporter/payload is invalid" in error for error in errors), errors)
+        assert_raw_authority(crlf_record)
+
     def assert_direct_node_test_replay_convergence(self) -> None:
         fixtures = [self.direct_node_test_fixture(self.node_test_reporter_fixture(duration=duration))
                     for duration in ("1.25", "120.5")]
@@ -13822,6 +14127,7 @@ class CI6ReplayVerificationTest(unittest.TestCase):
         self.assert_urs_verifier_gates()
         self.assert_direct_node_test_semantic_parser_matrix()
         self.assert_direct_node_test_projection_matrix()
+        self.assert_direct_node_test_privacy_gate()
         self.assert_direct_node_test_replay_convergence()
         self.assertEqual(self.compare(), [])
         commands = self.documents["command-results.json"]
