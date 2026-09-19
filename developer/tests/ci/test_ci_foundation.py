@@ -6798,12 +6798,22 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
         stale_report: dict | None = None,
         compact_stdout: bool = False,
         mutate_document=None,
+        failure_path_fixture: bool = False,
     ) -> tuple[ci.FoundationRunner, bool]:
         with tempfile.TemporaryDirectory(prefix="ci-static-authority-") as temp_dir:
             repo = Path(temp_dir)
             static_target = repo / ci.STATIC_SUITE_RELATIVE_PATH
             static_target.parent.mkdir(parents=True)
             static_target.write_text("# static authority fixture\n", encoding="utf-8")
+            fixture_targets = [ci.STATIC_SUITE_RELATIVE_PATH]
+            if failure_path_fixture:
+                reading_target = next(target for target in ci.R03_FAILURE_TARGETS.values()
+                                      if target.endswith("/reading_question_audit.py"))
+                fixture_targets.append(reading_target)
+                reading_path = repo / reading_target
+                reading_path.parent.mkdir(parents=True, exist_ok=True)
+                reading_path.write_text("# existing Reading authority fixture\n", encoding="utf-8")
+                (repo / "snapshot").mkdir()
             report_path = repo / "developer" / "tests" / "e2e" / "reports" / "static-ci-report.json"
             report_path.parent.mkdir(parents=True)
             if stale_report is not None:
@@ -6851,6 +6861,10 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
                 return capture
 
             def fake_snapshot(plan_record, **_kwargs):
+                if failure_path_fixture:
+                    capture.failure_path_authority = ci._failure_path_authority_from_plan(
+                        plan_record, snapshot_root=repo / "snapshot", repo_root=repo,
+                    )
                 result = fake_execute(
                     plan_record["commandId"],
                     plan_record["commandClass"],
@@ -6907,7 +6921,7 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
             with (
                 mock.patch.multiple(ci, REPO_ROOT=repo),
                 mock.patch.object(ci.uuid, "uuid4", return_value=self.INVOCATION_UUID),
-                mock.patch.object(ci, "deterministic_candidate_paths", return_value=([ci.STATIC_SUITE_RELATIVE_PATH], [])),
+                mock.patch.object(ci, "deterministic_candidate_paths", return_value=(fixture_targets, [])),
                 mock.patch.object(ci, "execute_planned_static_suite", side_effect=fake_snapshot),
                 mock.patch.object(ci.FoundationRunner, "run_direct_syntax", autospec=True),
             ):
@@ -7094,6 +7108,390 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
         self.assertTrue(any("static machine observations are incomplete" in error for error in errors), errors)
 
         self.assert_bounded_static_replay_diagnostics(transcript_records)
+        self.assert_static_report_privacy_gate(runner, first_capture)
+
+    def assert_static_report_privacy_gate(self, safe_runner, safe_capture) -> None:
+        import test_backend_canonical_portable_result as backend
+
+        privacy_error = "static machine report failed evidence privacy admission"
+        stream_fields = ("stdoutSha256", "stderrSha256", "stdoutBytesObserved", "stderrBytesObserved")
+        authority_fields = (*stream_fields, "targets", "protectedTargetBundle", "executionInputs",
+                            "executionInputBundleDigest", "containment", "processTreeStatus",
+                            "containmentDisposition", "descendantsObserved", "descendantsReaped",
+                            "descendantsSurviving", "executed", "started", "exitCode")
+        unsafe = backend.unsafe_stream_cases()
+        payloads = {
+            "credential": unsafe["credential token"],
+            "private-path": unsafe["Windows drive path"],
+            "onion": "a" * 56 + ".onion",
+            "bridge": "obfs4 example.invalid:443 " + "A" * 40 + " cert=synthetic iat-mode=0",
+        }
+        review_payloads = {
+            "posix-root": "/root/.ssh/private-canary",
+            "posix-users": "/Users/private-canary/.ssh/id_rsa",
+            "posix-etc": "/etc/private-canary/credentials",
+            "posix-var": "/var/lib/private-canary/credentials",
+            "c1-csi": "prefix\u009b31mprivate-canary",
+            "c1-st": "prefix\u009cprivate-canary",
+        }
+        r2_payloads = {
+            "r2-posix-whitespace": "/ private-reviewer/credential.key",
+            "r2-posix-root": "/private-reviewer/key",
+            "r2-posix-space": "/ private-reviewer/key",
+            "r2-posix-two-spaces": "/  private-reviewer/key",
+            "r2-posix-component-space": "/tmp/private reviewer/key",
+            "r2-posix-file-space": "/home/user/private file",
+            "r2-windows-backslash": r"C:\private-reviewer\credential.key",
+            "r2-windows-slash": "C:/private-reviewer/key",
+            "r2-unc": r"\\private-reviewer\share\key",
+            "r2-extended-drive": r"\\?\C:\private-reviewer\key",
+            "r2-extended-unc": r"\\?\UNC\private-reviewer\share\key",
+            "r2-device": r"\\.\C:\private-reviewer\key",
+            "r2-nt-dos": r"\??\C:\private-reviewer\key",
+            "r2-nt-device": r"\Device\HarddiskVolume1\private-reviewer\key",
+            "r2-unmapped-token": "<unmapped-abs-sha256:" + "a" * 64 + ">",
+        }
+        reading_scope = next(scope for scope, target in ci.R03_FAILURE_TARGETS.items()
+                             if target.endswith("/reading_question_audit.py"))
+        canonicalize = ci._canonicalize_static_result_failure_paths
+        placements = {
+            "scalar": lambda text: text,
+            "list": lambda text: {"nested": [None, [text]]},
+            "object": lambda text: {"nested": {"value": text}},
+            "key": lambda text: {"nested": [{text: "benign"}]},
+        }
+
+        self.assert_static_report_privacy_bounds({**unsafe, **payloads, **review_payloads, **r2_payloads,
+            "other-posix-root": "/vault-private/canary",
+            "file-uri-posix": "file:///root/.ssh/private-canary",
+            "labeled-posix": "origin:/root/.ssh/private-canary",
+            "posix-separator-alias": "\\root\\.ssh\\private-canary",
+        })
+        publication_template = fake_runner(self.baseline)
+
+        def publication(source, record=None):
+            runner = copy.deepcopy(publication_template)
+            spec = copy.deepcopy(source.command_plan_by_id["static-suite"])
+            record = copy.deepcopy(record if record is not None else next(
+                item for item in source.command_results if item["commandId"] == "static-suite"))
+            # Isolate this command from the fixture's unexecuted policy prefix.
+            spec["ordinal"] = record["ordinal"] = 0
+            for raw in record["producerObservations"]:
+                raw["commandOrdinal"] = 0
+                raw["producerRecordDigest"] = ci._producer_record_digest({
+                    key: value for key, value in raw.items() if key != "producerRecordDigest"})
+            record["producerObservationSetDigest"] = ci.producer_observation_set_digest(record["producerObservations"])
+            runner.profile, runner.platform = spec["profile"], spec["platform"]
+            runner.command_plan, runner.command_results = [spec], [record]
+            runner.observations = [{"commandId": "static-suite", "rawObservation": raw}
+                                   for raw in record["producerObservations"]]
+            runner.hard_gate_results = copy.deepcopy(source.hard_gate_results)
+            runner.execution_binding = synthetic_execution_binding(
+                spec["profile"], ci.command_plan_digest([spec]), platform_name=spec["platform"])
+            closure, runtime_digest, dependency_digest = ci._runtime_precondition_document(
+                spec["profile"], "MEASUREMENT_FAILED")
+            runner.runtime_closure_document = closure
+            runner.runtime.update(runtimeClosureDigest=runtime_digest,
+                                  dependencyClosureDigest=dependency_digest, dependencyMemberCount="0")
+            return runner
+
+        def persist(runner, root):
+            output = root / "evidence"
+            ci.create_fresh_evidence_root(output, repo_root=root)
+            ci.write_evidence(runner, empty_comparison(), output_dir=output, evidence_authority_root=root)
+            self.assertEqual(ci.verify_evidence_file_set(
+                output, repo_root=root, expected_command_plan=runner.command_plan), [])
+            document = ci.strict_json_loads((output / "command-results.json").read_bytes(),
+                                           label="static report privacy evidence fixture")
+            self.assertEqual(document["records"][0], ci._compact_command_record_for_evidence(runner.command_results[0]))
+            return output, document["records"][0]
+
+        # Start the forgery matrix from an actual, independently valid artifact.
+        with tempfile.TemporaryDirectory(prefix="static-privacy-safe-") as temp:
+            _, safe_record = persist(publication(safe_runner), Path(temp))
+        safe_report = safe_record["validatedStaticMachineReport"]
+        self.assertEqual(safe_report, safe_capture.validated_static_machine_report)
+        self.assertIsNotNone(ci._validated_static_machine_output_identity(safe_record))
+        self.assertFalse(ci._evidence_publication_json_is_safe(safe_report))
+        self.assertTrue(ci._static_machine_report_evidence_is_safe(safe_report, safe_record["resolvedExecutablePath"]))
+
+        def coherent_record(detail):
+            forged = copy.deepcopy(safe_record)
+            report = forged["validatedStaticMachineReport"]
+            report["observations"][0]["detail"] = copy.deepcopy(detail)
+            data = ci._json_bytes(report)
+            forged["stdoutSha256"], forged["stdoutBytesObserved"] = hashlib.sha256(data).hexdigest(), len(data)
+            self.assertEqual(ci.parse_static_machine_report(data, expected_invocation_id=report["invocationId"]),
+                             (report, []))
+            digest = ci.command_output_digest(forged)
+            forged["producerObservations"] = [ci.make_raw_observation(
+                "static-suite", 0, ordinal, "static-producer-v1", result["name"],
+                ci.STATIC_SUITE_RELATIVE_PATH, result, digest,
+            ) for ordinal, result in enumerate(report["observations"])]
+            forged["producerObservationSetDigest"] = ci.producer_observation_set_digest(forged["producerObservations"])
+            return forged
+
+        rejected = omitted = controls = 0
+        for placement, locate in placements.items():
+            with self.subTest(static_privacy_safe_structure=placement):
+                control = coherent_record(locate("benign-structural-control"))
+                with tempfile.TemporaryDirectory(prefix="static-privacy-control-") as temp:
+                    _, persisted = persist(publication(safe_runner, control), Path(temp))
+                self.assertIsNotNone(ci._validated_static_machine_output_identity(persisted))
+                controls += 1
+            for family, payload in {**payloads, **review_payloads, **r2_payloads}.items():
+                with self.subTest(static_privacy_producer=family, placement=placement):
+                    report = self.passing_report()
+                    report["observations"][0]["detail"] = locate(payload)
+                    capture = contained_capture()
+                    capture.stderr_raw = b""
+                    is_r2 = family in r2_payloads
+                    if is_r2:
+                        report["observations"][0]["name"] = reading_scope.removeprefix("result:")
+                    def before_canonicalization(document):
+                        if not is_r2:
+                            return
+                        original = copy.deepcopy(document)
+                        self.assertFalse(ci._raw_static_machine_report_evidence_is_safe(
+                            document, capture.argv[0], capture.failure_path_authority))
+                        self.assertEqual(document, original)
+                        if family == "r2-windows-backslash" and placement != "key":
+                            counterfactual, binding = canonicalize(
+                                document["observations"][0], capture.failure_path_authority)
+                            self.assertTrue(binding["unmappedAbsolutePathDigests"])
+                            self.assertIn("<unmapped-abs-sha256:", json.dumps(counterfactual))
+                            # An already translated copy cannot replace raw admission.
+                            hidden = copy.deepcopy(document)
+                            hidden["observations"][0]["detail"] = "benign"
+                            capture.identity_stdout_raw = ci._json_bytes(hidden)
+                    with mock.patch.object(ci, "_canonicalize_static_result_failure_paths",
+                                           wraps=canonicalize) as canonicalizer:
+                        source, _ = self.exercise(capture, report=report,
+                            failure_path_fixture=is_r2, mutate_document=before_canonicalization)
+                        if is_r2:
+                            canonicalizer.assert_not_called()
+                    record = next(item for item in source.command_results if item["commandId"] == "static-suite")
+                    self.assertIsNone(capture.validated_static_machine_report)
+                    if not (family == "r2-windows-backslash" and placement != "key"):
+                        self.assertIsNone(capture.identity_stdout_raw)
+                    self.assertNotIn("validatedStaticMachineReport", record)
+                    self.assertEqual(source.observations, [])
+                    self.assertEqual(self.gate(source, "STATIC-SUITE-RESULT")["detail"], privacy_error)
+                    self.assertTrue(record["executed"])
+                    self.assertEqual(record["exitCode"], 0)
+                    for stream in ("stdout", "stderr"):
+                        data = getattr(capture, stream + "_raw")
+                        self.assertEqual(record[stream + "Sha256"], hashlib.sha256(data).hexdigest())
+                        self.assertEqual(record[stream + "BytesObserved"], len(data))
+                    authority = {key: copy.deepcopy(record[key]) for key in authority_fields}
+                    with tempfile.TemporaryDirectory(prefix="static-privacy-producer-") as temp:
+                        output, persisted = persist(publication(source), Path(temp))
+                        self.assertNotIn("validatedStaticMachineReport", persisted)
+                        for path in output.iterdir():
+                            data = path.read_bytes()
+                            self.assertNotIn(payload.encode(), data)
+                            self.assertNotIn(json.dumps(payload, ensure_ascii=False)[1:-1].encode(), data)
+                    self.assertEqual({key: record[key] for key in authority_fields}, authority)
+                    self.assertIsNone(ci._validated_static_machine_output_identity(record))
+                    self.assertEqual({key: ci._canonical_transcript_record(record)[key] for key in stream_fields},
+                                     {key: record[key] for key in stream_fields})
+                    omitted += 1
+
+                with self.subTest(static_privacy_forged=family, placement=placement):
+                    with tempfile.TemporaryDirectory(prefix="static-privacy-forged-") as temp:
+                        root = Path(temp)
+                        # Disable only this admission predicate while constructing
+                        # coherent attacker evidence. The real writer synchronizes
+                        # observations, semantic digests, aggregates and manifests.
+                        with mock.patch.object(ci, "_static_machine_report_evidence_is_safe", return_value=True):
+                            forged = coherent_record(locate(payload))
+                            runner = publication(safe_runner, forged)
+                            output, persisted = persist(runner, root)
+                        before = {path.name: path.read_bytes() for path in output.iterdir()}
+                        self.assertIn(json.dumps(payload, ensure_ascii=False)[1:-1].encode(),
+                                      before["command-results.json"])
+                        authority = {key: copy.deepcopy(persisted[key]) for key in authority_fields}
+                        errors = ci.verify_evidence_file_set(output, repo_root=root,
+                                                             expected_command_plan=runner.command_plan)
+                        self.assertIn(privacy_error, errors)
+                        for error in errors:
+                            self.assertNotIn(payload, error)
+                            self.assertNotIn(json.dumps(payload, ensure_ascii=False)[1:-1], error)
+                        self.assertIsNone(ci._validated_static_machine_output_identity(persisted))
+                        canonical = ci._canonical_transcript_record(persisted)
+                        self.assertTrue(canonical["invalidStaticMachineLocalEvidence"])
+                        self.assertEqual({key: canonical[key] for key in stream_fields},
+                                         {key: persisted[key] for key in stream_fields})
+                        self.assertEqual({key: persisted[key] for key in authority_fields}, authority)
+                        self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, before)
+                        rejected += 1
+        self.assertEqual((rejected, omitted, controls), (40 + 4 * len(r2_payloads),
+                                                        40 + 4 * len(r2_payloads), 4))
+        print("I13_P2B_FORGED_MATRIX 16/16_REJECT REVIEW_MATRIX=24/24_REJECT "
+              "PRODUCER_40/40_OMITTED SAFE_CONTROLS=4/4")
+
+        # Use the same protected plan factory as production, with the existing
+        # Reading target. No test-only path class is added to the authority.
+        authorized_count = 0
+        for root_kind in ("repository_root", "snapshot_root"):
+            for spelling in ("native", "slash"):
+                capture = contained_capture()
+                capture.stderr_raw = b""
+                report = self.passing_report()
+                report["observations"][0]["name"] = reading_scope.removeprefix("result:")
+                expected = {}
+                def authorized_document(document):
+                    authority = capture.failure_path_authority
+                    target = ci.R03_FAILURE_TARGETS[reading_scope]
+                    path = str(Path(getattr(authority, root_kind)) / target)
+                    if spelling == "slash":
+                        path = path.replace("\\", "/")
+                    document["observations"][0]["detail"] = {"nested": [path]}
+                    self.assertTrue(ci._raw_static_machine_report_evidence_is_safe(
+                        document, capture.argv[0], authority))
+                    canonical, binding = canonicalize(document["observations"][0], authority)
+                    self.assertEqual(binding["authorizedTargetPaths"], [target])
+                    self.assertEqual(binding["unmappedAbsolutePathDigests"], [])
+                    expected["result"] = canonical
+                source, _ = self.exercise(capture, report=report, failure_path_fixture=True,
+                                          mutate_document=authorized_document)
+                retained = capture.validated_static_machine_report
+                self.assertIsNotNone(retained)
+                self.assertEqual(retained["observations"], [expected["result"]])
+                with tempfile.TemporaryDirectory(prefix="static-r2-authorized-") as temp:
+                    _, record = persist(publication(source), Path(temp))
+                self.assertIsNotNone(ci._validated_static_machine_output_identity(record))
+                self.assertEqual(record["stdoutSha256"], hashlib.sha256(capture.stdout_raw).hexdigest())
+                self.assertEqual(record["stdoutBytesObserved"], len(capture.stdout_raw))
+                authorized_count += 1
+
+        # Preserve the closed release-prefix exception and reject secrets even
+        # when another part of the same string is an authority-matched path.
+        for scope in ci.RELEASE_ONLY_SKIP_FAILURE_TARGETS:
+            capture = contained_capture()
+            capture.stderr_raw = b""
+            report = self.passing_report()
+            report["observations"][0]["name"] = scope.removeprefix("result:")
+            def release_document(document):
+                target = ci.RELEASE_ONLY_SKIP_FAILURE_TARGETS[scope]
+                path = str(Path(capture.failure_path_authority.snapshot_root) / target)
+                document["observations"][0]["detail"] = {"skipped": True, "reason": "missing_checklist:" + path}
+                self.assertTrue(ci._raw_static_machine_report_evidence_is_safe(
+                    document, capture.argv[0], capture.failure_path_authority))
+            source, _ = self.exercise(capture, report=report, failure_path_fixture=True,
+                                      mutate_document=release_document)
+            self.assertIsNotNone(capture.validated_static_machine_report)
+            with tempfile.TemporaryDirectory(prefix="static-r2-release-") as temp:
+                _, record = persist(publication(source), Path(temp))
+            self.assertIsNotNone(ci._validated_static_machine_output_identity(record))
+            authorized_count += 1
+
+        for family in ("credential", "onion", "bridge"):
+            capture = contained_capture()
+            capture.stderr_raw = b""
+            report = self.passing_report()
+            report["observations"][0]["name"] = reading_scope.removeprefix("result:")
+            def secret_document(document):
+                authority = capture.failure_path_authority
+                path = str(Path(authority.snapshot_root) / ci.R03_FAILURE_TARGETS[reading_scope])
+                document["observations"][0]["detail"] = path + " " + payloads[family]
+                self.assertFalse(ci._raw_static_machine_report_evidence_is_safe(
+                    document, capture.argv[0], authority))
+            source, _ = self.exercise(capture, report=report, failure_path_fixture=True,
+                                      mutate_document=secret_document)
+            self.assertIsNone(capture.validated_static_machine_report)
+            self.assertEqual(self.gate(source, "STATIC-SUITE-RESULT")["detail"], privacy_error)
+            with tempfile.TemporaryDirectory(prefix="static-r2-secret-") as temp:
+                output, _ = persist(publication(source), Path(temp))
+                for path in output.iterdir():
+                    self.assertNotIn(payloads[family].encode(), path.read_bytes())
+
+        # A canonical-looking report cannot override explicit evidence that an
+        # original path was unmapped, even if that token is no longer retained.
+        with tempfile.TemporaryDirectory(prefix="static-r2-binding-") as temp:
+            root = Path(temp)
+            with mock.patch.object(ci, "_static_machine_record_evidence_is_safe", return_value=True):
+                forged = coherent_record("benign")
+                raw = forged["producerObservations"][0]
+                raw["failurePathAuthority"] = {
+                    "schemaVersion": 1,
+                    "canonicalizationKind": "SOURCE-SNAPSHOT-BOUND-FAILURE-PATHS-V1",
+                    "authorizedTargetPaths": [], "authorizedToolRoles": [],
+                    "unmappedAbsolutePathDigests": ["sha256:" + "b" * 64],
+                    "literalPlaceholderDigests": [],
+                }
+                raw["producerRecordDigest"] = ci._producer_record_digest({
+                    key: value for key, value in raw.items() if key != "producerRecordDigest"})
+                forged["producerObservationSetDigest"] = ci.producer_observation_set_digest([raw])
+                runner = publication(safe_runner, forged)
+                output, persisted = persist(runner, root)
+            before = {path.name: path.read_bytes() for path in output.iterdir()}
+            errors = ci.verify_evidence_file_set(output, repo_root=root,
+                                                expected_command_plan=runner.command_plan)
+            self.assertIn(privacy_error, errors)
+            self.assertIsNone(ci._validated_static_machine_output_identity(persisted))
+            self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, before)
+        self.assertEqual(authorized_count, 6)
+        print("I13_P2B_R2 REVIEWER_POSIX=4/4_REJECT PATH_MATRIX=60/60_REJECT "
+              "RAW_PRODUCER=60/60_OMITTED WINDOWS_PRECANONICAL=REJECT "
+              "AUTHORIZED_PATHS=6/6_PASS SECRET_WITH_AUTHORITY=3/3_REJECT UNMAPPED_BINDING=REJECT")
+
+        # Authority exceptions never propagate to observation values or keys,
+        # and normalization's volatile fields cannot hide unsafe retained text.
+        for label, mutate in (
+            ("same-tool-path-value", lambda r: r["observations"][0].update(detail=safe_record["resolvedExecutablePath"])),
+            ("same-tool-path-key", lambda r: r["observations"][0].update(detail={safe_record["resolvedExecutablePath"]: None})),
+            ("volatile-field", lambda r: r["observations"][0].update(detail={"timestamp": payloads["credential"]})),
+            ("name", lambda r: r["observations"][0].update(name=payloads["onion"])),
+            ("authority-key", lambda r: r["commandResults"][0].update({payloads["private-path"]: "benign"})),
+            ("unbound-tool-path", lambda r: r["commandResults"][0].update(resolvedExecutablePath=payloads["private-path"])),
+        ):
+            with self.subTest(static_privacy_authority_scope=label):
+                forged = copy.deepcopy(safe_record)
+                mutate(forged["validatedStaticMachineReport"])
+                self.assertFalse(ci._static_machine_report_evidence_is_safe(
+                    forged["validatedStaticMachineReport"], forged["resolvedExecutablePath"]))
+                self.assertIsNone(ci._validated_static_machine_output_identity(forged))
+
+    def assert_static_report_privacy_bounds(self, unsafe_texts) -> None:
+        safe = {"values": [None, True, False, 0, 42, -3, 1.25, "caf\u00e9", "cafe\u0301", "line\r\nnext\tfield",
+                           "developer/tests/ci", "https://example.invalid/api", "<repo>/developer/tests/ci",
+                           "<task-root>/output", "<abs-path>/output"]}
+        before = copy.deepcopy(safe)
+        self.assertTrue(ci._evidence_publication_json_is_safe(safe))
+        self.assertEqual(safe, before)
+        for label, text in unsafe_texts.items():
+            for value in (text, {"nested": [[text]]}, {"nested": [{text: None}]}):
+                with self.subTest(static_privacy_text=label):
+                    self.assertFalse(ci._evidence_publication_json_is_safe(value))
+                    self.assertFalse(ci._raw_static_machine_report_evidence_is_safe(value, None, None))
+        self.assertFalse(ci._evidence_publication_json_is_safe("prefix " + unsafe_texts["bridge"] + " suffix"))
+        for depth in (ci.MAX_EVIDENCE_JSON_DEPTH, ci.MAX_EVIDENCE_JSON_DEPTH + 1):
+            value = "safe"
+            for _ in range(depth):
+                value = [value]
+            self.assertEqual(ci._evidence_publication_json_is_safe(value), depth == ci.MAX_EVIDENCE_JSON_DEPTH)
+        recursive = []
+        recursive.append(recursive)
+        class IntSubclass(int):
+            pass
+        for label, value in (
+            ("cycle", recursive), ("object", object()), ("tuple", ("safe",)), ("bytes", b"safe"),
+            ("non-string-key", {0: "safe"}), ("integer-subclass", IntSubclass(1)),
+            ("nan", float("nan")), ("infinity", float("inf")), ("negative-infinity", float("-inf")),
+            ("surrogate-value", {"nested": "\ud800"}), ("surrogate-key", {"\udfff": "safe"}),
+            ("string-bound", "x" * (ci.MAX_EVIDENCE_STRING_BYTES + 1)),
+            ("key-bound", {"x" * (ci.MAX_EVIDENCE_STRING_BYTES + 1): None}),
+            ("utf8-byte-bound", "\u00e9" * ci.MAX_EVIDENCE_STRING_BYTES),
+            ("array-bound", [None] * (ci.MAX_EVIDENCE_COLLECTION_ITEMS + 1)),
+            ("object-bound", {str(i): None for i in range(ci.MAX_EVIDENCE_COLLECTION_ITEMS + 1)}),
+            ("total-member-bound", [[None] * (ci.MAX_EVIDENCE_COLLECTION_ITEMS // 2)] * 3),
+            ("total-text-bound", ["x" * ci.MAX_EVIDENCE_STRING_BYTES]
+             * (ci.MAX_STATIC_MACHINE_STDOUT_BYTES // ci.MAX_EVIDENCE_STRING_BYTES + 1)),
+        ):
+            with self.subTest(static_privacy_bound=label):
+                self.assertFalse(ci._evidence_publication_json_is_safe(value))
+                self.assertFalse(ci._raw_static_machine_report_evidence_is_safe(value, None, None))
 
     def assert_bounded_static_replay_diagnostics(self, equivalent_records: list[dict]) -> None:
         unsafe = "PRIVATE-CANARY:C:\\private\\secret.txt?credential=token"
@@ -7133,13 +7531,13 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
 
         report = self.passing_report()
         report["observations"].extend([
-            {"name": unsafe, "status": "pass", "detail": {"flag": True, unsafe: unsafe}},
+            {"name": "diagnostic-fixture", "status": "pass", "detail": {"flag": True, "note": "safe"}},
             {"name": "later-private-observation", "status": "pass", "detail": None},
         ])
         original = from_report(report)
         changed_report = copy.deepcopy(report)
         changed_report["observations"][1]["detail"]["flag"] = 1
-        changed_report["observations"][2]["detail"] = {unsafe: unsafe}
+        changed_report["observations"][2]["detail"] = {"later": "safe-change"}
         changed = from_report(changed_report)
         diagnostic = diagnose(original, changed)
         nested = diagnostic["staticMachineReport"]

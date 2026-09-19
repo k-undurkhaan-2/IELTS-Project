@@ -1865,6 +1865,184 @@ def _direct_node_evidence_text_is_safe(value: str) -> bool:
     ) is None
 
 
+_STATIC_MACHINE_REPORT_PRIVACY_ERROR = "static machine report failed evidence privacy admission"
+
+
+def _evidence_publication_json_is_safe(
+    value: Any,
+    *,
+    authorized_path_values: Mapping[tuple[str | int, ...], str] | None = None,
+    failure_path_authorities: Mapping[tuple[str | int, ...], "FailurePathAuthority"] | None = None,
+    failure_path_prefixes: Mapping[tuple[str | int, ...], str] | None = None,
+    defer_path_admission: bool = False,
+) -> bool:
+    """Inspect bounded concrete JSON, including keys, without changing evidence.
+
+    Parent executable exceptions are location-bound. Raw admission may also
+    inspect scoped FailurePathAuthority references through the existing mask.
+    Neither exception bypasses other text checks. The raw preflight defers path
+    admission only until bounds/types are proven and scoped authority selected.
+    """
+    remaining = MAX_EVIDENCE_COLLECTION_ITEMS
+    remaining_text_bytes = MAX_STATIC_MACHINE_STDOUT_BYTES
+
+    def safe_text(
+        text: str, *, authorized_path: bool = False,
+        path_authority: "FailurePathAuthority | None" = None, path_prefix: str = "",
+    ) -> bool:
+        nonlocal remaining_text_bytes
+        if len(text) > MAX_EVIDENCE_STRING_BYTES:
+            return False
+        try:
+            size = len(text.encode("utf-8", errors="strict"))
+            remaining_text_bytes -= size
+            if size > MAX_EVIDENCE_STRING_BYTES or remaining_text_bytes < 0:
+                return False
+        except UnicodeError:
+            return False
+        if any(0x80 <= ord(character) <= 0x9F for character in text):
+            return False
+        line_view = text.replace("\r\n", "\n")
+        privacy_view = line_view.replace("\\", "/")
+        # Check original content before masking any authorized path identity.
+        # Authority never exempts secret material, controls, or an unmapped token.
+        if (
+            strip_terminal_controls(line_view) != line_view
+            or contains_high_confidence_secret(privacy_view)
+            or any(pattern.search(privacy_view) for pattern in REDACTION_PATTERNS)
+            or re.search(r"(?i)<unmapped-abs-sha256:", text)
+            or re.search(
+                r"(?i)\bobfs4\s+\S+:\d+\s+[A-F0-9]{40}\s+cert=\S+\s+iat-mode=\d+\b",
+                privacy_view,
+            )
+        ):
+            return False
+        if authorized_path or defer_path_admission:
+            return True
+        inspection_view = text
+        if path_authority is not None:
+            # This temporary view proves exact existing authority only. It is
+            # never substituted for the report or retained as exact evidence.
+            if path_prefix and inspection_view.startswith(path_prefix):
+                inspection_view = inspection_view[len(path_prefix):]
+            inspection_view, _ = _mask_authorized_failure_paths(
+                inspection_view, path_authority,
+                authorized_targets=set(), authorized_tools=set(),
+            )
+        privacy_view = inspection_view.replace("\\", "/")
+        if re.search(r"(?i)\bfile:/", privacy_view):
+            return False
+        # A POSIX root remains absolute when the next component begins with
+        # whitespace (or the slash is alone). Relative paths and URLs retain
+        # their existing boundaries; ambiguous standalone slashes fail closed.
+        for match in re.finditer(r"(?<![\w./\\-])/(?!/)", privacy_view):
+            if not privacy_view.endswith(("<repo>", "<task-root>", "<abs-path>"), 0, match.start()):
+                return False
+        return _direct_node_evidence_text_is_safe(inspection_view)
+
+    def inspect(
+        item: Any, path: tuple[str | int, ...], depth: int,
+        path_authority: "FailurePathAuthority | None" = None,
+    ) -> bool:
+        nonlocal remaining
+        if depth > MAX_EVIDENCE_JSON_DEPTH or remaining <= 0:
+            return False
+        remaining -= 1
+        if failure_path_authorities is not None:
+            path_authority = failure_path_authorities.get(path, path_authority)
+        if type(item) is str:
+            return safe_text(item, authorized_path=(
+                authorized_path_values is not None
+                and path in authorized_path_values
+                and item == authorized_path_values[path]
+            ), path_authority=path_authority, path_prefix=(
+                failure_path_prefixes.get(path, "") if failure_path_prefixes else ""
+            ))
+        if item is None or type(item) in (bool, int):
+            return True
+        if type(item) is float:
+            return math.isfinite(item)
+        if type(item) is dict:
+            # Keys are not canonicalized by the failure-path contract, so they
+            # receive no path exception. Charge keys and values to one budget.
+            if len(item) > remaining // 2:
+                return False
+            for key, child in item.items():
+                remaining -= 1
+                if type(key) is not str or not safe_text(key):
+                    return False
+                if not inspect(child, (*path, key), depth + 1, path_authority):
+                    return False
+            return True
+        if type(item) is list:
+            return len(item) <= remaining and all(
+                inspect(child, (*path, index), depth + 1, path_authority)
+                for index, child in enumerate(item)
+            )
+        return False
+
+    return inspect(value, (), 0)
+
+
+def _static_machine_report_evidence_is_safe(report: Any, executable_path: Any) -> bool:
+    # The static registry has exactly one nested command. Its two absolute
+    # executable fields must still match the independently checked parent plan.
+    paths = ({
+        ("commandResults", 0, "argv", 0): executable_path,
+        ("commandResults", 0, "resolvedExecutablePath"): executable_path,
+    } if type(executable_path) is str else {})
+    return _evidence_publication_json_is_safe(report, authorized_path_values=paths)
+
+
+def _raw_static_machine_report_evidence_is_safe(
+    report: Any, executable_path: Any, authority: Any,
+) -> bool:
+    # Bound the original structure before scope selection can inspect nested
+    # release details. This pass alone never authorizes a path or retention.
+    if not _evidence_publication_json_is_safe(report, defer_path_admission=True):
+        return False
+    paths = ({
+        ("commandResults", 0, "argv", 0): executable_path,
+        ("commandResults", 0, "resolvedExecutablePath"): executable_path,
+    } if type(executable_path) is str else {})
+    authorities = {}
+    prefixes = {}
+    if isinstance(authority, FailurePathAuthority) and type(report) is dict:
+        results = report.get("observations")
+        if type(results) is list and len(results) <= MAX_EVIDENCE_COLLECTION_ITEMS:
+            for index, result in enumerate(results):
+                if type(result) is not dict:
+                    continue
+                scope = "result:" + result.get("name", "") if type(result.get("name")) is str else ""
+                selected = (authority if scope in R11_KNOWN_DEBT_FAILURE_TARGETS
+                            and scope not in R03_FAILURE_TARGETS else
+                            _static_result_failure_path_authority(result, authority))
+                if selected is not None:
+                    authorities[("observations", index)] = selected
+                    if scope in RELEASE_ONLY_SKIP_FAILURE_TARGETS:
+                        prefixes[("observations", index, "detail", "reason")] = "missing_checklist:"
+    return _evidence_publication_json_is_safe(
+        report, authorized_path_values=paths,
+        failure_path_authorities=authorities, failure_path_prefixes=prefixes,
+    )
+
+
+def _static_machine_record_evidence_is_safe(record: Mapping[str, Any]) -> bool:
+    if not _static_machine_report_evidence_is_safe(
+        record.get("validatedStaticMachineReport"), record.get("resolvedExecutablePath"),
+    ):
+        return False
+    observations = record.get("producerObservations")
+    if type(observations) is list:
+        if len(observations) > MAX_EVIDENCE_COLLECTION_ITEMS:
+            return False
+        for raw in observations:
+            binding = raw.get("failurePathAuthority") if type(raw) is dict else None
+            if type(binding) is dict and binding.get("unmappedAbsolutePathDigests"):
+                return False
+    return True
+
+
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -9949,6 +10127,7 @@ def _validated_static_machine_output_identity(
     report = record.get("validatedStaticMachineReport")
     if (
         not isinstance(report, Mapping)
+        or not _static_machine_record_evidence_is_safe(record)
         or record.get("commandId") != "static-suite"
         or record.get("commandClass") != "static-suite"
         or record.get("resultSemantics") != "machine-v2-complete-execution"
@@ -17375,11 +17554,10 @@ def canonicalize_failure_identity_value(
     }
 
 
-def _canonicalize_static_result_failure_paths(
-    result: Mapping[str, Any],
-    authority: FailurePathAuthority,
-) -> tuple[Any, dict[str, Any] | None]:
-    """Bind only approved static failure paths, including exact missing release input."""
+def _static_result_failure_path_authority(
+    result: Mapping[str, Any], authority: FailurePathAuthority,
+) -> FailurePathAuthority | None:
+    """Select the unchanged closed R03/release path contract for both stages."""
 
     scope = f"result:{result.get('name', '')}"
     selected_authority = authority
@@ -17390,7 +17568,7 @@ def _canonicalize_static_result_failure_paths(
             or not nested_skip(detail)
             or not isinstance(detail, Mapping)
         ):
-            return copy.deepcopy(result), None
+            return None
         logical_target = RELEASE_ONLY_SKIP_FAILURE_TARGETS[scope]
         if logical_target not in {logical for logical, _canonical in authority.targets}:
             canonical_target = str(
@@ -17408,6 +17586,23 @@ def _canonicalize_static_result_failure_paths(
                 ),
                 trusted_executables=authority.trusted_executables,
             )
+    elif scope not in R03_FAILURE_TARGETS:
+        return None
+    return selected_authority
+
+
+def _canonicalize_static_result_failure_paths(
+    result: Mapping[str, Any],
+    authority: FailurePathAuthority,
+) -> tuple[Any, dict[str, Any] | None]:
+    """Bind only approved static failure paths, including exact missing release input."""
+
+    scope = f"result:{result.get('name', '')}"
+    selected_authority = _static_result_failure_path_authority(result, authority)
+    if selected_authority is None:
+        return copy.deepcopy(result), None
+    if scope in RELEASE_ONLY_SKIP_FAILURE_TARGETS:
+        detail = result["detail"]
         reason = detail.get("reason")
         if not isinstance(reason, str):
             return canonicalize_failure_identity_value(result, selected_authority)
@@ -17450,8 +17645,6 @@ def _canonicalize_static_result_failure_paths(
                 | set(reason_binding["literalPlaceholderDigests"])
             ),
         }
-    elif scope not in R03_FAILURE_TARGETS:
-        return copy.deepcopy(result), None
     return canonicalize_failure_identity_value(result, selected_authority)
 
 
@@ -19326,7 +19519,7 @@ class FoundationRunner:
         if not capture.output_limited:
             try:
                 report, parse_errors = parse_static_machine_report(
-                    capture.failure_identity_stdout_bytes(),
+                    capture.authoritative_stdout_bytes(),
                     expected_invocation_id=invocation_id,
                 )
                 report_errors.extend(parse_errors)
@@ -19349,6 +19542,11 @@ class FoundationRunner:
         invocation_exact = capture.argv == argv
         if not invocation_exact:
             report_errors.append("static machine invocation argv identity is not exact")
+        if report is not None and not report_errors and not _raw_static_machine_report_evidence_is_safe(
+            report, argv[0], capture.failure_path_authority,
+        ):
+            capture.validated_static_machine_report = None
+            report_errors.append(_STATIC_MACHINE_REPORT_PRIVACY_ERROR)
         canonical_report: dict[str, Any] | None = None
         canonical_observation_bindings: list[Mapping[str, Any] | None] = []
         if report is not None and not report_errors and capture.execution_passed():
@@ -19379,8 +19577,12 @@ class FoundationRunner:
                 canonical_results.append(canonical_result)
                 canonical_observation_bindings.append(binding)
             canonical_report["observations"] = canonical_results
-            _canonicalize_static_machine_capture(capture, canonical_report)
-            capture.validated_static_machine_report = copy.deepcopy(canonical_report)
+            if _static_machine_report_evidence_is_safe(canonical_report, argv[0]):
+                _canonicalize_static_machine_capture(capture, canonical_report)
+                capture.validated_static_machine_report = copy.deepcopy(canonical_report)
+            else:
+                capture.validated_static_machine_report = None
+                report_errors.append(_STATIC_MACHINE_REPORT_PRIVACY_ERROR)
         static_command_record = self.add_command(capture)
         static_command_record["executionInputs"] = copy.deepcopy(
             protected_bundle["executionInputs"]
@@ -19406,6 +19608,8 @@ class FoundationRunner:
             elif capture.error:
                 detail_parts.append(f"runner error: {sanitize_text(capture.error)}")
             detail_parts.extend(report_errors)
+            if _STATIC_MACHINE_REPORT_PRIVACY_ERROR in report_errors:
+                detail_parts = [_STATIC_MACHINE_REPORT_PRIVACY_ERROR]
             self.add_hard_gate("STATIC-SUITE-RESULT", False, "; ".join(detail_parts))
         else:
             assert canonical_report is not None
@@ -22136,7 +22340,9 @@ def _validate_command_record(
         errors.append(f"{label}: producerObservationSetDigest is invalid")
     if "validatedStaticMachineReport" in record:
         static_identity = _validated_static_machine_output_identity(record)
-        if static_identity is None:
+        if not _static_machine_record_evidence_is_safe(record):
+            errors.append(_STATIC_MACHINE_REPORT_PRIVACY_ERROR)
+        elif static_identity is None:
             errors.append(f"{label}: validated static machine report does not bind local execution authority")
         elif isinstance(producer, list) and [
             raw.get("rawStructuredFields") if isinstance(raw, Mapping) else None
