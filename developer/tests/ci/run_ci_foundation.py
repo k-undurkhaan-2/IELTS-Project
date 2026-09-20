@@ -1866,6 +1866,124 @@ def _direct_node_evidence_text_is_safe(value: str) -> bool:
 
 
 _STATIC_MACHINE_REPORT_PRIVACY_ERROR = "static machine report failed evidence privacy admission"
+_STATIC_AUTHORIZED_PATH_MARKER = "__CI_STATIC_AUTHORIZED_PATH__"
+
+
+def _static_evidence_path_text_is_safe(value: str) -> bool:
+    """Classify bounded reference starts, not punctuation inside relative paths."""
+    if len(value) > MAX_EVIDENCE_STRING_BYTES:
+        return False
+    text = value.replace("\\", "/")
+    reference_start = True
+    relative_separator = False
+    relative_context = False
+    punctuation_groups: list[tuple[str, bool]] = []
+    closed_authorized_path = False
+    token_start = 0
+    index = 0
+    while index < len(text):
+        if text.startswith(_STATIC_AUTHORIZED_PATH_MARKER, index):
+            # An exact authorized reference cannot supply a relative prefix to
+            # adjoining, untrusted path components after the authority mask.
+            reference_start = False
+            relative_separator = relative_context = False
+            punctuation_groups.clear()
+            closed_authorized_path = True
+            index += len(_STATIC_AUTHORIZED_PATH_MARKER)
+            continue
+        token = next((item for item in ("<repo>", "<task-root>", "<abs-path>")
+                      if text.startswith(item, index)), None)
+        if token is not None:
+            reference_start = False
+            index += len(token)
+            continue
+        character = text[index]
+        category = unicodedata.category(character) if ord(character) > 127 else ""
+        if character.isspace() or character in "\"'`<>|=,;":
+            reference_start = True
+            relative_separator = False
+            closed_authorized_path = False
+            token_start = index + 1
+            # Ordinary spaces may occur inside content-path components. This
+            # context can prove a later matched group is internal, but cannot
+            # authorize a slash at a new reference start.
+            if character != " ":
+                relative_context = False
+                punctuation_groups.clear()
+        elif category in {"Ps", "Pi"}:
+            # Every opener exposes an immediate slash as a potential root.
+            # Adjacent close/open markup starts a separate reference, just as
+            # an ASCII Markdown destination does below.
+            previous = text[index - 1:index]
+            if previous and (previous in ")]}" or unicodedata.category(previous) in {"Pe", "Pf"}):
+                relative_context = False
+                punctuation_groups.clear()
+            punctuation_groups.append(("Pe" if category == "Ps" else "Pf", relative_context))
+            reference_start = True
+            relative_separator = False
+            closed_authorized_path = False
+            token_start = index + 1
+        elif category in {"Pe", "Pf"}:
+            continuation = False
+            if punctuation_groups:
+                expected, continuation = punctuation_groups.pop()
+                continuation = continuation and expected == category
+            # Separators first seen inside a quoted/bracketed reference do
+            # not establish a relative prefix outside that reference. Only
+            # context proven before its opener can cross the closing mark.
+            relative_separator = continuation
+            relative_context = relative_separator
+            reference_start = not relative_separator
+            if reference_start:
+                token_start = index + 1
+        elif category in {"Po", "Pd"}:
+            # Unicode textual separators end prose even when it contains an
+            # earlier path. Subsequent component text can establish a relative
+            # token again; punctuation alone never proves the next slash safe.
+            reference_start = True
+            relative_separator = relative_context = False
+            punctuation_groups.clear()
+            closed_authorized_path = False
+            token_start = index + 1
+        elif character in "([{":
+            # A Markdown destination/reference starts after its label; the
+            # label's relative slashes do not authorize the new reference.
+            if not relative_separator or (character in "([" and text[index - 1:index] == "]"):
+                reference_start = True
+                relative_separator = relative_context = False
+                punctuation_groups.clear()
+                closed_authorized_path = False
+                token_start = index + 1
+        elif character == ":":
+            # URI schemes keep their separators inside the same reference;
+            # a label such as origin:/private starts a new path reference.
+            scheme = text[token_start:index]
+            reference_start = not (text.startswith("//", index + 1)
+                and re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*", scheme))
+            if reference_start:
+                relative_separator = relative_context = False
+                punctuation_groups.clear()
+                token_start = index + 1
+        elif character == "/":
+            if reference_start or closed_authorized_path:
+                return False
+            relative_separator = relative_context = True
+        elif character not in ")]}":
+            # A mark attached to a delimiter cannot establish a component
+            # before the first slash. Preserve the existing state without
+            # introducing a Unicode normalization pass.
+            if category not in {"Mn", "Mc", "Me"}:
+                reference_start = False
+        index += 1
+    # Unconditional privacy checks ran on the original text before masking.
+    # Reuse the Windows/UNC/device/file-URI grammar, but do not rerun the older
+    # POSIX normalizer: its mid-token regex would undo the relative-path
+    # classification above. Malformed URI parsers fail closed, not outward.
+    try:
+        return (redact_windows_absolute_references(value) == value
+                and redact_windows_absolute_references(text) == text)
+    except ValueError:
+        return False
 
 
 def _evidence_publication_json_is_safe(
@@ -1874,6 +1992,7 @@ def _evidence_publication_json_is_safe(
     authorized_path_values: Mapping[tuple[str | int, ...], str] | None = None,
     failure_path_authorities: Mapping[tuple[str | int, ...], "FailurePathAuthority"] | None = None,
     failure_path_prefixes: Mapping[tuple[str | int, ...], str] | None = None,
+    scoped_executable_paths: Mapping[tuple[str | int, ...], str] | None = None,
     defer_path_admission: bool = False,
 ) -> bool:
     """Inspect bounded concrete JSON, including keys, without changing evidence.
@@ -1889,6 +2008,7 @@ def _evidence_publication_json_is_safe(
     def safe_text(
         text: str, *, authorized_path: bool = False,
         path_authority: "FailurePathAuthority | None" = None, path_prefix: str = "",
+        executable_path: str | None = None,
     ) -> bool:
         nonlocal remaining_text_bytes
         if len(text) > MAX_EVIDENCE_STRING_BYTES:
@@ -1925,24 +2045,31 @@ def _evidence_publication_json_is_safe(
             # never substituted for the report or retained as exact evidence.
             if path_prefix and inspection_view.startswith(path_prefix):
                 inspection_view = inspection_view[len(path_prefix):]
-            inspection_view, _ = _mask_authorized_failure_paths(
+            inspection_view, restorations = _mask_authorized_failure_paths(
                 inspection_view, path_authority,
                 authorized_targets=set(), authorized_tools=set(),
             )
-        privacy_view = inspection_view.replace("\\", "/")
-        if re.search(r"(?i)\bfile:/", privacy_view):
-            return False
-        # A POSIX root remains absolute when the next component begins with
-        # whitespace (or the slash is alone). Relative paths and URLs retain
-        # their existing boundaries; ambiguous standalone slashes fail closed.
-        for match in re.finditer(r"(?<![\w./\\-])/(?!/)", privacy_view):
-            if not privacy_view.endswith(("<repo>", "<task-root>", "<abs-path>"), 0, match.start()):
-                return False
-        return _direct_node_evidence_text_is_safe(inspection_view)
+            for marker, _ in restorations:
+                inspection_view = inspection_view.replace(marker, _STATIC_AUTHORIZED_PATH_MARKER)
+        if executable_path:
+            # Canonical failure details preserve the trusted executable. Use
+            # precisely the same bounded tool patterns as FailurePathAuthority,
+            # only in its existing scopes, and never grant a directory prefix.
+            basename = executable_path.replace("\\", "/").rsplit("/", 1)[-1]
+            parent = executable_path[:-len(basename)].rstrip("/\\") if basename else ""
+            if parent and basename in inspection_view:
+                try:
+                    patterns = _failure_path_patterns(parent, parent, basename)
+                except ValueError:
+                    return False
+                for pattern in patterns:
+                    inspection_view = re.sub(pattern.pattern, _STATIC_AUTHORIZED_PATH_MARKER, inspection_view)
+        return _static_evidence_path_text_is_safe(inspection_view)
 
     def inspect(
         item: Any, path: tuple[str | int, ...], depth: int,
         path_authority: "FailurePathAuthority | None" = None,
+        executable_path: str | None = None,
     ) -> bool:
         nonlocal remaining
         if depth > MAX_EVIDENCE_JSON_DEPTH or remaining <= 0:
@@ -1950,6 +2077,8 @@ def _evidence_publication_json_is_safe(
         remaining -= 1
         if failure_path_authorities is not None:
             path_authority = failure_path_authorities.get(path, path_authority)
+        if scoped_executable_paths is not None:
+            executable_path = scoped_executable_paths.get(path, executable_path)
         if type(item) is str:
             return safe_text(item, authorized_path=(
                 authorized_path_values is not None
@@ -1957,7 +2086,7 @@ def _evidence_publication_json_is_safe(
                 and item == authorized_path_values[path]
             ), path_authority=path_authority, path_prefix=(
                 failure_path_prefixes.get(path, "") if failure_path_prefixes else ""
-            ))
+            ), executable_path=executable_path)
         if item is None or type(item) in (bool, int):
             return True
         if type(item) is float:
@@ -1971,12 +2100,12 @@ def _evidence_publication_json_is_safe(
                 remaining -= 1
                 if type(key) is not str or not safe_text(key):
                     return False
-                if not inspect(child, (*path, key), depth + 1, path_authority):
+                if not inspect(child, (*path, key), depth + 1, path_authority, executable_path):
                     return False
             return True
         if type(item) is list:
             return len(item) <= remaining and all(
-                inspect(child, (*path, index), depth + 1, path_authority)
+                inspect(child, (*path, index), depth + 1, path_authority, executable_path)
                 for index, child in enumerate(item)
             )
         return False
@@ -1991,7 +2120,21 @@ def _static_machine_report_evidence_is_safe(report: Any, executable_path: Any) -
         ("commandResults", 0, "argv", 0): executable_path,
         ("commandResults", 0, "resolvedExecutablePath"): executable_path,
     } if type(executable_path) is str else {})
-    return _evidence_publication_json_is_safe(report, authorized_path_values=paths)
+    # Prove structure and unconditional privacy before inspecting scope details.
+    if not _evidence_publication_json_is_safe(report, defer_path_admission=True):
+        return False
+    executables = {}
+    if type(executable_path) is str and type(report) is dict:
+        for index, result in enumerate(report.get("observations", [])
+                if type(report.get("observations")) is list else []):
+            if type(result) is not dict or type(result.get("name")) is not str:
+                continue
+            scope = "result:" + result["name"]
+            if ((scope in R11_KNOWN_DEBT_FAILURE_TARGETS and scope not in R03_FAILURE_TARGETS)
+                    or _static_result_has_failure_path_authority(result)):
+                executables[("observations", index)] = executable_path
+    return _evidence_publication_json_is_safe(report, authorized_path_values=paths,
+                                             scoped_executable_paths=executables)
 
 
 def _raw_static_machine_report_evidence_is_safe(
@@ -17554,6 +17697,16 @@ def canonicalize_failure_identity_value(
     }
 
 
+def _static_result_has_failure_path_authority(result: Mapping[str, Any]) -> bool:
+    """Share the existing closed R03/release scope guard across admission stages."""
+    scope = f"result:{result.get('name', '')}"
+    if scope in RELEASE_ONLY_SKIP_FAILURE_TARGETS:
+        detail = result.get("detail")
+        return (result.get("status") == "pass" and nested_skip(detail)
+                and isinstance(detail, Mapping))
+    return scope in R03_FAILURE_TARGETS
+
+
 def _static_result_failure_path_authority(
     result: Mapping[str, Any], authority: FailurePathAuthority,
 ) -> FailurePathAuthority | None:
@@ -17561,14 +17714,9 @@ def _static_result_failure_path_authority(
 
     scope = f"result:{result.get('name', '')}"
     selected_authority = authority
+    if not _static_result_has_failure_path_authority(result):
+        return None
     if scope in RELEASE_ONLY_SKIP_FAILURE_TARGETS:
-        detail = result.get("detail")
-        if (
-            result.get("status") != "pass"
-            or not nested_skip(detail)
-            or not isinstance(detail, Mapping)
-        ):
-            return None
         logical_target = RELEASE_ONLY_SKIP_FAILURE_TARGETS[scope]
         if logical_target not in {logical for logical, _canonical in authority.targets}:
             canonical_target = str(
@@ -17586,8 +17734,6 @@ def _static_result_failure_path_authority(
                 ),
                 trusted_executables=authority.trusted_executables,
             )
-    elif scope not in R03_FAILURE_TARGETS:
-        return None
     return selected_authority
 
 

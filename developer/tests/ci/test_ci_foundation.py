@@ -7113,6 +7113,8 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
     def assert_static_report_privacy_gate(self, safe_runner, safe_capture) -> None:
         import test_backend_canonical_portable_result as backend
 
+        self.assert_h2_static_report_paths()
+        self.assert_h3_static_report_paths()
         privacy_error = "static machine report failed evidence privacy admission"
         stream_fields = ("stdoutSha256", "stderrSha256", "stdoutBytesObserved", "stderrBytesObserved")
         authority_fields = (*stream_fields, "targets", "protectedTargetBundle", "executionInputs",
@@ -7151,6 +7153,14 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
             "r2-nt-device": r"\Device\HarddiskVolume1\private-reviewer\key",
             "r2-unmapped-token": "<unmapped-abs-sha256:" + "a" * 64 + ">",
         }
+        h2_payloads = {
+            "h2-file-posix-tmp": "file:///tmp/private/key",
+            "h2-file-posix-home": "file:///home/user/private.key",
+            "h2-file-drive": "file:///C:/private-reviewer/key",
+            "h2-file-localhost": "file://localhost/C:/private-reviewer/key",
+            "h2-file-unc": "file://private-reviewer/share/key",
+            "h2-file-unc-slashes": "file:////private-reviewer/share/key",
+        }
         reading_scope = next(scope for scope, target in ci.R03_FAILURE_TARGETS.items()
                              if target.endswith("/reading_question_audit.py"))
         canonicalize = ci._canonicalize_static_result_failure_paths
@@ -7161,7 +7171,7 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
             "key": lambda text: {"nested": [{text: "benign"}]},
         }
 
-        self.assert_static_report_privacy_bounds({**unsafe, **payloads, **review_payloads, **r2_payloads,
+        self.assert_static_report_privacy_bounds({**unsafe, **payloads, **review_payloads, **r2_payloads, **h2_payloads,
             "other-posix-root": "/vault-private/canary",
             "file-uri-posix": "file:///root/.ssh/private-canary",
             "labeled-posix": "origin:/root/.ssh/private-canary",
@@ -7215,10 +7225,19 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
         self.assertFalse(ci._evidence_publication_json_is_safe(safe_report))
         self.assertTrue(ci._static_machine_report_evidence_is_safe(safe_report, safe_record["resolvedExecutablePath"]))
 
-        def coherent_record(detail):
+        h2_boundaries = {
+            "h2-markdown-root": "[docs/path](/private-reviewer/key)",
+            "h2-markdown-whitespace": "[docs/path](/ private-reviewer/key)",
+            "h2-executable-dollar": safe_record["resolvedExecutablePath"] + "$/private-key",
+            "h2-executable-bracket": safe_record["resolvedExecutablePath"] + ")/private-key",
+        }
+
+        def coherent_record(detail, *, failure_scope=False):
             forged = copy.deepcopy(safe_record)
             report = forged["validatedStaticMachineReport"]
             report["observations"][0]["detail"] = copy.deepcopy(detail)
+            if failure_scope:
+                report["observations"][0]["name"] = reading_scope.removeprefix("result:")
             data = ci._json_bytes(report)
             forged["stdoutSha256"], forged["stdoutBytesObserved"] = hashlib.sha256(data).hexdigest(), len(data)
             self.assertEqual(ci.parse_static_machine_report(data, expected_invocation_id=report["invocationId"]),
@@ -7239,13 +7258,13 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
                     _, persisted = persist(publication(safe_runner, control), Path(temp))
                 self.assertIsNotNone(ci._validated_static_machine_output_identity(persisted))
                 controls += 1
-            for family, payload in {**payloads, **review_payloads, **r2_payloads}.items():
+            for family, payload in {**payloads, **review_payloads, **r2_payloads, **h2_payloads, **h2_boundaries}.items():
                 with self.subTest(static_privacy_producer=family, placement=placement):
                     report = self.passing_report()
                     report["observations"][0]["detail"] = locate(payload)
                     capture = contained_capture()
                     capture.stderr_raw = b""
-                    is_r2 = family in r2_payloads
+                    is_r2 = family in r2_payloads or family in h2_payloads or family in h2_boundaries
                     if is_r2:
                         report["observations"][0]["name"] = reading_scope.removeprefix("result:")
                     def before_canonicalization(document):
@@ -7304,7 +7323,7 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
                         # coherent attacker evidence. The real writer synchronizes
                         # observations, semantic digests, aggregates and manifests.
                         with mock.patch.object(ci, "_static_machine_report_evidence_is_safe", return_value=True):
-                            forged = coherent_record(locate(payload))
+                            forged = coherent_record(locate(payload), failure_scope=family in h2_boundaries)
                             runner = publication(safe_runner, forged)
                             output, persisted = persist(runner, root)
                         before = {path.name: path.read_bytes() for path in output.iterdir()}
@@ -7325,10 +7344,87 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
                         self.assertEqual({key: persisted[key] for key in authority_fields}, authority)
                         self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, before)
                         rejected += 1
-        self.assertEqual((rejected, omitted, controls), (40 + 4 * len(r2_payloads),
-                                                        40 + 4 * len(r2_payloads), 4))
+        expected_rejections = 40 + 4 * (len(r2_payloads) + len(h2_payloads) + len(h2_boundaries))
+        self.assertEqual((rejected, omitted, controls), (expected_rejections, expected_rejections, 4))
         print("I13_P2B_FORGED_MATRIX 16/16_REJECT REVIEW_MATRIX=24/24_REJECT "
               "PRODUCER_40/40_OMITTED SAFE_CONTROLS=4/4")
+
+        # Malformed URI text is rejected before any canonicalizer can parse
+        # it. It cannot serve as a coherent forged-record construction fixture.
+        for placement, locate in placements.items():
+            with self.subTest(h2_malformed_uri=placement):
+                payload = "file://[private-reviewer/key"
+                capture = contained_capture()
+                report = self.passing_report()
+                report["observations"][0]["name"] = reading_scope.removeprefix("result:")
+                report["observations"][0]["detail"] = locate(payload)
+                with mock.patch.object(ci, "_canonicalize_static_result_failure_paths", wraps=canonicalize) as canonicalizer:
+                    source, _ = self.exercise(capture, report=report, failure_path_fixture=True)
+                    canonicalizer.assert_not_called()
+                self.assertIsNone(capture.validated_static_machine_report)
+                self.assertEqual(self.gate(source, "STATIC-SUITE-RESULT")["detail"], privacy_error)
+                with tempfile.TemporaryDirectory(prefix="static-h2-malformed-") as temp:
+                    output, persisted = persist(publication(source), Path(temp))
+                    self.assertNotIn("validatedStaticMachineReport", persisted)
+                    for path in output.iterdir():
+                        self.assertNotIn(payload.encode(), path.read_bytes())
+
+        h2_safe = (
+            "P1/次高频/14. Example (VIP)/audio.mp3",
+            "P1/次高频/14. Example (VIP)/14. Example.html",
+            "js/bundles/core-foundation.bundle.js", "developer/tests/js/example.test.js",
+            "file://", "在 file:// 环境下运行",
+            "relative/(VIP)/tmp/file.txt", "relative/(VIP)/home/file.txt",
+        )
+        h2_controls = 0
+        for payload in h2_safe:
+            for placement, locate in placements.items():
+                with self.subTest(h2_safe_report=payload, placement=placement):
+                    capture = contained_capture()
+                    report = self.passing_report()
+                    report["observations"][0]["detail"] = locate(payload)
+                    source, _ = self.exercise(capture, report=report)
+                    self.assertIsNotNone(capture.validated_static_machine_report)
+                    self.assertEqual(capture.validated_static_machine_report["observations"][0]["detail"],
+                                     locate(payload))
+                    with tempfile.TemporaryDirectory(prefix="static-h2-safe-") as temp:
+                        _, persisted = persist(publication(source), Path(temp))
+                    self.assertIsNotNone(ci._validated_static_machine_output_identity(persisted))
+                    self.assertEqual(persisted["stdoutSha256"], hashlib.sha256(capture.stdout_raw).hexdigest())
+                    self.assertEqual(persisted["stdoutBytesObserved"], len(capture.stdout_raw))
+                    h2_controls += 1
+        # The canonicalizer intentionally preserves a trusted executable. Its
+        # inspection exception must use the same scope and exact tool identity.
+        for spelling in ("native", "slash", "repr"):
+            capture = contained_capture()
+            report = self.passing_report()
+            report["observations"][0]["name"] = reading_scope.removeprefix("result:")
+            expected = {}
+            def trusted_executable_document(document):
+                executable = capture.argv[0]
+                text = (executable.replace("\\", "/") if spelling == "slash" else
+                        repr(executable) if spelling == "repr" else executable)
+                document["observations"][0]["detail"] = "Command [" + text + "] failed"
+                original = copy.deepcopy(document)
+                self.assertTrue(ci._raw_static_machine_report_evidence_is_safe(
+                    document, executable, capture.failure_path_authority))
+                canonical, binding = canonicalize(document["observations"][0], capture.failure_path_authority)
+                self.assertEqual(canonical, document["observations"][0])
+                self.assertEqual(binding["authorizedToolRoles"], ["python-static-producer"])
+                self.assertEqual(binding["unmappedAbsolutePathDigests"], [])
+                self.assertEqual(document, original)
+                expected["result"] = canonical
+            source, _ = self.exercise(capture, report=report, failure_path_fixture=True,
+                                      mutate_document=trusted_executable_document)
+            self.assertEqual(capture.validated_static_machine_report["observations"], [expected["result"]])
+            with tempfile.TemporaryDirectory(prefix="static-h2-executable-") as temp:
+                _, persisted = persist(publication(source), Path(temp))
+            self.assertIsNotNone(ci._validated_static_machine_output_identity(persisted))
+            self.assertEqual(persisted["stdoutSha256"], hashlib.sha256(capture.stdout_raw).hexdigest())
+        self.assertEqual(h2_controls, 32)
+        print("I13_P2B_H2 FILE_URI_MATRIX=24/24_REJECT RAW_PRODUCER=24/24_OMITTED "
+              "BOUNDARY_MATRIX=16/16_REJECT MALFORMED_URI=4/4_OMITTED "
+              "SAFE_RELATIVE_SCHEME=32/32_PASS TRUSTED_EXECUTABLE=3/3_PASS")
 
         # Use the same protected plan factory as production, with the existing
         # Reading target. No test-only path class is added to the authority.
@@ -7452,6 +7548,449 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
                 self.assertFalse(ci._static_machine_report_evidence_is_safe(
                     forged["validatedStaticMachineReport"], forged["resolvedExecutablePath"]))
                 self.assertIsNone(ci._validated_static_machine_output_identity(forged))
+
+        self.assert_h3_static_report_publication(
+            safe_runner, publication, persist, coherent_record, placements)
+
+    @staticmethod
+    def h3_static_path_cases():
+        reviewer = {
+            "fullwidth-colon": "私有路径：/private-reviewer/credential.key",
+            "fullwidth-parenthesis": "（/private-reviewer/credential.key）",
+        }
+        punctuation = {
+            "colon-po": "路径：/private/key",
+            "comma-po": "路径，/private/key",
+            "semicolon-po": "路径；/private/key",
+            "parenthesis-ps-pe": "（/private/key）",
+            "bracket-ps-pe": "【/private/key】",
+            "corner-ps-pe": "「/private/key」",
+            "double-quote-pi-pf": "“/private/key”",
+            "single-quote-pi-pf": "‘/private/key’",
+            "closing-parenthesis-pe": "路径）/private/key",
+            "closing-bracket-pe": "路径】/private/key",
+            "closing-quote-pf": "路径”/private/key",
+            "arabic-comma-po": "路径،/private/key",
+            "arabic-semicolon-po": "路径؛/private/key",
+            "ideographic-comma-po": "路径、/private/key",
+            "em-dash-pd": "路径—/private/key",
+            "relative-then-comma": "js/example.js，/private/key",
+            "relative-then-prose": "docs/path 路径：/private/key",
+            "relative-then-group": "docs/path （/private/key）",
+            "relative-then-prose-group": "docs/path 路径（/private/key）",
+            "adjacent-markup": "【docs/path】（/private/key）",
+            "double-quote-reference-end": "“docs/path”/private-reviewer/credential.key",
+            "single-quote-reference-end": "‘docs/path’/private-reviewer/credential.key",
+            "bracket-reference-end": "【docs/path】/private/key",
+            "parenthesis-reference-end": "（docs/path）/private/key",
+            "colon-nonspacing-mark": "路径：\u0301/private/key",
+            "opening-nonspacing-mark": "（\u0301/private/key）",
+            "colon-spacing-mark": "路径：\u0903/private/key",
+            "opening-enclosing-mark": "【\u20dd/private/key】",
+            "colon-variation-selector": "路径：\ufe0f/private/key",
+            "quote-nonspacing-mark": "“\u0301/private/key”",
+            "comma-nonspacing-mark": "路径，\u0301/private/key",
+            "semicolon-enclosing-mark": "路径；\u20dd/private/key",
+        }
+        positives = (
+            "P1/题目（VIP）/audio.mp3", "P1/题目【VIP】/audio.mp3",
+            "P1/题目“VIP”/audio.mp3", "P1/题目‘VIP’/audio.mp3",
+            "root/目录：说明/file.txt", "developer/tests/ci/example.py",
+            "P1/次高频/14. P1 Notes on island hotel (VIP)/audio.mp3",
+            "P1/次高频/33. P1 Southwest Cycle Path (VIP)/audio.mp3",
+            "P1/次高频/14. Example（VIP）/audio.mp3",
+            "内联注入在 file:// 环境下也能维持套题标签页",
+            "file://", "在 file:// 环境下运行",
+            "https://example.invalid/api/path?section=docs/intro",
+            "https://example.invalid/guide#part/one",
+            "P1/题目（VI\u0301P）/audio.mp3", "root/cafe\u0301/file.txt",
+        )
+        return reviewer, punctuation, positives
+
+    def assert_h3_static_report_paths(self) -> None:
+        reviewer, punctuation, positives = self.h3_static_path_cases()
+        credential_urls = (
+            "https://user:synthetic@example.invalid/api",
+            "http://user:synthetic@example.invalid/api",
+            "https://example.invalid/api?token=synthetic",
+            "postgresql://user:synthetic@example.invalid/db",
+        )
+        for expected, texts in ((False, (*reviewer.values(), *punctuation.values(), *credential_urls)),
+                                (True, positives)):
+            for text in texts:
+                for value in (text, {"nested": [None, [text]]}, {"nested": {"value": text}}, {text: None}):
+                    with self.subTest(h3_path_text=text, expected=expected):
+                        before = copy.deepcopy(value)
+                        self.assertEqual(ci._evidence_publication_json_is_safe(value), expected)
+                        self.assertEqual(ci._raw_static_machine_report_evidence_is_safe(value, None, None), expected)
+                        self.assertEqual(value, before)
+        self.assertEqual({ci.unicodedata.category(char) for char in "（）」”؛—“"},
+                         {"Ps", "Pe", "Pi", "Pf", "Po", "Pd"})
+        print("I13_P2B_H3_CLASSIFIER REVIEWER=8/8_REJECT PUNCTUATION=128/128_REJECT "
+              "RELATIVE_SCHEME_URL=64/64_PASS CREDENTIAL_URL=16/16_REJECT")
+
+    def assert_h3_static_report_publication(self, safe_runner, publication, persist, coherent_record, placements) -> None:
+        reviewer, punctuation, positives = self.h3_static_path_cases()
+        privacy_error = "static machine report failed evidence privacy admission"
+        rejected = omitted = controls = 0
+        for family, payload in {**reviewer, **punctuation}.items():
+            for placement, locate in placements.items():
+                with self.subTest(h3_producer=family, placement=placement):
+                    capture = contained_capture()
+                    capture.stderr_raw = b""
+                    report = self.passing_report()
+                    report["observations"][0]["detail"] = locate(payload)
+                    source, _ = self.exercise(capture, report=report)
+                    self.assertIsNone(capture.validated_static_machine_report)
+                    self.assertIsNone(capture.identity_stdout_raw)
+                    self.assertEqual(source.observations, [])
+                    self.assertEqual(self.gate(source, "STATIC-SUITE-RESULT")["detail"], privacy_error)
+                    with tempfile.TemporaryDirectory(prefix="static-h3-producer-") as temp:
+                        output, record = persist(publication(source), Path(temp))
+                        self.assertNotIn("validatedStaticMachineReport", record)
+                        self.assertIsNone(ci._validated_static_machine_output_identity(record))
+                        for stream in ("stdout", "stderr"):
+                            data = getattr(capture, stream + "_raw")
+                            self.assertEqual(record[stream + "Sha256"], hashlib.sha256(data).hexdigest())
+                            self.assertEqual(record[stream + "BytesObserved"], len(data))
+                        for path in output.iterdir():
+                            self.assertNotIn(payload.encode(), path.read_bytes())
+                    omitted += 1
+                with self.subTest(h3_coherent_forgery=family, placement=placement):
+                    with tempfile.TemporaryDirectory(prefix="static-h3-forged-") as temp:
+                        root = Path(temp)
+                        output = root / "evidence"
+                        ci.create_fresh_evidence_root(output, repo_root=root)
+                        runner = publication(safe_runner, coherent_record(locate(payload)))
+                        # The real writer emits all synchronized records, digests,
+                        # aggregates and manifests, then its real verifier refuses
+                        # publication. Neither privacy nor verifier is mocked.
+                        with self.assertRaisesRegex(RuntimeError, "^" + privacy_error + "$"):
+                            ci.write_evidence(runner, empty_comparison(), output_dir=output,
+                                              evidence_authority_root=root)
+                        before = {path.name: path.read_bytes() for path in output.iterdir()}
+                        self.assertEqual(set(before), set(ci.EVIDENCE_FILE_NAMES))
+                        document = ci.strict_json_loads(before["command-results.json"])
+                        record = document["records"][0]
+                        self.assertEqual(record, ci._compact_command_record_for_evidence(runner.command_results[0]))
+                        self.assertIn(payload.encode(), before["command-results.json"])
+                        summary = ci.strict_json_loads(before["summary.json"])
+                        for member in summary["evidenceManifest"]:
+                            data = before[member["relativeFilename"]]
+                            self.assertEqual(member["byteLength"], len(data))
+                            self.assertEqual(member["sha256"], hashlib.sha256(data).hexdigest())
+                        errors = ci.verify_evidence_file_set(output, repo_root=root,
+                                                             expected_command_plan=runner.command_plan)
+                        self.assertEqual(errors, [privacy_error])
+                        self.assertIsNone(ci._validated_static_machine_output_identity(record))
+                        self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, before)
+                        rejected += 1
+        for payload in positives:
+            for placement, locate in placements.items():
+                with self.subTest(h3_positive=payload, placement=placement):
+                    capture = contained_capture()
+                    report = self.passing_report()
+                    report["observations"][0]["detail"] = locate(payload)
+                    source, _ = self.exercise(capture, report=report)
+                    self.assertIsNotNone(capture.validated_static_machine_report)
+                    self.assertEqual(capture.validated_static_machine_report["observations"][0]["detail"],
+                                     locate(payload))
+                    with tempfile.TemporaryDirectory(prefix="static-h3-positive-") as temp:
+                        _, record = persist(publication(source), Path(temp))
+                    self.assertIsNotNone(ci._validated_static_machine_output_identity(record))
+                    controls += 1
+        self.assertEqual((rejected, omitted, controls), (136, 136, 64))
+        print("I13_P2B_H3 REVIEWER_FULLWIDTH=8/8_REJECT UNICODE_PUNCTUATION=128/128_REJECT "
+              "RAW_PRODUCER=136/136_OMITTED RELATIVE_SCHEME_URL=64/64_PASS "
+              "UNMOCKED_WRITER_VERIFIER=PASS DIAGNOSTICS=FIXED")
+
+    def assert_h2_static_report_paths(self) -> None:
+        import base64
+        import zlib
+
+        positives = (
+            "file://", "在 file:// 环境下运行", '\"file://\"',
+            "P1/次高频/14. Example (VIP)/audio.mp3",
+            "P1/次高频/14. Example (VIP)/14. Example.html",
+            "js/bundles/core-foundation.bundle.js", "developer/tests/js/example.test.js",
+            '"P1/次高频/14. Example (VIP)/audio.mp3"',
+            "[P1/次高频/14. Example (VIP)/audio.mp3]",
+            "assets/[section]/recording (final)/audio.mp3",
+            "relative/folder)/audio.mp3", "(relative/path)/file",
+            "relative$/audio.mp3", "relative/punctuation($!&)/audio.mp3",
+            *("relative/(VIP)/" + component + "/file.txt"
+              for component in ("home", "opt", "private", "tmp", "usr", "__w")),
+            "[docs/path](relative/path)", "[docs/path][relative/path]",
+            "a/b ratio; see js/bundles/core-foundation.bundle.js",
+            "https://example.invalid/api", "<repo>/developer/tests/ci",
+        )
+        negatives = (
+            "/tmp/private/key", "/private-reviewer/key", "/ private-reviewer/key", "/  private-reviewer/key",
+            "/tmp/private reviewer/key", "/home/user/private file", "/",
+            '"/ private-reviewer/key"', "[/ private-reviewer/key]", "(/ private-reviewer/key)",
+            "origin:/private-reviewer/key", "origin: / private-reviewer/key",
+            "P1/次高频/14. Example (VIP)/audio.mp3 /private-reviewer/key",
+            "js/example.js; / private-reviewer/key", "js/example.js,/private-reviewer/key",
+            "[docs/path](/private-reviewer/key)", "[docs/path](/ private-reviewer/key)",
+            "[docs/path][/private-reviewer/key]", "![docs/path](/ private-reviewer/key)",
+            r"C:\private-reviewer\key", "C:/private-reviewer/key", r"\\private-reviewer\share\key",
+            "file:///tmp/private/key", "file:///home/user/private.key", "file:///C:/private-reviewer/key",
+            "file://localhost/C:/private-reviewer/key", "file://private-reviewer/share/key",
+            "file:////private-reviewer/share/key", "file:///C:/private-reviewer/key?x=1",
+            "file:///C:/private-reviewer/key#fragment", "file://user@private-reviewer/share/key",
+            "file:///C:/private-reviewer%2fkey", "file:///C:/private-reviewer/%ZZkey",
+            "file://[", "file://[private-reviewer/key", "file://private-reviewer]/key",
+            "file://private／reviewer/key", "[file:///tmp/private/key]",
+        )
+        for expected, texts in ((True, positives), (False, negatives)):
+            for text in texts:
+                for value in (text, {"nested": [None, [text]]}, {"nested": {"value": text}}, {text: None}):
+                    with self.subTest(h2_path_text=text, expected=expected):
+                        before = copy.deepcopy(value)
+                        self.assertEqual(ci._evidence_publication_json_is_safe(value), expected)
+                        self.assertEqual(ci._raw_static_machine_report_evidence_is_safe(value, None, None), expected)
+                        self.assertEqual(value, before)
+
+        # Complete, unmodified retained reports from hosted run 35368601319,
+        # attempt 1. Compression keeps both real fixtures inside this existing
+        # test file; their decoded SHA-256 binds every field and observation.
+        hosted = (
+            ("ubuntu", 10558736685, "d7b66d59f77b36c46ee865a9b0d5064d8bf790dbe0cffa7479d3e31ac2e61920", (
+                'c-rMXYjYDvw%_wBdi`OuTNl}u{HAud%GhS{T^_zRNoqGxuF*`(9vICiGb0-%l`0c3HrNIN<_!V!2y7B;k`2Vz#{8FE%}Dx`zi`j#o{?sx8A%`+'
+                'Zr!Ak*q%P!efsq2^XNW(`il<;X%V$#Qc$H4MNkLj32K-vyGe_Xh$bXa5TXg8uRGe^-q9PULU%8G5IZ~KokF~;OQccSCA4=)U9otquRGB$wI_Oe'
+                'I>mM=-rLc#%hU8IHPVV{K)av9S3<sE|A%rxQM73)4V|E3+LSeQ=!EP6!++YH-;VAo*3l=Xd>}1tTFPvj)C`kKrlu*PAWqV@k&HR1scjvt(O7G='
+                'v+YE8XIorW+fwW^er?%RY9X@6`<FzgsG_B)-ev+dj5bkj)6?p>VG5=!jvHy&q^+rpuYN?7BT492R%zszp{WtWl(e*20VAtZnke8<BeLWz6??mS'
+                'VnU2YqGBu&>Fn+jBE7w$6oFr8XL~f>*&_%o6|`{ZJD>;#lC6cKSi~fyYf@UIdP{kQVaWpx)Dn+JbUGm$rk?S_s-_^TNvfJ-0GVbzqy!!QjyPph'
+                '@_<jXMq5i?D4SM_pG`eYJ>O+>K$9qZZ!dn-bV*hP#s4jBrqbqqIVpQEn3hc#TtvaIrM^;%U?wy@i4f^{S~b(2GF?l^3M~z}RHW0-(z0HOqD~D>'
+                'nQ}Q(h%0nNFekBv2AM6O<*`X2*42$|$7!OsHxcb@k9Wtq`nviOy+R_^CHBO7x<rx2M5#;agrz0|i^SsXJ$(Q#^(4A`sU&ntaiP6xFY@O|foM-p'
+                'SIi3r3v-MDPXJjMd4WSx3N>kwAtKaWoe?B`L<I^?(TEl|s6NG5*(mi3^wk4q9KKG_vX%Ws@i&|zhq`aP^svt&{iM#0UZJ<6BN6TB>l8W!F(!5='
+                'VzgcA7JEe68%=c6j<_Vyz9<k{5_;SF5}kcQBHrFhh2B_SPg%PT#X6!;RxJ3kViB5hk^-mJ;!xz4QH`@9XN-um0E^4?1GfX#c#EWoX<U7OlU25~'
+                'WU83Sl;Kum)F`fXou)M1j7)J>Ybj1z39W%c2S)Y}9UkHUvT9Nt7TjoBRjIyLkd-uW1J2M<r`(lPTv*g4pjb`LAO|&d1f<e{25XT~k(K$lra~P^'
+                '6od+jfEMeQpX{^S*8H;){Zt{zXa~fgCt4@Xq(ZEx*R9)6?3u?t1}sV{kcph4yF$7tv0w{`3`wDW4u#Lhj5epFP1JN6Nx*O<hJGvm-g?aNbB(8l'
+                'LMH?<6A@CWI)H)Ak&z-W-+HDF__Q1`CaI!$K#Pz^J&J`RF$h9VH1|2$)mxsF4MSEZ_LRo&E9GL^A&=X`m(?aEfBL3<`v+_Gk#*sL_3FMobJAL!'
+                'x0b$de2!#Q0Zt#90ulv{gcpyAx||9vG&2g_qiEuB4p7f{a^Ie`pWe65%;rxn=U-pUuPoZvUNk<KNm-JpS|%uQzCh?w6=r0wtiTH0lQvCFWzEC#'
+                'gpt=Z2iC<OtaG=VIhem=Jzgl>yqLdsp;<E_8peKEJzlX~;CovV?1EPK#m~7|GD&p}*fy@q(gY0#(bTvmpd~QD$^$vt;n-0}bq{!O@q(pQdLji('
+                'Uj|VR`3A<uh`s#6zH+Ns1OwA#8pd@<RWdNImFrB^Oojw3@C1b}V6F+sKx=i;ntkG+GJmgd<Du7PG(<sFnX+vU9hJ91&dK>#KUf#Oj%a`iv9Hc$'
+                'H=DrB%!H(1=O;BVIy_6TOnAAdv>6oU5G*EoLP(DB-^V~P$YP+(tElGu+{?dLtpd^){{zcgHmd@rbU_5QN{hcljEpK)tpbAuoauD&mxv?9gK9ZN'
+                'Y<-N@2IF#jBpp{|v43PZRKCNMDRh)3YH)WvEh|#QQ67Zzk|U|NuH=@VG?CHcOtS644u@5+-z%8C2r~dGl`EbRA){!5RAUezgmbS}xp2$<d>=7q'
+                'ES+2V!9IK0TAXeAC_=Plbu>q*LIs05ny{!dnuVNBf%{a~feOU}3_mbc6iuZ>cMt+IUrvBsO$;y&b=k}iW@R@6CBfiYN&@voa<^8kS66ad8`i@g'
+                'f8AQl|MIW=>p2i-x#hd|{6+G)oFXul*6K_9!Hj+Pkx!-_ms6>t15uO2{}>)2B?7ZH8zOTHV)T3g3{Uc>-whrbIQ;jKA%Z&LFO`NUcq!;{3Mz;S'
+                'q$AfIgPLe&QuH14uhRqwp~?5u_k_-6@O$arFg0D6pb>OY;_n3m-ZL6&5d-`^P=I<w0`>P^@YoM%j5%1eHjNrpe6XR|5Yd_A=$H_VdScia%I}Nc'
+                '=g!XAtIw--xtnlEf@(dXLphPzk9X7egJ<^j^TYt*8rMz``_8Gtjf*=(;_UXF{PU}XS*ByEkTNDUpAEAky~Q=nG)!Gc^`}yMk*qu3Bg`ZGbr|{f'
+                'n9&S35y{1DP<QvCyHbS@t1d+Y>{LTG>42t!BW8vgUT8r38}XTC&UZf^U7-pM$zi?zJ~#WATMhR5thIC{yMCU}K6rGC_R~i}#7Q6l8k+}eZ3}!w'
+                '``$0v?FIYFGka-uN0*Y*-SdU~+LdMqj{M^X_BR)^8xOM^m%#L}@6Cm<n+KvWy9B0W6FeVHO~@1FEELzZX@mN0`y?2<{x7cA;Q#8nA7z`7)HH!>'
+                'LwJ#6f!<{~CU4W4q$L|1P*}4rhE+`bwXOX8clpO>tXtdpZ_ngzU42WQuRTYCcs!lrDm-qgWqT1|Ug{CHxgSsn=B^3fc>@*2^aR_9l>}3$ECh>D'
+                '#LZf6x>Xd*$trafIj#$OCc?)PP!1kc#09D-1!*)LDebRR0+^FDNlVrYl=IEVdRVR&`~1de4M;N@i(n<l5)MEFcP*mBpIWkRa6_01poqJ6BPgh*'
+                'HC?I#;_Q<c;Y0`mozjlehz9JS8&xWpnwi>hF7wEY-z<Gggb9_J`PFUEX7=LQ!ll)Qq-HfsVU$ymfL)SXn<J=EogJhdH~uTT-c9U#D~0bCv+J9M'
+                '%iH;1)`*s(>d*-x`A(7G`%fexC<=-w0*F}Kr{4z(Mn(mW0#)BQ4q*(ihZzCHI(fl*^var_vzP9_Q!WVU-(`jT<8Q4CU-L!qzHrEG+|PaW(!Rc3'
+                'xOwq?;oy8fbHlpz%?@xufEYLk(v(1Ng_#-73p>65JUzZgN#MicJ&A%K9NvK}_(+u#GL_i$^AG~E^8%o<)8bwbcTmPtpopnXRgsRH+QfuH#}kS+'
+                '{XP(KY>si<Yj}@nupp6f*9(02XymsqTXP$^&AZw48T;HL>+5qnz>Iv)!us*6{PWY<jmN~<9v%eCeoRa2;tp+Lm3JE#3_40vnju5~nRnACdM~9u'
+                'N1d3hchk4aRquMtu8I7v`{hpPyY4kfy)*o7`sA??JJQt{Uz;PkHYH0`cRBVQXb(fi$VR9CPjn%b0;N@$`KmCx#K)iAylib;e%t=D>yPYvTWEgX'
+                'p5eQTd`Q1;E!wxg1Isjb{+WI4v2}6HI`^b-|Fm`PUjEgqFk~@GfIG&-+c2-4dwMl@<<VQ8F5UjFbil;*CK?kNQn<cpt$YLcX4jWXM=W?q&&%!Q'
+                '7uJOb*^LEX%!rFIhPfRx0NbV9)3et0theb#_{c@IaOZ|SbJFoO&TkgxmI^bQ`R%VOF;RriGy63`!s)H3)ZE~JFZ`QPLb6|Ev5nZhF(?ZYs%Bth'
+                '?OshsZ8WT!bOI0Fp(+@P2KDb(Ii@44%#Hl8dZlpGUEWjpVlcB0FBbbT<_Jw5Z&49<hGQ+EJ4nHVmW)HHTPq0OGu)31YPg_>HBAYGcZXLOu)^k#'
+                ';{oPeCLHE~6Vwm{fm_sdjm1?d`ve2&y@yG9Xc;7hUI%<}e*9G`f`%)1ZamvPKnY?moM~bhiziyei@g2wCJ2%2*3JCdonnwiZuu@q{@nRB>;5Tw'
+                ';Zkn%j&*U~p1<gb#@Ba1n$@!vHBvMRL`}yf$Q$<fB+!<9?%@t>P_f8E5JAmQC1HJFU_DxtC>5L1S5Y@Op-f@Qi*1<h=NrxgY*X6x_ShD+p4?#s'
+                'B#O5Jf)KFI--S7D6b(GbW08rdm2hP{T@5>N>RgQ$wLyOFyTZ&R>(!+I@n5P;tl1~lk2A!Wl#`&|ek!l>_S(o=y_tP^wrb}t=7hsGg)3`yKk8vm'
+                '!sPy;DXQyWY2p2q148P(A(N!~1Rd2h^Ap*e-0N<VGzXi?NYrwX7udUh<6XsAE=B$v!&nt|g@OG3_oVV`E4$-jU_*cKltSBoEIYc=l5xBuMgC0u'
+                'aOA%Nnynh^Tr1wtLucpa5AJ{M0e=*y-Pr}oZJq{^UT!osO)?fQ4xwGZPSu(tAB(1{v!l{hjF5N6WnaH%Jv$u`p9e#aBn7leH8lkGt*?s+5>mDz'
+                'v{jOg<0DeSjrVBx7Nt{)ED9zamMW^Dp)XU$Q(D@D1}d*FfJ5fC8jE$77g5R6tH0b0`V1-M4A!5PWUYMBj6~b)A65$AUoYJMx~->`j6}&n&7=ka'
+                'a`uxESOo+_mC2YU%GAuX3D`($GS%T<2fk*ao&I)YLlIPoOv2v^`NPM<BY&)~8IH~#SvMyoA;XZ#kbYek)Cr1rrs`^?BgR_!L;(E&>~w%%rGme)'
+                'ojM29(ZSjngL#{r#@O0{jHpn;)?NMM>1yY#fYGE%kx3-UfS?=o)$QVSr{!c4hq0d;!0`3e?dH>QnBrMDDonsz2J#VZz7g<0l65uI!zW}E>Vm`r'
+                '?;f0MXvrYMDhrZDH-YrWfl5Rm`?Rz{>uR=_(`8Tx38|B@bPA8`>#NzzY92}?z!+tC2})fR`=YGkU%6op*dEj31h4cFK_!B$<2|DK8tP^Z?bCFF'
+                'qPmH|8c$WJS-A5}GuB$EnP``TfFk1>=@;?#ug0&h!OWg8;m01KzP4hVoM`yLbRuE;0kIU|Rb#c4n&`yU79$_AeHYyS!EJhy(3Il@<&!*Bb%H$Y'
+                '^l?@bR82b$qXWrNSG_l1C#AaGQ6DLRaQ_W6ih5<32{2D1)%5s2GpRHxWvdmkxZlR4Z*7p8oz#@gH6dzsQA=>wD6iRkO_^R3qE;7S0zc$?&E`UQ'
+                'JLG$<=IT-l^#IlC=q=R7n^&oYM6i+x{93cAAgvShu~tKMX`y<6YIYQ;r2@YOH}ytp>&=DNo2#=r;c9hPL*rF1uGM%wy08wIn%xAb%7AaRnrVu3'
+                'c>`ry3xIb}P0<dk!{`=;T;Cg3J)6cs0FDRNOf`Mj%jqd-f2Xx{jXs*7q^tMPsE)4DdJ|N1^&Z|-L)U2S4VO^$)|#iEtM~J6)N^$l-b6dsXsK@H'
+                'T)my<>E;^!yn$*CYN;X3TvJ}{oMNutTVr~;dfUxX%QbqbQ!7_*r5O^XnK~KU4^+vx4~yI0hmKcfJ4vg~_T?boIIWQYV1IGzcY>-^7f{4Fi2yb)'
+                '+uxjS{H{=3koK_rBu>6BpLM`9m-HtvFN-EsTzrXVaOISrzK=xx8^QP~R{5!;@>8ehe!u^uzqpsoaV<v#&7+_#XeXzHb3!|$PU78lJuD+oVAD?F'
+                '0YN|R)U0E&coYWV<RkooLiibXJ*U9lqd@!GV^TU3;OEue)D~3(L@+DC<ITd2hovU`2N?X0YU3vc*l1}BzRSD$e<B47h)Ka>wyf^1Dm(bmj#xnH'
+                '0X{P!`Hx(vk5r!5jq1KUEoD;-YFeBO;vlz-hUJkODh&ofy2JBR6t2(a*ES3Hujg*9Mw~00>ofVepY55)JfeFC4ykgRr?M~a6;_@X?%d}WQ0*rx'
+                '_MO*FJf^C7WuN1~`)$G<{pvw)-p-0a!6T#n1BZtPhQ{5LaKwHwZ=YOyw^+F0qa(sZQ5KQHrGHvaFYf5|WBcsO!rTR(0*CWJ_?4*!+3kRQLRN`='
+                '^`-r<E7qg0a~t0_E8`N7E-e&=e6+XQFHm^iE2p&6FKtX+sL0JUF2uop9>ZX9CmoaDRu~tgDV!h%aacPDt&{_#FwBaTvzzlL%)=TULVu)}Z3T?S'
+                'Wy}bR_k=%z-?Zsbnka|Bz=Z*Rp3J0T66`k_Y>mCTmK<c%FaoQj4O2@p9I)#l)tk>W7;cOzl*O<O>O#V-3H(_atv!ZD7(Dhotjea7(kKjML=i+f'
+                'sVSg@0!V~V&J7Q+ib4U9hz_-@bjRUFDM;qb5I<?g5pXv!yh1P|@L)nlVkGadD#=r_1iV-U0R~>`KT`$9Gom0U=ZZnmv<RV$1Ljb$5(uvxtLao}'
+                '7@QVH0GRHXe>UfsP?H7$x_QiafN>xMHnI<lWn)q}PAhxUREGi>Qy5gr8UW6b)kE=Pz_;Zvnu6TSI8b79?2pC^26tgxayiw5f%z={PZ~WPObuEI'
+                'mQ1Bhj_8mgqzo`K*iK0~An-l7?haG19uZ%DU85T880O)`y@U!FlMS7VK1U9r{0jm*kXB5YFKO0cIgo6m(8}>HoV}XvyHmy?scNKk+8;MG1x8)T'
+                'XuRBwg>*Osnkq7INy>%PEMb6*MFXMONVqWlYg(w7XD0GR6T^WxrOV0_6vkSVntbE53<6U#%bz<_P?E>xV49dVJjhfO<Ngm{Nw9|Y3vpUbFW0T}'
+                'Oc1A81=22L4ItCAd<Ou0LPPOa6)bd>1DId1xVy+fLTv&k0_n*~;bfC31H#=yOwF83E6ij*C``!{l^r`^o{{>a>Rl+~0EjifE0I<haKCCyd$NB!'
+                'U>OPN=1!%KiD5aQ5w2ckqsXz`FD&tGu-x}laKa%2R*!5rgscvNhz80#EHq&5gcN4D_Rme|!jd_M?$x<62Ms1FX^Bd~U{wXEZ20>Oz+Vy4s<XJ<'
+                ')sJG%F(k@?fn@#;jqrHIain?xj(FFA=Z?j|L4TE`kck5r-jAamg&V}|Nm<u5S7II3g0)&PjIl)Reo>?;kiZU0)lq=~ek>^II$C!X&);Y!47kX5'
+                'V=1aAI4d}iP((O;aU>21sp?>%lCKP|4m2I|WB&E3Ah-{!_X7`UdTqG<zLevkU<WXFq#p|JOdkZVMG6<+2m;1vV3|$@kzGCsua4oHTq>nat)IIS'
+                'BgN~w6~M^KTxu(tLHkXUCR1hw6yM758Rr!+EK_6+6{)k#wRoF_ht4{De*lD`RB4OpILRWdf2le_x#dhB%1#b^$vzG8HY$Mj$rF<b{AU`qAjd=<'
+                '%(=f;0o$u+(*bPa192rNm}IGHfK_I>1msTN!E`cSp|kve!MffH!?--yjnEzG=Mlz%qRkKzRLL;r3uI>lG_6@&$3l?F?t<|82fY~zU4SWyTgI~B'
+                '=xd|oP6dFDv8&{MuB*aytV&HC76KL4CiwWSgFB@1w;BRKyk_eGpfr%z2mmV?KEZQkxH}5rYRah3bTcNkv?6&V58K2aOUEnaB?tY;pdJr>B!E9s'
+                'ifop&0$$IhmExY=6$sjHD2L0aVwsmP<~*fQ30Pur=Hdm~UnaPlz;tSrEuC}<Qz4ZJu^{55!HaV?hk_KAFfjpwSa8kFl29|M!iAMG2QRd+icS}C'
+                'UX|L!b}lN_1!&4@+P^%?@{ck9t7PT}Qrh*NN={ACN_3$@0l@t@qz|xsXcg{}ACmhEB_J1fNB__u=n@~mlEU2j7#$M;=Uv*t?uy4-si$Ml0uOEv'
+                'Gq=kn(o||C*(eP)xF=@1_!ylJpgc_&(;%)-!YubeYOqt1a_bA#2&_+>`QnC7IRw6tRALP#al*V3)|j8q-u^yN<*svM8{GfCeVI6W2nOL9R&**6'
+                'aC{WWAPJB`L}TumaYQ8qp}9F_kWcw{!o9bn1a)0P@Bqf~Jr#ps;z)dMM<N1~4Fr_|i<ZDR5isDU@Mw>TTmlPD*N{s{N|1GE>EE}P2^T42j>6Sj'
+                'i$*W=E8N~BT}v6nxolHxK3Q~{o!*Psu_rfl9Ejj}H7*3fupbaOnktKeTaP3(-E$IYII;?;fz0hkBBg7lh9^If6j)+u79%1SB_}yfGvPGyz$Jwg'
+                '$E6HGhDHc&T(hJksJ(tqk&DWzVZJA8_7p!bdFxZMCoA^CUHHGXbpaC^tZY~t7qaU=<xehW*U#qG=J;`-_3{Nz6%T#dcUJPN&#YHhe%)H+$w4tG'
+                'uHoBjC50=uty355rw^?4^~#Z0kFG(xyw}3FSD~By%Cdd_QG;VS`#8U{Xg&Nf|MR2W<clLt^&>62kFX=`BQ3j*IN<DCzkym5AGt%_MLr!G9Ubo<'
+                '8ygxuJbdWj(cSKlh9yj);GBeBdy(B-vNo3UzpUk!f8^BTL^yIpg@4=0@BaK}66Jp&eu9aKs>vVzgwH|!rLFuqElh3f%Fxkb3U{6|{Ft%3ySrz1'
+                'wEK@oTD~0M@5GT0KmAYz*bjG+58tZE508FG_<IGwny^|Tz)2dx2jB=N7m2o3pRnAy7xv6a`}T%)>l^FUrSLhcD{LTi&PZ|6h-cQ|cT^M8I(k*('
+                '{MD{;M+O6xj;J0wz1_obRVYhiw9P15$m42!TmohvFQwjZO=aGWzTRa>4(=iL!c}|W6%aUga`CrLW*wz1hSa&9VzUWu&7+k24HG-f_e{qP=6$h!'
+                'A<U)T3_9~XV?46NzJMvgtqb2_l*#wkvm2|;ptgg&dl{MFTVkYyIpJ^f5q1q7v^?k$?;DvxcovpV;w|{~^M#oiYi@(bO4UNOuDAsDWSRZ1C-@H7'
+                '?I#4^z}(%|MtF{o?D|6X<=y<LSGmof?ZuOh$h|k0d%9g%d0t&6ds}V{$L_Xn!docJ+|0iYNZfACJ}Jyyz!kG`nHvJu;!8}~)KI@YZ9O&mEx9f_'
+                'ZHnzvd#DwuQ<`FOm5B#169Pp9FYro<{Hevlo%^}X)7i}zg_*PV!auD=u-BHeuU_MWQGnb0H8P>g5?E%1ldmn9lPBL<7r(X_A6n-ZicRvRfK7hN'
+                'ZImzg4=lrxJDtsa=j4J|TFITABZG$y5FXRX0|lMtc(oFiUwp~GvL8o}sDANP+jMbbkoac6fS^l_SuXArlCtqM7VQ{~wnd{gnCD}B2!<UIlfv?i'
+                '{Mu4s?i_TVUwMQt$Th@5y=}cUI`?IuXa?8T?$S9j9Fz?aJ);b<&OHIa=?IFoGuHg~jiC^YwMAp~A>m|wavrwe$=?b$mvi54HiiPv0fu{{xLuEr'
+                '?Nr640^Iiu<OOgcFv4-Cr5MMewC8US>--t(!cSay7nW~gg5-v9h_%(4mqX4&6u6sdc-Eqa9`8%4x{vy{ewGHV<vWj>-mfS`HbBnct(ZhwWxJ8Z'
+                '`uv&ZnlcoGlth{A^A6FAs!xh?<K##&6<wfwbwA=~ijM1BjKXc>OHUVg_XOybO!4+&?Xm7idtW5ldpO#?yQ6(~ti3hX)$tFv^4rRHO&w$uVW(ax'
+                'O;$~#F#+$SVdP7y3HGF@sZ*Gnh}|I(L_wm2MUL>7`9cjy`}UG`Zl!ST325kM*oqjP&VvS=XE<y0KU4wV3@q$x_pFCEv#)LxV}qT8V1wjt{cN4N'
+                '@gJ~^moDU2S3$a47niJuOV<1g_{fv{SgYUU&Oa-D<U0r6kM{gk!tX%1cM<H>h1``JHLO3!ByZ?lL3coe4~V32GY@wP;S+LmF>QE~AD7`p83UFP'
+                'bkFo#uor<*)m*NE37>sAYb{>oam_pvdPB2OnN;gA)sq#G!!!v)Dc>ER%uL8sl|}#8xCS0b`KgDXM-22tVG&YE7R``1iJVPaygUJ-!h0oQO3-CN'
+                'W!D&DvA)i(S{DwOD~OjvZa)Jn$(mhnjAwnE5*!#nvRgO#`(2(bW45<|{LC`cIlOvl5i_o0hB18S-f5*(FAGi$=F(zC=dG{?m*VwpaP;`goxg6~'
+                'EQwb4Eftg)hV#-VhTU)6wYE;-W1p{2<{oeIr_8|M$ZjuW*O#m_OI!_w=dn-96FR>M=sulBWR_Kve>A<vQE$!2UIjj5-#!~?MG)esMu6+{d^9yv'
+                'z`A|mk5@gs>A1;k@4<e4GWTSmaO(`F(QMLEeB%*BI|GIg?F=1*y|4v>mbnmX_VNqF{{O@<VnM@*g};ciwv=Ca!XL-j*#V%@6R0e`=y$XSpx+UG'
+                'If{96?vVgNQ<h-r{$?$SGW&I;xF1OP<{rVMpsQ!|4`#FL%b=C<Ad!(0FF3VMQFRJWV^&x4t1G;exA&i!uXcX>(0y3pGbhGw98)iuxMc|SB9WwH'
+                '6MmMK#pAVYyjW|vNGi-+gtd&`1GtvwFWGk={kk>J+WmFwY~xo=WpzqWWND059|fl=>`EObO2=C#n*K4>+4f@vq^1f^2xIsKJ%HK69*iFmOw3HW'
+                'Pc{RA2GHIB6C~)qE`RiL0PO)hVJxrCiw}S*au2C@1w9h&3~XF<+u7~Rckx4O(zlLEBzE724$nV4xEK8Jm-(N+&90y4Mk#01CfvDFU<tDGU1`w0'
+                'fLm@4d9VIDw?3VGkG=ww4Y3F`7m0TE_$(r~ED6?7IvHv2>TU6r9`ysa9H$vJlGyIu(~}yR)-|vI`2CU;Me`Bl5-e}<g3q6~9(-@FEoV1wdYk+*'
+                '(B6vU#x~56f1pQ$?jR2pO|$=xgh&bs-dkV^Hu0ufXu_C)LPKQh4ICwIxyHJx<Z$IO$9aiib<w`k@I_d!1+NHlGF&#WVuS6cdcLwJ?Nrb~;T2)@'
+                'Y04#-d)v@=`5i37?CVwZzP4xaiLSMi71!JWgqJwlzoLA5mNyZ48@>U-f~C5-*Bxj%1uEr^w=fNgPS1oB#{noKPk1i)qF5~ous695{ei=`z;%-}'
+                'DSV6$CZkI1gD*e$U*EZ&(f'
+            )),
+            ("windows", 10558737954, "f7331d4f85702ed251b40af637bf6d8ca3682fda7328e4dbdaa9c06fe76a7514", (
+                'c-rkfYf~FXw%_wBdik)~t!n`iAi%Y|RT%J^yMA!NNoqH^sL@OdCLYZwGb6B)N)=9mu?^UcgWq;+96R>r0ZBG-F!=Fbb~PjEQ~ts|r+Y@4(acD)'
+                'CG1;wH<bjKKHYu#^y%~HK7IPbHwftvwM<4(rEx`2N8}l5m>qjbheW#tsV~tdCI<Qj5;RHUv|Ab!`}=#OexbLgpGy7xVp59t4-R&x2Bblniud%1'
+                'NwGgM*e7)-dOG%anx3FWPB9H=_g(l($cOCzP%bEnHczF|6I9HZvZjunkUe1dPq*{iu|1VK`pldUq+@vR)YPnIm{c+~O%VlgmQGF0%c`W!8&gx`'
+                'd2?1%r>1&3<B86A_teyhWbf2emVND{Cuql>YD=+w-oGR|M-?qg^)3^rVswdem!4Cn4O1{>aoWhqChg4Tef49a9LoR#vPxs`8JZe1Oi9a`0T@}G'
+                '(?kJ>9Frw)X`hhj?h~X$tXmjN$9l!SL@bpS#8|HoPY$O01u6}sIs!Ct=sc_l29mFXqgcTtt7}qDq<Tkfg)zwk4P+CK$8<U)8>XK3!m6eqs~M`A'
+                'lK`1xJ!AzP{*F0iRPun&vqn3sUnrYiil0qAM?K$Vb6AroeDAJ&)O1N!1;zg@XJ&KeK{+FPFqoH37+g%juhqV?ieRQSJ;Naw3wR23EiEgwI_7GT'
+                'PT$YTdJspQ8k#cavZ#<!=(u3cVhe5Jx{w|wXN5#x68q?tlIgzmKwRiei9$RcAB>B=BCNYqZ%?u(ksR!mx`kem_V?26<Ule$C=H|~F`kS|y~)9W'
+                'zCodGFY*USiFkMKU|+%u2TOI50(Ss?7@>hzvI;e6g*9T-U9T~mgqRAXoTD)<Wl(*NF|~*0KxjQ=?&0eUty$|IR(`{|a>)F`ixB&)5HLQN>L2K#'
+                '$z*r3zgwhYBH7bBm`)2xu}>UG42bC-C?Awk;$S?U?i)y_`uiyDj`xT{x>xM!AE;^9Az4pve@|bf;G@8DH02Bho^8ad$Tt%j=SR*NF=r`O7VH~t'
+                '2dwc9NfUFp4*vpdhP7m>n3=5MR%6ttta_bhHQkKOCAciEOj;GK;UkB}4~`xk<p8p3QXQ7wL{3$yzF&})9B>29&@rdnm04VDG$pE7P0k>PHFX^1'
+                ')3BCPO-4ml=Hr@xf{-YP7Ze5^)-ONWXP#N7zpv6y6*7!=Kn!}KbJol##QN^4b@QRU@W97_6`2LnkyCU}L^o9y>`3KQNuhoYh0pI9T~0}tsOdD8'
+                'hT%vI{Z9V9^F71QHJ%y@oe{)*Ovq-N00uTkMvB3F>-i?&b8^g>rHbMKtw0|0s2GmK2uM58JmBbCZ+S*G3|XDoR~^5vlnZQ!JZ=vk)ti*kr`PS9'
+                '-&%|Jt@B@6Pw(0bC#{Xs*6KH{&ylPu!0DrNK%%gb@Zw2Pm$Q+DW?rHD6iqzN0h$?4@vD>ecXzE*i=~rmrRNt)>nrw^N39QLR+c2H)(A?RFA%y^'
+                'g&El|E3iWM<xEpkS@W<wVdPECfpy_q>+B6@4o=^)9xRuyUnpHU->#Vu4dbA!9uF)R_}-NP3!xK!@pCSg%u-zgwoU1>G(*EdG&Q9OXcNq^@=%U;'
+                'ICjF(;lmzWykI$%p2z~z*FZEwzTwG9Vy`{2FWqPt!N5qFhjATIl|0OAaGj}|$&i2ro~F<R%ryZSXl<-miw_-CPTwhCyXUnY4N*{4rfj<-N9Aph'
+                'b8_kFx7PX3Vj7@A?8{4qoi;EtGbSlm{uvFd4$l&-5ne7TT?U0Y)YL9|LdZ<=-zPya$YQ9>3siG{?&sg@RsrdY|A7rIn{@%Rx*&pDrIlY|MqU-`'
+                'R)N6+&UC)=OU#ktVYQqhwmv2rgK@b%o=YjRI5a*MDc@nr6golE4Y)g%lNBlEC=bGU$&u7gE)~}vwvo|OOtS664#!lm<O9rJff)vs$`#MJkXJN8'
+                'YA^^8!o{Z>T(}i~x{H`ImM*S;YoGbtT3KxSC?d3FeKaSiLIs05ny{iX+J&4>f%{a~m5Rgy3_mbc6iuZ>cMt+IUrvKvO$;y&b=k}lW@WbnCBfiY'
+                'N&@voiZ?c_r<aOPwyk?V{Q6|2^vgd=&zC@)71wUtr!SBX<Sc=yv^E~wUoP0U@B3uhaXFi<I1mj<{I{`jQYA2Jvn4WjAVxnggW*a3@SBk%!$<!*'
+                'K1xt0{3&RNf|r86r=WtUKss{WF`|iPK1*Lg|2j>B5So2Web4Az2EUf>4O7#F85%<uCG}b`;60<U7Bj%#0|ltZBv5~^1&@P(#-xKqXWOVz#|Ilt'
+                'j1rwWj*bb@swak>q5Qt^P4Uc<z43FsF82}+Nl>k)btoq?`|)b}{_=bK>N#S7a7}3^h<)pm^0f=QMB>7;Tcw{b6K0uCszTP7)qFP0uJo4DG}AD3'
+                'Av=`K?nkojdXF%V@Yhk~+xLuixQR$EW`nxB56PekA5&e5hS;fwY|>#(1xL(`G`!G&_BY})%bf3iJo+LP8j{0${!MZ50k<0Ltwn3~Qeo>HpMCJ?'
+                'R_yQYhY=@@1ZZs@tj#CjE82H{DLh-YFMV&XZtUt(a=QC@xwLty9fG6u;7j|93x(}_h3$)Adf0cCBG}CXQC?gHQ?d=7kEW*OnOYV~>Ds(O{kDAu'
+                'j9vd1*K6>9b={Ae%}8pRz_k&)$gx20vKEt<X-(2HEe<HESr@}PCjRD=(&?{D4^CM(o|V2jRlITeC3(K_90}s_T$Zcwl&RM2MSyv!$JjQ1NFkWJ'
+                'CVb}&1d8biwi7D}rVuOyi&4bQT5h@pisek5x{93A1w9|*;|VDT4=UyY1xi60&Bv<yD?tErmS$+xnt^h@8QBcWHDaHCGg<@EjK(5Z39^I(5W!uG'
+                '>F}qPX&T%R=0YgquH6_4s(DS9>VP==Bt|q5!a(P=<20rLJLpE83Z`aecb&^TGUMNtzE#3RO3l*7Gtg%C%9--Tjh3WlJxgJNQ;~pOQrui3s8O9A'
+                'q+K`ugI(_>_MP?e*DHmso$}|;O22FpElbtW6GG;dBEk2cNLo-76j1~av7UYUI#4k3DsU92`qpuXVt{?j2q4zU^Va>R*6AgC_3kU>f{6ZIRwzCA'
+                '$~ylUUj(lUhvN3#;>VBetIx{UFT5@sobRWuSvS7e1uh5?1BXGH66meGu)uj?*B5}N$JZzcd|13DQ4og1E06_msd8GT5}SS=LO^z300cX&>;-WL'
+                'WjYIrnCes&>9ncM%qVm^t!VSF10l!en8v+^*N6rS5}9_rz*mn(>DlMj(sps@c42G5K6~H#?CdTuBj2;Ie)zcb^QVRF2gKPP9s$dKQp@S$E^T4e'
+                'cAF9mIzh9VAw&Q9SJNkYFV#LLoS3aw)3?i2uX@a`iTtYj<xc3U?lnWbGyH1$<gpOD($yqio8!7RCrea!IrbH34@1VtMyLOGbRnAsrBz<|xV*T^'
+                '$6wg_+}i&9W&1B|-M8;NLG$zG0^eQaL;Cf}ihc8IuuO~RzPGPDur6#`XCIdDerlb)Q+oO|3R#R2;EplzHq2`mzq?$#bpNGKmu`MtJz(N`6OD;H'
+                'DPP^O*1rIJ3tMZ|BNjZQ=jHa=BkTN^h3#cu%!rFIhPl0G0Jf{e@6K4y7QIck!bdKu<y+V6g_Dl2ac-x)v|3)+DLwlvh>0S6kUyvi5>9WRQhS2~'
+                'KJ;%!37H|0#WrI1#)vG;sG5P1wfi+4wb7Vr(iuE>hpJ#G8q~jE<(Q7FGB@(0>Q%#0_jpg?D^blpyjbkVq$4zWyhR}H498kUcZ7loEg45tw^kUu'
+                'XSi<})NnzMYMK%X?+&jiV1>;e#{<l{d^F4<C#WF|0=KA}8jGt^4hRO)dmoeZ&@xC0y$Sfr{P?Q`f`)@TH=gYtpaij(Pqi_O#S^XKMc)2t2ZTuB'
+                '$@S9atxAwaaqTup{^Ge!>+UD^^2OrLE$hN*`}74zG(Nut(yW=SsPT$XAZj`;LEf;(CxN!?v-fskgNj8Sf(UAdDv9a?BkR$kM5)-8zAC!G31x~>'
+                'UTnkkAm4BvW}DKkx5u`q^~^3KAW^&(5Qczt?l#PEt7zak9*aywt%NJv>1xc0Q|D^5q76z*UzZmyT2C*Ai2rJ3Vl6(jepn#JtegS$_G4|8m)Azt'
+                '#`VJEGj%(6F((|hEnL~C`w0(w5+?VL%u!tjOA9Zu91^mx4VetpXXu2cneWKv?0$EXq&?UKBT;KbUTE+BjdvAexfJ;W3}aQ;6$bL#-;&_hPIkw|'
+                'z=nS3DTTIwUvqS&Wm0%qiu{rI;mCi5G+Q^;xlz2KhtAH`AKd@i2mUBdyR!>a-1!tldacpaHpy7IID~cqJ5_6se5{zN&W=h~B|_dAmwok)_5G(I'
+                '@p&-xSVlmrR8u2hU;4U;AR%P~p{<f^93Pj`ZoEggw<woYWKl5bm=vgnhQ3T0PiZ+58VFur0Ef(NHIeA8EuxaASAV%1^chjg8Ehyg$y)8A8IO0_'
+                '->#Rxxmv#aSyz828IP00nn?`;<QyX7unGu<Dw9b~l&P8T60niZOt#0r4t&kTd;RUmh9amEnT5X<^1HXk#(&>jGaQ|LvTn{wLY^U$Cqud}s52Dr'
+                'Of}U?PlC1bjsW@r*y#|zN(FyoJ53I#r-!vM3G+5PkFmAGc~PN+t-I#O)7Q;g0i#KkVzWq+VL>;VtJ}xx&dZq$4&xv-fZ>~~o8;4Rl;T-9Donsz'
+                '2J#VZz7g<0GEFtq&nIL8>Vm`r?;f0MXvrXBDhrZDH-QYLfJ#Il2eh0)n`(A|(`7^l38|CGTo#Y)o2xm%Y92|a!5C$D2})BH2ji^bpSfWU*uJNw'
+                '2wv$Uf=UEg$9qK0HI!rx9nf@xqPmH}8qe0LS-$l}JJwpYnRuUrfFk1>84~dxu*R>i!OWg8;m1CqxwaCVoM`yLbRuDf0I@9K)nK(%o9M;WmLPAj'
+                'eHYyS!EJhy)|BG}<&!*DcY-|a402WzR82b$qXWs&RJ|8pC)K*ixQ~=Txc`P3MZGe{1em9hdV2hTnNeDmvh@mC+;3~rw=qb=P8!PQh7gUqXe78B'
+                'ls9a?p-gWG(Wr|kfgka`VRI3@9r3+Ub4{s*W`G)X^b%_0#j7+zB3#LYer?!PnAQpV*r=hVv`{lZ4Lb_eQlVeNn|dL&_2R<o#noApaE-capz-P#'
+                'H)^~YUDyOn!)`)UWyrTi&9p_jynr%o1i(9}r)bC2F?5R}uJ4Vho=xL00LKGsr<y+M<@7AHzuQ{6K_6{U()D|2RYx~yy$ve5eh)9Ip&PXJf=j4='
+                'Ywgp|_4|1>>bX7+FQT0rwA8e6uHR1kbaR7#UO+X6wbYVkZYZyIPchf;tu?(|zwLIZ<p#Ypsg>)u(hiBzPMwVHhpJ@UhsAC0Bgcc;PI9WVeL2E6'
+                'P8%cuI9S>GouMk#1r#w(B7mLG?JquU{jN|-koK|sBu?TlpLM`9mkgybFN-DxF21DlxN>Sw-^b(rjbQwg2!84be(Lqy@AsedSN4)QuC<7uc@(w<'
+                '?c|hjPH0EfS-iWhM`Z*GZQ3b3B<RPTnoUd=kHR3Fe1u<6h(6<P<`md_6lh<0K&oc~{Jh$m+M;fN2xcXCuv5NvuiAwF0E6FAZT-Xm8?A1^_jxz}'
+                'Ph?>MF)3KdmX++Qvx6V+NraRh;xiMG|Hy@UOXYdpsP4<tQZvP%rp4JX4sy$AR353(>R=Eg8J(Y^e08z3xl_J-wRmGA=3L?2S|~03WG_765#76R'
+                'NLAeVr11DodHv_|t-JgJs{L@?zV*C~$5aik>~kD=ziqgqUq9&0+gT+jczj}L_~_X1=(L*>j@XY*+b1_)Ef#M0=(sRbkwv6@@$c4m7k2gfv3=%o'
+                'dFeb)fx~$q`pQ&`>~=^#A*;l`{Mi1-CF}lY#qF=!m2nA3mlG;NK0c823lyIB$|>#jOB+)c0=b!{g%sG&lNc=Sq+{~i3e$o#hZDpgj%tUYm0Ex-'
+                'hFP(4c60uOc~rwg=(qHmt$^v2j5%WQp71*?f93>D*Fs?6!Z1HiW>PT&_L~g0#(rJPj4)~#p;dB*sbv@r*!8ID&1@PDH%S%BV%SD>A#FAUem{rS'
+                '9z!Dv9(x{BWz$J%6a_M_2qK-;6i`ATBtj_Xh6h+hkpM_UhuU?z<8TucBy)b0pETnLxEmN<A)FC-Fd-u`l6Op%<T+UaUaW%v1F!a<uLI*5Q5ckS'
+                '#h_wZL{P>7b0`=D!YjvWE?XT2r-cy$rhDd}%{eC2q+x(=9y1<b914Mr8~|h4m=%uGU~ii0Pyk~J!%A5Lz&WydB=sKfZ7qzZAU87(l-L~mqw&JQ'
+                'T^N^KPW5nLK8yd8Lr(`&g9gDe*__D{9aV&^0cHl<DX9enz6aOcVG7nG;>)jV)PtSGJe;_f5P&h+(7EVy<PgfgFt9^8#gzGyW*yc7$wn5f9Ph%}'
+                'uj#%!WgL>KMoy<gDMM3W)Imn$<!&sb!y(XAg@LP5E}~`?17s{33dKgkh3TJjLSUYm$QMlv2jY~jDNj=vYej1Ejnf(kOwufW;7mbP9@m0tV$Sd&'
+                '6DY?0AHI@c4ILCxw3c43Tj!Y|PO|{gE@T5B)3bbs0enV7@mCita+L#^U$D5l$YDZl1}6gP$w}d4lc@p1-9yaHoXIK7WIim+$uq%@9Wc*G{ZaKU'
+                'lyL~e8sL@ADGYc>HRe5ez#Xu>gmiPKQpd!w9MFhXud-3$Snd~A`8Hhcdn!2LkRhu_HXK6M2SG$b<sB9pFn2;0Q(XJ!CURlPoJ05PT$zIg6P27q'
+                'rEsvi0#r8qeTLw#2szbRT<+>eG3OW(wZK3!e}_hNyy7%cJp@O*Yru2IV&I^^N=C@101WTPQIEn6WA==!>zXUEj%wjrtrEsqrS_00(kw_|hozdR'
+                'zyRMClw1?7yNc&8G#>?A;k(H!RTP{R97rT0oV_>_hlFf>ut>>Q1J?wa4*4<vdR-9Qht-FGhcvx0+(BQ;@kp>km^;!Bg?FY8gV!QOi*E!0V>Gl('
+                'r-H~XpF~&3@J%k2a;7%K-HGwab=?3kvND(2ie}Iu)1;ZK8Gzzj89w7Y0K+mxHc*i|%Up}MS$OEI!}o_k7)n7~OvgzUY4c0f3CgWy`bc(i;H&m&'
+                'n70uCIv~%?D)66aG=iKIbuj1tS_f>uqRoe}i4Vk;pkR_^>jBo8<tmUneTQ?IR6u9>0mF5@7lv_pxErB6($6D|Lq(e*q^Xi;%oobe254HdvW|r?'
+                'lida3^$&Y96uJO&6t|3J!O_=7)tw3fon%+Z{ajav=~$J9IxGSzs!j0mT?cnm<!?2FfOyT;LqKUDuMq-PHGIP7%5ZlSqSchqoatuFYB@#nNFKI{'
+                'KbcDf<s}Dw%b*?)eLRFevWje0wE|wxr9pAe?h1r$H`K!ARk6lPm~@`f2m)4FoVj?R_Lm9nCNP~^XG<rS#Z*W&LM)7UIq>3~&7m-bCCto#AQoJ6'
+                'vnte#x^PjY%)yH+tfSLKoL8kWv7L)bO#zy+n)5G@n*3wT|Eik#p_F#Lr>avEwh~>aNC0p@j_AWIA6mdY@<Vcep$g>U?&u#H23_R?SW=i<AERSJ'
+                ';Jiya++Fc_E6sH5S>WOAVdi$ZN}8Znl8x$6!+T<;i;vOy0BX~OF%9DSB+POjp$0o8skOdPjllZEnXhc<)I#7}NmbTh5+}+lVU79u?B(wR1$UiW'
+                '+u;7^&CiLmhhPw%VMV7B0mny?43Y*JL^S4}8B;1D2+hqYgS^YX6YjkoBdF`rf(I~#@2MCB6G!56I}#C?Y#^u%ShNJjiGTq&hevx%<PunLx`tdr'
+                'vVyEbOaHvNMz~0sbQG@MSuuK<U*Yy9=~~tx&SjfQ^O=g%?DSs2jy<`d<3I$*t8pO+hW&uR(NtL!+<GLf>7J8F!;w`$4P<UV5?Ng{H9Yx=Wx*25'
+                'u^17tB00%%nvbTD2QDLIIW9E_GBhG+<C-N^LGAT>DqK`k4f8!&i=XfVlb1dvd$?{d--iENPtIdPgY|7|`+Q;R$I{8Q!q%DM<`O>+v>rd=sp6qe'
+                '`__7C<9qArrC*<{@Z_MF6xZ<WwUY9so7N}i?eD&{wzh&JvF=}ic6qPmuP#G3rS&!Y-2E2Ea^^v4eZ{)>L+Pjcd&!4WPW7pdy;JN6d#Yp4lmpJb'
+                '4H>9K@!31nUF6--iHYf<$;r`)qhm)7AKU8=X-vWt3eHLBl}Cl0Rcm{#^vh;(?FUXhPK2o`75?oezxm@INu2+I_z5N^swTht13m}!r>@%Pv@o@?'
+                'D?=wLDcpI=@b`?p$z=cDc=GpC9Ul$z7vspA@4l%5?3;VYn=jSmo5$WH{JjETO;{~4;3SRUQ*eZni^MzYPgwEnBYWYbeRJEo@rCvDV)UFf6*dq#'
+                'XQVP|#4~H~JF1C!9lfe){%Y5>BZGlTQ>uqf_(ELB8*!dj;;Qe&d0vWh-iq_S7FUPbG(o$Jiq$-=rluuW0MpfU{GHkS%hBAsG|Az8#9qE^FFysM'
+                '7f-JIhx9?x>nN2m^v?At+dT=^X_SWlnE>Ae<oJH;w81<#wx@)7*xNySo}-LMrP${&ow#-WYm89&=4xSkqa8EgAn#seCio5+sbWs}yMBaSVFwEV'
+                'bddL@%`iO6YbWsr{noki!h*H5&Eu>Zq1seT1AFew{>MXnL+s{5f)8o#?dl>tKS*I~x$yXQ>653$ouBNLla9E)vsC=<S$X~E`tsb{a%(syyOM;r'
+                'P+quRdLEMW-CBHDUOJDfX!~<+L|7}2G2K&3{q}eDH|V$O_UN=Nc2nb_2GXvy#aycq8DL_BiVa@il^mr{R?4^T7I!`^>^v$joUxbxZmoc=w^n%i'
+                '93Ptk+)iI1GrBB+RaZXw+=4lI__cN6GkfKpb#A%RBwq^H<h$Iy`H=s>G90<n+0xfe9*NcU;+Z8fa^w)<@t{1&&}oiWt77@#NBk@MacoNUi?qgO'
+                'j~l<lHxh;gU24thai@^fjHk6o$#}dg9&f-rZ{s5}?0A`!*RGW|SIbLhq5IPMeSCecB^Da!8fehDFMCBhxVCYZ&T-?2Y>4Pp<%xCnAqY-KP;8#E'
+                'PJh!H3h_i&JkcByPR1zbQ4F3qu6%v1_|;BpDDeDYxUY&^{rFH%U2Fp2z9%HlgZqKek-II$I2P6O0)trRPFd%F<ifkWb{&%|w}eBYtI@n1aUQY2'
+                'olwKG7CrQMT~gJ35V-UG9B?h)wbb+>MIo{Qat3eIq;o3U$*k1pPdqo2p&+Cr%4DB+h+b5EQj{AfQ<XG!q4L%Jh@UAsy)Q8ew~dcHUEsYHpjRf#'
+                '+e>sOlCkc=SbX4UJh`_gvA4Uovpbpmn_Ky1<-4YiFp97fv#chorqP;!cTza=CDjIdQq<Hr%xlE%p9rELQNp55_^W=A2Bdv+)jGRgzVZ+>bUSQC'
+                'jBMut2hJ0o4f-Dqz_$Yn`^p{b-u1%MYn8ZS=MdQ-#T!3ar>^}AEaTPlrHu`c?$(7>>)xt$`VoBOiGi$*FN){BuYBaY4&IOU>C1%QpK$Ln*c;2m'
+                'OV=7$e~wAs(wl_tfCwKD$>K&J?lQtB<mO7s@eDs|!%H>>EF<Wi>9=q%0wc1yTm=)p@OaT$xy)mtc^37SW+Rx8>nPPTfv97efuYpytk33WWU9)d'
+                '|7%JE52W_QM9^afdZ(}msU(YL#Ct~0hA&>c08!z+&M+tFvY@gn5Q)TKZ(pO!3d|M6izPR|2P?^1+-i+yeVh^=R6q((uJgCQJloA|zXAD~Ww&#9'
+                '_2LR<YsKtjChc@trc<v8Yz^nqN=4_Lu@;x&)o0-7@mD{8eR91jTHSY8P+}O)E1?*&zkS<!@(Df^`ut?^!47{04GfOLv*p6ps&#6WtD)!|_!)Ud'
+                '=eG#mXV-|#GIH{druQi8r5V|)z!&VBXF{zALLAiyaD$$Yre+FQcQE?lt9#cSH<|4{*gu~vK3p!}IE5)V+q4v4cm(m@kRil-BgbGbKLJ6@T!>A3'
+                '?Ga-Ce_|Mkuwf*kU(?xKEv-M~4{Pl10MO_ORhC}#d%8o=?}@%x#k@K9IDw!kOEB$!yOu<a{W@ORBP4u>k6=R4jWeY$7Ykc!pq23ul93WGM|I9o'
+                'bq-H*Hr7iU>%5e=_pgPIU(c4J`%uICPR!mkrgAcI8xiWoVj0Iyd_O0P#~a&yiOy&-RbIFN>l-}^a5v9gv~S=4^~q`0?ypbIw0?C}R_6pomL^&C'
+                '2_R9_6+KM6j<;Ae{cWnVEy)0+rV36-Wb}nUfZ4|$pdS}Z%yfD{Hba4i(FOstB<%h#e?)T_Z3H~AtgX(A4}p4e554z<Jv!|SY+7{N+3U=A<wIx2'
+                'x3;PzcHf(h&SyNbAAIx2rJuekY@OqVDrep{+~HDSS+etDX~ezITWceEuM#`ANS*wVz5<jNi5N5&i}&{XtR%NA0~S&)6YK69=<t;u^8<Grr+GG#'
+                '#NNI0vl^M#HLwc!eU&UllM-YVEP3#Z&z-Zr{Kno~D{No)Hu+Jg4VJ>qZkQwgK#zspX&$YZYyTe!kr5QU2f-3{;?1|n1T-OqhRD_%I8WS~P4v~t'
+                '3Cm@U^RmOnihZf&i?v>>UJ>L>v}|C-2HRuxd}UAMsi2plE5hh=luI!8_M-1HJy?r{=NsseJzK;lzcx<>uFV4oFL5k_K>4#p-bCc>`W6HWmg?qy'
+                'cc8Tt2+AFAVGfj^o{uJu15iVr=-l!Zv04#eFLJ&54To=m>t<<2cpIHgMwP@HAHDIvMcc|0'
+            )),
+        )
+        for platform, artifact_id, digest, encoded in hosted:
+            with self.subTest(h2_hosted_report=platform, artifact_id=artifact_id):
+                body = zlib.decompress(base64.b85decode(encoded))
+                self.assertEqual(hashlib.sha256(body).hexdigest(), digest)
+                report = ci.strict_json_loads(body, label="complete known-good hosted static report")
+                before = copy.deepcopy(report)
+                executable = ("/opt/hostedtoolcache/Python/3.12.14/x64/bin/python3.12" if platform == "ubuntu"
+                              else r"C:\hostedtoolcache\windows\Python\3.12.10\x64\python.exe")
+                self.assertEqual(len(report["observations"]), 118)
+                self.assertEqual(report["commandResults"][0]["resolvedExecutablePath"], executable)
+                self.assertEqual(report["observations"][90]["detail"], "内联注入在 file:// 环境下也能维持套题标签页")
+                self.assertTrue(ci._static_machine_report_evidence_is_safe(report, executable))
+                self.assertTrue(ci._static_machine_record_evidence_is_safe({
+                    "validatedStaticMachineReport": report, "resolvedExecutablePath": executable,
+                    "producerObservations": [],
+                }))
+                for field in ("missingAudio", "missingHtml", "missingPdf"):
+                    for index in (1, 4):
+                        value = report["observations"][72]["detail"][field][index]
+                        self.assertTrue(value.startswith("P1/次高频/"))
+                        self.assertIn("(VIP)/", value)
+                        self.assertTrue(ci._evidence_publication_json_is_safe(value))
+                self.assertEqual(report, before)
+                self.assertFalse(ci._static_machine_report_evidence_is_safe(report, executable + "-unbound"))
+                malformed_executable = "file://[private-reviewer/python"
+                malformed = copy.deepcopy(report)
+                malformed["commandResults"][0]["argv"][0] = malformed_executable
+                malformed["commandResults"][0]["resolvedExecutablePath"] = malformed_executable
+                malformed["observations"][86]["detail"] = malformed_executable
+                self.assertFalse(ci._static_machine_report_evidence_is_safe(malformed, malformed_executable))
+                for detail in (executable + "-unbound", {executable: "benign"},
+                               executable + " " + "a" * 56 + ".onion",
+                               executable + " / private-reviewer/key",
+                               executable + "$/private-key", executable + ")/private-key",
+                               executable + "!/private-key", executable + "&/private-key"):
+                    forged = copy.deepcopy(report)
+                    forged["observations"][86]["detail"] = detail
+                    self.assertFalse(ci._static_machine_report_evidence_is_safe(forged, executable))
+                forged = copy.deepcopy(report)
+                forged["observations"][0]["detail"] = executable
+                self.assertFalse(ci._static_machine_report_evidence_is_safe(forged, executable))
+        print("I13_P2B_H2_HOSTED UBUNTU=PASS WINDOWS=PASS OBSERVATIONS=118/118 "
+              "SCHEME_PROSE=PASS RELATIVE_VIP=PASS EXECUTABLE_AUTHORITY=SCOPED")
 
     def assert_static_report_privacy_bounds(self, unsafe_texts) -> None:
         safe = {"values": [None, True, False, 0, 42, -3, 1.25, "caf\u00e9", "cafe\u0301", "line\r\nnext\tfield",
