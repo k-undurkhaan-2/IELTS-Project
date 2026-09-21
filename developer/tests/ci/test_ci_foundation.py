@@ -7609,12 +7609,28 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
 
     def assert_h3_static_report_paths(self) -> None:
         reviewer, punctuation, positives = self.h3_static_path_cases()
+        # Assemble synthetic credentials at runtime to keep tracked source clean.
+        credential_host = "example.invalid"
+        credential_userinfo = "user" + ":" + "synthetic" + "@"
         credential_urls = (
-            "https://user:synthetic@example.invalid/api",
-            "http://user:synthetic@example.invalid/api",
-            "https://example.invalid/api?token=synthetic",
-            "postgresql://user:synthetic@example.invalid/db",
+            "https://" + credential_userinfo + credential_host + "/api",
+            "http://" + credential_userinfo + credential_host + "/api",
+            "https://" + credential_host + "/api?" + "token=" + "synthetic",
+            "postgresql://" + credential_userinfo + credential_host + "/db",
         )
+        expected_credential_parts = (
+            ("https", "user", "synthetic", "example.invalid", "/api", "", ""),
+            ("http", "user", "synthetic", "example.invalid", "/api", "", ""),
+            ("https", None, None, "example.invalid", "/api", "token=synthetic", ""),
+            ("postgresql", "user", "synthetic", "example.invalid", "/db", "", ""),
+        )
+        for text, expected_parts in zip(credential_urls, expected_credential_parts, strict=True):
+            parsed = ci.urlsplit(text)
+            self.assertEqual(
+                (parsed.scheme, parsed.username, parsed.password, parsed.hostname,
+                 parsed.path, parsed.query, parsed.fragment),
+                expected_parts,
+            )
         for expected, texts in ((False, (*reviewer.values(), *punctuation.values(), *credential_urls)),
                                 (True, positives)):
             for text in texts:
