@@ -17552,13 +17552,260 @@ class CI7ExternalAuthorityBindingTest(unittest.TestCase):
         self.assertEqual(captured.source_kind, "live")
         self.assertEqual(captured.binding_mode, "local")
 
+    def assert_required_replay_pass_gate(self) -> None:
+        from dataclasses import replace
+
+        baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
+        with tempfile.TemporaryDirectory(prefix="rg1-replay-gate-") as temp_dir:
+            root = Path(temp_dir)
+
+            def invoke(output, runner, context, *, required):
+                argv = [
+                    "--verify-evidence", "--expected-profile", "policy",
+                    "--expected-producer-job", "repository-policy-producer",
+                    "--expected-verifier-job", "repository-policy",
+                    "--expected-runner-os", "Linux",
+                    "--untrusted-evidence-root", str(output),
+                ]
+                if required:
+                    argv.append("--require-replay-pass")
+                authority = ci.ExecutionExternalAuthority(
+                    source_kind="live", binding_mode="github-actions", runner_os="Linux",
+                    job_id=context.verifier_job_id, run_id=context.run_id,
+                    run_attempt=context.run_attempt, event_name=context.event_name,
+                    repository=context.repository, checkout_sha=context.checkout_commit,
+                )
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with mock.patch.object(ci, "capture_live_external_authority", return_value=authority), \
+                        mock.patch.object(ci, "prepare_verification_authority", return_value=(context, runner)), \
+                        mock.patch.object(ci, "rebuild_external_verification_context", return_value=context), \
+                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    exit_code = ci.main(argv)
+                runner.cleanup_task_resources.assert_called_once_with()
+                return exit_code, stdout.getvalue(), stderr.getvalue()
+
+            # The blocker uses the complete independently selected policy plan.
+            # The real writer derives FAIL/counts/manifests from one hard failure.
+            plan = ci.expected_command_authority(
+                "policy", baseline=baseline, current_platform="ubuntu",
+            )
+            with mock.patch.object(ci, "expected_command_authority", return_value=plan):
+                producer = fake_runner(baseline)
+            producer.platform = "ubuntu"
+            producer.runtime["platform"] = "ubuntu"
+            producer.execution_binding = self.github_binding(
+                "repository-policy", command_plan_digest=producer.command_plan_digest,
+            )
+            producer.hard_gate_results = [{
+                "id": ci.HARD_GATE_AUTHORITY[0], "status": "fail",
+                "detail": "RG1 coherent hard gate failure",
+            }]
+            context = synthetic_external_context(producer.execution_binding)
+            output = root / "valid-fail"
+            ci.create_fresh_evidence_root(output, repo_root=root)
+            ci.write_evidence(producer, empty_comparison(), output_dir=output,
+                              evidence_authority_root=root)
+            summary = ci.strict_json_load_file(output / "summary.json")
+            self.assertEqual(summary["status"], "FAIL")
+            self.assertEqual(summary["counts"]["hardGateFailures"], 1)
+            self.assertEqual(summary["counts"]["policyViolations"], 0)
+            self.assertEqual(summary["counts"]["commands"], len(plan))
+            self.assertEqual(ci.verify_evidence_file_set(
+                output, repo_root=root, expected_command_plan=plan, expected_context=context,
+            ), [])
+            before = {name: (output / name).read_bytes() for name in ci.EVIDENCE_FILE_NAMES}
+            for required in (False, True):
+                with self.subTest(valid_fail_requires_replay=required):
+                    runner = copy.deepcopy(producer)
+                    runner.run = mock.Mock(side_effect=AssertionError("FAIL evidence must skip replay"))
+                    runner.cleanup_task_resources = mock.Mock()
+                    code, stdout, stderr = invoke(output, runner, context, required=required)
+                    runner.run.assert_not_called()
+                    if required:
+                        self.assertEqual(code, ci.EXIT_POLICY_VIOLATION)
+                        self.assertIn("required fresh replay gate=REJECT", stderr)
+                        self.assertNotIn("status=PASS", stdout)
+                    else:
+                        self.assertEqual(code, ci.EXIT_SUCCESS)
+                        self.assertIn("status=PASS replay=NOT-REQUIRED", stdout)
+                        self.assertEqual(stderr, "")
+                    self.assertEqual(before, {
+                        name: (output / name).read_bytes() for name in ci.EVIDENCE_FILE_NAMES
+                    })
+
+            # Independently execute bounded policy predicates for producer and
+            # replay. Keep the real file verifier, replay comparison and envelope.
+            plan = compact_policy_fixture_plan()
+            for spec in plan:
+                spec["platform"] = "ubuntu"
+            with mock.patch.object(ci, "expected_command_authority", return_value=plan):
+                template = fake_runner(baseline)
+            template.platform = "ubuntu"
+            template.runtime["platform"] = "ubuntu"
+            template.execution_binding = self.github_binding(
+                "repository-policy", command_plan_digest=template.command_plan_digest,
+            )
+            context = replace(synthetic_external_context(template.execution_binding),
+                              fresh_runtime_closure_digest=template.runtime["runtimeClosureDigest"])
+            template.verifier_execution_binding = context.verifier_binding()
+            template.authorization_context_binding = context.authorization_context_binding()
+            template.authorization_context_binding_digest = ci.authorization_context_binding_digest(
+                template.authorization_context_binding,
+            )
+            template.runtime_closure_digest = context.fresh_runtime_closure_digest
+            template.dependency_closure_digest = template.runtime["dependencyClosureDigest"]
+            template.dependency_member_count = 0
+            executions = []
+
+            def fresh_runner():
+                runner = copy.deepcopy(template)
+                runner.command_results = []
+                runner.close_execution_leases = mock.Mock()
+                runner.cleanup_task_resources = mock.Mock()
+
+                def execute():
+                    workflow = ci.WORKFLOW_PATH.read_text(encoding="utf-8")
+                    policy = (ci.REPO_ROOT / "docs" / "CI_POLICY.md").read_text(encoding="utf-8")
+                    checks = (
+                        ci.validate_baseline_document(baseline),
+                        ci.check_governance_language(workflow, policy),
+                        ci.check_workflow_text(workflow),
+                    )
+                    self.assertEqual(checks, ([], [], []))
+                    runner.command_results = [
+                        synthetic_record_from_spec(spec, passed=not errors)
+                        for spec, errors in zip(plan, checks)
+                    ]
+                    ci.finalize_evidence_transcript(runner)
+                    executions.append(runner)
+                    return ci._derive_runner_authoritative_evidence(runner)
+
+                runner.run = mock.Mock(side_effect=execute)
+                return runner
+
+            producer = fresh_runner()
+            comparison = producer.run()
+            output = root / "valid-pass"
+            ci.create_fresh_evidence_root(output, repo_root=root)
+            ci.write_evidence(producer, comparison, output_dir=output, evidence_authority_root=root)
+            self.assertEqual(ci.strict_json_load_file(output / "summary.json")["status"], "PASS")
+            before = {name: (output / name).read_bytes() for name in ci.EVIDENCE_FILE_NAMES}
+            runner = fresh_runner()
+            with mock.patch.object(ci, "rebuild_external_verification_context", return_value=context):
+                errors, transcript = ci.verify_evidence_with_replay(
+                    output, expected_context=context, verification_runner=runner,
+                    evidence_authority_root=root,
+                )
+            self.assertEqual(errors, [])
+            self.assertEqual(transcript["finalAcceptance"], "PASS")
+            self.assertEqual(len(transcript["replayAuthorizationEnvelopeDigest"]), 64)
+            self.assertEqual(transcript["verifierReplayContextBinding"]["cleanupResult"], "closed-clean")
+            self.assertIsNot(producer.command_results, runner.command_results)
+            runner.run.assert_called_once_with()
+            runner.close_execution_leases.assert_called_once_with()
+            runner = fresh_runner()
+            code, stdout, stderr = invoke(output, runner, context, required=True)
+            self.assertEqual(code, ci.EXIT_SUCCESS)
+            self.assertIn("status=PASS replay=PASS", stdout)
+            self.assertEqual(stderr, "")
+            self.assertEqual(len(executions), 3)
+            runner.run.assert_called_once_with()
+
+            for mode in ("unavailable", "no-comparison", "rejected"):
+                with self.subTest(fresh_replay=mode):
+                    runner = fresh_runner()
+                    if mode == "unavailable":
+                        runner.run.side_effect = OSError("RG1 replay unavailable")
+                    elif mode == "no-comparison":
+                        runner.run.side_effect = lambda: None
+                    else:
+                        runner.hard_gate_results = [{
+                            "id": ci.HARD_GATE_AUTHORITY[0], "status": "fail",
+                            "detail": "RG1 replay rejected",
+                        }]
+                    code, stdout, stderr = invoke(output, runner, context, required=True)
+                    self.assertEqual(code, ci.EXIT_POLICY_VIOLATION)
+                    self.assertNotIn("status=PASS", stdout)
+                    self.assertIn("verification failed", stderr)
+                    runner.run.assert_called_once_with()
+                    runner.close_execution_leases.assert_called_once_with()
+
+            # Exercise missing output at the real outer verifier boundary too.
+            runner = fresh_runner()
+            with mock.patch.object(ci, "run_verification_replay", return_value=(None, [])):
+                code, stdout, stderr = invoke(output, runner, context, required=True)
+            self.assertEqual(code, ci.EXIT_POLICY_VIOLATION)
+            self.assertIn("required fresh replay gate=REJECT", stderr)
+            self.assertNotIn("status=PASS", stdout)
+
+            # Fault-inject the CLI return contract: non-null is insufficient,
+            # and later outer-verifier errors still override an accepted replay.
+            for result in (None, {}, [], {"finalAcceptance": "REJECT"},
+                           {"finalAcceptance": "pass"}, {"finalAcceptance": True}):
+                with self.subTest(unaccepted_transcript=result), mock.patch.object(
+                    ci, "verify_evidence_with_replay", return_value=([], result),
+                ):
+                    code, stdout, stderr = invoke(output, fresh_runner(), context, required=True)
+                    self.assertEqual(code, ci.EXIT_POLICY_VIOLATION)
+                    self.assertIn("required fresh replay gate=REJECT", stderr)
+                    self.assertNotIn("status=PASS", stdout)
+            with mock.patch.object(ci, "verify_evidence_with_replay", return_value=(
+                ["RG1 post-replay evidence changed"], transcript,
+            )):
+                code, stdout, stderr = invoke(output, fresh_runner(), context, required=True)
+            self.assertEqual(code, ci.EXIT_POLICY_VIOLATION)
+            self.assertIn("RG1 post-replay evidence changed", stderr)
+            self.assertNotIn("status=PASS", stdout)
+            self.assertNotIn("gate=REJECT", stderr)
+            self.assertEqual(before, {
+                name: (output / name).read_bytes() for name in ci.EVIDENCE_FILE_NAMES
+            })
+
+            # Ordinary evidence errors precede the opt-in acceptance check.
+            (output / "command-results.json").write_bytes(before["command-results.json"] + b" ")
+            runner = fresh_runner()
+            code, stdout, stderr = invoke(output, runner, context, required=True)
+            self.assertEqual(code, ci.EXIT_POLICY_VIOLATION)
+            self.assertIn("verification failed", stderr)
+            self.assertNotIn("gate=REJECT", stderr)
+            self.assertNotIn("status=PASS", stdout)
+            runner.run.assert_not_called()
+
     def test_missing_expected_profile_and_invalid_cli_matrix_fails_before_authority(self) -> None:
+        self.assert_required_replay_pass_gate()
         with mock.patch.object(ci, "prepare_verification_authority") as prepare, mock.patch.object(
             ci, "verify_evidence_with_replay"
         ) as replay:
             self.assertEqual(ci.main(["--verify-evidence"]), ci.EXIT_CONFIGURATION_ERROR)
         prepare.assert_not_called()
         replay.assert_not_called()
+
+        replay_argv = ["--verify-evidence", "--expected-profile", "policy"]
+        invalid_replay_argv = (
+            ["--require-replay-pass"],
+            ["--list-profiles", "--require-replay-pass"],
+            ["--profile", "policy", "--require-replay-pass"],
+            ["--prepare-developer-esbuild", "--require-replay-pass"],
+            [*replay_argv, "--require-replay-p"],
+            [*replay_argv, "--require-replay-pass=true"],
+            [*replay_argv, "--require-replay-pass=false"],
+            [*replay_argv, "--require-replay-pass", "--require-replay-pass"],
+            [*replay_argv, "--require-replay-pass", "--require-replay-p"],
+            [*replay_argv, "--require-replay-p", "--require-replay-pass"],
+        )
+        for argv in invalid_replay_argv:
+            with self.subTest(replay_authority_argv=argv), \
+                    mock.patch.object(ci, "capture_live_external_authority") as capture, \
+                    mock.patch.object(ci, "prepare_verification_authority") as prepare, \
+                    mock.patch.object(ci, "verify_evidence_with_replay") as replay, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(ci.main(argv), ci.EXIT_CONFIGURATION_ERROR)
+                capture.assert_not_called()
+                prepare.assert_not_called()
+                replay.assert_not_called()
+        with mock.patch.dict(os.environ, {"CI_REQUIRE_REPLAY_PASS": "1"}):
+            self.assertFalse(ci.parse_args(replay_argv).require_replay_pass)
+        self.assertTrue(ci.parse_args([*replay_argv, "--require-replay-pass"]).require_replay_pass)
 
         invalid_argv = (
             ["--verify-evidence", "--expected-profile", ""],
@@ -17848,6 +18095,18 @@ class CI7ExternalAuthorityBindingTest(unittest.TestCase):
             ),
             "neutralized-exit": workflow.replace(policy_command, policy_command + " || true", 1),
         }
+        self.assertEqual(ci.check_workflow_text(workflow), [])
+        for job, command in ci.FINAL_VERIFIER_COMMANDS.items():
+            self.assertEqual(command.split().count("--require-replay-pass"), 1)
+            self.assertIn(command, workflow)
+            for label, replacement in (
+                ("missing", ""),
+                ("abbreviated", " --require-replay-p"),
+                ("duplicated", " --require-replay-pass --require-replay-pass"),
+            ):
+                mutations[f"{job}-replay-requirement-{label}"] = workflow.replace(
+                    command, command.replace(" --require-replay-pass", replacement, 1), 1,
+                )
         for name, candidate in mutations.items():
             with self.subTest(name=name):
                 self.assertNotEqual(candidate, workflow, name)

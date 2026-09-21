@@ -7649,7 +7649,7 @@ FINAL_VERIFIER_COMMANDS = MappingProxyType(
     {
         "repository-policy": (
             '"$CI_TRUSTED_PYTHON" -B developer/tests/ci/run_ci_foundation.py '
-            "--verify-evidence --expected-profile policy "
+            "--verify-evidence --require-replay-pass --expected-profile policy "
             "--expected-producer-job repository-policy-producer "
             "--expected-verifier-job repository-policy --expected-runner-os Linux "
             '--untrusted-evidence-root "$RUNNER_TEMP/ci-untrusted/repository-policy" '
@@ -7657,7 +7657,7 @@ FINAL_VERIFIER_COMMANDS = MappingProxyType(
         ),
         "ubuntu-canonical": (
             '"$CI_TRUSTED_PYTHON" -B developer/tests/ci/run_ci_foundation.py '
-            "--verify-evidence --expected-profile all "
+            "--verify-evidence --require-replay-pass --expected-profile all "
             "--expected-producer-job ubuntu-canonical-producer "
             "--expected-verifier-job ubuntu-canonical --expected-runner-os Linux "
             '--untrusted-evidence-root "$RUNNER_TEMP/ci-untrusted/ubuntu-canonical" '
@@ -7665,7 +7665,7 @@ FINAL_VERIFIER_COMMANDS = MappingProxyType(
         ),
         "windows-compatibility": (
             "& $env:CI_TRUSTED_PYTHON -B developer/tests/ci/run_ci_foundation.py "
-            "--verify-evidence --expected-profile all "
+            "--verify-evidence --require-replay-pass --expected-profile all "
             "--expected-producer-job windows-compatibility-producer "
             "--expected-verifier-job windows-compatibility --expected-runner-os Windows "
             '--untrusted-evidence-root "$env:RUNNER_TEMP/ci-untrusted/windows-compatibility" '
@@ -25318,6 +25318,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--expected-runner-os",
         "--expected-invocation-id",
         "--untrusted-evidence-root",
+        "--require-replay-pass",
         "--release-authoritative",
     ):
         occurrences = sum(
@@ -25356,6 +25357,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--untrusted-evidence-root")
     parser.add_argument("--require-linux-containment-self-test", action="store_true")
     parser.add_argument("--require-fresh-runtime-closure", action="store_true")
+    parser.add_argument(
+        "--require-replay-pass", action="store_true",
+        help="Require an accepted fresh replay for evidence-verifier success.",
+    )
     try:
         args = parser.parse_args(selected_argv)
     except argparse.ArgumentError as exc:
@@ -25381,6 +25386,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     elif any(value is not None for value in expected_options) or (
         args.require_linux_containment_self_test
         or args.require_fresh_runtime_closure
+        or args.require_replay_pass
     ):
         raise ValueError("expected verification context options require --verify-evidence")
     return args
@@ -25578,6 +25584,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("CI foundation evidence verification failed:", file=sys.stderr)
             for error in verification_errors:
                 print(f"- {sanitize_text(error)}", file=sys.stderr)
+            return EXIT_POLICY_VIOLATION
+        if args.require_replay_pass and (
+            not isinstance(replay_transcript, Mapping)
+            or replay_transcript.get("finalAcceptance") != "PASS"
+        ):
+            print(
+                "CI foundation evidence verification failed: required fresh replay gate=REJECT",
+                file=sys.stderr,
+            )
             return EXIT_POLICY_VIOLATION
         replay_status = "PASS" if replay_transcript is not None else "NOT-REQUIRED"
         print(
