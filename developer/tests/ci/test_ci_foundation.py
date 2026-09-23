@@ -41,6 +41,97 @@ import run_static_suite as static_suite  # noqa: E402
 import test_standalone_packaging as standalone_packaging  # noqa: E402
 
 
+BACKEND_PORTABLE_VERIFIER_PATH = "developer/tests/ci/backend_canonical_portable_result.py"
+
+
+def assert_portable_verifier_trust_membership(test: unittest.TestCase) -> None:
+    for name in ("CI_TRUST_FILE_PATHS", "TRUSTED_FILE_PATHS"):
+        paths = getattr(ci, name)
+        test.assertEqual(paths.count(BACKEND_PORTABLE_VERIFIER_PATH), 1, name)
+        # Keep the entry point and its acceptance implementation adjacent.
+        test.assertEqual(paths.index(BACKEND_PORTABLE_VERIFIER_PATH),
+                         paths.index("developer/tests/ci/run_ci_foundation.py") + 1, name)
+
+
+@contextlib.contextmanager
+def portable_verifier_trust_fixture(*, source_root: Path | None = None):
+    with tempfile.TemporaryDirectory(prefix="ti1-trust-inventory-") as temp_dir:
+        root = Path(temp_dir)
+        paths = set(ci.CI_TRUST_FILE_PATHS) | set(ci.TRUSTED_FILE_PATHS)
+        paths.add(BACKEND_PORTABLE_VERIFIER_PATH)
+        for relative in paths:
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(((source_root or ci.REPO_ROOT) / relative).read_bytes())
+        locked = {}
+        for relative, expected_sha256 in ci.LOCKED_FILE_SHA256.items():
+            canonical = (root / relative).read_bytes().replace(b"\r\n", b"\n")
+            assert hashlib.sha256(canonical).hexdigest() == expected_sha256
+            locked[relative] = {
+                "objectId": ci.LOCKED_FILE_GIT_BLOB_OIDS[relative],
+                "sha256": expected_sha256,
+                "canonicalBytes": canonical,
+            }
+        module = root / BACKEND_PORTABLE_VERIFIER_PATH
+        original = module.read_bytes()
+        offset = original.index(b"def _bind_producer(")
+        mutated = original[:offset] + original[offset:].replace(b"return None", b"return True", 1)
+        assert mutated != original and len(mutated) == len(original)
+        yield SimpleNamespace(root=root, module=module, original=original,
+                              mutated=mutated, locked_identities=locked)
+
+
+@contextlib.contextmanager
+def backend_verifier_source_fixture():
+    """Provide actual source targets and freshly measured trust for outer fixtures."""
+    with portable_verifier_trust_fixture(source_root=Path(__file__).resolve().parents[3]) as source:
+        git = str(Path(shutil.which("git")).resolve(strict=True))
+        environment = dict(os.environ)
+        subprocess.run([git, "init", "--quiet"], cwd=source.root, env=environment,
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        source.tools = {"git": git}
+        source.environment = environment
+        source.target = ci._target_authority(source.root, BACKEND_PORTABLE_VERIFIER_PATH)
+        source.trust_records, source.trust_digest = ci.ci_trust_file_set_authority(
+            git=git, environment=environment, repo_root=source.root)
+        yield source
+
+
+@contextlib.contextmanager
+def frozen_backend_spy(name, *, direct_module=None, before=None, **mock_options):
+    """Observe fresh-module calls without replacing their implementation authority.
+
+    Optional direct-module instrumentation also covers existing low-level tests;
+    each call delegates to that particular module's original implementation.
+    """
+    loader = ci._frozen_backend_portable_verifier
+    spy = mock.Mock(**mock_options)
+
+    @contextlib.contextmanager
+    def instrument(module):
+        original = getattr(module, name)
+
+        def call(*args, **kwargs):
+            if before is not None:
+                before()
+            result = spy(*args, **kwargs)
+            return result if mock_options else original(*args, **kwargs)
+
+        with mock.patch.object(module, name, side_effect=call):
+            yield
+
+    @contextlib.contextmanager
+    def observed(*args, **kwargs):
+        with loader(*args, **kwargs) as module, instrument(module):
+            yield module
+
+    with contextlib.ExitStack() as stack:
+        if direct_module is not None:
+            stack.enter_context(instrument(direct_module))
+        stack.enter_context(mock.patch.object(ci, "_frozen_backend_portable_verifier", side_effect=observed))
+        yield spy
+
+
 def _path_is_relative_to(path: Path, parent: Path) -> bool:
     try:
         path.relative_to(parent)
@@ -4469,10 +4560,49 @@ class WorkflowPolicyTest(unittest.TestCase):
             )
         )
 
+    def assert_policy_trust_inventories(self, policy: str) -> None:
+        assert_portable_verifier_trust_membership(self)
+        tick = chr(96)
+        inventories = (
+            ("The CI trust files are:", ci.CI_TRUST_FILE_PATHS),
+            ("The CI trust-file set used by replay binding is exactly, in order:", ci.CI_TRUST_FILE_PATHS),
+            ("The fixed trusted manifest is:", ci.TRUSTED_FILE_PATHS),
+        )
+        for heading, expected in inventories:
+            self.assertEqual(policy.count(heading), 1, heading)
+            pattern = re.escape(heading) + rf"\n\n((?:- {tick}[^\n{tick}]+{tick}\n)+)(?=\n)"
+            matches = list(re.finditer(pattern, policy))
+            self.assertEqual(len(matches), 1, heading)
+            actual = tuple(line[3:-1] for line in matches[0].group(1).splitlines())
+            self.assertEqual(actual, tuple(expected), heading)
+
     def test_documentation_contains_explicit_bootstrap_warning(self) -> None:
         self.assertEqual(ci.check_governance_language(self.workflow, self.policy), [])
         for warning in ci.TRUST_WARNING_LINES:
             self.assertIn(warning, self.policy)
+
+        self.assert_policy_trust_inventories(self.policy)
+        tick = chr(96)
+        entry = f"- {tick}{BACKEND_PORTABLE_VERIFIER_PATH}{tick}\n"
+        previous = f"- {tick}developer/tests/ci/run_ci_foundation.py{tick}\n"
+        for heading in (
+            "The CI trust files are:",
+            "The CI trust-file set used by replay binding is exactly, in order:",
+            "The fixed trusted manifest is:",
+        ):
+            pattern = re.escape(heading) + rf"\n\n((?:- {tick}[^\n{tick}]+{tick}\n)+)(?=\n)"
+            match = re.search(pattern, self.policy)
+            block = match.group(1)
+            variants = {
+                "missing": block.replace(entry, "", 1),
+                "duplicated": block.replace(entry, entry + entry, 1),
+                "reordered": block.replace(previous + entry, entry + previous, 1),
+            }
+            for label, replacement in variants.items():
+                with self.subTest(inventory=heading, mutation=label):
+                    candidate = self.policy[:match.start(1)] + replacement + self.policy[match.end(1):]
+                    with self.assertRaises(AssertionError):
+                        self.assert_policy_trust_inventories(candidate)
 
     def test_final_result_output_contains_candidate_control_warning(self) -> None:
         for warning in ci.TRUST_WARNING_LINES:
@@ -8627,6 +8757,54 @@ class TrustedExecutionTest(unittest.TestCase):
             after, errors = ci.snapshot_trusted_files(repo_root=root, paths=("trusted.txt",))
             self.assertEqual(errors, [])
             self.assertTrue(ci.compare_trusted_snapshots(before, after))
+
+        assert_portable_verifier_trust_membership(self)
+        with portable_verifier_trust_fixture() as fixture:
+            original_snapshot = ci.snapshot_trusted_files
+            before, errors = original_snapshot(
+                repo_root=fixture.root, locked_identities=fixture.locked_identities)
+            self.assertEqual(errors, [])
+            self.assertEqual(tuple(before), ci.TRUSTED_FILE_PATHS)
+            self.assertIn(BACKEND_PORTABLE_VERIFIER_PATH, before)
+
+            def current_snapshot(*, locked_identities):
+                # Leave paths unspecified to exercise the production default manifest.
+                return original_snapshot(repo_root=fixture.root, locked_identities=locked_identities)
+
+            runner = object.__new__(ci.FoundationRunner)
+            runner.initial_trusted_snapshot = before
+            runner.hard_gate_results = []
+            runner.violations = []
+            runner.tool_leases = {}
+            runner.runtime_dependency_guard = None
+            runner.child_environment = {}
+            runner.require_tool = mock.Mock(return_value=sys.executable)
+            runner.verify_tool_authority = mock.Mock(return_value=[])
+            with mock.patch.object(ci, "snapshot_trusted_files", side_effect=current_snapshot), \
+                 mock.patch.object(ci, "capture_locked_file_git_identities",
+                                   return_value=(fixture.locked_identities, [])):
+                runner.verify_trusted_integrity("ti1-unchanged")
+                self.assertEqual(runner.hard_gate_results[-1]["status"], "pass")
+                self.assertEqual(runner.violations, [])
+                fixture.module.write_bytes(fixture.mutated)
+                after, errors = original_snapshot(
+                    repo_root=fixture.root, locked_identities=fixture.locked_identities)
+                self.assertEqual(errors, [])
+                self.assertEqual(ci.compare_trusted_snapshots(before, after),
+                                 [f"trusted file changed: {BACKEND_PORTABLE_VERIFIER_PATH}"])
+                runner.verify_trusted_integrity("ti1-mutated")
+                gate = runner.hard_gate_results[-1]
+                self.assertEqual(gate["id"], "TRUSTED-FILE-INTEGRITY-TI1-MUTATED")
+                self.assertEqual(gate["status"], "fail")
+                self.assertIn(BACKEND_PORTABLE_VERIFIER_PATH, gate["detail"])
+                self.assertEqual(runner.violations, [{"id": gate["id"], "detail": gate["detail"]}])
+                fixture.module.write_bytes(fixture.original)
+                restored, errors = original_snapshot(
+                    repo_root=fixture.root, locked_identities=fixture.locked_identities)
+                self.assertEqual(errors, [])
+                self.assertEqual(ci.compare_trusted_snapshots(before, restored), [])
+                runner.verify_trusted_integrity("ti1-restored")
+                self.assertEqual(runner.hard_gate_results[-1]["status"], "pass")
 
     def test_unbounded_child_stdout_is_terminated(self) -> None:
         environment = ci.child_process_environment({"python": sys.executable}, source_environment=os.environ)
@@ -17970,6 +18148,472 @@ class CI7ExternalAuthorityBindingTest(unittest.TestCase):
                 )
                 self.assertTrue(errors, name)
 
+    def assert_backend_verifier_trust_binding(self, git: str, environment: dict) -> None:
+        assert_portable_verifier_trust_membership(self)
+        with portable_verifier_trust_fixture() as fixture:
+            for args in (("init", "--quiet"), ("add", "--", ".")):
+                completed = subprocess.run([git, *args], cwd=fixture.root, env=environment,
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                self.assertEqual(completed.returncode, 0, completed.stderr.decode(errors="replace"))
+            original_measure = ci.ci_trust_file_set_authority
+            baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
+            runner = SimpleNamespace(profile="policy", release_gate_required=False,
+                                     baseline=baseline, tools={"git": git},
+                                     child_environment=environment, command_plan_digest="2" * 64)
+
+            def pair():
+                measured = []
+
+                def measure(**kwargs):
+                    self.assertEqual(kwargs["repo_root"], fixture.root)
+                    records, digest = original_measure(**kwargs)
+                    measured.append((copy.deepcopy(records), digest))
+                    return records, digest
+
+                authority = dict(runner_os="Linux", run_id="123456", run_attempt="1",
+                                 event_name="pull_request", repository="fixture/ti1",
+                                 checkout_sha="1" * 40)
+                with mock.patch.object(ci, "current_checkout_identity",
+                                       return_value=("1" * 40, "3" * 40)), \
+                     mock.patch.object(ci, "ci_trust_file_set_authority", side_effect=measure):
+                    producer = ci.build_synthetic_generation_execution_binding(
+                        runner, repo_root=fixture.root,
+                        external_authority=ci.synthetic_execution_external_authority(
+                            job_id="repository-policy-producer", **authority))
+                    verifier = ci.build_externally_expected_verification_context(
+                        expected_profile="policy", release_gate_required=False,
+                        expected_producer_job="repository-policy-producer",
+                        expected_verifier_job="repository-policy", expected_runner_os="Linux",
+                        expected_invocation_id=None, command_plan_digest_value=runner.command_plan_digest,
+                        fresh_runtime_closure_digest="4" * 64, baseline=baseline, git=git,
+                        child_environment=environment, repo_root=fixture.root,
+                        external_authority=ci.synthetic_execution_external_authority(
+                            job_id="repository-policy", **authority))
+                self.assertEqual(len(measured), 2)
+                self.assertEqual(measured[0], measured[1])
+                self.assertEqual([r["relativePath"] for r in measured[0][0]], list(ci.CI_TRUST_FILE_PATHS))
+                self.assertEqual(producer, verifier.evidence_binding())
+                self.assertEqual(producer["trustFileDigest"], measured[0][1])
+                self.assertEqual(verifier.verifier_binding()["trustFileDigest"], measured[0][1])
+                self.assertEqual(ci.execution_binding_external_context_errors(
+                    producer, ci.execution_binding_digest(producer), verifier), [])
+                return producer, verifier, measured[0]
+
+            producer, context, measured = pair()
+            self.assertEqual(pair()[2], measured)
+            fixture.module.write_bytes(fixture.mutated)
+            changed_producer, changed_context, changed = pair()
+            self.assertNotEqual(changed[1], measured[1])
+            self.assertEqual([r["relativePath"] for r in changed[0]],
+                             [r["relativePath"] for r in measured[0]])
+            for old, new in zip(measured[0], changed[0]):
+                if old["relativePath"] == BACKEND_PORTABLE_VERIFIER_PATH:
+                    self.assertEqual({k: v for k, v in old.items() if k != "sha256"},
+                                     {k: v for k, v in new.items() if k != "sha256"})
+                    self.assertNotEqual(old["sha256"], new["sha256"])
+                else:
+                    self.assertEqual(old, new)
+            self.assertEqual({key for key in producer if producer[key] != changed_producer[key]},
+                             {"trustFileDigest", "producerInvocationId"})
+            self.assertTrue(ci.execution_binding_external_context_errors(
+                producer, ci.execution_binding_digest(producer), changed_context))
+            fixture.module.write_bytes(fixture.original)
+            restored_producer, restored_context, restored = pair()
+            self.assertEqual(restored, measured)
+            self.assertEqual(restored_producer, producer)
+            self.assertEqual(restored_context, context)
+            fixture.module.unlink()
+            with self.assertRaisesRegex(ValueError, "CI trust file is unavailable"):
+                original_measure(git=git, environment=environment, repo_root=fixture.root)
+
+    def assert_backend_verifier_acceptance_dependency(self) -> None:
+        import test_backend_canonical_portable_result as backend
+
+        self.assertIs(backend.ci, ci)
+        self.assertEqual(Path(inspect.getfile(backend.portable)).resolve(),
+                         (CI_DIR / "backend_canonical_portable_result.py").resolve())
+        assert_portable_verifier_trust_membership(self)
+        with backend.outer_fixture() as case, \
+             frozen_backend_spy("_bind_producer") as producer, \
+             frozen_backend_spy("_bind_replay") as replay:
+            errors, transcript = backend.verify(case)
+            self.assertEqual(errors, [])
+            self.assertEqual(transcript["finalAcceptance"], "PASS")
+            self.assertGreaterEqual(producer.call_count, 1)
+            self.assertGreaterEqual(replay.call_count, 2)
+            self.assertTrue(all(call.args[0] is ci for call in producer.call_args_list))
+            self.assertTrue(all(call.args[0] is ci for call in replay.call_args_list))
+        for hook in ("_bind_producer", "_bind_replay"):
+            with self.subTest(acceptance_dependency=hook), backend.outer_fixture() as case, \
+                 frozen_backend_spy(hook, return_value=None) as rejected:
+                errors, transcript = backend.verify(case)
+                self.assertTrue(any("backend-canonical portable result unavailable" in e for e in errors))
+                self.assertNotEqual((transcript or {}).get("finalAcceptance"), "PASS")
+                rejected.assert_called()
+                if hook == "_bind_producer":
+                    case.runner.run.assert_not_called()
+        for name in ("CI_TRUST_FILE_PATHS", "TRUSTED_FILE_PATHS"):
+            original = getattr(ci, name)
+            for label, replacement in (
+                ("removed", tuple(p for p in original if p != BACKEND_PORTABLE_VERIFIER_PATH)),
+                ("duplicated", (*original, BACKEND_PORTABLE_VERIFIER_PATH)),
+            ):
+                with self.subTest(inventory=name, mutation=label), \
+                     mock.patch.object(ci, name, replacement), self.assertRaises(AssertionError):
+                    assert_portable_verifier_trust_membership(self)
+
+    def assert_backend_frozen_source_authority(self) -> None:
+        with backend_verifier_source_fixture() as source:
+            plans = [synthetic_command_spec("source-" + str(i), "baseline-policy", i,
+                         targets=[copy.deepcopy(source.target)],
+                         execution_input_mode="PROTECTED-TARGET-BUNDLE") for i in range(2)]
+            runner = SimpleNamespace(command_plan=plans, tools=source.tools,
+                                     child_environment=source.environment)
+
+            def context():
+                return SimpleNamespace(command_plan_digest=ci.command_plan_digest(runner.command_plan),
+                                       trust_file_digest=source.trust_digest)
+
+            def load():
+                return ci._frozen_backend_portable_verifier(runner, context(), repo_root=source.root)
+
+            def rejected(label, *, after_execution=False):
+                entered = False
+                with self.subTest(source_authority=label), \
+                     self.assertRaisesRegex(ci._BackendPortableVerifierUnavailable,
+                                            "^" + ci._BACKEND_PORTABLE_UNAVAILABLE + "$"):
+                    with load():
+                        entered = True
+                self.assertEqual(entered, after_execution, label)
+
+            with load() as first:
+                self.assertNotEqual(first.__name__, "backend_canonical_portable_result")
+                self.assertIs(sys.modules[first.__name__], first)
+            self.assertNotIn(first.__name__, sys.modules)
+            with load() as second:
+                self.assertIsNot(second, first)
+                self.assertIsNot(second._ProducerContext, first._ProducerContext)
+            self.assertNotIn(second.__name__, sys.modules)
+
+            # Recompute the plan digest after each target mutation so these controls
+            # specifically exercise cross-binding/lease checks, not a stale digest.
+            changes = {
+                "sha256": lambda t: t.update(sha256="0" * 64),
+                "size": lambda t: t.update(size=t["size"] + 1),
+                "missing stable identity": lambda t: t.update(fileIdentity=None),
+                "wrong stable identity": lambda t: t["fileIdentity"].update(inodeOrFileIndex="0"),
+                "missing canonical source": lambda t: t.update(canonicalSourcePath=None),
+                "wrong canonical source": lambda t: t.update(canonicalSourcePath=str(source.root / "other.py")),
+                "nonregular source": lambda t: t.update(modeType="other"),
+                "reparse source": lambda t: t.update(reparsePoint=True),
+            }
+            for label, change in changes.items():
+                runner.command_plan = copy.deepcopy(plans)
+                for plan in runner.command_plan:
+                    change(plan["targets"][0])
+                rejected(label)
+            for field in ("sha256", "size", "fileIdentity", "canonicalSourcePath"):
+                runner.command_plan = copy.deepcopy(plans)
+                key = {"fileIdentity": "wrong stable identity",
+                       "canonicalSourcePath": "wrong canonical source"}.get(field, field)
+                changes[key](runner.command_plan[1]["targets"][0])
+                rejected("conflicting occurrences: " + field)
+            runner.command_plan = copy.deepcopy(plans)
+            runner.command_plan[0]["targets"].append(copy.deepcopy(source.target))
+            rejected("duplicate target within command")
+            runner.command_plan = copy.deepcopy(plans)
+            for plan in runner.command_plan:
+                plan["targets"].clear()
+            rejected("missing target")
+            runner.command_plan = copy.deepcopy(plans)
+
+            actual_trust = ci.ci_trust_file_set_authority
+            records, digest = actual_trust(git=source.tools["git"],
+                                           environment=source.environment, repo_root=source.root)
+            for label in ("digest", "missing", "duplicate", "path", "size", "sha256"):
+                mutated = copy.deepcopy(records)
+                member = next(r for r in mutated if r["relativePath"] == BACKEND_PORTABLE_VERIFIER_PATH)
+                changed_digest = digest
+                if label == "digest":
+                    changed_digest = "0" * 64
+                elif label == "missing":
+                    mutated.remove(member)
+                elif label == "duplicate":
+                    mutated.append(copy.deepcopy(member))
+                elif label == "path":
+                    member["relativePath"] += ".other"
+                elif label == "size":
+                    member["byteLength"] += 1
+                else:
+                    member["sha256"] = "0" * 64
+                with mock.patch.object(ci, "ci_trust_file_set_authority", return_value=(mutated, changed_digest)):
+                    rejected("trust record " + label)
+            # Also exercise a real independently measured whole-set digest change.
+            policy = source.root / "docs/CI_POLICY.md"
+            original_policy = policy.read_bytes()
+            policy.write_bytes(original_policy + b"\nchanged trust member\n")
+            rejected("actual current trust digest")
+            policy.write_bytes(original_policy)
+
+            leases = []
+            real_lease = ci.TargetExecutionLease
+
+            def capture(*args, **kwargs):
+                lease = real_lease(*args, **kwargs)
+                leases.append(lease)
+                return lease
+
+            with mock.patch.object(ci, "TargetExecutionLease", side_effect=capture):
+                for operation in ("materialize", "verify"):
+                    with mock.patch.object(real_lease, operation,
+                                           side_effect=OSError("private source path and unbounded " * 1000)):
+                        rejected(operation + " exception", after_execution=operation == "verify")
+                    self.assertTrue(leases[-1]._closed)
+                with mock.patch.object(real_lease, "materialize", return_value=b"unplanned bytes"):
+                    rejected("materialized byte substitution")
+                self.assertTrue(leases[-1]._closed)
+                with mock.patch.object(ci, "uuid") as identifiers:
+                    identifiers.uuid4.return_value.hex = "collision"
+                    private_name = "_ci_backend_portable_" + source.target["sha256"] + "_collision"
+                    existing = SimpleNamespace()
+                    with mock.patch.dict(sys.modules, {private_name: existing}):
+                        rejected("private namespace collision")
+                        self.assertIs(sys.modules[private_name], existing)
+                self.assertTrue(leases[-1]._closed)
+            with mock.patch.object(ci, "TargetExecutionLease", side_effect=OSError("private acquisition failure")):
+                rejected("lease acquisition")
+
+            for label, data in (
+                ("compile", b"def invalid syntax\n"),
+                ("exec", b"raise RuntimeError('private execution detail')\n"),
+                ("missing producer binder", source.original + b"\ndel _bind_producer\n"),
+                ("missing replay binder", source.original + b"\ndel _bind_replay\n"),
+            ):
+                source.module.write_bytes(data)
+                target = ci._target_authority(source.root, BACKEND_PORTABLE_VERIFIER_PATH)
+                for plan in runner.command_plan:
+                    plan["targets"] = [copy.deepcopy(target)]
+                _, source.trust_digest = actual_trust(git=source.tools["git"],
+                    environment=source.environment, repo_root=source.root)
+                before_modules = {key for key in sys.modules if key.startswith("_ci_backend_portable_")}
+                with mock.patch.object(ci, "TargetExecutionLease", side_effect=capture):
+                    rejected(label)
+                self.assertTrue(leases[-1]._closed)
+                self.assertEqual({key for key in sys.modules if key.startswith("_ci_backend_portable_")},
+                                 before_modules)
+            self.assertEqual(list(source.module.parent.rglob("*.pyc")), [])
+        print("TI2_CONTROL trust_target_cross_binding=PASS bounded_fail_closed_errors=PASS")
+
+    def assert_backend_frozen_source_execution(self) -> None:
+        import test_backend_canonical_portable_result as backend
+
+        malicious_source = (CI_DIR / "backend_canonical_portable_result.py").read_bytes().replace(
+            b"_require(results[0] == results[1])", b"_require(True)")
+        for timing in ("before current trust", "after current trust"):
+            changed = backend.fixture(stdout=backend.npm_stdout("90", "912").replace(
+                b"value 1000", b"value 9999", 1), physical="9")
+            with self.subTest(rewrite_load_restore=timing), backend.outer_fixture(replay=changed) as case:
+                source = case.source
+                self.assertNotEqual(source.original, malicious_source)
+                before = source.module.stat()
+                original_target = copy.deepcopy(source.target)
+                actual_trust = ci.ci_trust_file_set_authority
+
+                def rewrite():
+                    source.module.write_bytes(malicious_source)
+                    os.utime(source.module, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+                def measure_then_rewrite(**kwargs):
+                    measured = actual_trust(**kwargs)
+                    self.assertEqual(measured[1], case.context.trust_file_digest)
+                    rewrite()
+                    return measured
+
+                with contextlib.ExitStack() as stack:
+                    if timing == "before current trust":
+                        rewrite()
+                    else:
+                        stack.enter_context(mock.patch.object(ci, "ci_trust_file_set_authority",
+                                                             side_effect=measure_then_rewrite))
+                    try:
+                        errors, transcript = backend.verify(case)
+                    finally:
+                        source.module.write_bytes(source.original)
+                        os.utime(source.module, ns=(before.st_atime_ns, before.st_mtime_ns))
+                self.assertEqual(errors, [ci._BACKEND_PORTABLE_UNAVAILABLE])
+                self.assertNotEqual((transcript or {}).get("finalAcceptance"), "PASS")
+                case.runner.run.assert_not_called()
+                restored_trust = actual_trust(git=source.tools["git"],
+                    environment=source.environment, repo_root=case.root)
+                self.assertEqual(restored_trust[1], case.context.trust_file_digest)
+                self.assertEqual(source.module.read_bytes(), source.original)
+                if os.name == "nt":
+                    self.assertEqual(ci._target_authority(case.root, BACKEND_PORTABLE_VERIFIER_PATH),
+                                     original_target)
+        print("TI2_CONTROL rewrite_load_restore=REJECT restored_trust=MATCH")
+
+        # Observe the exact bytes reaching compile, including a mutation attempt
+        # immediately after held-byte materialization, before compile/exec.
+        with backend.outer_fixture(replay=backend.fixture(stdout=backend.npm_stdout("90", "912").replace(
+                b"value 1000", b"value 9999", 1), physical="9")) as case:
+            original_materialize = ci.TargetExecutionLease.materialize
+            materialized = []
+            mutation = []
+            metadata = case.source.module.stat()
+
+            def materialize(lease):
+                data = original_materialize(lease)
+                if lease.relative_path == BACKEND_PORTABLE_VERIFIER_PATH:
+                    materialized.append(data)
+                    try:
+                        case.source.module.write_bytes(malicious_source)
+                    except OSError:
+                        mutation.append("write-blocked-by-held-lease")
+                    else:
+                        mutation.append("path-rewritten-after-materialization")
+                return data
+
+            compiled = []
+            original_semantics_observed = False
+            def compile_held(data, filename, mode, **kwargs):
+                self.assertIs(data, materialized[0])
+                self.assertEqual(hashlib.sha256(data).hexdigest(), case.source.target["sha256"])
+                self.assertEqual((filename, mode, kwargs),
+                                 (BACKEND_PORTABLE_VERIFIER_PATH, "exec", {"dont_inherit": True}))
+                compiled.append(data)
+                return compile(data, filename, mode, **kwargs)
+
+            with mock.patch.object(ci.TargetExecutionLease, "materialize", materialize), \
+                 mock.patch.object(ci, "compile", side_effect=compile_held, create=True):
+                try:
+                    with ci._frozen_backend_portable_verifier(case.runner, case.context,
+                                                            repo_root=case.root) as module:
+                        self.assertEqual(len(materialized), 1)
+                        # The original parser/equality code remains active even if
+                        # POSIX allowed the live path to change after materialize.
+                        self.assertIn("results[0] == results[1]", materialized[0].decode())
+                        self.assertEqual(module._derive_equal_result.__code__.co_filename,
+                                         BACKEND_PORTABLE_VERIFIER_PATH)
+                        producer = module._bind_producer(ci, case.documents["command-results.json"],
+                                                         case.runner.command_plan, case.root)
+                        self.assertIsNotNone(producer)
+                        pair = module._bind_replay(ci, producer, case.documents["command-results.json"],
+                                                   case.runner)
+                        self.assertIsNotNone(pair)
+                        self.assertIsNone(module._derive_equal_result(ci, pair))
+                        original_semantics_observed = True
+                        if mutation == ["path-rewritten-after-materialization"]:
+                            self.assertEqual(case.source.module.read_bytes(), malicious_source)
+                except ci._BackendPortableVerifierUnavailable:
+                    self.assertEqual(mutation, ["path-rewritten-after-materialization"])
+                    self.assertEqual(len(compiled), 1)
+                finally:
+                    if mutation == ["path-rewritten-after-materialization"]:
+                        case.source.module.write_bytes(case.source.original)
+                        os.utime(case.source.module, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+            self.assertTrue(original_semantics_observed)
+            self.assertEqual(compiled, [case.source.original])
+            self.assertEqual(list(case.source.module.parent.rglob("*.pyc")), [])
+            print("TI2_CONTROL executed_source_sha256=MATCH_FROZEN_TARGET sha256="
+                  + hashlib.sha256(compiled[0]).hexdigest() + " mutation=" + mutation[0])
+
+        for semantic_change in (False, True):
+            stdout = backend.npm_stdout("90", "912")
+            if semantic_change:
+                stdout = stdout.replace(b"value 1000", b"value 9999", 1)
+            with backend.outer_fixture(replay=backend.fixture(stdout=stdout, physical="9")) as case:
+                poisoned = ci.ModuleType("backend_canonical_portable_result")
+                poison_methods = [mock.Mock(side_effect=AssertionError("poisoned cache used")) for _ in range(4)]
+                for name, method in zip(("_bind_producer", "_bind_replay", "_derive_equal_result", "_comparison_views"),
+                                        poison_methods):
+                    setattr(poisoned, name, method)
+                with mock.patch.dict(sys.modules, {"backend_canonical_portable_result": poisoned}):
+                    errors, transcript = backend.verify(case)
+                    self.assertIs(sys.modules["backend_canonical_portable_result"], poisoned)
+                for method in poison_methods:
+                    method.assert_not_called()
+                self.assertEqual(transcript["finalAcceptance"], "REJECT" if semantic_change else "PASS")
+                self.assertEqual(bool(errors), semantic_change)
+        print("TI2_CONTROL sys_modules_poisoning=NO_EFFECT duration_only=PASS semantic_difference=REJECT")
+
+    def assert_backend_source_lease_lifecycle(self) -> None:
+        import test_backend_canonical_portable_result as backend
+
+        for failure in (None, "post-use verification", "producer binder", "replay binder", "fresh replay"):
+            with self.subTest(lease_lifecycle=failure), backend.outer_fixture() as case:
+                leases, events, modules = [], [], []
+                real_lease = ci.TargetExecutionLease
+                real_loader = ci._frozen_backend_portable_verifier
+
+                class ObservedLease(real_lease):
+                    def __init__(self, *args, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        if self.relative_path == BACKEND_PORTABLE_VERIFIER_PATH:
+                            leases.append(self)
+                            events.append("source-open")
+
+                    def verify(self):
+                        if self.relative_path == BACKEND_PORTABLE_VERIFIER_PATH:
+                            events.append("source-verify")
+                            if failure == "post-use verification":
+                                return False, "private verification detail " * 1000
+                        return super().verify()
+
+                    def close(self):
+                        if getattr(self, "relative_path", None) == BACKEND_PORTABLE_VERIFIER_PATH \
+                                and not self._closed:
+                            events.append("source-close")
+                        return super().close()
+
+                @contextlib.contextmanager
+                def observed_loader(*args, **kwargs):
+                    with real_loader(*args, **kwargs) as module, contextlib.ExitStack() as stack:
+                        modules.append(module)
+                        for name in ("_bind_producer", "_bind_replay", "_derive_equal_result", "_comparison_views"):
+                            original = getattr(module, name)
+                            def observed(*args, _name=name, _original=original, **kwargs):
+                                self.assertEqual(len(leases), 1)
+                                self.assertFalse(leases[0]._closed)
+                                self.assertIs(_original.__globals__, module.__dict__)
+                                events.append(_name)
+                                if ((_name == "_bind_producer" and failure == "producer binder")
+                                        or (_name == "_bind_replay" and failure == "replay binder")):
+                                    raise RuntimeError("private binder detail " * 1000)
+                                return _original(*args, **kwargs)
+                            stack.enter_context(mock.patch.object(module, name, side_effect=observed))
+                        yield module
+
+                def run():
+                    self.assertFalse(leases[0]._closed)
+                    events.append("fresh-replay")
+                    if failure == "fresh replay":
+                        raise RuntimeError("private replay detail")
+                    return case.comparison
+
+                case.runner.run.side_effect = run
+                with mock.patch.object(ci, "TargetExecutionLease", ObservedLease), \
+                     mock.patch.object(ci, "_frozen_backend_portable_verifier", side_effect=observed_loader):
+                    errors, transcript = backend.verify(case)
+                self.assertEqual(len(leases), 1)
+                self.assertEqual(len(modules), 1)
+                self.assertTrue(leases[0]._closed)
+                self.assertNotIn(modules[0].__name__, sys.modules)
+                self.assertEqual(events[-2:], ["source-verify", "source-close"])
+                if failure is None:
+                    self.assertEqual(errors, [])
+                    self.assertEqual(transcript["finalAcceptance"], "PASS")
+                    self.assertLess(events.index("_bind_producer"), events.index("fresh-replay"))
+                    self.assertLess(events.index("fresh-replay"), events.index("_bind_replay"))
+                    self.assertEqual(events.count("_bind_replay"), 2)
+                    self.assertLess(events.index("_comparison_views"), events.index("source-verify"))
+                elif failure == "fresh replay":
+                    self.assertTrue(any("verification replay execution is unavailable" in e for e in errors))
+                    self.assertNotEqual((transcript or {}).get("finalAcceptance"), "PASS")
+                else:
+                    self.assertEqual(errors, [ci._BACKEND_PORTABLE_UNAVAILABLE])
+                    self.assertNotEqual((transcript or {}).get("finalAcceptance"), "PASS")
+        print("TI2_CONTROL same_module_both_binders=PASS lease_open_through_use=PASS post_use_verify=PASS cleanup=PASS")
+
     def test_cross_commit_tree_and_trust_file_substitution_matrix_is_rejected(self) -> None:
         evidence = self.github_binding("windows-compatibility")
         mutations = {
@@ -18025,6 +18669,12 @@ class CI7ExternalAuthorityBindingTest(unittest.TestCase):
         ).hexdigest()
         self.assertNotEqual(changed_digest, digest)
 
+        self.assert_backend_verifier_trust_binding(tools["git"], runner.child_environment)
+        self.assert_backend_verifier_acceptance_dependency()
+        self.assert_backend_frozen_source_authority()
+        self.assert_backend_frozen_source_execution()
+        self.assert_backend_source_lease_lifecycle()
+
     def test_seventh_review_exact_policy_in_ubuntu_slot_fails_before_replay(self) -> None:
         policy_evidence = self.github_binding("repository-policy")
         ubuntu_expected = self.github_binding("ubuntu-canonical")
@@ -18053,6 +18703,24 @@ class CI7ExternalAuthorityBindingTest(unittest.TestCase):
         self.assertTrue(result_errors)
         read_evidence.assert_not_called()
         replay.assert_not_called()
+
+    def assert_policy_hosted_verifier_commands(self, policy: str) -> None:
+        marker = "fresh runner, the authoritative verifier's terminal step runs:"
+        self.assertEqual(policy.count(marker), 1)
+        tick = chr(96)
+        fence = tick * 3
+        tail = policy.split(marker, 1)[1]
+        self.assertTrue(tail.startswith("\n\n" + fence + "text\n"))
+        block = tail.split(fence + "text\n", 1)[1].split("\n" + fence, 1)[0]
+        expected = []
+        for job, command in ci.FINAL_VERIFIER_COMMANDS.items():
+            suffix = command.split(" -B ", 1)[1]
+            for root in ("$RUNNER_TEMP", "$env:RUNNER_TEMP"):
+                suffix = suffix.replace(f'"{root}/ci-untrusted/{job}"', f".ci-untrusted/{job}")
+            documented = "<ABSOLUTE_PYTHON> -B " + suffix
+            self.assertEqual(documented.split().count("--require-replay-pass"), 1)
+            expected.append(f"{job}:\n{documented}")
+        self.assertEqual(block, "\n\n".join(expected))
 
     def test_workflow_verifier_command_mutation_matrix_is_rejected(self) -> None:
         workflow = ci.WORKFLOW_PATH.read_text(encoding="utf-8")
@@ -18111,6 +18779,20 @@ class CI7ExternalAuthorityBindingTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertNotEqual(candidate, workflow, name)
                 self.assertTrue(ci.check_workflow_text(candidate), name)
+
+        policy = (CI_DIR.parents[2] / "docs/CI_POLICY.md").read_text(encoding="utf-8")
+        self.assert_policy_hosted_verifier_commands(policy)
+        for job in ci.FINAL_VERIFIER_COMMANDS:
+            prefix = f"{job}:\n<ABSOLUTE_PYTHON> -B developer/tests/ci/run_ci_foundation.py --verify-evidence"
+            self.assertEqual(policy.count(prefix + " --require-replay-pass"), 1)
+            for label, replacement in (
+                ("missing", ""), ("abbreviated", " --require-replay-p"),
+                ("duplicated", " --require-replay-pass --require-replay-pass"),
+            ):
+                with self.subTest(documented_verifier=job, mutation=label):
+                    candidate = policy.replace(prefix + " --require-replay-pass", prefix + replacement, 1)
+                    with self.assertRaises(AssertionError):
+                        self.assert_policy_hosted_verifier_commands(candidate)
 
     def test_cross_file_binding_and_coherent_forgery_are_rejected(self) -> None:
         baseline = ci.strict_json_load_file(ci.BASELINE_PATH)

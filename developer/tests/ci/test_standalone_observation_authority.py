@@ -29,14 +29,15 @@ PATH = "developer/tests/ci/test_standalone_packaging.py"
 STREAM = b"Ran 4 tests in 0.125s\n\nOK\n"
 
 
-def runner_fixture(root, platform="windows"):
+def runner_fixture(root, platform="windows", *, preserve_source=False):
     base = backend.fixture(platform)
     template, _, _ = backend.replay_fixture(base, base)
     runner = object.__new__(ci.FoundationRunner)
     runner.__dict__.update(vars(template))
     target = root / PATH
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(b"# protected standalone fixture\n")
+    if not preserve_source:
+        target.write_bytes(b"# protected standalone fixture\n")
     spec = fixtures.synthetic_command_spec("standalone-packaging", "standalone-packaging", 0,
         targets=[ci._target_authority(root, PATH)], execution_input_mode="PROTECTED-TARGET-BUNDLE")
     argv = [sys.executable, "-B", PATH]
@@ -153,7 +154,7 @@ def counters():
     with mock.patch.object(ci, "_rederive_observation_record", wraps=ci._rederive_observation_record) as reconstruction, \
          mock.patch.object(ci, "_derive_authoritative_evidence", wraps=ci._derive_authoritative_evidence) as derivation, \
          mock.patch.object(ci, "parse_node_test_semantic_result", wraps=ci.parse_node_test_semantic_result) as parser, \
-         mock.patch.object(backend.portable, "_parse_stdout", wraps=backend.portable._parse_stdout) as backend_parser:
+         backend.portable_spy("_parse_stdout") as backend_parser:
         yield SimpleNamespace(reconstruction=reconstruction, derivation=derivation,
                               parser=parser, backend_parser=backend_parser)
 
@@ -588,7 +589,7 @@ class StandaloneObservationAuthorityTest(unittest.TestCase):
             ci.finalize_evidence_transcript(runner)
             with mock.patch.object(ci, "REPO_ROOT", case.root), \
                  mock.patch.object(ci, "rebuild_external_verification_context", return_value=case.context), \
-                 mock.patch.object(backend.portable, "_bind_producer") as backend_bind, counters() as calls, \
+                 backend.portable_spy("_bind_producer") as backend_bind, counters() as calls, \
                  mock.patch.object(ci, "_validate_evidence_semantics_with_authority", wraps=ci._validate_evidence_semantics_with_authority) as stages:
                 errors, transcript = ci.verify_evidence_with_replay(case.output, expected_context=case.context,
                     verification_runner=runner, repo_root=case.root, evidence_authority_root=case.root)
@@ -1650,13 +1651,13 @@ class StandaloneRetentionProductionTest(unittest.TestCase):
         replay_backend = backend.fixture(platform, ordinal=701, stdout=backend.npm_stdout("90", "912"), physical="9")
         with self.subTest(platform=platform), backend.outer_fixture(producer_backend, replay_backend,
             prefix_count=701, extra=("standalone-packaging",), hosted=True, frontend_ordinals=frontend) as outer:
-            standalone, standalone_capture = runner_fixture(outer.root, platform)
+            producer_backend, replay_backend = outer.producer, outer.replay
+            standalone, standalone_capture = runner_fixture(outer.root, platform, preserve_source=True)
             standalone.command_plan[0]["ordinal"] = standalone.command_results[0]["ordinal"] = 702
             runners = []
             for duration in (b"0.125", b"9.875"):
                 runner = object.__new__(ci.FoundationRunner)
                 runner.__dict__.update(copy.deepcopy(vars(outer.runner)))
-                runner.child_environment = {}
                 runner.command_plan[702] = copy.deepcopy(standalone.command_plan[0])
                 runner.command_results[702] = copy.deepcopy(standalone.command_results[0])
                 capture = copy.deepcopy(standalone_capture)
@@ -1692,7 +1693,7 @@ class StandaloneRetentionProductionTest(unittest.TestCase):
                     backend.drift_unrelated_record(replay.command_results[ordinal])
                 replay.run = mock.Mock(return_value=comparison)
                 with mock.patch.object(ci, "rebuild_external_verification_context", return_value=context), \
-                     mock.patch.object(backend.portable, "_identity", wraps=backend.portable._identity) as identity:
+                     backend.portable_spy("_identity") as identity:
                     calls.backend_parser.reset_mock()
                     errors, transcript = ci.verify_evidence_with_replay(producer_case.output, expected_context=context,
                         verification_runner=replay, repo_root=outer.root, evidence_authority_root=outer.root)
@@ -1828,7 +1829,8 @@ def packaging_replay_fixture(platform="windows", *, producer_stderr=None, replay
         packaging_python_authority(evidence)
     with backend.outer_fixture(producer_backend, replay_backend, prefix_count=701,
             extra=("standalone-packaging",), hosted=True, frontend_ordinals=frontend) as outer:
-        standalone, template_capture = runner_fixture(outer.root, platform)
+        producer_backend, replay_backend = outer.producer, outer.replay
+        standalone, template_capture = runner_fixture(outer.root, platform, preserve_source=True)
         standalone.command_plan[0]["ordinal"] = standalone.command_results[0]["ordinal"] = 702
         runners = []
         streams = ((producer_stdout, packaging_reporter(platform=platform) if producer_stderr is None else producer_stderr),
@@ -1836,7 +1838,6 @@ def packaging_replay_fixture(platform="windows", *, producer_stderr=None, replay
         for side, (stdout, stderr) in enumerate(streams):
             runner = object.__new__(ci.FoundationRunner)
             runner.__dict__.update(copy.deepcopy(vars(outer.runner)))
-            runner.child_environment = {}
             runner.command_plan[702] = copy.deepcopy(standalone.command_plan[0])
             runner.command_results[702] = copy.deepcopy(standalone.command_results[0])
             capture = copy.deepcopy(template_capture)
@@ -1885,8 +1886,8 @@ def packaging_counters():
                            wraps=ci._parse_standalone_packaging_stderr) as parser, \
          mock.patch.object(ci, "_standalone_packaging_semantic_identity",
                            wraps=ci._standalone_packaging_semantic_identity) as identity, \
-         mock.patch.object(backend.portable, "_parse_stdout", wraps=backend.portable._parse_stdout) as backend_parser, \
-         mock.patch.object(backend.portable, "_identity", wraps=backend.portable._identity) as backend_identity:
+         backend.portable_spy("_parse_stdout") as backend_parser, \
+         backend.portable_spy("_identity") as backend_identity:
         yield SimpleNamespace(parser=parser, identity=identity, backend_parser=backend_parser, backend_identity=backend_identity)
 
 

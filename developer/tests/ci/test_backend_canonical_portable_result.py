@@ -21,6 +21,10 @@ import test_ci_foundation as fixtures
 import backend_canonical_portable_result as portable
 
 
+def portable_spy(name, **kwargs):
+    return fixtures.frozen_backend_spy(name, direct_module=portable, **kwargs)
+
+
 def digest(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -209,36 +213,45 @@ def replay_fixture(producer, replay, *, compact=False, extra=False, prefix_count
 @contextlib.contextmanager
 def outer_fixture(producer=None, replay=None, *, compact=True, extra=False, prefix_count=0,
                   hosted=False, frontend_ordinals=()):
-    producer = fixture() if producer is None else producer
-    replay = fixture(stdout=npm_stdout("90", "912"), physical="9") if replay is None else replay
-    runner, _documents, _comparison = replay_fixture(producer, replay, extra=extra,
-        prefix_count=prefix_count, frontend_ordinals=frontend_ordinals)
-    if hosted:
-        runner.execution_binding.update(bindingMode="github-actions", producerJobId=(
-            "windows-compatibility-producer" if runner.platform == "windows" else "ubuntu-canonical-producer"),
-            runId="123456", runAttempt="1", eventName="workflow_dispatch", repository="fixture/backend-cli")
-        runner.execution_binding["producerInvocationId"] = ci._github_binding_invocation_id({
-            k: v for k, v in runner.execution_binding.items() if k != "producerInvocationId"})
-    context = replace(fixtures.synthetic_external_context(runner.execution_binding),
-                      fresh_runtime_closure_digest=runner.runtime_closure_digest)
-    runner.verifier_execution_binding = context.verifier_binding()
-    runner.authorization_context_binding = context.authorization_context_binding()
-    runner.authorization_context_binding_digest = ci.authorization_context_binding_digest(
-        runner.authorization_context_binding)
-    runner.baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
-    producer_runner = copy.deepcopy(runner)
-    producer_runner.command_results[prefix_count] = copy.deepcopy(producer.command_record)
-    producer_runner.command_plan[prefix_count] = copy.deepcopy(producer.expected_authority)
-    producer_runner.runtime = copy.deepcopy(producer.runtime)
-    producer_runner.runtime_closure_document = copy.deepcopy(producer.runtime_closure)
-    producer_runner.runtime_closure_guard_evidence = copy.deepcopy(producer.runtime_guard)
-    for target in (runner, producer_runner):
-        target.observations = [{"rawObservation": raw} for record in target.command_results
-                               for raw in record["producerObservations"]]
-        ci.finalize_evidence_transcript(target)
-    with tempfile.TemporaryDirectory(prefix="backend-portable-") as temp:
-        root = Path(temp)
-        (root / "backend").mkdir()
+    with fixtures.backend_verifier_source_fixture() as source:
+        producer = fixture() if producer is None else copy.deepcopy(producer)
+        replay = fixture(stdout=npm_stdout("90", "912"), physical="9") if replay is None else copy.deepcopy(replay)
+        # Both sides include the unchanged verifier source, with actual local authority.
+        # Source authority is independently remeasured by the production loader.
+        for evidence in (producer, replay):
+            evidence.expected_authority["targets"].append(copy.deepcopy(source.target))
+            rebuilt = fixtures.synthetic_record_from_spec(evidence.expected_authority)
+            for key in (*portable.AUTHORITY_KEYS, "executionInputs", "executionInputBundleDigest", "protectedTargetBundle"):
+                evidence.command_record[key] = copy.deepcopy(rebuilt[key])
+        runner, _documents, _comparison = replay_fixture(producer, replay, extra=extra,
+            prefix_count=prefix_count, frontend_ordinals=frontend_ordinals)
+        runner.tools, runner.child_environment = source.tools, source.environment
+        runner.execution_binding["trustFileDigest"] = source.trust_digest
+        if hosted:
+            runner.execution_binding.update(bindingMode="github-actions", producerJobId=(
+                "windows-compatibility-producer" if runner.platform == "windows" else "ubuntu-canonical-producer"),
+                runId="123456", runAttempt="1", eventName="workflow_dispatch", repository="fixture/backend-cli")
+            runner.execution_binding["producerInvocationId"] = ci._github_binding_invocation_id({
+                k: v for k, v in runner.execution_binding.items() if k != "producerInvocationId"})
+        context = replace(fixtures.synthetic_external_context(runner.execution_binding),
+                          fresh_runtime_closure_digest=runner.runtime_closure_digest)
+        runner.verifier_execution_binding = context.verifier_binding()
+        runner.authorization_context_binding = context.authorization_context_binding()
+        runner.authorization_context_binding_digest = ci.authorization_context_binding_digest(
+            runner.authorization_context_binding)
+        runner.baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
+        producer_runner = copy.deepcopy(runner)
+        producer_runner.command_results[prefix_count] = copy.deepcopy(producer.command_record)
+        producer_runner.command_plan[prefix_count] = copy.deepcopy(producer.expected_authority)
+        producer_runner.runtime = copy.deepcopy(producer.runtime)
+        producer_runner.runtime_closure_document = copy.deepcopy(producer.runtime_closure)
+        producer_runner.runtime_closure_guard_evidence = copy.deepcopy(producer.runtime_guard)
+        for target in (runner, producer_runner):
+            target.observations = [{"rawObservation": raw} for record in target.command_results
+                                   for raw in record["producerObservations"]]
+            ci.finalize_evidence_transcript(target)
+        root = source.root
+        (root / "backend").mkdir(exist_ok=True)
         (root / "backend/package.json").write_bytes(producer.package_json)
         package_target = ci._target_authority(root, "backend/package.json")
         # The independent verifier plan uses the actual candidate's local identity.
@@ -272,7 +285,7 @@ def outer_fixture(producer=None, replay=None, *, compact=True, extra=False, pref
              mock.patch.object(ci, "REPO_ROOT", root):
             yield SimpleNamespace(producer=producer, replay=replay, runner=runner, context=context,
                 root=root, output=output, documents=documents, comparison=comparison,
-                pair={"producer": producer, "replay": replay})
+                pair={"producer": producer, "replay": replay}, source=source)
 
 
 def write_documents(output, documents, *, ascii_json=False):
@@ -448,9 +461,9 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                 case = SimpleNamespace(context=context, runner=runner, output=output)
                 with mock.patch.object(ci, "REPO_ROOT", root), \
                      mock.patch.object(ci, "rebuild_external_verification_context", return_value=context), \
-                     mock.patch.object(portable, "_parse_stdout") as parser, \
-                     mock.patch.object(portable, "_identity") as identity, \
-                     mock.patch.object(portable, "_bind_producer") as binder:
+                     portable_spy("_parse_stdout") as parser, \
+                     portable_spy("_identity") as identity, \
+                     portable_spy("_bind_producer") as binder:
                     exit_code, (errors, transcript), text, _ = invoke_main(case)
                 self.assertEqual((exit_code, errors), (ci.EXIT_SUCCESS, []), text)
                 self.assertEqual(transcript["finalAcceptance"], "PASS")
@@ -481,8 +494,8 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                         drift_unrelated_record(other)
                         return case.comparison
                     case.runner.run.side_effect = drift
-                with mock.patch.object(portable, "_parse_stdout", wraps=portable._parse_stdout) as parser, \
-                     mock.patch.object(portable, "_identity", wraps=portable._identity) as identity:
+                with portable_spy("_parse_stdout") as parser, \
+                     portable_spy("_identity") as identity:
                     exit_code, (errors, transcript), output, call = invoke_main(case)
                 self.assertNotIn("backend_result_evidence", call.kwargs)
                 case.runner.run.assert_called_once()
@@ -525,8 +538,8 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                     case.runner.captures.clear()
                 return case.comparison
             case.runner.run.side_effect = drift
-            with mock.patch.object(portable, "_parse_stdout", wraps=portable._parse_stdout) as parser, \
-                 mock.patch.object(portable, "_identity", wraps=portable._identity) as identity:
+            with portable_spy("_parse_stdout") as parser, \
+                 portable_spy("_identity") as identity:
                 exit_code, (errors, transcript), output, call = invoke_main(case)
             self.assertEqual(exit_code, ci.EXIT_POLICY_VIOLATION, output)
             self.assertEqual(transcript["finalAcceptance"], "REJECT")
@@ -563,8 +576,8 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                 self.assert_hosted_mismatches("ubuntu", backend_change=change)
 
     def assert_rejected(self, case, label, *, parser_calls=0, identity_calls=0):
-        with mock.patch.object(portable, "_parse_stdout", wraps=portable._parse_stdout) as parser, \
-             mock.patch.object(portable, "_identity", wraps=portable._identity) as identity:
+        with portable_spy("_parse_stdout") as parser, \
+             portable_spy("_identity") as identity:
             errors, transcript = verify(case)
         self.assertTrue(errors, label)
         self.assertNotIn("backendCanonicalPortableResult", transcript or {}, label)
@@ -592,13 +605,7 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
     def test_call_order_and_detached_authorization_bound_attachment(self):
         with outer_fixture() as case:
             events = []
-            originals = {name: getattr(portable, name) for name in (
-                "_bind_producer", "_bind_replay", "_parse_stdout", "_identity")}
-            def traced(name):
-                def call(*args, **kwargs):
-                    events.append(name)
-                    return originals[name](*args, **kwargs)
-                return call
+            names = ("_bind_producer", "_bind_replay", "_parse_stdout", "_identity")
             raw_verify = ci.verify_evidence_file_set
             semantics = ci._validate_evidence_semantics
             compare = ci._compare_verification_replay_claims
@@ -634,8 +641,8 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
             before_files = {p.name: p.read_bytes() for p in case.output.iterdir()}
             before_record = json_bytes(case.runner.command_results)
             with contextlib.ExitStack() as stack:
-                for name in originals:
-                    stack.enter_context(mock.patch.object(portable, name, side_effect=traced(name)))
+                for name in names:
+                    stack.enter_context(portable_spy(name, before=lambda name=name: events.append(name)))
                 stack.enter_context(mock.patch.object(ci, "verify_evidence_file_set", side_effect=raw))
                 stack.enter_context(mock.patch.object(ci, "_validate_evidence_semantics", side_effect=semantic))
                 stack.enter_context(mock.patch.object(ci, "_compare_verification_replay_claims", side_effect=compared))
@@ -686,7 +693,7 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
             with self.subTest(case=label), outer_fixture() as case:
                 change(case.documents)
                 write_documents(case.output, case.documents)
-                with mock.patch.object(portable, "_bind_producer", side_effect=AssertionError("must not bind")):
+                with portable_spy("_bind_producer", side_effect=AssertionError("must not bind")):
                     self.assert_rejected(case, label)
                 case.runner.run.assert_not_called()
         for label in ("missing evidence file", "extra evidence file", "invalid JSON"):
@@ -1021,8 +1028,8 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
             encoded = fields[stream].encode()
             self.assertFalse(len(encoded) == on_disk[stream + "BytesObserved"]
                              and digest(encoded) == on_disk[stream + "Sha256"])
-            with mock.patch.object(portable, "_parse_stdout", wraps=portable._parse_stdout) as parser, \
-                 mock.patch.object(portable, "_identity", wraps=portable._identity) as identity:
+            with portable_spy("_parse_stdout") as parser, \
+                 portable_spy("_identity") as identity:
                 self.assertIsNone(portable._bind_producer(ci, case.documents["command-results.json"],
                                   case.runner.command_plan, case.root))
                 exit_code, (errors, transcript), output, _ = invoke_main(case)
@@ -1147,9 +1154,9 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                             self.assertEqual(len(fields["stdout"].encode()), record["stdoutBytesObserved"])
                             self.assertNotEqual(digest(fields["stdout"].encode()), record["stdoutSha256"])
                         before_files = {p.name: p.read_bytes() for p in case.output.iterdir()}
-                        with mock.patch.object(portable, "_parse_stdout", wraps=portable._parse_stdout) as parser, \
-                             mock.patch.object(portable, "_identity", wraps=portable._identity) as identity, \
-                             mock.patch.object(portable, "_bind_side", wraps=portable._bind_side) as bind_side:
+                        with portable_spy("_parse_stdout") as parser, \
+                             portable_spy("_identity") as identity, \
+                             portable_spy("_bind_side") as bind_side:
                             self.assertIsNone(portable._bind_producer(ci, case.documents["command-results.json"],
                                               case.runner.command_plan, case.root))
                             bind_side.assert_not_called()
@@ -1213,9 +1220,9 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                     for observed in (producer.command_record, record):
                         self.assertEqual({key: observed[key] for key in original_authority}, original_authority)
                     before_files = {p.name: p.read_bytes() for p in case.output.iterdir()}
-                    with mock.patch.object(portable, "_parse_stdout", wraps=portable._parse_stdout) as parser, \
-                         mock.patch.object(portable, "_identity", wraps=portable._identity) as identity, \
-                         mock.patch.object(portable, "_bind_side", wraps=portable._bind_side) as bind_side:
+                    with portable_spy("_parse_stdout") as parser, \
+                         portable_spy("_identity") as identity, \
+                         portable_spy("_bind_side") as bind_side:
                         bound = portable._bind_producer(ci, case.documents["command-results.json"],
                                                        case.runner.command_plan, case.root)
                         self.assertTrue(bound is None, "reserved marker must fail before side binding")
@@ -1275,8 +1282,8 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                     self.assertEqual(case.runner.captures[0].stderr_raw, b"")
                     for path in case.output.iterdir():
                         self.assertNotIn("[BACKEND STREAM REDACTED]", path.read_text(encoding="utf-8"))
-                    with mock.patch.object(portable, "_parse_stdout", wraps=portable._parse_stdout) as parser, \
-                         mock.patch.object(portable, "_identity", wraps=portable._identity) as identity:
+                    with portable_spy("_parse_stdout") as parser, \
+                         portable_spy("_identity") as identity:
                         self.assertIsNotNone(portable._bind_producer(ci, case.documents["command-results.json"],
                                              case.runner.command_plan, case.root))
                         exit_code, (errors, transcript), output, _ = invoke_main(case)
@@ -1390,9 +1397,9 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                 backend_result_evidence=case.pair, backendCanonicalPortableResult={"identityDigest": "claimed"})
             bad["command-results.json"]["records"][0]["stdoutSha256"] = "0" * 64
             case.runner.backend_result_evidence = case.pair
-            with mock.patch.object(portable, "_parse_stdout", side_effect=AssertionError("lower parser")) as parser, \
-                 mock.patch.object(portable, "_identity", side_effect=AssertionError("lower identity")) as identity, \
-                 mock.patch.object(portable, "_derive_equal_result", side_effect=AssertionError("lower derivation")) as derive:
+            with portable_spy("_parse_stdout", side_effect=AssertionError("lower parser")) as parser, \
+                 portable_spy("_identity", side_effect=AssertionError("lower identity")) as identity, \
+                 portable_spy("_derive_equal_result", side_effect=AssertionError("lower derivation")) as derive:
                 for documents in (bad, {}):
                     transcript, errors = ci.compare_verification_replay_claims(documents, case.runner, case.comparison)
                     self.assertTrue(errors)
@@ -1411,7 +1418,7 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                 parser.assert_not_called()
                 identity.assert_not_called()
                 derive.assert_not_called()
-        with mock.patch.object(portable, "_parse_stdout") as parser, mock.patch.object(portable, "_identity") as identity:
+        with portable_spy("_parse_stdout") as parser, portable_spy("_identity") as identity:
             self.assertIsNone(portable._derive_equal_result(ci, {"producer": fixture(), "replay": fixture()}))
             parser.assert_not_called()
             identity.assert_not_called()
@@ -1419,8 +1426,8 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
     def test_raw_local_frontend_and_packaging_paths_are_unchanged(self):
         with outer_fixture() as case:
             before = json_bytes(ci.finalize_evidence_transcript(case.runner))
-            with mock.patch.object(portable, "_parse_stdout", side_effect=AssertionError("local parser")), \
-                 mock.patch.object(portable, "_identity", side_effect=AssertionError("local identity")):
+            with portable_spy("_parse_stdout", side_effect=AssertionError("local parser")), \
+                 portable_spy("_identity", side_effect=AssertionError("local identity")):
                 errors = []
                 self.assertFalse(ci._validate_command_record(case.producer.command_record, 0, errors,
                     expected_record=case.producer.expected_authority))

@@ -39,10 +39,11 @@ import unicodedata
 import uuid
 import weakref
 from collections import defaultdict
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
-from types import MappingProxyType
+from types import MappingProxyType, ModuleType
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import quote, unquote_to_bytes, urlsplit
 
@@ -239,6 +240,7 @@ CI_TRUST_FILE_PATHS = (
     ".github/workflows/ci.yml",
     "developer/tests/ci/phase1-ci-baseline.json",
     "developer/tests/ci/run_ci_foundation.py",
+    "developer/tests/ci/backend_canonical_portable_result.py",
     "developer/tests/ci/run_static_suite.py",
     "developer/tests/ci/test_ci_foundation.py",
     "developer/tests/ci/test_standalone_packaging.py",
@@ -488,6 +490,7 @@ TRUSTED_FILE_PATHS = (
     ".github/workflows/ci.yml",
     "developer/tests/ci/phase1-ci-baseline.json",
     "developer/tests/ci/run_ci_foundation.py",
+    "developer/tests/ci/backend_canonical_portable_result.py",
     "developer/tests/ci/run_static_suite.py",
     "developer/tests/ci/test_ci_foundation.py",
     "developer/tests/ci/test_standalone_packaging.py",
@@ -24279,6 +24282,103 @@ def _standalone_packaging_comparison_views(documents, runner, prior_views, pair,
     return views
 
 
+_BACKEND_PORTABLE_UNAVAILABLE = (
+    "verification replay backend-canonical portable result unavailable or mismatched"
+)
+
+
+class _BackendPortableVerifierUnavailable(ValueError):
+    """A bounded failure at the frozen backend implementation boundary."""
+
+
+@contextmanager
+def _frozen_backend_portable_verifier(
+    verification_runner: FoundationRunner,
+    expected_context: ExternallyExpectedVerificationContext,
+    *,
+    repo_root: Path,
+):
+    """Execute only cross-bound held source bytes; keep their lease through use."""
+
+    relative = "developer/tests/ci/backend_canonical_portable_result.py"
+    lease = module = None
+    module_name = None
+    registered = False
+    try:
+        try:
+            authority = None
+            for command in verification_runner.command_plan:
+                members = [target for target in command["targets"] if target.get("path") == relative]
+                if len(members) > 1:
+                    raise ValueError("duplicate backend source target")
+                if members:
+                    target = members[0]
+                    if authority is None:
+                        authority = copy.deepcopy(target)
+                    elif _canonical_frame(target) != _canonical_frame(authority):
+                        raise ValueError("conflicting backend source targets")
+            if (
+                authority is None
+                or set(authority) != {"path", "canonicalSourcePath", "size", "sha256",
+                                      "fileIdentity", "modeType", "reparsePoint"}
+                or type(authority["size"]) is not int
+                or not 0 < authority["size"] <= MAX_SCANNED_FILE_BYTES
+                or not isinstance(authority["sha256"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", authority["sha256"]) is None
+                or not isinstance(authority["fileIdentity"], dict)
+                or not isinstance(authority["canonicalSourcePath"], str)
+                or not authority["canonicalSourcePath"]
+                or authority["modeType"] != "regular-file"
+                or authority["reparsePoint"] is not False
+                or command_plan_digest(verification_runner.command_plan) != expected_context.command_plan_digest
+            ):
+                raise ValueError("backend source target authority unavailable")
+            trust_records, trust_digest = ci_trust_file_set_authority(
+                git=_runner_required_tool(verification_runner, "git", phase="EXECUTION_BINDING"),
+                environment=verification_runner.child_environment,
+                repo_root=repo_root,
+            )
+            members = [record for record in trust_records if record.get("relativePath") == relative]
+            if (trust_digest != expected_context.trust_file_digest or len(members) != 1
+                    or members[0].get("byteLength") != authority["size"]
+                    or members[0].get("sha256") != authority["sha256"]):
+                raise ValueError("backend source trust and target authority disagree")
+            lease = TargetExecutionLease(
+                authority, repo_root=repo_root, execution_adapter="PROTECTED-TARGET-BUNDLE")
+            source_bytes = lease.materialize()
+            if (type(source_bytes) is not bytes or len(source_bytes) != authority["size"]
+                    or hashlib.sha256(source_bytes).hexdigest() != authority["sha256"]):
+                raise ValueError("backend source materialization differs from authority")
+            module_name = "_ci_backend_portable_" + authority["sha256"] + "_" + uuid.uuid4().hex
+            module = ModuleType(module_name)
+            module.__file__ = relative
+            if sys.modules.setdefault(module_name, module) is not module:
+                raise ValueError("backend source module namespace collision")
+            registered = True
+            code = compile(source_bytes, relative, "exec", dont_inherit=True)
+            exec(code, module.__dict__)
+            if any(not callable(getattr(module, name, None)) for name in (
+                    "_bind_producer", "_bind_replay", "_derive_equal_result", "_comparison_views")):
+                raise ValueError("backend source acceptance implementation unavailable")
+            yield module
+        finally:
+            try:
+                if lease is not None and not lease.verify()[0]:
+                    raise ValueError("backend source post-use verification failed")
+                if registered and sys.modules.get(module_name) is not module:
+                    raise ValueError("backend source module namespace changed")
+            finally:
+                try:
+                    if registered and sys.modules.get(module_name) is module:
+                        del sys.modules[module_name]
+                finally:
+                    if lease is not None:
+                        lease.close()
+    except Exception:
+        # Neither source paths nor exception text become public diagnostics.
+        raise _BackendPortableVerifierUnavailable(_BACKEND_PORTABLE_UNAVAILABLE) from None
+
+
 def verify_evidence_with_replay(
     output_dir: Path = OUTPUT_DIR,
     *,
@@ -24374,143 +24474,146 @@ def verify_evidence_with_replay(
         verification_runner, expected_context, records, verification_runner.command_plan,
         documents, snapshots, output_dir)) if packaging_portability else None)
     deferred_portability = backend_portability or packaging_portability
-    bound_pair = packaging_pair = None
-    comparison = None
-    if not deferred_portability:
-        replay_operation = _run_verification_replay if observation_authority is not None else run_verification_replay
-        transcript, replay_errors = replay_operation(
-            documents, expected_context=expected_context,
-            verification_runner=verification_runner, repo_root=repo_root,
-        )
-    else:
-        if backend_portability:
-            import backend_canonical_portable_result as backend_portable
-
-            unavailable = "verification replay backend-canonical portable result unavailable or mismatched"
-            backend_context = backend_portable._bind_producer(
-                sys.modules[__name__], documents["command-results.json"],
-                verification_runner.command_plan, repo_root,
-            )
-            if backend_context is None:
-                return [unavailable], None
-        comparison, replay_errors = _execute_verification_replay(
-            expected_context=expected_context, verification_runner=verification_runner,
-            repo_root=repo_root,
-        )
-        transcript = None
-        if comparison is not None:
-            if backend_portability:
-                bound_pair = backend_portable._bind_replay(
-                    sys.modules[__name__], backend_context,
-                    documents["command-results.json"], verification_runner,
-                )
-                if bound_pair is None:
-                    replay_errors.append(unavailable)
-            # Authority, execution state and cleanup remain ahead of parsing.
-            # Semantic inequality in another command is collected afterward.
-            try:
-                transcript, comparison_errors = _verification_replay_eligibility(
-                    documents, verification_runner, comparison,
-                )
-            except (OSError, AttributeError, KeyError, TypeError, ValueError) as exc:
-                return sorted(set(replay_errors + [
-                    "verification replay authority finalization failed: " + type(exc).__name__])), None
-            replay_errors.extend(comparison_errors)
-            transcript, replay_errors = _finish_verification_replay(
-                transcript, replay_errors, expected_context=expected_context,
-                runner=verification_runner,
-            )
-            if packaging_portability and not replay_errors:
-                # Freeze only the completed replay, after its ordinary finalizer
-                # has rebound observation context and cleanup has succeeded.
-                packaging_pair = _bind_standalone_portable_replay(packaging_context)
-    errors.extend(replay_errors)
-    if transcript is not None and transcript.get("finalAcceptance") != "PASS":
-        errors.append(
-            "verification replay lacks a PASS ReplayAuthorizationEnvelope"
-        )
     try:
-        rebuilt_context = rebuild_external_verification_context(
-            expected_context,
-            verification_runner,
-            repo_root=repo_root,
-        )
-    except (OSError, ValueError) as exc:
-        errors.append(
-            f"verification replay external context could not be revalidated: {type(exc).__name__}: {sanitize_text(str(exc))}"
-        )
-    else:
-        if rebuilt_context != expected_context:
-            errors.append("verification replay external context changed during replay")
-    for name, original in snapshots.items():
-        current, current_errors = _read_evidence_file_snapshot(
-            output_dir / name,
-            output_dir=output_dir,
-            byte_limit=EVIDENCE_FILE_BYTE_LIMITS[name],
-        )
-        errors.extend(f"{name}: {error}" for error in current_errors)
-        if current is not None and (
-            current.identity != original.identity or current.data != original.data
-        ):
-            errors.append(f"{name}: evidence changed during verification replay")
-    if deferred_portability:
-        # Evidence/context/cleanup and authority eligibility precede parsing.
-        try:
-            if {entry.name for entry in os.scandir(output_dir)} != set(EVIDENCE_FILE_NAMES):
-                errors.append("evidence file membership changed during verification replay")
-        except OSError as exc:
-            errors.append(f"evidence directory cannot be re-enumerated: {type(exc).__name__}")
-        result = packaging_result = None
-        packaging_rebound = None
-        if not errors and packaging_pair is not None:
-            packaging_rebound = _bind_standalone_portable_replay(packaging_context)
-            if packaging_rebound != packaging_pair:
-                errors.append("verification replay standalone-packaging authority changed")
-        if not errors and backend_portability and bound_pair is not None:
-            rebound = backend_portable._bind_replay(
-                sys.modules[__name__], backend_context,
-                documents["command-results.json"], verification_runner,
-            )
-            if rebound != bound_pair:
-                errors.append(unavailable)
-            else:
-                result = backend_portable._derive_equal_result(sys.modules[__name__], rebound)
-                if result is None:
-                    errors.append(unavailable)
-        if not errors and packaging_rebound is not None:
-            packaging_result = _derive_standalone_packaging_equal_result(packaging_rebound)
-        if packaging_portability and packaging_result is None:
-            errors.append("verification replay standalone-packaging portable result unavailable or mismatched")
-        if comparison is not None:
-            # A backend record loses its raw difference only after both full
-            # results were derived and compared equal. Every unavailable or
-            # unequal result retains the raw comparison, even on another error.
-            views = (backend_portable._comparison_views(sys.modules[__name__], rebound, result)
-                     if result is not None else None)
-            if packaging_result is not None:
-                views = _standalone_packaging_comparison_views(
-                    documents, verification_runner, views, packaging_rebound, packaging_result)
-            try:
-                collection_views = (_replay_collection_comparison_views(
-                    documents, verification_runner, comparison, views) if not errors else None)
-                transcript, comparison_errors = _compare_verification_replay_claims(
-                    documents, verification_runner, comparison, comparison_views=views,
-                    collection_views=collection_views,
+        with (_frozen_backend_portable_verifier(verification_runner, expected_context, repo_root=repo_root)
+              if backend_portability else nullcontext()) as backend_portable:
+            bound_pair = packaging_pair = None
+            comparison = None
+            if not deferred_portability:
+                replay_operation = _run_verification_replay if observation_authority is not None else run_verification_replay
+                transcript, replay_errors = replay_operation(
+                    documents, expected_context=expected_context,
+                    verification_runner=verification_runner, repo_root=repo_root,
                 )
-            except (OSError, AttributeError, KeyError, TypeError, ValueError) as exc:
-                return sorted(set(errors + [
-                    "verification replay comparison authority became unavailable: " + type(exc).__name__])), None
-            errors.extend(comparison_errors)
-            if result is not None and not errors:
-                transcript["backendCanonicalPortableResult"] = result
-            transcript, errors = _finish_verification_replay(
-                transcript, errors, expected_context=expected_context,
-                runner=verification_runner,
-            )
-        if errors and transcript is not None:
-            transcript.pop("backendCanonicalPortableResult", None)
-            transcript["finalAcceptance"] = "REJECT"
-    return sorted(set(errors)), transcript
+            else:
+                if backend_portability:
+                    unavailable = _BACKEND_PORTABLE_UNAVAILABLE
+                    backend_context = backend_portable._bind_producer(
+                        sys.modules[__name__], documents["command-results.json"],
+                        verification_runner.command_plan, repo_root,
+                    )
+                    if backend_context is None:
+                        return [unavailable], None
+                comparison, replay_errors = _execute_verification_replay(
+                    expected_context=expected_context, verification_runner=verification_runner,
+                    repo_root=repo_root,
+                )
+                transcript = None
+                if comparison is not None:
+                    if backend_portability:
+                        bound_pair = backend_portable._bind_replay(
+                            sys.modules[__name__], backend_context,
+                            documents["command-results.json"], verification_runner,
+                        )
+                        if bound_pair is None:
+                            replay_errors.append(unavailable)
+                    # Authority, execution state and cleanup remain ahead of parsing.
+                    # Semantic inequality in another command is collected afterward.
+                    try:
+                        transcript, comparison_errors = _verification_replay_eligibility(
+                            documents, verification_runner, comparison,
+                        )
+                    except (OSError, AttributeError, KeyError, TypeError, ValueError) as exc:
+                        return sorted(set(replay_errors + [
+                            "verification replay authority finalization failed: " + type(exc).__name__])), None
+                    replay_errors.extend(comparison_errors)
+                    transcript, replay_errors = _finish_verification_replay(
+                        transcript, replay_errors, expected_context=expected_context,
+                        runner=verification_runner,
+                    )
+                    if packaging_portability and not replay_errors:
+                        # Freeze only the completed replay, after its ordinary finalizer
+                        # has rebound observation context and cleanup has succeeded.
+                        packaging_pair = _bind_standalone_portable_replay(packaging_context)
+            errors.extend(replay_errors)
+            if transcript is not None and transcript.get("finalAcceptance") != "PASS":
+                errors.append(
+                    "verification replay lacks a PASS ReplayAuthorizationEnvelope"
+                )
+            try:
+                rebuilt_context = rebuild_external_verification_context(
+                    expected_context,
+                    verification_runner,
+                    repo_root=repo_root,
+                )
+            except (OSError, ValueError) as exc:
+                errors.append(
+                    f"verification replay external context could not be revalidated: {type(exc).__name__}: {sanitize_text(str(exc))}"
+                )
+            else:
+                if rebuilt_context != expected_context:
+                    errors.append("verification replay external context changed during replay")
+            for name, original in snapshots.items():
+                current, current_errors = _read_evidence_file_snapshot(
+                    output_dir / name,
+                    output_dir=output_dir,
+                    byte_limit=EVIDENCE_FILE_BYTE_LIMITS[name],
+                )
+                errors.extend(f"{name}: {error}" for error in current_errors)
+                if current is not None and (
+                    current.identity != original.identity or current.data != original.data
+                ):
+                    errors.append(f"{name}: evidence changed during verification replay")
+            if deferred_portability:
+                # Evidence/context/cleanup and authority eligibility precede parsing.
+                try:
+                    if {entry.name for entry in os.scandir(output_dir)} != set(EVIDENCE_FILE_NAMES):
+                        errors.append("evidence file membership changed during verification replay")
+                except OSError as exc:
+                    errors.append(f"evidence directory cannot be re-enumerated: {type(exc).__name__}")
+                result = packaging_result = None
+                packaging_rebound = None
+                if not errors and packaging_pair is not None:
+                    packaging_rebound = _bind_standalone_portable_replay(packaging_context)
+                    if packaging_rebound != packaging_pair:
+                        errors.append("verification replay standalone-packaging authority changed")
+                if not errors and backend_portability and bound_pair is not None:
+                    rebound = backend_portable._bind_replay(
+                        sys.modules[__name__], backend_context,
+                        documents["command-results.json"], verification_runner,
+                    )
+                    if rebound != bound_pair:
+                        errors.append(unavailable)
+                    else:
+                        result = backend_portable._derive_equal_result(sys.modules[__name__], rebound)
+                        if result is None:
+                            errors.append(unavailable)
+                if not errors and packaging_rebound is not None:
+                    packaging_result = _derive_standalone_packaging_equal_result(packaging_rebound)
+                if packaging_portability and packaging_result is None:
+                    errors.append("verification replay standalone-packaging portable result unavailable or mismatched")
+                if comparison is not None:
+                    # A backend record loses its raw difference only after both full
+                    # results were derived and compared equal. Every unavailable or
+                    # unequal result retains the raw comparison, even on another error.
+                    views = (backend_portable._comparison_views(sys.modules[__name__], rebound, result)
+                             if result is not None else None)
+                    if packaging_result is not None:
+                        views = _standalone_packaging_comparison_views(
+                            documents, verification_runner, views, packaging_rebound, packaging_result)
+                    try:
+                        collection_views = (_replay_collection_comparison_views(
+                            documents, verification_runner, comparison, views) if not errors else None)
+                        transcript, comparison_errors = _compare_verification_replay_claims(
+                            documents, verification_runner, comparison, comparison_views=views,
+                            collection_views=collection_views,
+                        )
+                    except (OSError, AttributeError, KeyError, TypeError, ValueError) as exc:
+                        return sorted(set(errors + [
+                            "verification replay comparison authority became unavailable: " + type(exc).__name__])), None
+                    errors.extend(comparison_errors)
+                    if result is not None and not errors:
+                        transcript["backendCanonicalPortableResult"] = result
+                    transcript, errors = _finish_verification_replay(
+                        transcript, errors, expected_context=expected_context,
+                        runner=verification_runner,
+                    )
+                if errors and transcript is not None:
+                    transcript.pop("backendCanonicalPortableResult", None)
+                    transcript["finalAcceptance"] = "REJECT"
+            return sorted(set(errors)), transcript
+    except _BackendPortableVerifierUnavailable:
+        return [_BACKEND_PORTABLE_UNAVAILABLE], None
 
 
 def render_markdown_text(value: Any) -> str:
