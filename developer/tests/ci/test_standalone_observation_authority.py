@@ -398,6 +398,7 @@ class StandaloneObservationAuthorityTest(unittest.TestCase):
     def test_live_capture_requires_process_provenance(self):
         with authority_fixture() as case:
             binding = case.runner.execution_binding
+            self.enterContext(mock.patch.object(ci, "_canonical_runner_os", return_value=binding["producerRunnerOS"]))
             environment = {"GITHUB_ACTIONS": "true", "GITHUB_JOB": "windows-compatibility",
                 "RUNNER_OS": "Windows", "GITHUB_RUN_ID": binding["runId"], "GITHUB_RUN_ATTEMPT": "1",
                 "GITHUB_EVENT_NAME": binding["eventName"], "GITHUB_REPOSITORY": binding["repository"],
@@ -485,6 +486,7 @@ class StandaloneObservationAuthorityTest(unittest.TestCase):
             root = Path(temp)
             runner, _ = runner_fixture(root)
             initial = copy.deepcopy(runner.execution_binding)
+            self.enterContext(mock.patch.object(ci, "_canonical_runner_os", return_value=initial["producerRunnerOS"]))
             environment = {"GITHUB_ACTIONS": "true", "GITHUB_JOB": "windows-compatibility-producer",
                 "RUNNER_OS": "Windows", "GITHUB_RUN_ID": initial["runId"], "GITHUB_RUN_ATTEMPT": "1",
                 "GITHUB_EVENT_NAME": initial["eventName"], "GITHUB_REPOSITORY": initial["repository"],
@@ -523,6 +525,7 @@ class StandaloneObservationAuthorityTest(unittest.TestCase):
             root = Path(temp)
             template, _ = runner_fixture(root)
             binding = template.execution_binding
+            self.enterContext(mock.patch.object(ci, "_canonical_runner_os", return_value=binding["producerRunnerOS"]))
             (root / "developer/tests/ci/phase1-ci-baseline.json").write_bytes(ci.BASELINE_PATH.read_bytes())
             environment = {"GITHUB_ACTIONS": "true", "GITHUB_JOB": "windows-compatibility",
                 "RUNNER_OS": "Windows", "GITHUB_RUN_ID": binding["runId"], "GITHUB_RUN_ATTEMPT": "1",
@@ -636,6 +639,7 @@ class StandaloneObservationAuthorityTest(unittest.TestCase):
             root = Path(temp)
             template, _ = runner_fixture(root)
             binding = template.execution_binding
+            self.enterContext(mock.patch.object(ci, "_canonical_runner_os", return_value=binding["producerRunnerOS"]))
             environment = {"GITHUB_ACTIONS": "true", "GITHUB_JOB": "windows-compatibility-producer",
                 "RUNNER_OS": "Windows", "GITHUB_RUN_ID": binding["runId"], "GITHUB_RUN_ATTEMPT": "1",
                 "GITHUB_EVENT_NAME": binding["eventName"], "GITHUB_REPOSITORY": binding["repository"],
