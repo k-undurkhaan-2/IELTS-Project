@@ -22,6 +22,7 @@ The CI trust files are:
 - `.github/workflows/ci.yml`
 - `developer/tests/ci/phase1-ci-baseline.json`
 - `developer/tests/ci/run_ci_foundation.py`
+- `developer/tests/ci/backend_canonical_portable_result.py`
 - `developer/tests/ci/run_static_suite.py`
 - `developer/tests/ci/test_ci_foundation.py`
 - `developer/tests/ci/test_standalone_packaging.py`
@@ -365,6 +366,27 @@ identities, sticky mutation state, and closed cleanup state. A missing,
 reordered, additional, changed, linked, reparse-substituted, deleted, or
 recreated member fails the command or the profile.
 
+The backend portable acceptance implementation,
+`developer/tests/ci/backend_canonical_portable_result.py`, is both a CI trust
+file and a lifecycle trusted file. The verifier does not ordinary-import this
+acceptance code from the live filesystem or reuse the canonical module-name
+cache. It obtains the source authority from its independently rebuilt command
+plan, requires every occurrence of that target to agree on the complete
+protected authority, and cross-binds its exact path, byte length, and SHA-256
+to a freshly measured CI trust-file set whose digest equals the externally
+expected `CITrustFileSetDigest`. Missing or conflicting authority fails closed.
+
+A separate `TargetExecutionLease` materializes the exact held source bytes.
+The verifier compiles those bytes into a fresh private module and uses that same
+module for producer binding, fresh-replay binding, and final portable comparison.
+The source lease remains open through all these uses; post-use verification must
+succeed before acceptance is returned, and registration and lease cleanup run on
+failure too. This does not assert that filesystem state is wholly immutable or
+that every transient rewrite is observable: acceptance semantics are derived
+from frozen/materialized source bytes, so a later or restored filesystem rewrite
+cannot substitute executed verifier logic. Backend result comparison and artifact
+schemas are unchanged.
+
 `workflow-self-policy` is a three-input protected command over
 `.github/workflows/ci.yml`, `docs/CI_POLICY.md`, and the Phase 1 baseline JSON.
 Its policy API accepts those three byte strings plus independently planned
@@ -641,6 +663,7 @@ The fixed trusted manifest is:
 - `.github/workflows/ci.yml`
 - `developer/tests/ci/phase1-ci-baseline.json`
 - `developer/tests/ci/run_ci_foundation.py`
+- `developer/tests/ci/backend_canonical_portable_result.py`
 - `developer/tests/ci/run_static_suite.py`
 - `developer/tests/ci/test_ci_foundation.py`
 - `developer/tests/ci/test_standalone_packaging.py`
@@ -1268,6 +1291,7 @@ The CI trust-file set used by replay binding is exactly, in order:
 - `.github/workflows/ci.yml`
 - `developer/tests/ci/phase1-ci-baseline.json`
 - `developer/tests/ci/run_ci_foundation.py`
+- `developer/tests/ci/backend_canonical_portable_result.py`
 - `developer/tests/ci/run_static_suite.py`
 - `developer/tests/ci/test_ci_foundation.py`
 - `developer/tests/ci/test_standalone_packaging.py`
@@ -1417,13 +1441,13 @@ fresh runner, the authoritative verifier's terminal step runs:
 
 ```text
 repository-policy:
-<ABSOLUTE_PYTHON> -B developer/tests/ci/run_ci_foundation.py --verify-evidence --expected-profile policy --expected-producer-job repository-policy-producer --expected-verifier-job repository-policy --expected-runner-os Linux --untrusted-evidence-root .ci-untrusted/repository-policy --require-linux-containment-self-test
+<ABSOLUTE_PYTHON> -B developer/tests/ci/run_ci_foundation.py --verify-evidence --require-replay-pass --expected-profile policy --expected-producer-job repository-policy-producer --expected-verifier-job repository-policy --expected-runner-os Linux --untrusted-evidence-root .ci-untrusted/repository-policy --require-linux-containment-self-test
 
 ubuntu-canonical:
-<ABSOLUTE_PYTHON> -B developer/tests/ci/run_ci_foundation.py --verify-evidence --expected-profile all --expected-producer-job ubuntu-canonical-producer --expected-verifier-job ubuntu-canonical --expected-runner-os Linux --untrusted-evidence-root .ci-untrusted/ubuntu-canonical --require-linux-containment-self-test --require-fresh-runtime-closure
+<ABSOLUTE_PYTHON> -B developer/tests/ci/run_ci_foundation.py --verify-evidence --require-replay-pass --expected-profile all --expected-producer-job ubuntu-canonical-producer --expected-verifier-job ubuntu-canonical --expected-runner-os Linux --untrusted-evidence-root .ci-untrusted/ubuntu-canonical --require-linux-containment-self-test --require-fresh-runtime-closure
 
 windows-compatibility:
-<ABSOLUTE_PYTHON> -B developer/tests/ci/run_ci_foundation.py --verify-evidence --expected-profile all --expected-producer-job windows-compatibility-producer --expected-verifier-job windows-compatibility --expected-runner-os Windows --untrusted-evidence-root .ci-untrusted/windows-compatibility --require-fresh-runtime-closure
+<ABSOLUTE_PYTHON> -B developer/tests/ci/run_ci_foundation.py --verify-evidence --require-replay-pass --expected-profile all --expected-producer-job windows-compatibility-producer --expected-verifier-job windows-compatibility --expected-runner-os Windows --untrusted-evidence-root .ci-untrusted/windows-compatibility --require-fresh-runtime-closure
 ```
 
 The two shown hosted `all` verifier commands intentionally omit

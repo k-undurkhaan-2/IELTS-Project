@@ -4,7 +4,8 @@
 The runner intentionally uses only Python's standard library.  It invokes a
 small allowlist of repository validation commands, converts their output into
 scoped observations, and compares every non-pass observation with the frozen
-Phase 1 baseline.  Raw command output is never printed or persisted.
+Phase 1 baseline. Raw output is excluded from public diagnostics. Eligible
+direct Node successes retain bounded exact streams in locally validated evidence.
 """
 
 from __future__ import annotations
@@ -36,12 +37,14 @@ import time
 import tokenize
 import unicodedata
 import uuid
+import weakref
 from collections import defaultdict
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
-from types import MappingProxyType
-from typing import Any, Iterable, Mapping, Sequence
+from pathlib import Path, PureWindowsPath
+from types import MappingProxyType, ModuleType
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import quote, unquote_to_bytes, urlsplit
 
 
@@ -237,6 +240,7 @@ CI_TRUST_FILE_PATHS = (
     ".github/workflows/ci.yml",
     "developer/tests/ci/phase1-ci-baseline.json",
     "developer/tests/ci/run_ci_foundation.py",
+    "developer/tests/ci/backend_canonical_portable_result.py",
     "developer/tests/ci/run_static_suite.py",
     "developer/tests/ci/test_ci_foundation.py",
     "developer/tests/ci/test_standalone_packaging.py",
@@ -255,7 +259,7 @@ WORKFLOW_JOB_PROFILE_AUTHORITY = MappingProxyType(
                 "profile": "policy",
                 "verificationProfile": "policy",
                 "artifactIdentity": "untrusted-repository-policy-${{ runner.os }}-${{ github.run_attempt }}",
-                "evidenceRoot": ".ci-untrusted/repository-policy",
+                "evidenceRoot": "${{ runner.temp }}/ci-untrusted/repository-policy",
                 "evidencePaths": EVIDENCE_FILE_NAMES,
             }
         ),
@@ -268,7 +272,7 @@ WORKFLOW_JOB_PROFILE_AUTHORITY = MappingProxyType(
                 "profile": "all",
                 "verificationProfile": "all",
                 "artifactIdentity": "untrusted-ubuntu-canonical-${{ runner.os }}-${{ github.run_attempt }}",
-                "evidenceRoot": ".ci-untrusted/ubuntu-canonical",
+                "evidenceRoot": "${{ runner.temp }}/ci-untrusted/ubuntu-canonical",
                 "evidencePaths": EVIDENCE_FILE_NAMES,
             }
         ),
@@ -281,7 +285,7 @@ WORKFLOW_JOB_PROFILE_AUTHORITY = MappingProxyType(
                 "profile": "all",
                 "verificationProfile": "all",
                 "artifactIdentity": "untrusted-windows-compatibility-${{ runner.os }}-${{ github.run_attempt }}",
-                "evidenceRoot": ".ci-untrusted/windows-compatibility",
+                "evidenceRoot": "${{ runner.temp }}/ci-untrusted/windows-compatibility",
                 "evidencePaths": EVIDENCE_FILE_NAMES,
             }
         ),
@@ -486,6 +490,7 @@ TRUSTED_FILE_PATHS = (
     ".github/workflows/ci.yml",
     "developer/tests/ci/phase1-ci-baseline.json",
     "developer/tests/ci/run_ci_foundation.py",
+    "developer/tests/ci/backend_canonical_portable_result.py",
     "developer/tests/ci/run_static_suite.py",
     "developer/tests/ci/test_ci_foundation.py",
     "developer/tests/ci/test_standalone_packaging.py",
@@ -1831,6 +1836,359 @@ def contains_high_confidence_secret(value: str) -> list[str]:
     return sorted(set(hits))
 
 
+def _exact_retained_evidence_text_is_safe(value: str) -> bool:
+    """Inspect existing privacy rules without sanitizing retained stream bytes."""
+    # CRLF is reporter presentation, but all other removed controls (including
+    # bidi formatting) make exact retention unavailable. Preserve the original.
+    line_view = value.replace("\r\n", "\n")
+    if strip_terminal_controls(line_view) != line_view:
+        return False
+    if normalize_authorized_path_text(value) != value:
+        return False
+    # The ordinary sanitizer also recognizes paths and credential URLs after
+    # separator normalization. Inspect that view without rewriting the stream.
+    privacy_view = line_view.replace("\\", "/")
+    if normalize_authorized_path_text(privacy_view) != privacy_view:
+        return False
+    return not contains_high_confidence_secret(privacy_view) and not any(
+        pattern.search(privacy_view) for pattern in REDACTION_PATTERNS
+    )
+
+
+def _backend_exact_stream_text_is_safe(value: str) -> bool:
+    """Preserve the backend privacy contract through the shared predicate."""
+    return _exact_retained_evidence_text_is_safe(value)
+
+
+def _direct_node_evidence_text_is_safe(value: str) -> bool:
+    """Also reject bridge material embedded in Node reporter names or payloads."""
+    return _exact_retained_evidence_text_is_safe(value) and re.search(
+        r"(?i)\bobfs4\s+\S+:\d+\s+[A-F0-9]{40}\s+cert=\S+\s+iat-mode=\d+\b",
+        value,
+    ) is None
+
+
+_STATIC_MACHINE_REPORT_PRIVACY_ERROR = "static machine report failed evidence privacy admission"
+_STATIC_AUTHORIZED_PATH_MARKER = "__CI_STATIC_AUTHORIZED_PATH__"
+
+
+def _static_evidence_path_text_is_safe(value: str) -> bool:
+    """Classify bounded reference starts, not punctuation inside relative paths."""
+    if len(value) > MAX_EVIDENCE_STRING_BYTES:
+        return False
+    text = value.replace("\\", "/")
+    reference_start = True
+    relative_separator = False
+    relative_context = False
+    punctuation_groups: list[tuple[str, bool]] = []
+    closed_authorized_path = False
+    token_start = 0
+    index = 0
+    while index < len(text):
+        if text.startswith(_STATIC_AUTHORIZED_PATH_MARKER, index):
+            # An exact authorized reference cannot supply a relative prefix to
+            # adjoining, untrusted path components after the authority mask.
+            reference_start = False
+            relative_separator = relative_context = False
+            punctuation_groups.clear()
+            closed_authorized_path = True
+            index += len(_STATIC_AUTHORIZED_PATH_MARKER)
+            continue
+        token = next((item for item in ("<repo>", "<task-root>", "<abs-path>")
+                      if text.startswith(item, index)), None)
+        if token is not None:
+            reference_start = False
+            index += len(token)
+            continue
+        character = text[index]
+        category = unicodedata.category(character) if ord(character) > 127 else ""
+        if character.isspace() or character in "\"'`<>|=,;":
+            reference_start = True
+            relative_separator = False
+            closed_authorized_path = False
+            token_start = index + 1
+            # Ordinary spaces may occur inside content-path components. This
+            # context can prove a later matched group is internal, but cannot
+            # authorize a slash at a new reference start.
+            if character != " ":
+                relative_context = False
+                punctuation_groups.clear()
+        elif category in {"Ps", "Pi"}:
+            # Every opener exposes an immediate slash as a potential root.
+            # Adjacent close/open markup starts a separate reference, just as
+            # an ASCII Markdown destination does below.
+            previous = text[index - 1:index]
+            if previous and (previous in ")]}" or unicodedata.category(previous) in {"Pe", "Pf"}):
+                relative_context = False
+                punctuation_groups.clear()
+            punctuation_groups.append(("Pe" if category == "Ps" else "Pf", relative_context))
+            reference_start = True
+            relative_separator = False
+            closed_authorized_path = False
+            token_start = index + 1
+        elif category in {"Pe", "Pf"}:
+            continuation = False
+            if punctuation_groups:
+                expected, continuation = punctuation_groups.pop()
+                continuation = continuation and expected == category
+            # Separators first seen inside a quoted/bracketed reference do
+            # not establish a relative prefix outside that reference. Only
+            # context proven before its opener can cross the closing mark.
+            relative_separator = continuation
+            relative_context = relative_separator
+            reference_start = not relative_separator
+            if reference_start:
+                token_start = index + 1
+        elif category in {"Po", "Pd"}:
+            # Unicode textual separators end prose even when it contains an
+            # earlier path. Subsequent component text can establish a relative
+            # token again; punctuation alone never proves the next slash safe.
+            reference_start = True
+            relative_separator = relative_context = False
+            punctuation_groups.clear()
+            closed_authorized_path = False
+            token_start = index + 1
+        elif character in "([{":
+            # A Markdown destination/reference starts after its label; the
+            # label's relative slashes do not authorize the new reference.
+            if not relative_separator or (character in "([" and text[index - 1:index] == "]"):
+                reference_start = True
+                relative_separator = relative_context = False
+                punctuation_groups.clear()
+                closed_authorized_path = False
+                token_start = index + 1
+        elif character == ":":
+            # URI schemes keep their separators inside the same reference;
+            # a label such as origin:/private starts a new path reference.
+            scheme = text[token_start:index]
+            reference_start = not (text.startswith("//", index + 1)
+                and re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*", scheme))
+            if reference_start:
+                relative_separator = relative_context = False
+                punctuation_groups.clear()
+                token_start = index + 1
+        elif character == "/":
+            if reference_start or closed_authorized_path:
+                return False
+            relative_separator = relative_context = True
+        elif character not in ")]}":
+            # A mark attached to a delimiter cannot establish a component
+            # before the first slash. Preserve the existing state without
+            # introducing a Unicode normalization pass.
+            if category not in {"Mn", "Mc", "Me"}:
+                reference_start = False
+        index += 1
+    # Unconditional privacy checks ran on the original text before masking.
+    # Reuse the Windows/UNC/device/file-URI grammar, but do not rerun the older
+    # POSIX normalizer: its mid-token regex would undo the relative-path
+    # classification above. Malformed URI parsers fail closed, not outward.
+    try:
+        return (redact_windows_absolute_references(value) == value
+                and redact_windows_absolute_references(text) == text)
+    except ValueError:
+        return False
+
+
+def _evidence_publication_json_is_safe(
+    value: Any,
+    *,
+    authorized_path_values: Mapping[tuple[str | int, ...], str] | None = None,
+    failure_path_authorities: Mapping[tuple[str | int, ...], "FailurePathAuthority"] | None = None,
+    failure_path_prefixes: Mapping[tuple[str | int, ...], str] | None = None,
+    scoped_executable_paths: Mapping[tuple[str | int, ...], str] | None = None,
+    defer_path_admission: bool = False,
+) -> bool:
+    """Inspect bounded concrete JSON, including keys, without changing evidence.
+
+    Parent executable exceptions are location-bound. Raw admission may also
+    inspect scoped FailurePathAuthority references through the existing mask.
+    Neither exception bypasses other text checks. The raw preflight defers path
+    admission only until bounds/types are proven and scoped authority selected.
+    """
+    remaining = MAX_EVIDENCE_COLLECTION_ITEMS
+    remaining_text_bytes = MAX_STATIC_MACHINE_STDOUT_BYTES
+
+    def safe_text(
+        text: str, *, authorized_path: bool = False,
+        path_authority: "FailurePathAuthority | None" = None, path_prefix: str = "",
+        executable_path: str | None = None,
+    ) -> bool:
+        nonlocal remaining_text_bytes
+        if len(text) > MAX_EVIDENCE_STRING_BYTES:
+            return False
+        try:
+            size = len(text.encode("utf-8", errors="strict"))
+            remaining_text_bytes -= size
+            if size > MAX_EVIDENCE_STRING_BYTES or remaining_text_bytes < 0:
+                return False
+        except UnicodeError:
+            return False
+        if any(0x80 <= ord(character) <= 0x9F for character in text):
+            return False
+        line_view = text.replace("\r\n", "\n")
+        privacy_view = line_view.replace("\\", "/")
+        # Check original content before masking any authorized path identity.
+        # Authority never exempts secret material, controls, or an unmapped token.
+        if (
+            strip_terminal_controls(line_view) != line_view
+            or contains_high_confidence_secret(privacy_view)
+            or any(pattern.search(privacy_view) for pattern in REDACTION_PATTERNS)
+            or re.search(r"(?i)<unmapped-abs-sha256:", text)
+            or re.search(
+                r"(?i)\bobfs4\s+\S+:\d+\s+[A-F0-9]{40}\s+cert=\S+\s+iat-mode=\d+\b",
+                privacy_view,
+            )
+        ):
+            return False
+        if authorized_path or defer_path_admission:
+            return True
+        inspection_view = text
+        if path_authority is not None:
+            # This temporary view proves exact existing authority only. It is
+            # never substituted for the report or retained as exact evidence.
+            if path_prefix and inspection_view.startswith(path_prefix):
+                inspection_view = inspection_view[len(path_prefix):]
+            inspection_view, restorations = _mask_authorized_failure_paths(
+                inspection_view, path_authority,
+                authorized_targets=set(), authorized_tools=set(),
+            )
+            for marker, _ in restorations:
+                inspection_view = inspection_view.replace(marker, _STATIC_AUTHORIZED_PATH_MARKER)
+        if executable_path:
+            # Canonical failure details preserve the trusted executable. Use
+            # precisely the same bounded tool patterns as FailurePathAuthority,
+            # only in its existing scopes, and never grant a directory prefix.
+            basename = executable_path.replace("\\", "/").rsplit("/", 1)[-1]
+            parent = executable_path[:-len(basename)].rstrip("/\\") if basename else ""
+            if parent and basename in inspection_view:
+                try:
+                    patterns = _failure_path_patterns(parent, parent, basename)
+                except ValueError:
+                    return False
+                for pattern in patterns:
+                    inspection_view = re.sub(pattern.pattern, _STATIC_AUTHORIZED_PATH_MARKER, inspection_view)
+        return _static_evidence_path_text_is_safe(inspection_view)
+
+    def inspect(
+        item: Any, path: tuple[str | int, ...], depth: int,
+        path_authority: "FailurePathAuthority | None" = None,
+        executable_path: str | None = None,
+    ) -> bool:
+        nonlocal remaining
+        if depth > MAX_EVIDENCE_JSON_DEPTH or remaining <= 0:
+            return False
+        remaining -= 1
+        if failure_path_authorities is not None:
+            path_authority = failure_path_authorities.get(path, path_authority)
+        if scoped_executable_paths is not None:
+            executable_path = scoped_executable_paths.get(path, executable_path)
+        if type(item) is str:
+            return safe_text(item, authorized_path=(
+                authorized_path_values is not None
+                and path in authorized_path_values
+                and item == authorized_path_values[path]
+            ), path_authority=path_authority, path_prefix=(
+                failure_path_prefixes.get(path, "") if failure_path_prefixes else ""
+            ), executable_path=executable_path)
+        if item is None or type(item) in (bool, int):
+            return True
+        if type(item) is float:
+            return math.isfinite(item)
+        if type(item) is dict:
+            # Keys are not canonicalized by the failure-path contract, so they
+            # receive no path exception. Charge keys and values to one budget.
+            if len(item) > remaining // 2:
+                return False
+            for key, child in item.items():
+                remaining -= 1
+                if type(key) is not str or not safe_text(key):
+                    return False
+                if not inspect(child, (*path, key), depth + 1, path_authority, executable_path):
+                    return False
+            return True
+        if type(item) is list:
+            return len(item) <= remaining and all(
+                inspect(child, (*path, index), depth + 1, path_authority, executable_path)
+                for index, child in enumerate(item)
+            )
+        return False
+
+    return inspect(value, (), 0)
+
+
+def _static_machine_report_evidence_is_safe(report: Any, executable_path: Any) -> bool:
+    # The static registry has exactly one nested command. Its two absolute
+    # executable fields must still match the independently checked parent plan.
+    paths = ({
+        ("commandResults", 0, "argv", 0): executable_path,
+        ("commandResults", 0, "resolvedExecutablePath"): executable_path,
+    } if type(executable_path) is str else {})
+    # Prove structure and unconditional privacy before inspecting scope details.
+    if not _evidence_publication_json_is_safe(report, defer_path_admission=True):
+        return False
+    executables = {}
+    if type(executable_path) is str and type(report) is dict:
+        for index, result in enumerate(report.get("observations", [])
+                if type(report.get("observations")) is list else []):
+            if type(result) is not dict or type(result.get("name")) is not str:
+                continue
+            scope = "result:" + result["name"]
+            if ((scope in R11_KNOWN_DEBT_FAILURE_TARGETS and scope not in R03_FAILURE_TARGETS)
+                    or _static_result_has_failure_path_authority(result)):
+                executables[("observations", index)] = executable_path
+    return _evidence_publication_json_is_safe(report, authorized_path_values=paths,
+                                             scoped_executable_paths=executables)
+
+
+def _raw_static_machine_report_evidence_is_safe(
+    report: Any, executable_path: Any, authority: Any,
+) -> bool:
+    # Bound the original structure before scope selection can inspect nested
+    # release details. This pass alone never authorizes a path or retention.
+    if not _evidence_publication_json_is_safe(report, defer_path_admission=True):
+        return False
+    paths = ({
+        ("commandResults", 0, "argv", 0): executable_path,
+        ("commandResults", 0, "resolvedExecutablePath"): executable_path,
+    } if type(executable_path) is str else {})
+    authorities = {}
+    prefixes = {}
+    if isinstance(authority, FailurePathAuthority) and type(report) is dict:
+        results = report.get("observations")
+        if type(results) is list and len(results) <= MAX_EVIDENCE_COLLECTION_ITEMS:
+            for index, result in enumerate(results):
+                if type(result) is not dict:
+                    continue
+                scope = "result:" + result.get("name", "") if type(result.get("name")) is str else ""
+                selected = (authority if scope in R11_KNOWN_DEBT_FAILURE_TARGETS
+                            and scope not in R03_FAILURE_TARGETS else
+                            _static_result_failure_path_authority(result, authority))
+                if selected is not None:
+                    authorities[("observations", index)] = selected
+                    if scope in RELEASE_ONLY_SKIP_FAILURE_TARGETS:
+                        prefixes[("observations", index, "detail", "reason")] = "missing_checklist:"
+    return _evidence_publication_json_is_safe(
+        report, authorized_path_values=paths,
+        failure_path_authorities=authorities, failure_path_prefixes=prefixes,
+    )
+
+
+def _static_machine_record_evidence_is_safe(record: Mapping[str, Any]) -> bool:
+    if not _static_machine_report_evidence_is_safe(
+        record.get("validatedStaticMachineReport"), record.get("resolvedExecutablePath"),
+    ):
+        return False
+    observations = record.get("producerObservations")
+    if type(observations) is list:
+        if len(observations) > MAX_EVIDENCE_COLLECTION_ITEMS:
+            return False
+        for raw in observations:
+            binding = raw.get("failurePathAuthority") if type(raw) is dict else None
+            if type(binding) is dict and binding.get("unmappedAbsolutePathDigests"):
+                return False
+    return True
+
+
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -1905,6 +2263,79 @@ def raw_observation_json_value(value: Any) -> Any:
     for pattern in REDACTION_PATTERNS:
         normalized = pattern.sub("[REDACTED]", normalized)
     return normalized
+
+
+_BACKEND_STREAM_REDACTION_MARKER = "[BACKEND STREAM REDACTED]"
+_DIRECT_NODE_STREAM_REDACTION_MARKER = "[DIRECT NODE STREAM REDACTED]"
+_DIRECT_NODE_OBSERVATION_PRIVACY_ERROR = "direct Node process observation failed evidence privacy admission"
+
+
+def _successful_stream_observation_text(
+    raw_stream: bytes | None, ordinary: str, *,
+    privacy_check: Callable[[str], bool], marker: str, diagnostic: str,
+    preserve_exact: bool,
+) -> str:
+    """Return privacy-safe evidence text without changing raw stream authority."""
+    # Missing capture is not an exact empty stream. Ordinary text must never
+    # stand in for absent bytes, even when it reproduces the recorded authority.
+    # Backend keeps its safe ordinary fallback; direct Node requires safe raw
+    # UTF-8 before publishing its existing normalized observation representation.
+    candidate = marker if raw_stream is None or not preserve_exact else ordinary
+    try:
+        exact = raw_stream.decode("utf-8", errors="strict") if raw_stream is not None else None
+    except UnicodeError:
+        exact = None
+    if exact is not None and privacy_check(exact):
+        # Keep safe reporter presentation byte-exact. Apply the ordinary privacy
+        # redactions, without its unrelated timing/whitespace normalization.
+        redacted = exact
+        for pattern in REDACTION_PATTERNS:
+            redacted = pattern.sub("[REDACTED]", redacted)
+        if redacted == exact:
+            candidate = exact if preserve_exact else ordinary
+    # Escape protection/restoration can leave an ordinary sanitized candidate
+    # unsafe. Neither changed text nor successful sanitization proves privacy.
+    if not privacy_check(candidate):
+        candidate = marker
+    # Check the final value, including the fixed marker, before it can enter an
+    # observation or its derived copies. Never include source text in the error.
+    if not privacy_check(candidate):
+        raise ValueError(diagnostic)
+    return candidate
+
+
+def _backend_successful_stream_observation_text(
+    raw_stream: bytes | None, ordinary: str,
+) -> str:
+    return _successful_stream_observation_text(
+        raw_stream, ordinary, privacy_check=_backend_exact_stream_text_is_safe,
+        marker=_BACKEND_STREAM_REDACTION_MARKER,
+        diagnostic="backend stream observation failed its privacy check", preserve_exact=True,
+    )
+
+
+def _direct_node_successful_stream_observation_text(
+    raw_stream: bytes | None, ordinary: str,
+) -> str:
+    return _successful_stream_observation_text(
+        raw_stream, ordinary, privacy_check=_direct_node_evidence_text_is_safe,
+        marker=_DIRECT_NODE_STREAM_REDACTION_MARKER,
+        diagnostic=_DIRECT_NODE_OBSERVATION_PRIVACY_ERROR, preserve_exact=False,
+    )
+
+
+def _direct_node_process_observation_fields_are_safe(fields: Any) -> bool:
+    """Admit only the closed successful direct-Node process schema."""
+    if (not isinstance(fields, Mapping)
+        or set(fields) != {"executed", "exitCode", "stdout", "stderr", "error"}):
+        return False
+    return (
+        type(fields["executed"]) is bool and fields["executed"] is True
+        and type(fields["exitCode"]) is int and fields["exitCode"] == 0
+        and fields["error"] is None
+        and all(type(fields[name]) is str and _direct_node_evidence_text_is_safe(fields[name])
+                for name in ("stdout", "stderr"))
+    )
 
 
 def structured_signature(value: Any) -> str:
@@ -4688,6 +5119,7 @@ class CommandCapture:
     identity_stdout_raw: bytes | None = field(default=None, repr=False)
     identity_stderr_raw: bytes | None = field(default=None, repr=False)
     failure_path_authority: Any | None = field(default=None, repr=False)
+    validated_static_machine_report: dict[str, Any] | None = field(default=None, repr=False)
 
     def execution_passed(self) -> bool:
         return (
@@ -4790,6 +5222,12 @@ class CommandCapture:
             )
         if failure_summary:
             record["parsedFailureSummary"] = normalized_json_value(failure_summary)
+        if self.validated_static_machine_report is not None:
+            # Preserve local machine-plan authority for independent validation;
+            # the physical stdout hash above remains exact local evidence.
+            record["validatedStaticMachineReport"] = copy.deepcopy(
+                self.validated_static_machine_report
+            )
         return record
 
     def authoritative_stdout_bytes(self) -> bytes:
@@ -5662,6 +6100,7 @@ class TrustedBashLease:
             raise ctypes.WinError(ctypes.get_last_error())
         self.handle = handle
         self.path = str(canonical)
+        self.git_path = str(Path(git_path).resolve(strict=True))
         self.trusted_git_root = str(git_root.resolve(strict=True))
         try:
             self._initial_info = self._information(self.handle)
@@ -5729,15 +6168,38 @@ class TrustedBashLease:
                 return False, f"trusted Git Bash path drifted: {reason}"
             if str(path.resolve(strict=True)) != self.path:
                 return False, "trusted Git Bash canonical path drifted"
+            git_root, root_error = _trusted_git_installation_root(Path(self.git_path))
+            if git_root is None or str(git_root.resolve(strict=True)) != self.trusted_git_root:
+                return False, root_error or "trusted Git Bash installation relationship drifted"
+            if (
+                _trusted_git_bash_candidate_position(path, git_root, windows=True) is None
+                or not _non_reparse_directory_chain(path.parent, git_root)
+            ):
+                return False, "trusted Git Bash installation topology drifted"
             handle_info = self._information(self.handle)
             path_info = self._open_path_identity()
             if handle_info != self._initial_info or path_info != self._initial_info:
                 return False, "trusted Git Bash stable file identity drifted"
             if _sha256_file(path) != self.expected_sha256:
                 return False, "trusted Git Bash SHA-256 drifted"
+            if self.identity != {
+                "canonicalPath": self.path,
+                "trustedGitRoot": self.trusted_git_root,
+                **self._initial_info,
+                "sha256": self.expected_sha256,
+            }:
+                return False, "trusted Git Bash recorded lease identity drifted"
         except OSError as exc:
             return False, f"trusted Git Bash lease verification failed: {type(exc).__name__}"
         return True, None
+
+    def validated_identity(self) -> dict[str, Any]:
+        """Snapshot physical authority only while the locally held lease verifies."""
+
+        okay, error = self.verify()
+        if not okay:
+            raise OSError(error or "trusted Git Bash lease verification failed")
+        return dict(self.identity)
 
     def close(self) -> None:
         handle = getattr(self, "handle", None)
@@ -7154,9 +7616,28 @@ printf 'CI_TRUSTED_NPM_ENTRY=%s\\n' "$(realpath "$npm_path")" >> "$GITHUB_ENV"''
 LINUX_RUNTIME_CAPTURE_FRESH = LINUX_RUNTIME_CAPTURE + '''
 printf 'CI_FRESH_DEPENDENCY_INSTALL=1\\n' >> "$GITHUB_ENV"'''
 WINDOWS_RUNTIME_CAPTURE = '''$pythonPath = (Resolve-Path -LiteralPath (Join-Path $env:pythonLocation 'python.exe')).Path
-$nodePath = (Get-Command node.exe -CommandType Application).Source
-$npmEntry = (Resolve-Path -LiteralPath (Join-Path (Split-Path $nodePath -Parent) 'node_modules\\npm\\bin\\npm-cli.js')).Path
 if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) { throw 'trusted Python is unavailable' }
+$runtimeCapture = @'
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, 'developer/tests/ci')
+import run_ci_foundation as ci
+source = dict(os.environ)
+tools, errors = ci.resolve_trusted_tools({'node'}, source_environment=source)
+if errors:
+    raise SystemExit('trusted Node capture rejected by tool authority')
+source['CI_TRUSTED_NODE'] = tools['node']
+source['CI_TRUSTED_NPM_ENTRY'] = str(Path(tools['node']).parent / 'node_modules' / 'npm' / 'bin' / 'npm-cli.js')
+tools, errors = ci.resolve_trusted_tools({'node', 'npm'}, source_environment=source)
+if errors:
+    raise SystemExit('trusted Node/npm capture rejected by tool authority')
+print(json.dumps({'node': tools['node'], 'npmEntry': tools['npm']}))
+'@
+$runtimeJson = & $pythonPath -B -c $runtimeCapture
+if ($LASTEXITCODE -ne 0) { throw 'trusted Node/npm capture failed' }
+$runtimePaths = $runtimeJson | ConvertFrom-Json
+$nodePath = [string]$runtimePaths.node
+$npmEntry = [string]$runtimePaths.npmEntry
 if (-not (Test-Path -LiteralPath $nodePath -PathType Leaf)) { throw 'trusted Node is unavailable' }
 if (-not (Test-Path -LiteralPath $npmEntry -PathType Leaf)) { throw 'trusted npm entry is unavailable' }
 "CI_TRUSTED_PYTHON=$pythonPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -7171,26 +7652,26 @@ FINAL_VERIFIER_COMMANDS = MappingProxyType(
     {
         "repository-policy": (
             '"$CI_TRUSTED_PYTHON" -B developer/tests/ci/run_ci_foundation.py '
-            "--verify-evidence --expected-profile policy "
+            "--verify-evidence --require-replay-pass --expected-profile policy "
             "--expected-producer-job repository-policy-producer "
             "--expected-verifier-job repository-policy --expected-runner-os Linux "
-            "--untrusted-evidence-root .ci-untrusted/repository-policy "
+            '--untrusted-evidence-root "$RUNNER_TEMP/ci-untrusted/repository-policy" '
             "--require-linux-containment-self-test"
         ),
         "ubuntu-canonical": (
             '"$CI_TRUSTED_PYTHON" -B developer/tests/ci/run_ci_foundation.py '
-            "--verify-evidence --expected-profile all "
+            "--verify-evidence --require-replay-pass --expected-profile all "
             "--expected-producer-job ubuntu-canonical-producer "
             "--expected-verifier-job ubuntu-canonical --expected-runner-os Linux "
-            "--untrusted-evidence-root .ci-untrusted/ubuntu-canonical "
+            '--untrusted-evidence-root "$RUNNER_TEMP/ci-untrusted/ubuntu-canonical" '
             "--require-linux-containment-self-test --require-fresh-runtime-closure"
         ),
         "windows-compatibility": (
             "& $env:CI_TRUSTED_PYTHON -B developer/tests/ci/run_ci_foundation.py "
-            "--verify-evidence --expected-profile all "
+            "--verify-evidence --require-replay-pass --expected-profile all "
             "--expected-producer-job windows-compatibility-producer "
             "--expected-verifier-job windows-compatibility --expected-runner-os Windows "
-            "--untrusted-evidence-root .ci-untrusted/windows-compatibility "
+            '--untrusted-evidence-root "$env:RUNNER_TEMP/ci-untrusted/windows-compatibility" '
             "--require-fresh-runtime-closure"
         ),
     }
@@ -7438,7 +7919,7 @@ def _validate_workflow_steps(job_name: str, steps: Any, errors: list[str]) -> No
 
     setup_node = by_name.get("Set up Node.js", {})
     if job_name != "final-result":
-        if tuple(setup_node) != ("name", "uses", "with") or setup_node.get("with") != {"node-version": "24.x"}:
+        if tuple(setup_node) != ("name", "uses", "with") or setup_node.get("with") != {"node-version": "24.20.0"}:
             errors.append(f"{job_name} Node setup is not exact")
         if setup_node.get("uses") != f"actions/setup-node@{APPROVED_ACTIONS['actions/setup-node']['sha']}":
             errors.append(f"{job_name} Node action pin is not exact")
@@ -8509,7 +8990,7 @@ def capture_live_external_authority(
         values[name] = value
     if values["RUNNER_OS"] != _canonical_runner_os():
         raise ValueError("live external authority runner OS differs from the process platform")
-    return ExecutionExternalAuthority(
+    authority = ExecutionExternalAuthority(
         source_kind="live",
         binding_mode="github-actions",
         runner_os=values["RUNNER_OS"],
@@ -8520,6 +9001,10 @@ def capture_live_external_authority(
         repository=values["GITHUB_REPOSITORY"],
         checkout_sha=values["GITHUB_SHA"],
     )
+
+    if source_environment is None:
+        _remember_live_observation_capture(authority, _observation_bytes(vars(authority)))
+    return authority
 
 
 def select_generation_evidence_output(
@@ -8992,7 +9477,7 @@ def build_externally_expected_verification_context(
             role="verifier",
         )
 
-    return ExternallyExpectedVerificationContext(
+    context = ExternallyExpectedVerificationContext(
         binding_mode=binding_mode,
         expected_profile=expected_profile,
         release_gate_required=release_gate_required,
@@ -9013,6 +9498,12 @@ def build_externally_expected_verification_context(
         fresh_runtime_closure_digest=fresh_runtime_closure_digest,
         verifier_invocation_id=verifier_invocation_id,
     )
+
+    if _live_observation_capture_matches(external_authority):
+        _remember_prepared_observation_context(
+            context, (weakref.ref(external_authority), _observation_bytes(vars(context)))
+        )
+    return context
 
 
 def _runner_required_tool(runner: Any, name: str, *, phase: str) -> str:
@@ -9110,11 +9601,14 @@ def build_generation_execution_binding(
 
     if external_authority.source_kind != "live":
         raise ValueError("synthetic external authority is forbidden in production binding")
-    return _build_generation_execution_binding(
+    binding = _build_generation_execution_binding(
         runner,
         external_authority=external_authority,
         repo_root=repo_root,
     )
+
+    _prepare_generation_observation_authority(runner, external_authority, binding)
+    return binding
 
 
 def build_synthetic_generation_execution_binding(
@@ -9200,7 +9694,7 @@ def parse_static_machine_report(
         return None, ["static machine report top-level schema is not exact"]
     if value.get("documentKind") != STATIC_MACHINE_DOCUMENT_KIND:
         errors.append("static machine report documentKind is invalid")
-    if value.get("schemaVersion") != STATIC_MACHINE_SCHEMA_VERSION:
+    if type(value.get("schemaVersion")) is not int or value.get("schemaVersion") != STATIC_MACHINE_SCHEMA_VERSION:
         errors.append("static machine report schemaVersion is invalid")
     if value.get("invocationId") != expected_invocation_id:
         errors.append("static machine report invocationId does not match the parent invocation")
@@ -9263,11 +9757,18 @@ def parse_static_machine_report(
         if not isinstance(record, dict) or set(record) != command_required:
             errors.append(f"{label} schema is not exact")
             continue
-        if record.get("ordinal") != index:
+        if type(record.get("ordinal")) is not int or record.get("ordinal") != index:
             errors.append(f"{label} ordinal is invalid")
         if record.get("required") is not True or record.get("started") is not True or record.get("executed") is not True:
             errors.append(f"{label} did not execute as required")
-        if record.get("exitCode") not in record.get("allowedExecutionExits", []):
+        allowed_exits = record.get("allowedExecutionExits")
+        if (
+            not isinstance(allowed_exits, list)
+            or not allowed_exits
+            or any(type(exit_code) is not int for exit_code in allowed_exits)
+            or type(record.get("exitCode")) is not int
+            or record.get("exitCode") not in allowed_exits
+        ):
             errors.append(f"{label} exitCode is outside immutable authority")
         if record.get("timeoutStatus") != "within-limit" or record.get("outputLimitStatus") != "within-limit":
             errors.append(f"{label} has an execution-limit failure")
@@ -9747,14 +10248,141 @@ def syntax_failure_signature(scope: str, stderr: str, stdout: str) -> str:
 
 
 def command_output_digest(record: Mapping[str, Any]) -> str:
+    static_identity = _validated_static_machine_output_identity(record)
+    stdout_identity = static_identity if static_identity is not None else record
     return canonical_failure_digest(
         {
-            "stdoutSha256": record.get("stdoutSha256"),
+            "stdoutSha256": stdout_identity.get("stdoutSha256"),
             "stderrSha256": record.get("stderrSha256"),
-            "stdoutBytesObserved": record.get("stdoutBytesObserved"),
+            "stdoutBytesObserved": stdout_identity.get("stdoutBytesObserved"),
             "stderrBytesObserved": record.get("stderrBytesObserved"),
         }
     )
+
+
+def _validated_static_machine_output_identity(
+    record: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Project only a completed static machine report bound to local authority.
+
+    Raw stream hashes remain in execution evidence. A report cannot authorize
+    semantic stream identity merely by supplying a digest: reconstruct its
+    exact local producer plan from the independently verified parent command.
+    """
+
+    report = record.get("validatedStaticMachineReport")
+    if (
+        not isinstance(report, Mapping)
+        or not _static_machine_record_evidence_is_safe(record)
+        or record.get("commandId") != "static-suite"
+        or record.get("commandClass") != "static-suite"
+        or record.get("resultSemantics") != "machine-v2-complete-execution"
+        or record.get("executed") is not True
+        or record.get("started") is not True
+        or record.get("setupFailure") is not False
+        or record.get("exitCode") != 0
+        or record.get("timeoutStatus") != "within-limit"
+        or record.get("outputLimitStatus") != "within-limit"
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("processTreeError") is not None
+        or record.get("descendantsSurviving") != 0
+    ):
+        return None
+    invocation_id = report.get("invocationId")
+    argv = [
+        record.get("resolvedExecutablePath"), "-B", STATIC_SUITE_RELATIVE_PATH,
+        "--ci-machine-json-stdout", "--ci-invocation-id", invocation_id,
+    ]
+    if (
+        not isinstance(invocation_id, str)
+        or any(record.get(key) != argv for key in (
+            "argv", "logicalArgv", "executionArgv", "actualExecutionArgv",
+        ))
+        or record.get("toolRole") != "python-static-producer"
+    ):
+        return None
+    targets = record.get("targets")
+    if not isinstance(targets, list):
+        return None
+    protected = record.get("protectedTargetBundle")
+    if (
+        record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or not isinstance(protected, Mapping)
+        or protected.get("mutationDetected") is not False
+        or protected.get("cleanupState") != "closed"
+    ):
+        return None
+    pre = protected.get("preExecutionIdentities")
+    post = protected.get("postExecutionIdentities")
+    valid_full_identities = (
+        pre == post
+        and _full_protected_identity_array_matches_authority(record, pre)
+        and _full_protected_identity_array_matches_authority(record, post)
+    )
+    valid_compact_identities = (
+        bool(targets)
+        and all(protected.get(key) == [] for key in _PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS)
+        and pre == _protected_bundle_compact_identity_digests(record, phase="pre")
+        and post == _protected_bundle_compact_identity_digests(record, phase="post")
+    )
+    if not valid_full_identities and not valid_compact_identities:
+        return None
+    static_targets = [
+        target for target in targets
+        if isinstance(target, Mapping) and target.get("path") == STATIC_SUITE_RELATIVE_PATH
+    ]
+    if len(static_targets) != 1:
+        return None
+    static_target = static_targets[0]
+    expected_plan = [{
+        "commandId": "static-check-registry",
+        "ordinal": 0,
+        "commandClass": "static-machine-producer",
+        "required": True,
+        "profile": "static",
+        "platform": record.get("platform"),
+        "argv": argv,
+        "cwd": ".",
+        "toolRole": "python-static-producer",
+        "resolvedExecutablePath": record.get("resolvedExecutablePath"),
+        "resolvedExecutableSize": record.get("resolvedExecutableSize"),
+        "resolvedExecutableSha256": record.get("resolvedExecutableSha256"),
+        "targets": [{key: static_target.get(key) for key in ("path", "size", "sha256")}],
+        "resultSemantics": "complete-registry-execution-with-native-observations",
+        "allowedExecutionExits": [0],
+    }]
+    try:
+        validated, errors = parse_static_machine_report(
+            _json_bytes(report), expected_invocation_id=invocation_id,
+        )
+        if validated is None or errors:
+            return None
+        authority_keys = set(expected_plan[0])
+        reported_plan = [
+            {key: value for key, value in result.items() if key in authority_keys}
+            for result in validated["commandResults"]
+        ]
+        if (
+            reported_plan != expected_plan
+            or validated["commandPlanDigest"] != static_machine_command_plan_digest(expected_plan)
+        ):
+            return None
+        semantic_report = copy.deepcopy(validated)
+        # The local nested plan was checked exactly above. Bind the same tool
+        # bytes/targets/argv through the established portable plan projection.
+        semantic_report["commandResults"] = _portable_command_plan_value(
+            validated["commandResults"]
+        )
+        semantic_report["commandPlanDigest"] = command_plan_digest(expected_plan)
+        semantic_report = normalized_json_value(semantic_report)
+        canonical = _json_bytes(semantic_report)
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    return {
+        "stdoutSha256": hashlib.sha256(canonical).hexdigest(),
+        "stdoutBytesObserved": len(canonical),
+        "validatedStaticMachineReport": semantic_report,
+    }
 
 
 def command_capture_output_digest(capture: CommandCapture) -> str:
@@ -10015,6 +10643,12 @@ def derive_canonical_failure_material(
 ) -> dict[str, Any]:
     """Build baseline-blind failure material from command facts and one raw observation."""
 
+    portable_source = _portable_node_test_observation_source(validated_command_record)
+    if portable_source is not validated_command_record:
+        raw_set = validated_command_record.get("producerObservations", [])
+        if any(validated_raw_observation == raw for raw in raw_set):
+            validated_raw_observation = portable_source["producerObservations"][0]
+            validated_command_record = _canonical_transcript_record(validated_command_record)
     targets = []
     for target in validated_command_record.get("targets", []):
         if isinstance(target, Mapping):
@@ -10772,6 +11406,183 @@ def _command_execution_completed(record: Mapping[str, Any]) -> bool:
     )
 
 
+def _validated_portable_static_containment(
+    record: Mapping[str, Any],
+    *,
+    protected_bundle_valid: bool,
+) -> dict[str, str] | None:
+    """Project only proven Linux static-suite natural-reap count telemetry.
+
+    The supervisor's sampled registry can observe different numbers of transient
+    children in independent executions. Its exact local reap/death proof remains
+    mandatory. The bounded projection preserves the backend, disposition, zero
+    survivors/terminations, and every execution/cleanup/watcher fact in the
+    surrounding record; no other command or successful disposition is changed.
+    """
+
+    if (
+        protected_bundle_valid is not True
+        or record.get("commandId") != "static-suite"
+        or record.get("commandClass") != "static-suite"
+        or record.get("commandRole") != "observation-producing"
+        or record.get("toolRole") != "python-static-producer"
+        or record.get("profile") not in ("static", "all")
+        or record.get("platform") != "ubuntu"
+        or record.get("resultSemantics") != "machine-v2-complete-execution"
+        or record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or record.get("required") is not True
+        or record.get("executed") is not True
+        or record.get("started") is not True
+        or record.get("setupFailure") is not False
+        or type(record.get("exitCode")) is not int
+        or record.get("exitCode") != 0
+        or record.get("allowedExecutionExits") != [0]
+        or record.get("timeoutStatus") != "within-limit"
+        or record.get("outputLimitStatus") != "within-limit"
+        or record.get("containment") != "linux-subreaper-pidfd-proc-supervisor"
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("containmentDisposition") != "natural-exit-reaped"
+        or any(record.get(key) not in (None, "") for key in (
+            "error", "processTreeError", "limitReason",
+        ))
+        # Static-suite currently has no dependency watcher. Retain any future
+        # watcher evidence exactly until its successful projection is justified.
+        or record.get("dependencyBacked") is not False
+        or any(record.get(key) is not None for key in (
+            "runtimeClosureGuard", "closureWatcherActive", "closureMutationState",
+        ))
+    ):
+        return None
+    counts = {
+        key: record.get(key)
+        for key in (
+            "descendantsObserved", "descendantsReaped",
+            "descendantsTerminated", "descendantsSurviving",
+        )
+    }
+    if (
+        any(type(value) is not int or not 0 <= value <= 4096 for value in counts.values())
+        or counts["descendantsObserved"] == 0
+        or counts["descendantsObserved"] != counts["descendantsReaped"]
+        or counts["descendantsTerminated"] != 0
+        or counts["descendantsSurviving"] != 0
+    ):
+        return None
+    return {
+        "descendantsObserved": "<VALIDATED-NATURALLY-REAPED-COUNT>",
+        "descendantsReaped": "<VALIDATED-NATURALLY-REAPED-COUNT>",
+    }
+
+
+def _validated_portable_successful_external_test_containment(
+    record: Mapping[str, Any],
+    *,
+    protected_bundle_valid: bool,
+    node_test_semantics_valid: bool,
+) -> dict[str, str] | None:
+    """Project only natural-reap counts after independent Node success proof.
+
+    The caller derives ``node_test_semantics_valid`` from the validated raw
+    reporter and immutable direct-Node authority, never from a producer claim.
+    All containment and applicable dependency-guard evidence remains exact;
+    these two counts alone describe non-authoritative supervisor sampling.
+    Existing static-suite projection is deliberately kept separate and intact.
+    """
+
+    command_id = record.get("commandId")
+    if not isinstance(command_id, str):
+        return None
+    security_ids = {
+        f"frontend-security:{Path(relative).name}" for relative in SECURITY_GUARD_FILES
+    }
+    approved_command = (
+        command_id == "learner-focused"
+        and record.get("commandClass") == "learner-focused"
+        and record.get("toolRole") == "node-test"
+    ) or (
+        command_id in security_ids
+        and record.get("commandClass") == "frontend-security"
+        and record.get("toolRole") == "node-security-test"
+    ) or (
+        command_id == "frontend-security:messageOriginGuard.test.js"
+        and record.get("commandClass") == "frontend-security"
+        and record.get("toolRole") == "node-builtin-security-test"
+    )
+    if (
+        node_test_semantics_valid is not True
+        or protected_bundle_valid is not True
+        or not approved_command
+        or record.get("commandRole") != "observation-producing"
+        or record.get("profile") not in ("frontend", "all")
+        or record.get("platform") != "ubuntu"
+        or record.get("resultSemantics") != "exit-zero-pass-exit-one-classified-observation"
+        or record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or record.get("required") is not True
+        or not _command_execution_completed(record)
+        or type(record.get("exitCode")) is not int
+        or record.get("exitCode") != 0
+        or record.get("allowedExecutionExits") != [0, 1]
+        or record.get("containment") != "linux-subreaper-pidfd-proc-supervisor"
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("containmentDisposition") != "natural-exit-reaped"
+        or any(record.get(key) not in (None, "") for key in (
+            "error", "processTreeError", "limitReason",
+        ))
+    ):
+        return None
+    counts = {
+        key: record.get(key)
+        for key in (
+            "descendantsObserved", "descendantsReaped",
+            "descendantsTerminated", "descendantsSurviving",
+        )
+    }
+    if (
+        any(type(value) is not int or not 0 <= value <= 4096 for value in counts.values())
+        or counts["descendantsObserved"] == 0
+        or counts["descendantsObserved"] != counts["descendantsReaped"]
+        or counts["descendantsTerminated"] != 0
+        or counts["descendantsSurviving"] != 0
+    ):
+        return None
+    dependency_backed = record.get("toolRole") != "node-builtin-security-test"
+    if record.get("dependencyBacked") is not dependency_backed:
+        return None
+    guard = record.get("runtimeClosureGuard")
+    if dependency_backed:
+        if (
+            not isinstance(guard, dict)
+            or guard.get("active") is not False
+            or type(guard.get("guardSchemaVersion")) is not int
+            or guard.get("watcherBackend") != "_InotifyMutationWatcher"
+            or guard.get("activeDuringReplay") is not True
+            or guard.get("mutationState") != "clean"
+            or guard.get("queueOverflow") is not False
+            or type(guard.get("mutationEventCount")) is not int
+            or guard.get("mutationEventCount") != 0
+            or record.get("closureWatcherActive") is not True
+            or record.get("closureMutationState") != "clean"
+        ):
+            return None
+    elif any(record.get(key) is not None for key in (
+        "runtimeClosureGuard", "closureWatcherActive", "closureMutationState",
+    )):
+        return None
+    errors: list[str] = []
+    try:
+        if _validated_portable_protected_input_bundle_digest(record) is None:
+            return None
+        hard_failure = _validate_command_record(dict(record), 0, errors, expected_record=record)
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+        return None
+    if errors or hard_failure:
+        return None
+    return {
+        "descendantsObserved": "<VALIDATED-NATURALLY-REAPED-COUNT>",
+        "descendantsReaped": "<VALIDATED-NATURALLY-REAPED-COUNT>",
+    }
+
+
 def _plan_command_requires_completion(record: Mapping[str, Any]) -> bool:
     return bool(record.get("required")) or record.get("commandRole") == "observation-producing"
 
@@ -10840,7 +11651,8 @@ def producer_observation_universe(
             "producerObservations": copy.deepcopy(record.get("producerObservations", [])),
             "producerObservationSetDigest": record.get("producerObservationSetDigest"),
         }
-        for record in command_records
+        for raw_record in command_records
+        for record in (_portable_node_test_observation_source(raw_record),)
     ]
 
 
@@ -10851,40 +11663,136 @@ def producer_observation_universe_digest(
 
 
 def _canonical_replay_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {str(key): _canonical_replay_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_canonical_replay_value(item) for item in value]
-    if isinstance(value, str):
-        temporary_root = str(Path(tempfile.gettempdir()).resolve())
-        normalized = value
-        for spelling in {
-            temporary_root,
-            temporary_root.replace("\\", "/"),
-            temporary_root.replace("/", "\\"),
-        }:
-            if spelling:
-                normalized = re.sub(
-                    re.escape(spelling),
-                    "<TASK-TEMP>",
-                    normalized,
-                    flags=re.IGNORECASE if os.name == "nt" else 0,
-                )
-        repository_root = str(REPO_ROOT.resolve())
-        for spelling in {
-            repository_root,
-            repository_root.replace("\\", "/"),
-            repository_root.replace("/", "\\"),
-        }:
-            if spelling:
-                normalized = re.sub(
-                    re.escape(spelling),
-                    "<REPO>",
-                    normalized,
-                    flags=re.IGNORECASE if os.name == "nt" else 0,
-                )
-        return normalized
-    return value
+    # Scope the resolved authority to this traversal, never to the process.
+    # Resolve lazily so values without strings retain their filesystem-free path.
+    repository_root: str | None = None
+
+    def visit(current: Any) -> Any:
+        nonlocal repository_root
+        if isinstance(current, Mapping):
+            return {str(key): visit(item) for key, item in current.items()}
+        if isinstance(current, (list, tuple)):
+            return [visit(item) for item in current]
+        if isinstance(current, str):
+            temporary_root = str(Path(tempfile.gettempdir()).resolve())
+            normalized = current
+            for spelling in {
+                temporary_root,
+                temporary_root.replace("\\", "/"),
+                temporary_root.replace("/", "\\"),
+            }:
+                if spelling:
+                    normalized = re.sub(
+                        re.escape(spelling),
+                        "<TASK-TEMP>",
+                        normalized,
+                        flags=re.IGNORECASE if os.name == "nt" else 0,
+                    )
+            if repository_root is None:
+                repository_root = str(REPO_ROOT.resolve())
+            for spelling in {
+                repository_root,
+                repository_root.replace("\\", "/"),
+                repository_root.replace("/", "\\"),
+            }:
+                if spelling:
+                    normalized = re.sub(
+                        re.escape(spelling),
+                        "<REPO>",
+                        normalized,
+                        flags=re.IGNORECASE if os.name == "nt" else 0,
+                    )
+            return normalized
+        return current
+
+    return visit(value)
+
+
+def _git_bash_execution_lease_valid(record: Mapping[str, Any]) -> bool:
+    """Validate portable evidence without resolving another runner's local paths."""
+
+    lease = record.get("executionLease")
+    if (
+        record.get("commandId") != "git-bash-version"
+        or record.get("toolRole") != "git-bash-runtime"
+        or record.get("platform") != "windows"
+        or not isinstance(lease, dict)
+        or set(lease) != {
+            "canonicalPath", "trustedGitRoot", "size", "volumeSerial", "fileIndex",
+            "links", "creationTime", "writeTime", "reparsePoint", "sha256",
+        }
+        or lease.get("reparsePoint") is not False
+        or type(lease.get("links")) is not int
+        or lease["links"] != 1
+        or type(lease.get("size")) is not int
+        or not 0 <= lease["size"] < 2**64
+        or lease["size"] != record.get("resolvedExecutableSize")
+        or not isinstance(lease.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", lease["sha256"])
+        or lease["sha256"] != record.get("resolvedExecutableSha256")
+        or lease.get("canonicalPath") != record.get("resolvedExecutablePath")
+        or any(
+            not isinstance(lease.get(key), str)
+            or not re.fullmatch(r"[0-9]{1,20}", lease[key])
+            or int(lease[key]) >= 2**64
+            for key in ("volumeSerial", "fileIndex", "creationTime", "writeTime")
+        )
+        or any(
+            not isinstance(lease.get(key), str) or not lease[key] or "\x00" in lease[key]
+            for key in ("canonicalPath", "trustedGitRoot")
+        )
+    ):
+        return False
+    executable = PureWindowsPath(lease["canonicalPath"])
+    git_root = PureWindowsPath(lease["trustedGitRoot"])
+    if (
+        not executable.is_absolute()
+        or not git_root.is_absolute()
+        or ".." in executable.parts
+        or ".." in git_root.parts
+    ):
+        return False
+    try:
+        candidate = tuple(part.casefold() for part in executable.relative_to(git_root).parts)
+    except ValueError:
+        return False
+    return candidate in WINDOWS_GIT_BASH_CANDIDATE_SUFFIXES
+
+
+def _validated_portable_git_bash_execution_lease(
+    record: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Project a locally verified successful lease; failed physical evidence stays exact.
+
+    TrustedBashLease constructs the held identity and verifies it before the plan
+    snapshot and both sides of execution. Those checks remain local authority;
+    this projection is only the cross-job identity of their successful record.
+    """
+
+    if (
+        not _git_bash_execution_lease_valid(record)
+        or not _required_command_execution_passed(record)
+        or record.get("containment") != "windows-job-object"
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("descendantsSurviving") != 0
+        or any(record.get(key) is not None for key in ("error", "processTreeError", "limitReason"))
+    ):
+        return None
+    errors: list[str] = []
+    _validate_command_record(dict(record), 0, errors, expected_record=record)
+    if errors:
+        return None
+    lease = record["executionLease"]
+    return {
+        "leaseKind": "windows-git-bash-executable-v1",
+        "tool": "git-bash",
+        "size": lease["size"],
+        "sha256": lease["sha256"],
+        "reparsePoint": False,
+        "links": 1,
+        "trustedProductRelationship": "fixed-candidate-in-trusted-git-installation",
+        "nonReparseDirectoryChain": True,
+    }
 
 
 _PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS = (
@@ -10978,24 +11886,22 @@ def _canonical_protected_execution_inputs(
     return copy.deepcopy(inputs)
 
 
-def _protected_bundle_compact_identity_digests(
+def _portable_protected_bundle_authority(
     command: Mapping[str, Any],
-    *,
-    phase: str,
-) -> list[str]:
-    """Derive compact bundle identities from portable command-plan authority.
+) -> dict[str, Any] | None:
+    """Derive the shared portable bundle authority from the ordered target plan.
 
     The preimage deliberately excludes checkout-local canonical paths, inode/file
     indexes, and timestamps: a fresh verifier checkout has different values.
     Those values remain protected by each producer/replay TargetExecutionLease.
     The portable semantic identity instead binds the ordered path/content/input
     plan, the command association, the bundle version/adapter, and the pre/post
-    phase, all of which the verifier reconstructs without trusting these digests.
+    phase for compact leaves, all reconstructed without trusting these digests.
     """
 
     targets = command.get("targets")
     if not isinstance(targets, list) or not targets:
-        return []
+        return None
     execution_adapter = command.get("executionInputMode")
     ordered_authority = [
         {
@@ -11010,7 +11916,7 @@ def _protected_bundle_compact_identity_digests(
         if isinstance(target, Mapping)
     ]
     if len(ordered_authority) != len(targets):
-        return []
+        return None
     portable_input_digest = hashlib.sha256(
         _canonical_frame(
             {
@@ -11023,7 +11929,7 @@ def _protected_bundle_compact_identity_digests(
             }
         )
     ).hexdigest()
-    bundle_authority = {
+    return {
         "digestDomain": _PROTECTED_BUNDLE_COMPACT_IDENTITY_DOMAIN,
         "bundleVersion": PROTECTED_TARGET_BUNDLE_VERSION,
         "executionAdapter": execution_adapter,
@@ -11038,6 +11944,19 @@ def _protected_bundle_compact_identity_digests(
         "orderedTargetAndInputAuthority": ordered_authority,
         "portableExecutionInputBundleDigest": portable_input_digest,
     }
+
+
+def _protected_bundle_compact_identity_digests(
+    command: Mapping[str, Any],
+    *,
+    phase: str,
+) -> list[str]:
+    """Bind each phase and target to the shared portable bundle authority."""
+
+    bundle_authority = _portable_protected_bundle_authority(command)
+    if bundle_authority is None:
+        return []
+    ordered_authority = bundle_authority["orderedTargetAndInputAuthority"]
     bundle_authority_digest = hashlib.sha256(
         _canonical_frame(bundle_authority)
     ).hexdigest()
@@ -11055,7 +11974,7 @@ def _protected_bundle_compact_identity_digests(
                 }
             )
         ).hexdigest()
-        for index in range(len(targets))
+        for index in range(len(ordered_authority))
     ]
 
 
@@ -11161,6 +12080,8 @@ def _compact_command_record_for_evidence(
         return copy.deepcopy(source)
     if pre != post:
         return copy.deepcopy(source)
+    if _validated_portable_protected_input_bundle_digest(source) is None:
+        return copy.deepcopy(source)
     pre_digests = _protected_bundle_compact_identity_digests(source, phase="pre")
     post_digests = _protected_bundle_compact_identity_digests(source, phase="post")
     compact = {
@@ -11187,12 +12108,822 @@ def _compact_command_record_for_evidence(
     return compact
 
 
+def _validated_portable_protected_input_bundle_digest(
+    record: Mapping[str, Any],
+) -> str | None:
+    """Portableize only after raw evidence passes this job's local authority.
+
+    The ordinary validator checks full physical evidence or reconstructs compact
+    references, including the raw input digest, before any fields are removed.
+    Using the retained record here checks local consistency only: verification
+    still independently compares it with the freshly rebuilt command plan.
+    """
+
+    targets = record.get("targets")
+    if (
+        record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or record.get("executed") is not True
+        or not isinstance(targets, list)
+        or not targets
+        or any(
+            not isinstance(target, dict)
+            or target.get("modeType") != "regular-file"
+            or target.get("reparsePoint") is not False
+            for target in targets
+        )
+    ):
+        return None
+    errors: list[str] = []
+    _validate_command_record(dict(record), 0, errors, expected_record=record)
+    if errors:
+        return None
+    for target in targets:
+        stable = target.get("fileIdentity")
+        if (
+            type(target.get("size")) is not int
+            or not 0 <= target["size"] <= MAX_SCANNED_FILE_BYTES
+            or not isinstance(target.get("sha256"), str)
+            or not isinstance(target.get("canonicalSourcePath"), str)
+            or not isinstance(stable, Mapping)
+            or set(stable) != {
+                "deviceOrVolume", "inodeOrFileIndex", "creationOrChangeTimeNs",
+                "writeTimeNs", "reparsePoint",
+            }
+            or stable.get("reparsePoint") is not False
+            or any(
+                not isinstance(stable.get(key), str)
+                or not re.fullmatch(r"-?[0-9]+", stable[key])
+                for key in (
+                    "deviceOrVolume", "inodeOrFileIndex", "creationOrChangeTimeNs",
+                    "writeTimeNs",
+                )
+            )
+        ):
+            return None
+    # Full evidence retains the held lease identity. POSIX uses the same stable
+    # identity as the path; Windows captures a separate handle-information shape.
+    bundle = record["protectedTargetBundle"]
+    for target, identity in zip(targets, bundle["preExecutionIdentities"]):
+        if not isinstance(identity, Mapping):
+            continue  # Compact phase digests were independently checked above.
+        held = identity["heldStableIdentity"]
+        if held == target.get("fileIdentity"):
+            continue
+        if (
+            set(held) != {
+                "volumeSerial", "fileIndex", "size", "creationTime", "writeTime",
+                "linkCount", "reparsePoint",
+            }
+            or type(held.get("size")) is not int
+            or held.get("size") != target.get("size")
+            or type(held.get("linkCount")) is not int
+            or held["linkCount"] < 1
+            or any(
+                not isinstance(held.get(key), str)
+                or not re.fullmatch(r"[0-9]+", held[key])
+                for key in ("volumeSerial", "fileIndex", "creationTime", "writeTime")
+            )
+        ):
+            return None
+    authority = _portable_protected_bundle_authority(record)
+    if authority is None:
+        return None
+    return hashlib.sha256(_canonical_frame(authority)).hexdigest()
+
+
+def _validated_portable_target_stdin_input_authority(
+    record: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Project a single immutable stdin input only after complete local validation.
+
+    Retain all physical evidence in the raw record. The successful projection
+    shares the protected-bundle byte representation and binds the closed lease,
+    command association, and target ordering in a distinct digest domain.
+    """
+
+    if record.get("executionInputMode") != "TARGET-BYTES-STDIN":
+        return None
+    errors: list[str] = []
+    try:
+        hard_failure = _validate_command_record(dict(record), 0, errors, expected_record=record)
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+        return None
+    if (
+        errors or hard_failure or not _command_execution_completed(record)
+        or (record.get("platform"), record.get("containment")) not in {
+            ("windows", "windows-job-object"), ("ubuntu", "linux-subreaper-pidfd-proc-supervisor"),
+        }
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("descendantsSurviving") != 0
+        or any(record.get(key) is not None for key in ("error", "processTreeError", "limitReason"))
+    ):
+        return None
+    target = record["targets"][0]
+    lease = record["targetExecutionLease"]
+    execution_input = record["executionInputs"][0]
+    stable = target.get("fileIdentity")
+    if (
+        type(target.get("size")) is not int
+        or not 0 <= target["size"] <= MAX_SCANNED_FILE_BYTES
+        or not isinstance(target.get("sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", target["sha256"]) is None
+        or not isinstance(target.get("canonicalSourcePath"), str)
+        or not Path(target["canonicalSourcePath"]).is_absolute()
+        or target.get("modeType") != "regular-file"
+        or target.get("reparsePoint") is not False
+        or lease.get("reparsePoint") is not False
+        or type(lease.get("leaseVersion")) is not int
+        or lease["leaseVersion"] != TARGET_EXECUTION_LEASE_VERSION
+        or any(
+            type(value) is not int or value != target["size"]
+            for value in (
+                record.get("executionInputSize"), record.get("actualExecutionInputSize"),
+                lease.get("plannedByteLength"), lease.get("executedInputByteLength"),
+                execution_input.get("plannedByteLength"), execution_input.get("actualByteLength"),
+            )
+        )
+        or not isinstance(stable, Mapping)
+        or set(stable) != {
+            "deviceOrVolume", "inodeOrFileIndex", "creationOrChangeTimeNs", "writeTimeNs", "reparsePoint",
+        }
+        or stable.get("reparsePoint") is not False
+        or any(
+            not isinstance(stable.get(key), str) or re.fullmatch(r"-?[0-9]+", stable[key]) is None
+            for key in ("deviceOrVolume", "inodeOrFileIndex", "creationOrChangeTimeNs", "writeTimeNs")
+        )
+    ):
+        return None
+    relative = target["path"]
+    if (
+        Path(relative).is_absolute() or "\\" in relative
+        or any(part in {"", ".", ".."} for part in relative.split("/"))
+    ):
+        return None
+    pre = lease["preExecutionSourceIdentity"]
+    post = lease["postExecutionSourceIdentity"]
+    # The ordinary stdin validator requires snapshots to exist; this projection
+    # additionally proves their full physical content before discarding it.
+    try:
+        snapshots_match = (
+            _protected_source_identity_matches_target(pre, target)
+            and _protected_source_identity_matches_target(post, target)
+            and _json_bytes(pre) == _json_bytes(post)
+            and _json_bytes(pre["pathStableIdentity"]) == _json_bytes(stable)
+            and _json_bytes(lease["plannedStableFileIdentity"]) == _json_bytes(stable)
+            and _json_bytes(execution_input["plannedStableIdentity"]) == _json_bytes(stable)
+        )
+    except (KeyError, TypeError, ValueError, UnicodeError):
+        return None
+    if not snapshots_match:
+        return None
+    held = pre["heldStableIdentity"]
+    if record["platform"] == "windows":
+        if (
+            set(held) != {
+                "volumeSerial", "fileIndex", "size", "creationTime", "writeTime", "linkCount", "reparsePoint",
+            }
+            or type(held.get("size")) is not int or held["size"] != target["size"]
+            or type(held.get("linkCount")) is not int or not 1 <= held["linkCount"] < 2**32
+            or held.get("reparsePoint") is not False
+            or any(
+                not isinstance(held.get(key), str)
+                or re.fullmatch(r"[0-9]{1,20}", held[key]) is None
+                or int(held[key]) >= 2**width
+                for key, width in (
+                    ("volumeSerial", 32), ("fileIndex", 64), ("creationTime", 64), ("writeTime", 64),
+                )
+            )
+        ):
+            return None
+    elif _json_bytes(held) != _json_bytes(stable):
+        return None
+    portable_input = _portable_protected_execution_input_authority(target, "TARGET-BYTES-STDIN")
+    portable_lease = {
+        "leaseVersion": lease["leaseVersion"],
+        "logicalTargetPath": portable_input["logicalPath"],
+        "executionAdapter": portable_input["inputMode"],
+        "plannedByteLength": portable_input["plannedByteLength"],
+        "plannedSha256": portable_input["plannedSha256"],
+        "executedInputByteLength": portable_input["actualByteLength"],
+        "executedInputSha256": portable_input["actualSha256"],
+        "modeType": target["modeType"],
+        "reparsePoint": False,
+        "mutationDetected": False,
+        "cleanupState": "closed",
+        "targetIndex": 0,
+        "commandAssociation": {
+            key: record[key] for key in ("commandId", "ordinal", "commandClass", "profile", "toolRole")
+        },
+    }
+    portable_digest = hashlib.sha256(_canonical_frame({
+        "digestDomain": "ieltmps-target-bytes-stdin-portable-input-v1",
+        "targetExecutionLease": portable_lease,
+        "orderedExecutionInputs": [portable_input],
+    })).hexdigest()
+    return {
+        "executionInputs": [portable_input],
+        "executionInputBundleDigest": portable_digest,
+        "targetExecutionLease": portable_lease,
+    }
+
+
+def _validated_bundle_normalization_success_output_identity(
+    record: Mapping[str, Any],
+    *,
+    protected_bundle_valid: bool,
+) -> dict[str, Any] | None:
+    """Project this one exit-zero contract after its local evidence validates.
+
+    Node's successful test reporter is telemetry for bundle-normalization. Its
+    raw streams, hashes, and lengths remain local evidence; only the cross-job
+    transcript receives a freshly derived semantic stdout identity. Immutable
+    plan/trusted-tool comparison still binds the surrounding command authority.
+    """
+
+    if (
+        protected_bundle_valid is not True
+        or record.get("commandId") != "bundle-normalization"
+        or record.get("commandClass") != "bundle-parity"
+        or record.get("commandRole") != "required-execution"
+        or record.get("resultSemantics") != "exit-zero-required"
+        or record.get("toolRole") != "node-test"
+        or record.get("profile") not in ("frontend", "all")
+        or record.get("required") is not True
+        or not _command_execution_completed(record)
+        or type(record.get("exitCode")) is not int
+        or record.get("exitCode") != 0
+        or record.get("allowedExecutionExits") != [0]
+        or record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or (record.get("platform"), record.get("containment")) not in {
+            ("ubuntu", "linux-subreaper-pidfd-proc-supervisor"),
+            ("windows", "windows-job-object"),
+        }
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("descendantsSurviving") != 0
+        or any(record.get(key) is not None for key in (
+            "error", "processTreeError", "limitReason",
+        ))
+        or record.get("producerObservations") != []
+        or record.get("dependencyBacked") is not True
+    ):
+        return None
+    errors: list[str] = []
+    try:
+        hard_failure = _validate_command_record(dict(record), 0, errors, expected_record=record)
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+        return None
+    if errors or hard_failure:
+        return None
+    guard = record["runtimeClosureGuard"]
+    if (
+        guard.get("active") is not False
+        or type(guard.get("guardSchemaVersion")) is not int
+        or type(guard.get("mutationEventCount")) is not int
+        or (record["platform"], guard.get("watcherBackend")) not in {
+            ("ubuntu", "_InotifyMutationWatcher"),
+            ("windows", "_WindowsDirectoryMutationWatcher"),
+        }
+    ):
+        return None
+    executable = record.get("resolvedExecutablePath")
+    stable = record.get("resolvedExecutableFileIdentity")
+    target_path = "developer/tests/js/bundleNormalization.test.js"
+    argv = [executable, "--test", target_path]
+    if (
+        not isinstance(executable, str)
+        or not Path(executable).is_absolute()
+        or record["resolvedExecutableSize"] <= 0
+        or record.get("resolvedTestRunnerEntrypoint") != executable
+        or record.get("resolvedTestRunnerSha256") != record.get("resolvedExecutableSha256")
+        or any(record.get(key) != argv for key in (
+            "argv", "logicalArgv", "executionArgv", "actualExecutionArgv",
+        ))
+        or sum(target.get("path") == target_path for target in record["targets"]) != 1
+        or record.get("cwd") != "."
+        or not isinstance(stable, Mapping)
+        or stable.get("reparsePoint") is not False
+        or any(
+            not isinstance(stable.get(key), str)
+            or re.fullmatch(r"-?[0-9]+", stable[key]) is None
+            for key in (
+                "deviceOrVolume", "inodeOrFileIndex", "creationOrChangeTimeNs", "writeTimeNs",
+            )
+        )
+    ):
+        return None
+    canonical = _canonical_frame({
+        "digestDomain": "ieltmps-exit-zero-required-success-output-v1",
+        "commandId": record["commandId"],
+        "resultSemantics": record["resultSemantics"],
+        "exitCode": record["exitCode"],
+    })
+    return {
+        "stdoutSha256": hashlib.sha256(canonical).hexdigest(),
+        "stdoutBytesObserved": len(canonical),
+    }
+
+
+_NODE_TEST_MAX_STDOUT_BYTES = 256 * 1024
+_NODE_TEST_MAX_TESTS = 1024
+_NODE_TEST_MAX_NAME_LENGTH = 2048
+_NODE_TEST_MAX_PAYLOAD_BYTES = 16 * 1024
+_NODE_TEST_DURATION_PATTERN = r"(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?"
+_NODE_TEST_SUMMARY_KEYS = (
+    "tests", "suites", "pass", "fail", "cancelled", "skipped", "todo",
+)
+_NODE_TEST_LEARNER_PATHS = (
+    "developer/tests/js/learnerPalette.test.js",
+    "developer/tests/js/learnerUiRuntimeStabilization.test.js",
+)
+_NODE_TEST_SECURITY_JSON_DETAILS = {
+    "appActionsExportGuard.test.js": "app actions markdown export step-up guard passed",
+    "dataManagementPanel.test.js": "data management panel export and stale file read guard tests passed",
+    "examActionsExportGuard.test.js": "exam actions fallback export guard passed",
+    "examSessionReplayCloneGuard.test.js": "exam session replay clone guard passed",
+    "localDataRenderingGuard.test.js": "local data rendering guard tests passed",
+    "practiceRecordExportServerGuard.test.js": "server-owned practice-record export guard tests passed",
+    "remotePracticeDataSource.test.js": "remote practice data source tests passed",
+    "resourceCoreProbeBypassGuard.test.js": "resource core probe bypass guard passed",
+    "secureIdentifierGuard.test.js": "secure identifier guard tests passed",
+    "suiteBackGuardSecurity.test.js": "suite back guard history state sanitization tests passed",
+    "vocabSessionExportGuard.test.js": "vocab session export step-up guard passed",
+}
+
+
+def _node_test_geometry_valid(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"left", "top", "width", "height"}
+        and all(
+            type(number) in (int, float)
+            and abs(number) <= 1_000_000_000
+            and math.isfinite(number)
+            for number in value.values()
+        )
+        and value["width"] >= 0
+        and value["height"] >= 0
+    )
+
+
+def _node_test_learner_payload_valid(payload: Any) -> bool:
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"status", "detail", "tests", "evidence"}
+        or payload["status"] != "pass"
+        or payload["detail"] != "learner UI runtime stabilization regression tests passed"
+        or payload["tests"] != {
+            "practiceSummaryToggle": "pass",
+            "practiceBeforeBrowse": "pass",
+            "paletteLayoutStability": "pass",
+        }
+    ):
+        return False
+    evidence = payload["evidence"]
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != {
+            "expandedToggle", "collapsedToggle", "practiceFirstCalls", "widgetClicks",
+        }
+        or not _node_test_geometry_valid(evidence["expandedToggle"])
+        or not _node_test_geometry_valid(evidence["collapsedToggle"])
+        or type(evidence["widgetClicks"]) is not int
+        or not 0 <= evidence["widgetClicks"] <= 1_000_000
+    ):
+        return False
+    calls = evidence["practiceFirstCalls"]
+    return (
+        isinstance(calls, list)
+        and 1 <= len(calls) <= 128
+        and all(
+            isinstance(call, str)
+            and re.fullmatch(
+                r"ensure-browse|ensure-practice-suite|update:(?:true|false):(?:true|false)",
+                call,
+            ) is not None
+            for call in calls
+        )
+    )
+
+
+def _node_test_payload_valid(payload: Any, command_id: str) -> bool:
+    if command_id == "learner-focused":
+        return _node_test_learner_payload_valid(payload)
+    basename = command_id.removeprefix("frontend-security:")
+    detail = _NODE_TEST_SECURITY_JSON_DETAILS.get(basename)
+    return (
+        detail is not None
+        and isinstance(payload, dict)
+        and set(payload) == {"status", "detail"}
+        and payload["status"] == "pass"
+        and payload["detail"] == detail
+    )
+
+
+def _node_test_authorized_reporter_path(name: str, paths: tuple[str, ...]) -> str | None:
+    for path in paths:
+        if re.fullmatch(re.escape(path).replace("/", r"[/\\]"), name) is not None:
+            return path
+    return None
+
+
+def parse_node_test_semantic_result(
+    stdout: str,
+    *,
+    command_id: str,
+    authorized_test_paths: Sequence[str],
+) -> dict[str, Any] | None:
+    """Derive NodeTestSemanticResultV1, never accepting a producer digest.
+
+    Exact repository identifiers come solely from caller-validated immutable
+    argv/target authority. A slash or backslash spelling is normalized only
+    when an entire reporter test name equals that identifier. All other test
+    names and all structured payload values retain their semantic content.
+    """
+    if (
+        not isinstance(stdout, str)
+        or not stdout
+        or len(stdout) > _NODE_TEST_MAX_STDOUT_BYTES
+        or not isinstance(command_id, str)
+        or isinstance(authorized_test_paths, (str, bytes))
+        or not isinstance(authorized_test_paths, Sequence)
+        or not 1 <= len(authorized_test_paths) <= 2
+    ):
+        return None
+    try:
+        if len(stdout.encode("utf-8")) > _NODE_TEST_MAX_STDOUT_BYTES:
+            return None
+    except UnicodeError:
+        return None
+    # Node's captured spec reporter writes LF on both authorized platforms.
+    # Do not broaden normalization to ANSI escapes or arbitrary whitespace.
+    if not stdout.endswith("\n") or any(
+        ord(character) < 32 and character != "\n" or ord(character) == 127
+        for character in stdout
+    ):
+        return None
+    paths = tuple(authorized_test_paths)
+    if any(
+        not isinstance(path, str)
+        or re.fullmatch(r"developer/tests/js/[A-Za-z0-9_-]+\.test\.js", path) is None
+        for path in paths
+    ) or len(set(paths)) != len(paths):
+        return None
+    if command_id == "learner-focused":
+        if paths != _NODE_TEST_LEARNER_PATHS:
+            return None
+        payload_kind = "learner-runtime"
+        payload_path = paths[1]
+    elif command_id.startswith("frontend-security:"):
+        basename = command_id.removeprefix("frontend-security:")
+        if len(paths) != 1 or basename != paths[0].rsplit("/", 1)[1]:
+            return None
+        payload_path = paths[0]
+        if basename in _NODE_TEST_SECURITY_JSON_DETAILS:
+            payload_kind = "security-result"
+        elif basename == "adminFrontendGuard.test.js":
+            payload_kind = "security-success-line"
+        else:
+            payload_kind = None
+    else:
+        return None
+    lines = stdout[:-1].split("\n")
+    if not 9 <= len(lines) <= _NODE_TEST_MAX_TESTS + 256:
+        return None
+    summary_lines = lines[-8:]
+    counts: dict[str, int] = {}
+    for key, line in zip(_NODE_TEST_SUMMARY_KEYS, summary_lines[:7]):
+        match = re.fullmatch(rf"ℹ {key} (0|[1-9][0-9]{{0,3}})", line)
+        if match is None:
+            return None
+        counts[key] = int(match[1])
+    if (
+        re.fullmatch(rf"ℹ duration_ms {_NODE_TEST_DURATION_PATTERN}", summary_lines[-1]) is None
+        or not 1 <= counts["tests"] <= _NODE_TEST_MAX_TESTS
+        or counts["pass"] != counts["tests"]
+        or any(counts[key] != 0 for key in ("suites", "fail", "cancelled", "skipped", "todo"))
+    ):
+        return None
+    body = lines[:-8]
+    tests: list[dict[str, Any]] = []
+    payloads: list[dict[str, Any]] = []
+    index = 0
+    while index < len(body):
+        line = body[index]
+        test_match = re.fullmatch(rf"✔ (.+) \({_NODE_TEST_DURATION_PATTERN}ms\)", line)
+        if test_match is not None:
+            name = test_match[1]
+            if (
+                len(name) > _NODE_TEST_MAX_NAME_LENGTH
+                or name != name.strip()
+                or len(tests) >= _NODE_TEST_MAX_TESTS
+            ):
+                return None
+            normalized_name = _node_test_authorized_reporter_path(name, paths) or name
+            tests.append({"ordinal": len(tests) + 1, "name": normalized_name, "status": "pass"})
+            index += 1
+            continue
+        if payload_kind is None or payloads:
+            return None
+        if payload_kind == "security-success-line":
+            if line != "adminFrontendGuard.test.js passed":
+                return None
+            payload: Any = {"status": "pass", "detail": line}
+            index += 1
+        else:
+            if line != "{":
+                return None
+            # JSON.stringify(..., null, 2) emits one top-level closing brace
+            # on a line of its own. No arbitrary leading/trailing text passes.
+            closing = next((i for i in range(index + 1, len(body)) if body[i] == "}"), None)
+            if closing is None:
+                return None
+            payload_text = "\n".join(body[index:closing + 1])
+            if len(payload_text.encode("utf-8")) > _NODE_TEST_MAX_PAYLOAD_BYTES:
+                return None
+            try:
+                payload = strict_json_loads(payload_text, label="direct Node test payload")
+            except (ValueError, RecursionError, OverflowError):
+                return None
+            if not _node_test_payload_valid(payload, command_id):
+                return None
+            index = closing + 1
+        # Payload is emitted by the script whose immediately following file
+        # result closes the reporter body. Association and placement matter.
+        if index != len(body) - 1:
+            return None
+        associated_test = re.fullmatch(
+            rf"✔ (.+) \({_NODE_TEST_DURATION_PATTERN}ms\)", body[index],
+        )
+        if (
+            associated_test is None
+            or _node_test_authorized_reporter_path(associated_test[1], paths) != payload_path
+        ):
+            return None
+        payloads.append({"testOrdinal": len(tests) + 1, "kind": payload_kind, "value": payload})
+    if (
+        len(tests) != counts["tests"]
+        or bool(payloads) != (payload_kind is not None)
+        or (payload_kind is not None and command_id != "learner-focused" and len(tests) != 1)
+    ):
+        return None
+    return {
+        "schema": "NodeTestSemanticResultV1",
+        "commandId": command_id,
+        "authorizedTestPaths": list(paths),
+        "tests": tests,
+        "counts": counts,
+        "payloads": payloads,
+    }
+
+
+def _direct_node_test_authorized_paths(record: Mapping[str, Any]) -> tuple[str, ...] | None:
+    """Recognize only the immutable direct-test adapters in the frontend plan."""
+    command_id = record.get("commandId")
+    if command_id == "learner-focused":
+        command_class, role = "learner-focused", "node-test"
+        paths = (
+            "developer/tests/js/learnerPalette.test.js",
+            "developer/tests/js/learnerUiRuntimeStabilization.test.js",
+        )
+    elif command_id == "frontend-security:messageOriginGuard.test.js":
+        command_class, role = "frontend-security", "node-builtin-security-test"
+        paths = (MESSAGE_ORIGIN_SECURITY_GUARD,)
+    else:
+        matching = [path for path in SECURITY_GUARD_FILES
+                    if command_id == f"frontend-security:{Path(path).name}"]
+        if len(matching) != 1:
+            return None
+        command_class, role = "frontend-security", "node-security-test"
+        paths = tuple(matching)
+    executable = record.get("resolvedExecutablePath")
+    argv = [executable, "--test", *paths]
+    if (
+        record.get("commandClass") != command_class
+        or record.get("toolRole") != role
+        or record.get("commandRole") != "observation-producing"
+        or record.get("resultSemantics") != "exit-zero-pass-exit-one-classified-observation"
+        or record.get("profile") not in {"frontend", "all"}
+        or record.get("allowedExecutionExits") != [0, 1]
+        or record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+        or record.get("required") is not True
+        or record.get("cwd") != "."
+        or not isinstance(executable, str) or not Path(executable).is_absolute()
+        or any(record.get(key) != argv for key in ("argv", "logicalArgv", "executionArgv"))
+    ):
+        return None
+    return paths
+
+
+def _direct_node_test_raw_stream_errors(record: Mapping[str, Any]) -> list[str]:
+    """Validate exact retained streams independently of sanitized observations."""
+    streams = record.get("directNodeTestRawStreams")
+    if (
+        _direct_node_test_authorized_paths(record) is None
+        or type(record.get("exitCode")) is not int or record.get("exitCode") != 0
+        or not isinstance(streams, dict) or set(streams) != {"stdout", "stderr"}
+    ):
+        return ["direct Node test raw stream authority/schema is invalid"]
+    for name in ("stdout", "stderr"):
+        value = streams[name]
+        if not isinstance(value, str):
+            return ["direct Node test raw stream must be UTF-8 text"]
+        try:
+            data = value.encode("utf-8", errors="strict")
+        except UnicodeError:
+            return ["direct Node test raw stream must be UTF-8 text"]
+        if (len(data) > MAX_RECORDED_STREAM_BYTES
+            or len(data) != record.get(name + "BytesObserved")
+            or hashlib.sha256(data).hexdigest() != record.get(name + "Sha256")):
+            return ["direct Node test raw stream differs from observed bytes"]
+        if not _direct_node_evidence_text_is_safe(value):
+            return ["direct Node test raw stream failed its privacy check"]
+    return []
+
+
+def _validated_direct_node_test_semantic_projection(
+    record: Mapping[str, Any], *, protected_bundle_valid: bool,
+) -> dict[str, Any] | None:
+    """Derive a portable result only after the complete raw success proof."""
+    paths = _direct_node_test_authorized_paths(record)
+    if (
+        paths is None or protected_bundle_valid is not True
+        or not _command_execution_completed(record)
+        or type(record.get("exitCode")) is not int or record.get("exitCode") != 0
+        or record.get("processTreeStatus") != "contained-clean"
+        or record.get("descendantsSurviving") != 0
+        or record.get("descendantsTerminated") != 0
+        or record.get("containmentDisposition") not in {"no-descendants", "natural-exit-reaped"}
+        or any(record.get(key) is not None for key in ("error", "processTreeError", "limitReason"))
+        or (record.get("platform"), record.get("containment")) not in {
+            ("ubuntu", "linux-subreaper-pidfd-proc-supervisor"),
+            ("windows", "windows-job-object"),
+        }
+        or _direct_node_test_raw_stream_errors(record)
+    ):
+        return None
+    try:
+        errors: list[str] = []
+        if _validate_command_record(dict(record), 0, errors, expected_record=record) or errors:
+            return None
+        if _validated_portable_protected_input_bundle_digest(record) is None:
+            return None
+        if any(sum(target.get("path") == path for target in record["targets"]) != 1 for path in paths):
+            return None
+        if record["actualExecutionArgv"] != record["logicalArgv"]:
+            return None
+        if record["resolvedExecutableSize"] <= 0:
+            return None
+        stable = record["resolvedExecutableFileIdentity"]
+        if stable.get("reparsePoint") is not False or any(
+            not isinstance(stable.get(key), str) or re.fullmatch(r"-?[0-9]+", stable[key]) is None
+            for key in ("deviceOrVolume", "inodeOrFileIndex", "creationOrChangeTimeNs", "writeTimeNs")
+        ):
+            return None
+        if record.get("dependencyBacked") is True:
+            guard = record["runtimeClosureGuard"]
+            if (
+                record.get("resolvedTestRunnerEntrypoint") != record["resolvedExecutablePath"]
+                or record.get("resolvedTestRunnerSha256") != record["resolvedExecutableSha256"]
+                or guard.get("active") is not False
+                or type(guard.get("guardSchemaVersion")) is not int
+                or type(guard.get("mutationEventCount")) is not int
+                or (record["platform"], guard.get("watcherBackend")) not in {
+                    ("ubuntu", "_InotifyMutationWatcher"),
+                    ("windows", "_WindowsDirectoryMutationWatcher"),
+                }
+            ):
+                return None
+        elif (record.get("toolRole") != "node-builtin-security-test"
+              or record.get("dependencyBacked") is not False
+              or any(record.get(key) is not None for key in (
+                  "runtimeClosureGuard", "closureWatcherActive", "closureMutationState"))):
+            return None
+        observed, reaped = record["descendantsObserved"], record["descendantsReaped"]
+        if (record["containmentDisposition"] == "no-descendants" and (observed or reaped)
+            or record["containmentDisposition"] == "natural-exit-reaped"
+            and (observed <= 0 or observed != reaped)):
+            return None
+        producer = record["producerObservations"]
+        if len(producer) != 1:
+            return None
+        raw = producer[0]
+        if _validate_raw_observation(raw, label="direct-node-test", source=record):
+            return None
+        expected_scope = ("command:learner-focused-runtime" if record["commandId"] == "learner-focused"
+                          else f"file:{paths[0]}")
+        streams = record["directNodeTestRawStreams"]
+        expected_fields = raw_observation_json_value({
+            "executed": True, "exitCode": 0, "stdout": streams["stdout"],
+            "stderr": streams["stderr"], "error": None,
+        })
+        if (raw["observationOrdinal"] != 0 or raw["occurrences"] != 1
+            or raw["sourceResultId"] != expected_scope or raw["sourcePath"] != paths[0]
+            or raw["rawStructuredFields"] != expected_fields):
+            return None
+        semantic = parse_node_test_semantic_result(
+            streams["stdout"], command_id=record["commandId"], authorized_test_paths=paths,
+        )
+        if semantic is None:
+            return None
+        # Preserve exact test-name/payload Unicode too: the general frame's NFC
+        # string normalization is not an authorized reporter transformation.
+        semantic_bytes = json.dumps(
+            semantic, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8", errors="strict")
+        canonical = _canonical_frame({
+            "digestDomain": "ieltmps-direct-node-test-semantic-result-v1", "resultUtf8": semantic_bytes,
+        })
+        output_identity = {
+            "stdoutSha256": hashlib.sha256(canonical).hexdigest(),
+            "stdoutBytesObserved": len(canonical),
+        }
+        semantic_source_digest = canonical_failure_digest({
+            "digestDomain": "ieltmps-direct-node-test-semantic-source-output-v1",
+            "resultUtf8": semantic_bytes, "stderrSha256": record["stderrSha256"],
+            "stderrBytesObserved": record["stderrBytesObserved"],
+        })
+        portable_raw = copy.deepcopy(raw)
+        portable_raw["rawStructuredFields"]["stdout"] = semantic
+        portable_raw["sourceOutputDigest"] = semantic_source_digest
+        portable_raw["producerRecordDigest"] = _producer_record_digest({
+            key: value for key, value in portable_raw.items() if key != "producerRecordDigest"
+        })
+        return {
+            **output_identity, "semanticSourceOutputDigest": semantic_source_digest,
+            "producerObservations": [portable_raw],
+            "producerObservationSetDigest": producer_observation_set_digest([portable_raw]),
+        }
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+        return None
+
+
+def _portable_node_test_observation_source(record: Mapping[str, Any]) -> Mapping[str, Any]:
+    if _direct_node_test_authorized_paths(record) is None or record.get("exitCode") != 0:
+        return record
+    projection = _validated_direct_node_test_semantic_projection(
+        record, protected_bundle_valid=_validated_portable_protected_input_bundle_digest(record) is not None,
+    )
+    return {**record, **projection} if projection is not None else record
+
+
 def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
     source = dict(record)
-    if "executionInputs" in source:
+    portable_stdin_authority = _validated_portable_target_stdin_input_authority(record)
+    invalid_stdin_authority = (
+        record.get("executionInputMode") == "TARGET-BYTES-STDIN"
+        or record.get("targetExecutionLease") is not None
+    ) and portable_stdin_authority is None
+    if invalid_stdin_authority:
+        source["invalidTargetStdinLocalEvidence"] = True
+    if source.get("executionLease") is not None:
+        portable_bash_lease = _validated_portable_git_bash_execution_lease(record)
+        if portable_bash_lease is None:
+            source["invalidGitBashLeaseLocalEvidence"] = True
+        else:
+            source["executionLease"] = portable_bash_lease
+    portable_bundle_digest = _validated_portable_protected_input_bundle_digest(source)
+    portable_containment = _validated_portable_static_containment(
+        record, protected_bundle_valid=portable_bundle_digest is not None,
+    )
+    if portable_containment is not None:
+        source.update(portable_containment)
+    invalid_protected_bundle = (
+        source.get("executionInputMode") == "PROTECTED-TARGET-BUNDLE"
+        or source.get("protectedTargetBundle") is not None
+    ) and portable_bundle_digest is None
+    bundle_output_identity = _validated_bundle_normalization_success_output_identity(
+        record, protected_bundle_valid=portable_bundle_digest is not None,
+    )
+    if bundle_output_identity is not None:
+        source.update(bundle_output_identity)
+    node_projection = _validated_direct_node_test_semantic_projection(
+        record, protected_bundle_valid=portable_bundle_digest is not None,
+    )
+    if node_projection is not None:
+        source.update(node_projection)
+        source.pop("directNodeTestRawStreams", None)
+        external_containment = _validated_portable_successful_external_test_containment(
+            record, protected_bundle_valid=True, node_test_semantics_valid=True,
+        )
+        if external_containment is not None:
+            source.update(external_containment)
+    if "validatedStaticMachineReport" in source:
+        static_output_identity = (
+            _validated_static_machine_output_identity(record)
+            if portable_bundle_digest is not None else None
+        )
+        if static_output_identity is None:
+            source["invalidStaticMachineLocalEvidence"] = True
+        else:
+            source.update(static_output_identity)
+    if invalid_protected_bundle:
+        # Even a forged raw digest equal to the portable digest cannot make
+        # invalid physical evidence indistinguishable from a valid transcript.
+        source["invalidProtectedBundleLocalEvidence"] = True
+    if "executionInputs" in source and not (invalid_protected_bundle or invalid_stdin_authority):
         source["executionInputs"] = _canonical_protected_execution_inputs(source)
     protected_source = source.get("protectedTargetBundle")
-    if isinstance(protected_source, Mapping):
+    if isinstance(protected_source, Mapping) and not invalid_protected_bundle:
         source = {
             key: copy.deepcopy(value)
             for key, value in source.items()
@@ -11224,7 +12955,12 @@ def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
                 phase="post",
             )
         )
+        source["executionInputBundleDigest"] = portable_bundle_digest
+        protected_projection["executionInputBundleDigest"] = portable_bundle_digest
         source["protectedTargetBundle"] = protected_projection
+    if portable_stdin_authority is not None:
+        source.update(portable_stdin_authority)
+    invalid_input_authority = invalid_protected_bundle or invalid_stdin_authority
     canonical = _canonical_replay_value(source)
     canonical.pop("durationSeconds", None)
     tool_role = str(canonical.get("toolRole", "unknown"))
@@ -11244,16 +12980,19 @@ def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
         canonical["resolvedTestRunnerEntrypoint"] = (
             f"<TRUSTED-TOOL:{tool_role}>"
         )
-    for target in canonical.get("targets", []):
+    for target in ([] if invalid_input_authority else canonical.get("targets", [])):
         if isinstance(target, dict):
             target["canonicalSourcePath"] = None
             target["fileIdentity"] = None
-    for execution_input in canonical.get("executionInputs", []):
+    for execution_input in (
+        [] if invalid_input_authority or portable_stdin_authority is not None
+        else canonical.get("executionInputs", [])
+    ):
         if isinstance(execution_input, dict):
             execution_input["canonicalSourcePath"] = None
             execution_input["plannedStableIdentity"] = None
     lease = canonical.get("targetExecutionLease")
-    if isinstance(lease, dict):
+    if isinstance(lease, dict) and not invalid_input_authority and portable_stdin_authority is None:
         for key in (
             "canonicalSourcePath",
             "plannedStableFileIdentity",
@@ -11262,7 +13001,7 @@ def _canonical_transcript_record(record: Mapping[str, Any]) -> dict[str, Any]:
             if key in lease:
                 lease[key] = None
     protected = canonical.get("protectedTargetBundle")
-    if isinstance(protected, dict):
+    if isinstance(protected, dict) and not invalid_protected_bundle:
         for key in _PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS:
             protected[key] = []
     canonical["executionDurationClass"] = record.get("executionDurationClass")
@@ -11373,6 +13112,7 @@ def finalize_evidence_transcript(runner: Any) -> dict[str, Any]:
         "profileCompletedCommandClassSetDigest": class_digest,
         "authorizationContextBindingDigest": authorization_digest,
     }
+    admissions = _runner_observation_admissions(runner)
     rebound: list[dict[str, Any]] = []
     by_id = {
         str(record.get("commandId", "")): record
@@ -11388,7 +13128,7 @@ def finalize_evidence_transcript(runner: Any) -> dict[str, Any]:
         ) or str(raw.get("commandId", "") if isinstance(raw, Mapping) else "")
         source = by_id.get(command_id)
         rebound.append(
-            _rederive_observation_record(item, source, profile_context=context)
+            _reconstruct_observation_with_admission(item, source, profile_context=context, admissions=admissions)
             if source is not None and isinstance(item, Mapping)
             else copy.deepcopy(dict(item))
         )
@@ -11418,6 +13158,7 @@ def _command_authority_violations(
     observations: Sequence[Mapping[str, Any]],
     *,
     expected_plan: Sequence[Mapping[str, Any]] | None = None,
+    cross_job: bool = False,
 ) -> list[dict[str, Any]]:
     if (
         len(command_records) == 1
@@ -11446,7 +13187,14 @@ def _command_authority_violations(
         for record in command_records
     ]
     violations: list[dict[str, Any]] = []
-    if actual != expected:
+    # Physical identities are exact within an execution domain. Across jobs,
+    # bind producer records to the independently rebuilt verifier plan through
+    # the same portable projection used for commandAuthority and plan digests.
+    authority_matches = (
+        _portable_command_plan_value(actual) == _portable_command_plan_value(expected)
+        if cross_job else actual == expected
+    )
+    if not authority_matches:
         violations.append(
             {
                 "id": "COMMAND-AUTHORITY-MISMATCH",
@@ -11466,7 +13214,12 @@ def _command_authority_violations(
         authority = expected_by_id.get(command_id)
         if authority is None:
             continue
-        if record.get("actualExecutionArgv") != authority.get("executionArgv"):
+        # Cross-job semantic equality above binds executionArgv to the verifier.
+        # Actual argv must still exactly match the producer's own local argv.
+        execution_argv = (
+            record.get("executionArgv") if cross_job else authority.get("executionArgv")
+        )
+        if record.get("actualExecutionArgv") != execution_argv:
             violations.append(
                 {"id": "EXECUTION-ARGV-MISMATCH", "commandId": command_id}
             )
@@ -11655,6 +13408,411 @@ def _validate_failure_path_authority(
     return errors
 
 
+
+def _observation_identity_registry():
+    """Identity membership, never dataclass equality or a deserialized seal.
+
+    These process-local registries are not wire authority. Private orchestration
+    is trusted Python code; arbitrary in-process code execution is not a sandbox.
+    Weak references avoid retaining completed invocations or admitting reused IDs.
+    """
+    entries = {}
+
+    def remember(value, binding):
+        identity = id(value)
+        entries[identity] = (weakref.ref(value, lambda _ref: entries.pop(identity, None)), binding)
+
+    def lookup(value):
+        entry = entries.get(id(value))
+        return entry[1] if entry is not None and entry[0]() is value else None
+
+    return remember, lookup
+
+
+_remember_live_observation_capture, _lookup_live_observation_capture = _observation_identity_registry()
+_remember_prepared_observation_context, _lookup_prepared_observation_context = _observation_identity_registry()
+_remember_observation_authority, _lookup_observation_authority = _observation_identity_registry()
+_remember_observation_admission, _lookup_observation_admission = _observation_identity_registry()
+
+
+def _observation_bytes(value: Any) -> bytes:
+    # Do not NFC-fold strings or omit duration/stream bytes in an admission seal.
+    return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"), allow_nan=False).encode("utf-8", errors="strict")
+
+
+def _live_observation_capture_matches(authority: Any) -> bool:
+    return (type(authority) is ExecutionExternalAuthority
+            and authority.source_kind == "live"
+            and _lookup_live_observation_capture(authority) == _observation_bytes(vars(authority)))
+
+
+@dataclass(frozen=True, eq=False)
+class _ObservationAuthority:
+    issuance: str
+    execution_binding: bytes
+    authorization_binding: bytes
+    verifier_binding: bytes
+    command_plan: bytes
+    external_capture: bytes
+    expected_context: bytes
+
+
+@dataclass(frozen=True, eq=False)
+class _ObservationAdmission:
+    """Immutable exact-byte seal; possession without private registration fails."""
+    source: bytes
+    observation: bytes
+    validation: bytes
+
+
+@dataclass(frozen=True)
+class _ObservationValidation:
+    """Live inputs retained privately so a seal can be checked again on use."""
+    runner: Any
+    context: ExternallyExpectedVerificationContext | None
+    records: Sequence[Mapping[str, Any]]
+    plan: Sequence[Mapping[str, Any]]
+    documents: Mapping[str, dict[str, Any]] | None = None
+    snapshots: Mapping[str, _FileSnapshot] | None = None
+    output_dir: Path | None = None
+
+
+_STANDALONE_EXECUTION_PLATFORMS = {
+    "windows": ("Windows", "windows-compatibility-producer", "windows-compatibility",
+                "windows-job-object", "_WindowsDirectoryMutationWatcher"),
+    "ubuntu": ("Linux", "ubuntu-canonical-producer", "ubuntu-canonical",
+               "linux-subreaper-pidfd-proc-supervisor", "_InotifyMutationWatcher"),
+}
+
+
+def _bind_observation_authority(runner, context, external, binding, issuance):
+    platform = _STANDALONE_EXECUTION_PLATFORMS.get(runner.platform)
+    if platform is None:
+        return None
+    runner_os, producer_job, verifier_job, _, _ = platform
+    if (binding.get("bindingMode") != "github-actions"
+            or binding.get("producerJobId") != producer_job
+            or binding.get("producerRunnerOS") != runner_os
+            or binding.get("producerProfile") != "all"
+            or runner.profile != "all"
+            or external.binding_mode != "github-actions" or external.runner_os != runner_os
+            or external.job_id != (verifier_job if context is not None else producer_job)):
+        return None
+    if context is not None and (context.verifier_job_id != verifier_job
+                               or context.evidence_binding() != binding):
+        return None
+    if any(binding.get(key) != value for key, value in (
+        ("runId", external.run_id), ("runAttempt", external.run_attempt),
+        ("eventName", external.event_name), ("repository", external.repository),
+        ("checkoutCommit", external.checkout_sha),
+        ("commandPlanDigest", command_plan_digest(runner.command_plan)),
+        ("releaseGateRequired", runner.release_gate_required),
+    )):
+        return None
+    errors = []
+    _validate_execution_binding(binding, execution_binding_digest(binding),
+                                label="observation authority", errors=errors)
+    if errors:
+        return None
+    authorization = (context.authorization_context_binding() if context is not None
+                     else authorization_context_binding_from_execution_binding(binding))
+    verifier = context.verifier_binding() if context is not None else None
+    capability = _ObservationAuthority(
+        issuance, _observation_bytes(binding), _observation_bytes(authorization),
+        _observation_bytes(verifier), _observation_bytes(runner.command_plan),
+        _observation_bytes(vars(external)),
+        _observation_bytes(vars(context) if context is not None else None),
+    )
+    _remember_observation_authority(capability, (
+        weakref.ref(runner), weakref.ref(context) if context is not None else None,
+        weakref.ref(external), tuple(vars(capability).values()),
+    ))
+    runner._observation_authority = capability
+    return capability
+
+
+def _prepare_generation_observation_authority(runner, external, binding):
+    # Called only after the generation builder has checked checkout/trust/plan.
+    if type(runner) is FoundationRunner and _live_observation_capture_matches(external):
+        return _bind_observation_authority(runner, None, external, binding, "live-producer")
+    return None
+
+
+def _prepare_verifier_observation_authority(runner, context, external):
+    # A handmade matching context is absent from this preparation registry.
+    prepared = _lookup_prepared_observation_context(context)
+    if (type(runner) is FoundationRunner and _live_observation_capture_matches(external)
+            and prepared is not None and prepared[0]() is external
+            and prepared[1] == _observation_bytes(vars(context))
+            and runner.execution_binding == context.evidence_binding()
+            and runner.verifier_execution_binding == context.verifier_binding()
+            and runner.command_plan_digest == context.command_plan_digest
+            and runner.runtime_closure_digest == context.fresh_runtime_closure_digest):
+        return _bind_observation_authority(runner, context, external,
+                                          context.evidence_binding(), "live-verifier")
+    return None
+
+
+def _issue_synthetic_observation_authority_for_test(runner, context=None):
+    """Explicit test-only issuance. No CLI, claim, or production preparer selects it."""
+    external = runner.execution_external_authority
+    if type(external) is not ExecutionExternalAuthority or external.source_kind != "synthetic-test":
+        raise ValueError("observation test issuance requires explicit synthetic external authority")
+    return _bind_observation_authority(runner, context, external,
+                                      runner.execution_binding, "synthetic-test")
+
+
+def _observation_authority_for_runner(runner, context=None):
+    capability = getattr(runner, "_observation_authority", None)
+    held = _lookup_observation_authority(capability)
+    if type(capability) is not _ObservationAuthority or held is None or held[0]() is not runner:
+        return None
+    external = held[2]()
+    if (external is None or getattr(runner, "execution_external_authority", None) is not external
+            or tuple(vars(capability).values()) != held[3]
+            or capability.external_capture != _observation_bytes(vars(external))
+            or capability.command_plan != _observation_bytes(runner.command_plan)
+            or capability.execution_binding != _observation_bytes(runner.execution_binding)
+            or runner.profile != "all"
+            or runner.platform not in _STANDALONE_EXECUTION_PLATFORMS
+            or _STANDALONE_EXECUTION_PLATFORMS[runner.platform][:2] != (
+                runner.execution_binding.get("producerRunnerOS"), runner.execution_binding.get("producerJobId"))
+            or runner.release_gate_required is not runner.execution_binding.get("releaseGateRequired")
+            or runner.command_plan_digest != command_plan_digest(runner.command_plan)):
+        return None
+    if held[1] is not None:
+        if (held[1]() is not context or context is None
+                or capability.expected_context != _observation_bytes(vars(context))
+                or runner.verifier_execution_binding != context.verifier_binding()
+                or runner.runtime_closure_digest != context.fresh_runtime_closure_digest):
+            return None
+    elif context is not None:
+        return None
+    binding = authorization_context_binding_from_execution_binding(runner.execution_binding)
+    if (capability.authorization_binding != _observation_bytes(binding)
+            or getattr(runner, "authorization_context_binding", binding) != binding
+            or getattr(runner, "authorization_context_binding_digest", authorization_context_binding_digest(binding))
+               != authorization_context_binding_digest(binding)):
+        return None
+    return capability
+
+
+def _standalone_observation_candidate(source, raw):
+    source = source if isinstance(source, Mapping) else {}
+    raw = raw if isinstance(raw, Mapping) else {}
+    return (source.get("commandId") == "standalone-packaging"
+            or source.get("commandClass") == "standalone-packaging"
+            or raw.get("commandId") == "standalone-packaging"
+            # Names and paths remain data for other existing observation kinds.
+            or (raw.get("observationKind") == "process-output-v1" and (
+                raw.get("sourceResultId") == "command:standalone-packaging"
+                or raw.get("sourcePath") == "developer/tests/ci/test_standalone_packaging.py")))
+
+
+def _has_standalone_observation(records, observations=(), command_plan=()):
+    return (any(_standalone_observation_candidate(record, raw)
+                for record in records if isinstance(record, Mapping)
+                for raw in (record.get("producerObservations") or ()))
+            or any(_standalone_observation_candidate(item, item.get("rawObservation"))
+                   for item in observations if isinstance(item, Mapping))
+            or any(_standalone_observation_candidate(planned, {})
+                   and index < len(records) and isinstance(records[index], Mapping)
+                   and bool(records[index].get("producerObservations"))
+                   for index, planned in enumerate(command_plan)))
+
+
+def _observation_validation_digest(validation):
+    capability = _observation_authority_for_runner(validation.runner, validation.context)
+    if capability is None or capability.command_plan != _observation_bytes(validation.plan):
+        raise ValueError("standalone observation lacks held external authority")
+    material = [capability.execution_binding, capability.authorization_binding,
+                capability.verifier_binding, capability.expected_context, capability.command_plan,
+                _observation_bytes(validation.records)]
+    if validation.documents is None:
+        material.append(_observation_bytes(getattr(validation.runner, "observations", [])))
+    else:
+        documents, snapshots = validation.documents, validation.snapshots
+        if set(documents) != set(EVIDENCE_FILE_NAMES) - {"summary.md"} or set(snapshots or {}) != set(EVIDENCE_FILE_NAMES):
+            raise ValueError("standalone observation snapshot membership changed")
+        if documents["command-results.json"]["records"] != validation.records:
+            raise ValueError("standalone observation snapshot records changed")
+        for name in EVIDENCE_FILE_NAMES:
+            snapshot = snapshots[name]
+            if name != "summary.md":
+                decoded, errors = _decode_evidence_json(name, snapshot.data)
+                if errors or decoded != documents[name]:
+                    raise ValueError("standalone observation snapshot bytes changed")
+            material.extend((snapshot.data, _observation_bytes(snapshot.identity)))
+        summary = documents["summary.json"]
+        if (capability.execution_binding != _observation_bytes(summary.get("executionBinding"))
+                or capability.authorization_binding != _observation_bytes(summary.get("authorizationContextBinding"))
+                or snapshots["summary.md"].data != render_summary_markdown(summary).encode("utf-8")):
+            raise ValueError("standalone observation snapshot context changed")
+        manifest = summary.get("evidenceManifest")
+        expected_manifest = [{"relativeFilename": name, "byteLength": len(snapshots[name].data),
+                              "sha256": hashlib.sha256(snapshots[name].data).hexdigest(),
+                              "documentKind": EVIDENCE_DOCUMENT_KINDS[name]}
+                             for name in EVIDENCE_MANIFEST_FILE_NAMES]
+        if manifest != expected_manifest:
+            raise ValueError("standalone observation snapshot manifest changed")
+        if validation.output_dir is not None:
+            root = validation.output_dir
+            if {entry.name for entry in os.scandir(root)} != set(EVIDENCE_FILE_NAMES):
+                raise ValueError("standalone observation live membership changed")
+            for name, snapshot in snapshots.items():
+                fresh, errors = _read_evidence_file_snapshot(root / name, output_dir=root,
+                                                            byte_limit=EVIDENCE_FILE_BYTE_LIMITS[name])
+                if errors or fresh != snapshot:
+                    raise ValueError("standalone observation live snapshot changed")
+            if {entry.name for entry in os.scandir(root)} != set(EVIDENCE_FILE_NAMES):
+                raise ValueError("standalone observation live membership changed")
+            material.append(_observation_bytes(str(root.resolve(strict=True))))
+            material.append(_observation_bytes(_stat_identity(root.lstat())))
+    digest = hashlib.sha256()
+    for item in material:
+        digest.update(len(item).to_bytes(8, "big"))
+        digest.update(item)
+    return digest.digest()
+
+
+def _admit_standalone_observations(validation):
+    """Stage 1: structural binding. Stage 2: independently held authority."""
+    records, plan = validation.records, validation.plan
+    if not _has_standalone_observation(records, getattr(validation.runner, "observations", []), plan):
+        return ()
+    errors, candidates = [], []
+    if len(records) != len(plan):
+        errors.append("standalone observation command membership differs from the plan")
+    for index, source in enumerate(records):
+        expected = plan[index] if index < len(plan) else None
+        _validate_command_record(source, index, errors, expected_record=expected)
+        if not isinstance(source, Mapping):
+            continue
+        if (expected is None or source.get("ordinal") != index
+                or _portable_command_plan_value([{key: source.get(key) for key in expected}])
+                   != _portable_command_plan_value([expected])):
+            errors.append("standalone observation command does not bind the prepared plan")
+        producer = source.get("producerObservations")
+        if not isinstance(producer, list):
+            errors.append("standalone observation producer set is invalid")
+            continue
+        for ordinal, raw in enumerate(producer):
+            validator = (_validate_raw_observation_structure
+                         if _standalone_observation_candidate(source, raw) else _validate_raw_observation)
+            errors.extend(validator(raw, label="observation admission", source=source))
+            if not isinstance(raw, dict):
+                continue
+            if raw.get("observationOrdinal") != ordinal:
+                errors.append("standalone observation ordinal does not bind producer order")
+            if _standalone_observation_candidate(source, raw):
+                candidates.append((source, raw))
+        if source.get("producerObservationSetDigest") != producer_observation_set_digest(producer):
+            errors.append("standalone observation producer set digest changed")
+    if errors:
+        raise ValueError("; ".join(sorted(set(errors))))
+    projected = (validation.documents["command-results.json"].get("observations", [])
+                 if validation.documents is not None else getattr(validation.runner, "observations", []))
+    projected_candidates = []
+    for item in projected:
+        if isinstance(item, Mapping) and _standalone_observation_candidate(item, item.get("rawObservation")):
+            projected_candidates.append(item)
+            if not any(item.get("rawObservation") == raw
+                       and item.get("commandId", raw.get("commandId")) == source.get("commandId")
+                       for source, raw in candidates):
+                raise ValueError("standalone observation projection does not bind its producer")
+    if len(projected_candidates) > 1:
+        raise ValueError("standalone observation projection is duplicated")
+    validation_digest = _observation_validation_digest(validation)
+    if len(candidates) != 1:
+        raise ValueError("standalone observation must occur exactly once")
+    source, raw = candidates[0]
+    if (source.get("commandId") != "standalone-packaging"
+            or source.get("commandClass") != "standalone-packaging"
+            or source.get("toolRole") != "python-standalone-test"
+            or source.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+            or source.get("resultSemantics") != "exit-zero-required"
+            or source.get("profile") != "all" or source.get("platform") != validation.runner.platform
+            or source.get("commandRole") != "required-execution"
+            or source.get("required") is not True or source.get("allowedExecutionExits") != [0]
+            or not _required_command_execution_passed(source)
+            or _validated_portable_protected_input_bundle_digest(source) is None
+            or raw.get("observationKind") != "process-output-v1"
+            or raw.get("sourceResultId") != "command:standalone-packaging"
+            or raw.get("sourcePath") != "developer/tests/ci/test_standalone_packaging.py"
+            or raw.get("observationOrdinal") != 0 or raw.get("occurrences") != 1
+            or len(source["producerObservations"]) != 1):
+        raise ValueError("standalone observation association or execution is ineligible")
+    fields = raw.get("rawStructuredFields")
+    if (not isinstance(fields, dict) or set(fields) != {"executed", "exitCode", "stdout", "stderr", "error"}
+            or fields.get("executed") is not True or type(fields.get("exitCode")) is not int
+            or fields["exitCode"] != source["exitCode"] or fields.get("error") is not None):
+        raise ValueError("standalone observation process fields do not bind execution")
+    for stream in ("stdout", "stderr"):
+        value = fields.get(stream)
+        if not isinstance(value, str):
+            raise ValueError("standalone observation process stream is not text")
+        encoded = value.encode("utf-8", errors="strict")
+        if (len(encoded) != source.get(stream + "BytesObserved")
+                or hashlib.sha256(encoded).hexdigest() != source.get(stream + "Sha256")):
+            raise ValueError("standalone observation process stream does not bind source bytes")
+    proof = _ObservationAdmission(_observation_bytes(source), _observation_bytes(raw), validation_digest)
+    _remember_observation_admission(proof, (validation, proof.source, proof.observation, proof.validation))
+    return (proof,)
+
+
+def _matching_observation_admission(admissions, raw, source, *, records=None, plan=None):
+    for proof in admissions:
+        held = _lookup_observation_admission(proof)
+        if type(proof) is not _ObservationAdmission or held is None:
+            continue
+        validation = held[0]
+        try:
+            if (proof.source == held[1] == _observation_bytes(source)
+                    and proof.observation == held[2] == _observation_bytes(raw)
+                    and proof.validation == held[3] == _observation_validation_digest(validation)
+                    and (records is None or _observation_bytes(records) == _observation_bytes(validation.records))
+                    and (plan is None or _observation_bytes(plan) == _observation_bytes(validation.plan))):
+                return True
+        except (OSError, AttributeError, KeyError, TypeError, ValueError):
+            pass
+    return False
+
+
+def _validate_admitted_raw_observation(raw, *, label, source, source_output_digest=None, admissions=()):
+    if _standalone_observation_candidate(source, raw):
+        errors = _validate_raw_observation_structure(raw, label=label, source=source,
+                                                     source_output_digest=source_output_digest)
+        if errors or not _matching_observation_admission(admissions, raw, source):
+            return errors or [f"{label}: standalone observation lacks matching admission"]
+        return []
+    return _validate_raw_observation(raw, label=label, source=source, source_output_digest=source_output_digest)
+
+
+def _reconstruct_observation_with_admission(item, source, *, profile_context, admissions):
+    if _standalone_observation_candidate(source, item.get("rawObservation")) and not (
+        _matching_observation_admission(admissions, item.get("rawObservation"), source)
+    ):
+        raise ValueError("standalone reconstruction requires a current exact admission")
+    return _rederive_observation_record(item, source, profile_context=profile_context)
+
+
+def _runner_observation_admissions(runner):
+    context = getattr(runner, "external_verification_context", None)
+    return _admit_standalone_observations(_ObservationValidation(
+        runner, context, runner.command_results, runner.command_plan))
+
+
+def _derive_runner_authoritative_evidence(runner):
+    admissions = _runner_observation_admissions(runner)
+    operation = _derive_authoritative_evidence_with_admission if admissions else derive_authoritative_evidence
+    private = {"admissions": admissions} if admissions else {}
+    return operation(runner.profile, runner.observations, runner.completed_classes,
+                     runner.command_results, runner.baseline, runner.platform, runner.command_plan,
+                     getattr(runner, "authorization_context_binding_digest", None),
+                     release_gate_required=runner.release_gate_required, **private)
+
+
 def _source_observation_kinds(source: Mapping[str, Any]) -> frozenset[str]:
     """Return parser roles authorized by immutable source-command identity."""
 
@@ -11693,6 +13851,35 @@ def _validate_raw_observation(
     *,
     label: str,
     source: Mapping[str, Any] | None,
+    source_output_digest: str | None = None,
+) -> list[str]:
+    """Compatibility/source-only wrapper; structure alone grants no permission."""
+    errors = _validate_raw_observation_structure(raw, label=label, source=source,
+                                                 source_output_digest=source_output_digest)
+    if errors == [f"{label}: raw observation schema is not exact"]:
+        return errors
+    if source is not None and raw.get("observationKind") not in _source_observation_kinds(source):
+        # Preserve the compatibility wrapper's original diagnostic order as well
+        # as its source-only decision and exact-schema early return.
+        prefix_errors = {
+            f"{label}: raw observation schema version is invalid",
+            f"{label}: observationKind is not authorized",
+            *(f"{label}: {key} must be a non-empty string" for key in (
+                "commandId", "observationKind", "sourceResultId", "sourceOutputDigest", "producerRecordDigest")),
+        }
+        position = 0
+        while position < len(errors) and errors[position] in prefix_errors:
+            position += 1
+        errors.insert(position, f"{label}: observationKind is outside source command observation authority")
+    return errors
+
+
+def _validate_raw_observation_structure(
+    raw: Any,
+    *,
+    label: str,
+    source: Mapping[str, Any] | None,
+    source_output_digest: str | None = None,
 ) -> list[str]:
     expected_keys = {
         "schemaVersion",
@@ -11718,13 +13905,6 @@ def _validate_raw_observation(
             errors.append(f"{label}: {key} must be a non-empty string")
     if raw.get("observationKind") not in RAW_OBSERVATION_KINDS:
         errors.append(f"{label}: observationKind is not authorized")
-    if (
-        source is not None
-        and raw.get("observationKind") not in _source_observation_kinds(source)
-    ):
-        errors.append(
-            f"{label}: observationKind is outside source command observation authority"
-        )
     for key in ("commandOrdinal", "observationOrdinal"):
         if type(raw.get(key)) is not int or not 0 <= raw.get(key, -1) < MAX_EVIDENCE_COLLECTION_ITEMS:
             errors.append(f"{label}: {key} must be a bounded non-negative integer")
@@ -11743,6 +13923,11 @@ def _validate_raw_observation(
         f"{label}: {error}"
         for error in _raw_observation_forbidden_fields(raw.get("rawStructuredFields"))
     )
+    if (source is not None and _direct_node_test_authorized_paths(source) is not None
+        and type(source.get("exitCode")) is int and source.get("exitCode") == 0
+        and raw.get("observationKind") == "process-output-v1"
+        and not _direct_node_process_observation_fields_are_safe(raw.get("rawStructuredFields"))):
+        errors.append(_DIRECT_NODE_OBSERVATION_PRIVACY_ERROR)
     errors.extend(
         _validate_failure_path_authority(
             raw.get("failurePathAuthority"),
@@ -11766,7 +13951,12 @@ def _validate_raw_observation(
             errors.append(f"{label}: commandId does not bind the source command")
         if raw.get("commandOrdinal") != source.get("ordinal"):
             errors.append(f"{label}: commandOrdinal does not bind the source command")
-        if raw.get("sourceOutputDigest") != command_output_digest(source):
+        expected_output_digest = (
+            source_output_digest
+            if source_output_digest is not None
+            else command_output_digest(source)
+        )
+        if raw.get("sourceOutputDigest") != expected_output_digest:
             errors.append(f"{label}: sourceOutputDigest does not bind the producer command streams")
     return errors
 
@@ -11823,6 +14013,8 @@ def _validate_observation_record(
     command_by_id: Mapping[str, Mapping[str, Any]],
     *,
     authorization_context_binding_digest_value: str | None = None,
+    source_output_digests: Mapping[int, str] | None = None,
+    admissions: tuple[_ObservationAdmission, ...] = (),
 ) -> list[str]:
     label = f"command-results.json.observations[{index}]"
     expected_keys = {
@@ -11901,7 +14093,18 @@ def _validate_observation_record(
         errors.append(f"{label}: source command did not execute successfully enough to emit observations")
     else:
         raw = item.get("rawObservation")
-        errors.extend(_validate_raw_observation(raw, label=f"{label}.rawObservation", source=source))
+        errors.extend(_validate_admitted_raw_observation(
+            raw,
+            label=f"{label}.rawObservation",
+            source=source,
+            admissions=admissions,
+            source_output_digest=(
+                source_output_digests.get(id(source))
+                if source_output_digests is not None else None
+            ),
+        ))
+        if errors and _standalone_observation_candidate(source, raw):
+            return errors
         if isinstance(raw, dict):
             command_class = str(item.get("commandClass", ""))
             scope = str(item.get("testOrPathScope", ""))
@@ -11934,6 +14137,8 @@ def _validate_observation_record(
             )
             if len(matches) != 1:
                 errors.append(f"{label}: raw observation is not bound exactly once to the producer command")
+            if errors and _standalone_observation_candidate(source, raw):
+                return errors
             try:
                 derived = _rederive_observation_record(
                     item,
@@ -11999,9 +14204,90 @@ def derive_authoritative_evidence(
     authorization_context_binding_digest_value: str | None = None,
     *,
     release_gate_required: bool,
+    cross_job: bool = False,
+) -> dict[str, Any]:
+    """Source-only derivation; caller context strings cannot grant admission."""
+    if _has_standalone_observation(command_records, observations, command_plan or ()):
+        return {"observedDebts": [], "resolvedCandidates": [], "expectedOmissions": [],
+                "releaseOnlySkips": [], "violations": [{"id": "UNAUTHORIZED-PRODUCER-OBSERVATION",
+                                                       "commandId": "standalone-packaging"}]}
+    return _derive_authoritative_evidence(
+        profile, observations, completed_command_classes, command_records,
+        immutable_baseline_authority, current_platform, command_plan,
+        authorization_context_binding_digest_value,
+        release_gate_required=release_gate_required, cross_job=cross_job)
+
+
+def _require_current_observation_admissions(profile, observations, completed_classes,
+        records, platform, plan, authorization_digest, release_required, admissions):
+    if not _has_standalone_observation(records, observations, plan or ()):
+        return
+    candidates = [(record, raw) for record in records
+                  for raw in record.get("producerObservations", [])
+                  if _standalone_observation_candidate(record, raw)]
+    if len(candidates) != 1 or not all(
+        _matching_observation_admission(admissions, raw, record, records=records, plan=plan)
+        for record, raw in candidates
+    ):
+        raise ValueError("standalone derivation requires a current exact admission")
+    contexts = [_lookup_observation_admission(proof)[0] for proof in admissions
+                if _lookup_observation_admission(proof) is not None]
+    if not any(profile == context.runner.profile and platform == context.runner.platform
+               and release_required is context.runner.release_gate_required
+               and authorization_digest == context.runner.authorization_context_binding_digest
+               and sorted(set(completed_classes)) == actual_completed_command_classes(plan, records)
+               for context in contexts):
+        raise ValueError("standalone derivation invocation differs from admission")
+    for item in observations:
+        if _standalone_observation_candidate(item, item.get("rawObservation")):
+            if item.get("rawObservation") != candidates[0][1] or item.get("commandId") != "standalone-packaging":
+                raise ValueError("standalone derivation observation differs from admission")
+
+
+def _derive_authoritative_evidence_with_admission(
+    profile: str,
+    observations: Sequence[Mapping[str, Any]],
+    completed_command_classes: Iterable[str],
+    command_records: Sequence[Mapping[str, Any]],
+    immutable_baseline_authority: Mapping[str, Any],
+    current_platform: str,
+    command_plan: Sequence[Mapping[str, Any]] | None = None,
+    authorization_context_binding_digest_value: str | None = None,
+    *,
+    release_gate_required: bool,
+    cross_job: bool = False,
+    admissions: tuple[_ObservationAdmission, ...] = (),
+) -> dict[str, Any]:
+    """Consume a matching seal before entering authoritative derivation."""
+    _require_current_observation_admissions(profile, observations, completed_command_classes,
+        command_records, current_platform, command_plan, authorization_context_binding_digest_value,
+        release_gate_required, admissions)
+    return _derive_authoritative_evidence(
+        profile, observations, completed_command_classes, command_records,
+        immutable_baseline_authority, current_platform, command_plan,
+        authorization_context_binding_digest_value,
+        release_gate_required=release_gate_required, cross_job=cross_job, admissions=admissions)
+
+
+def _derive_authoritative_evidence(
+    profile: str,
+    observations: Sequence[Mapping[str, Any]],
+    completed_command_classes: Iterable[str],
+    command_records: Sequence[Mapping[str, Any]],
+    immutable_baseline_authority: Mapping[str, Any],
+    current_platform: str,
+    command_plan: Sequence[Mapping[str, Any]] | None = None,
+    authorization_context_binding_digest_value: str | None = None,
+    *,
+    release_gate_required: bool,
+    cross_job: bool = False,
+    admissions: tuple[_ObservationAdmission, ...] = (),
 ) -> dict[str, Any]:
     """Recompute all semantic evidence from commands and the frozen baseline map."""
 
+    _require_current_observation_admissions(profile, observations, completed_command_classes,
+        command_records, current_platform, command_plan, authorization_context_binding_digest_value,
+        release_gate_required, admissions)
     release_gate_required = _require_resolved_release_gate_required(
         profile,
         release_gate_required,
@@ -12014,6 +14300,12 @@ def derive_authoritative_evidence(
         if not command_id or command_id in command_by_id:
             continue
         command_by_id[command_id] = record
+    # This operation does not mutate command evidence. Validate structured
+    # source-output authority once per command, then reuse it for its records.
+    source_output_digests = {
+        id(record): command_output_digest(record)
+        for record in command_records
+    }
     valid_observations: list[Mapping[str, Any]] = []
     for index, item in enumerate(observations):
         item_errors = _validate_observation_record(
@@ -12023,6 +14315,8 @@ def derive_authoritative_evidence(
             authorization_context_binding_digest_value=(
                 authorization_context_binding_digest_value
             ),
+            source_output_digests=source_output_digests,
+            admissions=admissions,
         )
         if item_errors:
             derivation_violations.extend(
@@ -12053,10 +14347,12 @@ def derive_authoritative_evidence(
             )
         observed_ordinals: list[int] = []
         for index, raw in enumerate(records):
-            raw_errors = _validate_raw_observation(
+            raw_errors = _validate_admitted_raw_observation(
                 raw,
                 label=f"command:{command_id}.producerObservations[{index}]",
                 source=record,
+                admissions=admissions,
+                source_output_digest=source_output_digests.get(id(record)),
             )
             if raw_errors:
                 derivation_violations.extend(
@@ -12083,7 +14379,9 @@ def derive_authoritative_evidence(
             derivation_violations.append(
                 {"id": "PRODUCER-OBSERVATION-ORDINAL-GAP", "commandId": command_id}
             )
-        if not _source_observation_kinds(record) and records:
+        if not _source_observation_kinds(record) and records and not all(
+            _matching_observation_admission(admissions, raw, record) for raw in records
+        ):
             derivation_violations.append(
                 {"id": "UNAUTHORIZED-PRODUCER-OBSERVATION", "commandId": command_id}
             )
@@ -12125,6 +14423,7 @@ def derive_authoritative_evidence(
             command_records,
             valid_observations,
             expected_plan=command_plan,
+            cross_job=cross_job,
         )
     )
     comparison["violations"].extend(derivation_violations)
@@ -13712,7 +16011,7 @@ def build_profile_command_plan(
                 "resolvedExecutableSha256": executable_hash,
                 "resolvedExecutableFileIdentity": executable_identity,
                 "executionLease": (
-                    dict(bash_lease.identity)
+                    bash_lease.validated_identity()
                     if command_id == "git-bash-version" and bash_lease is not None
                     else None
                 ),
@@ -15401,22 +17700,26 @@ def canonicalize_failure_identity_value(
     }
 
 
-def _canonicalize_static_result_failure_paths(
-    result: Mapping[str, Any],
-    authority: FailurePathAuthority,
-) -> tuple[Any, dict[str, Any] | None]:
-    """Bind only approved static failure paths, including exact missing release input."""
+def _static_result_has_failure_path_authority(result: Mapping[str, Any]) -> bool:
+    """Share the existing closed R03/release scope guard across admission stages."""
+    scope = f"result:{result.get('name', '')}"
+    if scope in RELEASE_ONLY_SKIP_FAILURE_TARGETS:
+        detail = result.get("detail")
+        return (result.get("status") == "pass" and nested_skip(detail)
+                and isinstance(detail, Mapping))
+    return scope in R03_FAILURE_TARGETS
+
+
+def _static_result_failure_path_authority(
+    result: Mapping[str, Any], authority: FailurePathAuthority,
+) -> FailurePathAuthority | None:
+    """Select the unchanged closed R03/release path contract for both stages."""
 
     scope = f"result:{result.get('name', '')}"
     selected_authority = authority
+    if not _static_result_has_failure_path_authority(result):
+        return None
     if scope in RELEASE_ONLY_SKIP_FAILURE_TARGETS:
-        detail = result.get("detail")
-        if (
-            result.get("status") != "pass"
-            or not nested_skip(detail)
-            or not isinstance(detail, Mapping)
-        ):
-            return copy.deepcopy(result), None
         logical_target = RELEASE_ONLY_SKIP_FAILURE_TARGETS[scope]
         if logical_target not in {logical for logical, _canonical in authority.targets}:
             canonical_target = str(
@@ -15434,6 +17737,21 @@ def _canonicalize_static_result_failure_paths(
                 ),
                 trusted_executables=authority.trusted_executables,
             )
+    return selected_authority
+
+
+def _canonicalize_static_result_failure_paths(
+    result: Mapping[str, Any],
+    authority: FailurePathAuthority,
+) -> tuple[Any, dict[str, Any] | None]:
+    """Bind only approved static failure paths, including exact missing release input."""
+
+    scope = f"result:{result.get('name', '')}"
+    selected_authority = _static_result_failure_path_authority(result, authority)
+    if selected_authority is None:
+        return copy.deepcopy(result), None
+    if scope in RELEASE_ONLY_SKIP_FAILURE_TARGETS:
+        detail = result["detail"]
         reason = detail.get("reason")
         if not isinstance(reason, str):
             return canonicalize_failure_identity_value(result, selected_authority)
@@ -15476,8 +17794,6 @@ def _canonicalize_static_result_failure_paths(
                 | set(reason_binding["literalPlaceholderDigests"])
             ),
         }
-    elif scope not in R03_FAILURE_TARGETS:
-        return copy.deepcopy(result), None
     return canonicalize_failure_identity_value(result, selected_authority)
 
 
@@ -16740,6 +19056,23 @@ class FoundationRunner:
     ) -> dict[str, Any]:
         """Bind one process result to its command's raw output identity."""
 
+        if (_direct_node_test_authorized_paths(command_record) is not None
+            and isinstance(command_record, dict)):
+            command_record.pop("directNodeTestRawStreams", None)
+            if (capture.exit_code == 0 and capture.stdout_raw is not None
+                and capture.stderr_raw is not None):
+                try:
+                    streams = {
+                        "stdout": capture.stdout_raw.decode("utf-8", errors="strict"),
+                        "stderr": capture.stderr_raw.decode("utf-8", errors="strict"),
+                    }
+                except UnicodeError:
+                    pass
+                else:
+                    # Retain both original streams only when exact text is safe.
+                    # Ordinary sanitized observations never authorize retention.
+                    if all(_direct_node_evidence_text_is_safe(value) for value in streams.values()):
+                        command_record["directNodeTestRawStreams"] = streams
         raw_fields: Any = {
             "executed": capture.executed,
             "exitCode": capture.exit_code,
@@ -16782,6 +19115,26 @@ class FoundationRunner:
             command_output_digest(command_record),
             failure_path_authority=path_binding,
         )
+        backend_success = (
+            command_record.get("commandId") == command_record.get("commandClass") == "backend-canonical"
+            and capture.exit_code == 0)
+        direct_node_success = (
+            _direct_node_test_authorized_paths(command_record) is not None
+            and capture.exit_code == 0)
+        if backend_success or direct_node_success:
+            publish_stream = (_backend_successful_stream_observation_text if backend_success
+                              else _direct_node_successful_stream_observation_text)
+            for stream in ("stdout", "stderr"):
+                raw["rawStructuredFields"][stream] = publish_stream(
+                    getattr(capture, stream + "_raw"), raw["rawStructuredFields"][stream])
+            if direct_node_success:
+                fields = raw["rawStructuredFields"]
+                if not _direct_node_process_observation_fields_are_safe(fields):
+                    raise ValueError(_DIRECT_NODE_OBSERVATION_PRIVACY_ERROR)
+            # Only observation text/digests change. The original command stream
+            # hashes and byte lengths remain the binder's sole byte authority.
+            raw["producerRecordDigest"] = _producer_record_digest({
+                key: value for key, value in raw.items() if key != "producerRecordDigest"})
         return self.add_observation(
             {"commandId": capture.command_id, "rawObservation": raw}
         )
@@ -17315,7 +19668,7 @@ class FoundationRunner:
         if not capture.output_limited:
             try:
                 report, parse_errors = parse_static_machine_report(
-                    capture.failure_identity_stdout_bytes(),
+                    capture.authoritative_stdout_bytes(),
                     expected_invocation_id=invocation_id,
                 )
                 report_errors.extend(parse_errors)
@@ -17338,9 +19691,14 @@ class FoundationRunner:
         invocation_exact = capture.argv == argv
         if not invocation_exact:
             report_errors.append("static machine invocation argv identity is not exact")
+        if report is not None and not report_errors and not _raw_static_machine_report_evidence_is_safe(
+            report, argv[0], capture.failure_path_authority,
+        ):
+            capture.validated_static_machine_report = None
+            report_errors.append(_STATIC_MACHINE_REPORT_PRIVACY_ERROR)
         canonical_report: dict[str, Any] | None = None
         canonical_observation_bindings: list[Mapping[str, Any] | None] = []
-        if report is not None and not report_errors:
+        if report is not None and not report_errors and capture.execution_passed():
             canonical_report = copy.deepcopy(report)
             canonical_results: list[Any] = []
             for result in report["observations"]:
@@ -17368,7 +19726,12 @@ class FoundationRunner:
                 canonical_results.append(canonical_result)
                 canonical_observation_bindings.append(binding)
             canonical_report["observations"] = canonical_results
-            _canonicalize_static_machine_capture(capture, canonical_report)
+            if _static_machine_report_evidence_is_safe(canonical_report, argv[0]):
+                _canonicalize_static_machine_capture(capture, canonical_report)
+                capture.validated_static_machine_report = copy.deepcopy(canonical_report)
+            else:
+                capture.validated_static_machine_report = None
+                report_errors.append(_STATIC_MACHINE_REPORT_PRIVACY_ERROR)
         static_command_record = self.add_command(capture)
         static_command_record["executionInputs"] = copy.deepcopy(
             protected_bundle["executionInputs"]
@@ -17394,9 +19757,12 @@ class FoundationRunner:
             elif capture.error:
                 detail_parts.append(f"runner error: {sanitize_text(capture.error)}")
             detail_parts.extend(report_errors)
+            if _STATIC_MACHINE_REPORT_PRIVACY_ERROR in report_errors:
+                detail_parts = [_STATIC_MACHINE_REPORT_PRIVACY_ERROR]
             self.add_hard_gate("STATIC-SUITE-RESULT", False, "; ".join(detail_parts))
         else:
             assert canonical_report is not None
+            static_source_output_digest = command_output_digest(static_command_record)
             release_scopes = {
                 entry["testOrPathScope"] for entry in self.baseline.get("releaseOnlySkips", [])
             }
@@ -17429,7 +19795,7 @@ class FoundationRunner:
                     str(result["name"]),
                     STATIC_SUITE_RELATIVE_PATH,
                     result,
-                    command_output_digest(static_command_record),
+                    static_source_output_digest,
                     failure_path_authority=path_binding,
                 )
                 self.add_observation(
@@ -17708,6 +20074,95 @@ class FoundationRunner:
         )
         self.completed_classes.add("backend-canonical")
 
+    def _retain_standalone_process_observation(
+        self, record: dict[str, Any], capture: CommandCapture,
+    ) -> None:
+        """Retain exact safe streams under the held platform/job production authority.
+
+        Unavailable retention uses the existing empty producer set. Candidates
+        stay raw until complete-transcript A2 admission precedes reconstruction.
+        """
+        context = getattr(self, "external_verification_context", None)
+        authority = _observation_authority_for_runner(self, context)
+        if (authority is None or authority.issuance not in {"live-producer", "live-verifier"}
+                or not any(item is capture for item in self.captures)
+                or not any(item is record for item in self.command_results)
+                or capture.command_id != "standalone-packaging"
+                or capture.command_class != "standalone-packaging"
+                or not capture.execution_passed() or capture.error is not None
+                or capture.descendants_surviving != 0
+                or record.get("producerObservations") != []
+                or record.get("commandId") != "standalone-packaging"
+                or record.get("commandClass") != "standalone-packaging"
+                or record.get("toolRole") != "python-standalone-test"
+                or record.get("executionInputMode") != "PROTECTED-TARGET-BUNDLE"
+                or record.get("resultSemantics") != "exit-zero-required"
+                or record.get("profile") != "all" or record.get("platform") != self.platform
+                or record.get("commandRole") != "required-execution"
+                or record.get("required") is not True or record.get("allowedExecutionExits") != [0]
+                or not _required_command_execution_passed(record)
+                or record.get("containment") != _STANDALONE_EXECUTION_PLATFORMS[self.platform][3]
+                or record.get("processTreeStatus") != "contained-clean"
+                or any(record.get(key) is not None for key in ("error", "processTreeError", "limitReason"))):
+            return
+        expected = self.command_plan_by_id.get("standalone-packaging")
+        errors: list[str] = []
+        # Completion is normally derived by the later transcript finalizer.
+        completed = {**record, "completedCommandClass": "standalone-packaging"}
+        _validate_command_record(completed, record["ordinal"], errors, expected_record=expected)
+        if errors or expected is None or _validated_portable_protected_input_bundle_digest(completed) is None:
+            return
+        streams = {}
+        for stream in ("stdout", "stderr"):
+            captured = getattr(capture, stream + "_raw")
+            # Neither ordinary text nor its hash can replace missing capture.
+            if (not isinstance(captured, bytes)
+                    or len(captured) != getattr(capture, stream + "_bytes")
+                    or len(captured) > min(record[stream + "ByteLimit"],
+                                           getattr(capture, stream + "_byte_limit"), MAX_EVIDENCE_STRING_BYTES)):
+                return
+            try:
+                exact = captured.decode("utf-8", errors="strict")
+                encoded = exact.encode("utf-8", errors="strict")
+            except UnicodeError:
+                return
+            if (encoded != captured or len(encoded) != record[stream + "BytesObserved"]
+                    or hashlib.sha256(encoded).hexdigest() != record[stream + "Sha256"]
+                    or _BACKEND_STREAM_REDACTION_MARKER in exact
+                    or not _backend_exact_stream_text_is_safe(exact)):
+                return
+            streams[stream] = exact
+        raw = make_raw_observation(
+            "standalone-packaging", record["ordinal"], 0, "process-output-v1",
+            "command:standalone-packaging", "developer/tests/ci/test_standalone_packaging.py",
+            {"executed": True, "exitCode": 0, **streams, "error": None}, command_output_digest(record),
+        )
+        # The ordinary constructor normalizes presentation. Restore only proven
+        # exact bytes, then independently inspect the final serialized values.
+        raw["rawStructuredFields"].update(streams)
+        final_fields = strict_json_loads(_json_bytes(raw).decode("utf-8"),
+                                        label="standalone retention")["rawStructuredFields"]
+        for stream in ("stdout", "stderr"):
+            final = final_fields[stream]
+            encoded = final.encode("utf-8", errors="strict")
+            if (not _backend_exact_stream_text_is_safe(final)
+                    or encoded != getattr(capture, stream + "_raw")
+                    or len(encoded) != record[stream + "BytesObserved"]
+                    or hashlib.sha256(encoded).hexdigest() != record[stream + "Sha256"]):
+                return
+        raw["producerRecordDigest"] = _producer_record_digest({
+            key: value for key, value in raw.items() if key != "producerRecordDigest"})
+        previous = record["producerObservations"], record["producerObservationSetDigest"]
+        record["producerObservations"] = [raw]
+        record["producerObservationSetDigest"] = producer_observation_set_digest([raw])
+        _, errors = _preflight_command_record_positions(self.command_results, self.command_plan)
+        if errors or _observation_authority_for_runner(self, context) is not authority:
+            record["producerObservations"], record["producerObservationSetDigest"] = previous
+            return
+        # Do not call add_observation: it reconstructs before A2 admission. The
+        # normal finalizer admits the complete raw transcript, then reconstructs.
+        self.observations.append({"commandId": "standalone-packaging", "rawObservation": raw})
+
     def run_standalone_profile(self) -> None:
         environment = self.child_environment
         plan_record = self.command_plan_by_id["standalone-packaging"]
@@ -17735,6 +20190,7 @@ class FoundationRunner:
             "executionInputBundleDigest"
         ]
         standalone_record["protectedTargetBundle"] = protected_bundle
+        self._retain_standalone_process_observation(standalone_record, capture)
 
         scope = "membership:index.html::js/siteContent.js"
         def evaluate_membership(bundle: ProtectedTargetBundle) -> tuple[bool, str, Any]:
@@ -18014,17 +20470,7 @@ class FoundationRunner:
         self.verify_trusted_integrity("lockfile-check")
         self.close_execution_leases()
         finalize_evidence_transcript(self)
-        comparison = derive_authoritative_evidence(
-            self.profile,
-            self.observations,
-            self.completed_classes,
-            self.command_results,
-            self.baseline,
-            self.platform,
-            self.command_plan,
-            getattr(self, "authorization_context_binding_digest", None),
-            release_gate_required=self.release_gate_required,
-        )
+        comparison = _derive_runner_authoritative_evidence(self)
         self.violations.extend(comparison["violations"])
         if self.profile in {"static", "all"}:
             prior_hard_failures = [
@@ -18150,12 +20596,744 @@ def write_json(path: Path, value: Any, *, repo_root: Path = REPO_ROOT) -> None:
     _exclusive_write(path, _json_bytes(value), repo_root=repo_root)
 
 
+_DIAGNOSTIC_COMMAND_IDS = frozenset({
+    "baseline-schema", "node-version", "npm-version", "git-bash-version",
+    "git-candidate-paths", "git-tracked-paths", "git-diff-check",
+    "git-cached-diff-check", "git-stage-modes", "git-dir",
+    "tracked-private-resource-scan", "tracked-secret-scan",
+    "license-governance-consistency", "workflow-self-policy", "static-suite",
+    "python-source-syntax", "bundle-normalization", "learner-focused",
+    "backend-canonical", "standalone-packaging", "standalone-membership-audit",
+    "lockfile-integrity", "command-results-size-limit",
+})
+_DIAGNOSTIC_DERIVED_VIOLATION_TYPES = frozenset({
+    "MALFORMED-OBSERVATION", "UNKNOWN-NONPASS", "BASELINE-OCCURRENCE-LIMIT",
+    "REQUIRED-COMMAND-UNAVAILABLE", "RELEASE-ONLY-SKIP-IN-REQUIRED-GATE",
+    "BASELINE-SOURCE-COMMAND-SPLIT", "KNOWN-SCOPE-NOT-OBSERVED",
+    "RESOLVED-CANDIDATE-SOURCE-INVALID", "REQUIRED-POLICY-SCOPE-NOT-OBSERVED",
+    "COMMAND-RESULT-JSON-LIMIT", "COMMAND-AUTHORITY-MISMATCH",
+    "DUPLICATE-COMMAND-ID", "EXECUTION-ARGV-MISMATCH",
+    "EXECUTION-INPUT-MODE-MISMATCH", "EXECUTION-INPUT-IDENTITY-MISMATCH",
+    "REQUIRED-COMMAND-EXECUTION", "COMMAND-EXIT-OUTSIDE-AUTHORITY",
+    "REQUIRED-COMMAND-NONZERO", "NONZERO-COMMAND-WITHOUT-OBSERVATION",
+    "MALFORMED-COMMAND-OBSERVATION", "MALFORMED-PRODUCER-OBSERVATION-SET",
+    "PRODUCER-OBSERVATION-SET-DIGEST-MISMATCH", "MALFORMED-PRODUCER-OBSERVATION",
+    "DUPLICATE-PRODUCER-OBSERVATION", "PRODUCER-OBSERVATION-ORDINAL-GAP",
+    "UNAUTHORIZED-PRODUCER-OBSERVATION", "PRODUCER-OBSERVATION-COMPLETENESS",
+    "MALFORMED-COMPLETED-COMMAND-CLASS",
+    "RESOLVED-CANDIDATE-WITHOUT-SUCCESSFUL-SCOPE",
+})
+_DIAGNOSTIC_AUTHORITY_FIELDS = frozenset({
+    "commandId", "ordinal", "commandClass", "commandRole", "required",
+    "profile", "platform", "argv", "logicalArgv", "executionArgv",
+    "executionInputMode", "executionInputSize", "executionInputSha256", "cwd",
+    "toolRole", "resolvedExecutablePath", "resolvedExecutableSize",
+    "resolvedExecutableSha256", "resolvedExecutableFileIdentity", "executionLease",
+    "targets", "resultSemantics", "allowedExecutionExits",
+})
+_MAX_DIAGNOSTIC_AUTHORITY_FIELDS = 4
+
+
+# Diagnostic values mirror the immutable build_profile_command_plan registry.
+# Only classes registered by trusted runner code can appear in output.
+_REPLAY_DIAGNOSTIC_COMMAND_CLASSES = frozenset({
+    "baseline-policy", "runtime-identity", "repository-boundary",
+    "private-resource-exclusion", "secret-operational-artifact-exclusion",
+    "license-governance", "workflow-policy", "static-suite", "direct-syntax",
+    "bundle-parity", "learner-focused", "frontend-security", "backend-canonical",
+    "standalone-packaging", "standalone-membership", "lockfile-integrity",
+    "evidence-size-limit",
+})
+_REPLAY_DIAGNOSTIC_COMMAND_FAMILIES = frozenset({
+    "node-check", "frontend-security", "fixed-command", "other",
+})
+_REPLAY_DIAGNOSTIC_TARGET_INPUT_FIELDS = {
+    "targets": frozenset({"targets"}),
+    "executionInputs": frozenset({"executionInputs"}),
+    "actualExecutionInputIdentity": frozenset({
+        "actualExecutionInputMode", "actualExecutionInputSize", "actualExecutionInputSha256",
+    }),
+    "targetExecutionLease": frozenset({"targetExecutionLease"}),
+    "protectedTargetBundle": frozenset({"protectedTargetBundle"}),
+    "executionInputBundleDigest": frozenset({"executionInputBundleDigest"}),
+    "other": frozenset({
+        "executionLease", "invalidGitBashLeaseLocalEvidence", "executionInputMode",
+        "executionInputSize", "executionInputSha256", "fileScans",
+    }),
+}
+
+
+def _replay_producer_observation_context_categories(
+    producer: Mapping[str, Any], replay: Mapping[str, Any],
+    *, producer_source: Mapping[str, Any] | None = None,
+    replay_source: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Describe context differences without inferring unproved source causality.
+
+    Inputs are canonical command records. Optional original records only supply
+    digest preimages after their canonical context is checked against the input.
+    This diagnostic neither validates nor changes replay authority. A changed
+    self-checking digest is downstream only when it recomputes from both records;
+    changed raw facts remain ``other`` and are diagnosed separately in the
+    validated machine report. This list alone never proves source-only change.
+    """
+
+    profile_fields = frozenset({
+        "producerObservationUniverseDigest", "producerTranscriptDigest",
+        "profileCompletedCommandClassSetDigest", "authorizationContextBindingDigest",
+    })
+    failure_fields = frozenset({
+        "failureIdentity", "failureIdentityHash", "derivedFailureMembers",
+        "canonicalFailureMaterialVersion", "legacyBaselineComparisonDigest",
+        "signature",
+    })
+    # extract_failure_identity supplies these direct parsedFailureSummary keys;
+    # make_internal_result instead supplies status/diagnostic. Status already
+    # belongs to execution-status; diagnostic and unknown members remain other.
+    summary_failure_fields = failure_fields | frozenset({
+        "scope", "testIds", "fileLocations", "assertionNames", "expectedValues",
+        "observedValues", "errorClasses", "errorMessages", "structuredFailureSet",
+        "pathAuthority",
+    })
+    categories: set[str] = set()
+
+    def member_equal(left: Mapping[str, Any], right: Mapping[str, Any], key: str) -> bool:
+        try:
+            return _canonical_frame({"present": key in left, "value": left.get(key)}) == _canonical_frame({
+                "present": key in right, "value": right.get(key),
+            })
+        except (TypeError, ValueError, UnicodeError):
+            return False
+
+    def record_digest_valid(record: Mapping[str, Any]) -> bool:
+        try:
+            return record.get("producerRecordDigest") == _producer_record_digest({
+                key: value for key, value in record.items() if key != "producerRecordDigest"
+            })
+        except (TypeError, ValueError, UnicodeError):
+            return False
+
+    for key in profile_fields | failure_fields:
+        if not member_equal(producer, replay, key):
+            categories.add("profileContext" if key in profile_fields else "failureIdentity")
+    if not member_equal(producer, replay, "diagnosticPreview"):
+        categories.add("other")
+    if not member_equal(producer, replay, "parsedFailureSummary"):
+        left_summary = producer.get("parsedFailureSummary")
+        right_summary = replay.get("parsedFailureSummary")
+        if isinstance(left_summary, Mapping) and isinstance(right_summary, Mapping):
+            for key in left_summary.keys() | right_summary.keys():
+                if key == "status" or member_equal(left_summary, right_summary, key):
+                    continue
+                categories.add(
+                    "profileContext" if key in profile_fields
+                    else "failureIdentity" if key in summary_failure_fields
+                    else "other"
+                )
+        else:
+            categories.add("other")
+
+    observations_changed = not member_equal(producer, replay, "producerObservations")
+    set_digest_changed = not member_equal(producer, replay, "producerObservationSetDigest")
+    if set_digest_changed:
+        categories.add("producerObservationSetDigest")
+    digest_observations: list[list[Any] | None] = [None, None]
+    if observations_changed or set_digest_changed:
+        for side, (command, original) in enumerate((
+            (producer, producer_source), (replay, replay_source),
+        )):
+            digest_command: Mapping[str, Any] | None = command
+            if original is not None:
+                # Raw constructor normalization is component-boundary-aware;
+                # replay substitution can still alter embedded root literals.
+                # Check correspondence before using the original digest bytes.
+                context_keys = (
+                    "commandId", "commandClass", "ordinal",
+                    "producerObservations", "producerObservationSetDigest",
+                )
+                if isinstance(original, Mapping) and isinstance(original.get("producerObservations"), list):
+                    original_context = _canonical_replay_value({
+                        key: original[key] for key in context_keys if key in original
+                    })
+                    if all(member_equal(command, original_context, key) for key in context_keys):
+                        digest_command = original
+                    else:
+                        digest_command = None
+                else:
+                    digest_command = None
+            observations = (
+                digest_command.get("producerObservations")
+                if digest_command is not None else None
+            )
+            try:
+                valid_set_digest = (
+                    isinstance(observations, list)
+                    and len(observations) <= MAX_EVIDENCE_COLLECTION_ITEMS
+                    and digest_command is not None
+                    and digest_command.get("producerObservationSetDigest") == producer_observation_set_digest(observations)
+                )
+            except (TypeError, ValueError, UnicodeError):
+                valid_set_digest = False
+            if not valid_set_digest:
+                categories.add("other")
+            if isinstance(observations, list):
+                digest_observations[side] = observations
+    if observations_changed:
+        left_observations = producer.get("producerObservations")
+        right_observations = replay.get("producerObservations")
+        if (
+            not isinstance(left_observations, list)
+            or not isinstance(right_observations, list)
+            or max(len(left_observations), len(right_observations)) > MAX_EVIDENCE_COLLECTION_ITEMS
+        ):
+            categories.add("other")
+        else:
+            if len(left_observations) != len(right_observations):
+                categories.add("other")
+            for index, (left_raw, right_raw) in enumerate(zip(left_observations, right_observations)):
+                if not isinstance(left_raw, Mapping) or not isinstance(right_raw, Mapping):
+                    categories.add("other")
+                    continue
+                changed = {
+                    key for key in left_raw.keys() | right_raw.keys()
+                    if not member_equal(left_raw, right_raw, key)
+                }
+                if not changed:
+                    continue
+                if "sourceOutputDigest" in changed:
+                    categories.add("sourceOutputDigest")
+                if changed - {"sourceOutputDigest", "producerRecordDigest"}:
+                    categories.add("other")
+                for originals in digest_observations:
+                    if (
+                        originals is None or index >= len(originals)
+                        or not isinstance(originals[index], Mapping)
+                        or not record_digest_valid(originals[index])
+                    ):
+                        categories.add("other")
+    return sorted(categories)
+
+
+_REPLAY_DIAGNOSTIC_FIELD_CATEGORIES = {
+    "executionDurationClass": frozenset({"executionDurationClass"}),
+    "stdout-identity": frozenset({
+        "stdoutSha256", "stdoutBytesObserved", "stdoutByteLimit",
+        "validatedStaticMachineReport", "invalidStaticMachineLocalEvidence",
+        "directNodeTestRawStreams",
+    }),
+    "stderr-identity": frozenset({
+        "stderrSha256", "stderrBytesObserved", "stderrByteLimit",
+    }),
+    "execution-status": frozenset({
+        "executed", "started", "setupFailure", "exitCode", "timeoutStatus",
+        "outputLimitStatus", "completedCommandClass", "error", "limitReason",
+    }),
+    "process-containment": frozenset({
+        "containment", "processTreeStatus", "processTreeError",
+        "descendantsTerminated", "descendantsObserved", "descendantsReaped",
+        "descendantsSurviving", "containmentDisposition",
+    }),
+    "target-input-authority": frozenset({
+        "targets", "executionInputs", "executionLease", "targetExecutionLease",
+        "invalidGitBashLeaseLocalEvidence",
+        "executionInputMode", "executionInputSize", "executionInputSha256",
+        "actualExecutionInputMode", "actualExecutionInputSize",
+        "actualExecutionInputSha256", "fileScans",
+    }),
+    "executionInputBundleDigest": frozenset({"executionInputBundleDigest"}),
+    "runtime-closure": frozenset({
+        "dependencyBacked", "runtimeClosureDigest", "dependencyClosureDigest",
+        "nodePath", "resolvedTestRunnerEntrypoint", "resolvedTestRunnerSha256",
+        "closureWatcherActive", "closureMutationState", "runtimeClosureGuard",
+        "toolRole", "resolvedExecutablePath", "resolvedExecutableSize",
+        "resolvedExecutableSha256", "resolvedExecutableFileIdentity",
+    }),
+    "producer-observation-context": frozenset({
+        "producerObservations", "producerObservationSetDigest", "diagnosticPreview",
+        "semanticSourceOutputDigest",
+    }),
+    "command-membership": frozenset({"commandId", "ordinal"}),
+}
+_REPLAY_DIAGNOSTIC_NESTED_CATEGORIES = {
+    "parsedFailureSummary": (
+        "producer-observation-context", {"status": "execution-status"},
+    ),
+    "protectedTargetBundle": (
+        "target-input-authority", {
+            "executionInputBundleDigest": "protectedTargetBundle.executionInputBundleDigest",
+            "cleanupState": "process-containment",
+            "mutationDetected": "process-containment",
+        },
+    ),
+}
+_REPLAY_DIAGNOSTIC_CATEGORIES = frozenset({
+    *_REPLAY_DIAGNOSTIC_FIELD_CATEGORIES,
+    "protectedTargetBundle.executionInputBundleDigest",
+    "other-authorized-fixed-category",
+})
+_REPLAY_DIAGNOSTIC_HARD_GATE_IDS = frozenset({
+    *HARD_GATE_AUTHORITY,
+    "DIRECT-JAVASCRIPT-SYNTAX-EXECUTION", "DIRECT-PYTHON-SYNTAX",
+    "GIT-BASH-TRUSTED-RUNTIME", "IMMUTABLE-COMMAND-AUTHORITY",
+    "NODE-CI-FAMILY", "NPM-REQUIRED", "PYTHON-CI-FAMILY",
+    "RUNTIME-DEPENDENCY-CLOSURE", "RUNTIME-DEPENDENCY-CLOSURE-FINAL",
+    "RUNTIME-DEPENDENCY-CLOSURE-SETUP", "STATIC-SUITE-EXECUTION",
+    "STATIC-SUITE-RESULT", "TARGET-EXECUTION-SOURCE-INTEGRITY",
+    "TRUSTED-EXECUTABLE-RESOLUTION", "TRUSTED-FILE-MANIFEST",
+    *(
+        f"{prefix}-{phase}"
+        for prefix in (
+            "TRUSTED-TOOL-AUTHORITY", "TRUSTED-FILE-INTEGRITY",
+            "RUNTIME-DEPENDENCY-CLOSURE",
+        )
+        for phase in (
+            "RUNTIME", "POLICY", "STATIC", "FRONTEND", "BACKEND",
+            "STANDALONE", "LOCKFILE-CHECK", "POST-EXECUTION",
+        )
+    ),
+})
+_REPLAY_DIAGNOSTIC_VIOLATION_IDS = frozenset({
+    *_REPLAY_DIAGNOSTIC_HARD_GATE_IDS, *_DIAGNOSTIC_DERIVED_VIOLATION_TYPES,
+    "CI-RUNNER-ERROR", "RUNTIME-CLOSURE-PRECONDITION",
+})
+_MAX_REPLAY_FAILURE_DIAGNOSTICS = 8
+_MAX_REPLAY_TRANSCRIPT_DIAGNOSTICS = 8
+
+
+def _replay_changed_field_categories(
+    producer: Mapping[str, Any], replay: Mapping[str, Any],
+) -> list[str]:
+    """Classify differences with fixed vocabulary, never record keys or values."""
+
+    categories: set[str] = set()
+    missing = object()
+    for key in producer.keys() | replay.keys():
+        left, right = producer.get(key, missing), replay.get(key, missing)
+        if left == right:
+            continue
+        if key in _REPLAY_DIAGNOSTIC_NESTED_CATEGORIES:
+            fallback, nested = _REPLAY_DIAGNOSTIC_NESTED_CATEGORIES[key]
+            if isinstance(left, Mapping) and isinstance(right, Mapping):
+                for child in left.keys() | right.keys():
+                    if left.get(child, missing) != right.get(child, missing):
+                        categories.add(nested.get(child, fallback))
+            else:
+                categories.add(fallback)
+        else:
+            categories.add(next(
+                (category for category, fields in _REPLAY_DIAGNOSTIC_FIELD_CATEGORIES.items()
+                 if key in fields),
+                "other-authorized-fixed-category",
+            ))
+    return sorted(categories & _REPLAY_DIAGNOSTIC_CATEGORIES)
+
+
+def _replay_diagnostic_command_identity(
+    record: Mapping[str, Any], *, source_record: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Describe the command with fixed labels and its exact UTF-8 identity digest."""
+
+    command_id = record.get("commandId")
+    digest_command_id = command_id
+    if isinstance(source_record, Mapping) and isinstance(source_record.get("commandId"), str):
+        try:
+            # Replay may replace root spellings embedded in dynamic IDs. Use
+            # exact original UTF-8 bytes only after full canonical correspondence;
+            # this must not let a different source record relabel the diagnostic.
+            if _json_bytes(_canonical_transcript_record(source_record)) == _json_bytes(dict(record)):
+                digest_command_id = source_record["commandId"]
+        except (KeyError, TypeError, ValueError, UnicodeError, OSError):
+            pass
+    command_class = record.get("commandClass")
+    ordinal = record.get("ordinal")
+    family = "other"
+    if isinstance(command_id, str):
+        if command_id in _DIAGNOSTIC_COMMAND_IDS:
+            family = "fixed-command"
+        elif re.fullmatch(r"node-check:[^\x00-\x1f\x7f]+\.(?i:js|mjs)", command_id):
+            family = "node-check"
+        elif re.fullmatch(r"frontend-security:[^/\\\x00-\x1f\x7f]+\.js", command_id):
+            family = "frontend-security"
+    return {
+        "commandId": command_id if isinstance(command_id, str) and command_id in _DIAGNOSTIC_COMMAND_IDS else "OTHER",
+        "ordinal": ordinal if type(ordinal) is int and 0 <= ordinal < MAX_PROFILE_COMMANDS else None,
+        "commandClass": (
+            command_class if isinstance(command_class, str)
+            and command_class in _REPLAY_DIAGNOSTIC_COMMAND_CLASSES else None
+        ),
+        "commandFamily": family,
+        "commandIdDigest": (
+            "sha256:" + hashlib.sha256(digest_command_id.encode("utf-8")).hexdigest()
+            if isinstance(digest_command_id, str) else None
+        ),
+    }
+
+
+def _replay_target_input_difference_subcategories(
+    producer: Mapping[str, Any], replay: Mapping[str, Any],
+) -> list[str]:
+    """Name only differing fixed target/input categories, without their contents."""
+
+    missing = object()
+    categories: set[str] = set()
+    for category, fields in _REPLAY_DIAGNOSTIC_TARGET_INPUT_FIELDS.items():
+        for field in fields:
+            if producer.get(field, missing) == replay.get(field, missing):
+                continue
+            if field == "protectedTargetBundle" and not (
+                set(_replay_changed_field_categories(
+                    {field: producer[field]} if field in producer else {},
+                    {field: replay[field]} if field in replay else {},
+                )) & {"target-input-authority", "protectedTargetBundle.executionInputBundleDigest"}
+            ):
+                continue
+            categories.add(category)
+    return sorted(categories)
+
+
+def replay_transcript_difference_diagnostics(
+    producer_records: Sequence[Mapping[str, Any]],
+    replay_records: Sequence[Mapping[str, Any]],
+    *,
+    producer_source_records: Sequence[Mapping[str, Any]] | None = None,
+    replay_source_records: Sequence[Mapping[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Describe at most eight unequal canonical records; never authorize replay."""
+
+    diagnostics: list[dict[str, Any]] = []
+    for index in range(max(len(producer_records), len(replay_records))):
+        producer = producer_records[index] if index < len(producer_records) else None
+        replay = replay_records[index] if index < len(replay_records) else None
+        if producer == replay:
+            continue
+        identity_record = replay if replay is not None else producer
+        identity_sources = replay_source_records if replay is not None else producer_source_records
+        identity_source = (
+            identity_sources[index]
+            if identity_sources is not None and index < len(identity_sources) else None
+        )
+        diagnostic = {
+            **_replay_diagnostic_command_identity(identity_record, source_record=identity_source),
+            "changedFieldCategories": (
+                ["command-membership"] if producer is None or replay is None
+                else _replay_changed_field_categories(producer, replay)
+            ),
+            "producerRecordDigest": canonical_failure_digest(producer),
+            "replayRecordDigest": canonical_failure_digest(replay),
+        }
+        if producer is not None and replay is not None:
+            target_categories = _replay_target_input_difference_subcategories(producer, replay)
+            if target_categories:
+                diagnostic["targetInputSubcategories"] = target_categories
+            diagnostic.update(_replay_static_machine_difference_diagnostic(
+                producer, replay,
+                producer_source=(
+                    producer_source_records[index]
+                    if producer_source_records is not None and index < len(producer_source_records)
+                    else None
+                ),
+                replay_source=(
+                    replay_source_records[index]
+                    if replay_source_records is not None and index < len(replay_source_records)
+                    else None
+                ),
+            ))
+        diagnostics.append(diagnostic)
+        if len(diagnostics) == _MAX_REPLAY_TRANSCRIPT_DIAGNOSTICS:
+            break
+    return diagnostics
+
+
+def first_replay_transcript_difference_diagnostic(
+    producer_records: Sequence[Mapping[str, Any]],
+    replay_records: Sequence[Mapping[str, Any]],
+    *,
+    producer_source_records: Sequence[Mapping[str, Any]] | None = None,
+    replay_source_records: Sequence[Mapping[str, Any]] | None = None,
+) -> str | None:
+    """Retain the single-record diagnostic interface for existing consumers."""
+
+    diagnostics = replay_transcript_difference_diagnostics(
+        producer_records, replay_records,
+        producer_source_records=producer_source_records,
+        replay_source_records=replay_source_records,
+    )
+    return json.dumps(diagnostics[0], sort_keys=True, separators=(",", ":")) if diagnostics else None
+
+
+_STATIC_REPORT_DIAGNOSTIC_FIELDS = {
+    "documentKind": "document/schema",
+    "schemaVersion": "document/schema",
+    "invocationId": "invocation",
+    "executionStatus": "execution-status",
+    "internalRunnerFailures": "execution-status",
+    "commandPlanDigest": "command-plan",
+    "commandResults": "command-results",
+    "observations": "observations",
+    "nativeNonPassCount": "summary/counts",
+}
+_STATIC_OBSERVATION_DIAGNOSTIC_FIELDS = {
+    "name": "identity", "status": "status", "detail": "detail",
+}
+
+
+def _replay_static_changed_categories(
+    producer: Mapping[str, Any], replay: Mapping[str, Any],
+    field_categories: Mapping[str, str],
+) -> list[str]:
+    """Compare JSON types and presence exactly; emit only fixed categories."""
+
+    return sorted({
+        field_categories.get(key, "other")
+        for key in producer.keys() | replay.keys()
+        if (key not in producer or key not in replay
+            or canonical_failure_digest(producer[key]) != canonical_failure_digest(replay[key]))
+    })
+
+
+def _replay_validated_static_report(
+    canonical: Mapping[str, Any], source: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Recheck original local authority before inspecting its existing projection."""
+
+    if not isinstance(source, Mapping) or source.get("commandId") != "static-suite":
+        return None
+    try:
+        if _validated_portable_protected_input_bundle_digest(source) is None:
+            return None
+        identity = _validated_static_machine_output_identity(source)
+        if identity is None:
+            return None
+        report = identity["validatedStaticMachineReport"]
+        if (
+            canonical.get("invalidStaticMachineLocalEvidence") is True
+            or canonical.get("invalidProtectedBundleLocalEvidence") is True
+            or canonical_failure_digest(canonical.get("validatedStaticMachineReport"))
+            != canonical_failure_digest(report)
+        ):
+            return None
+    except (KeyError, TypeError, ValueError, UnicodeError):
+        return None
+    return report
+
+
+def _replay_static_machine_difference_diagnostic(
+    producer: Mapping[str, Any], replay: Mapping[str, Any],
+    *, producer_source: Mapping[str, Any] | None = None,
+    replay_source: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Describe validated static facts without changing comparison or authority."""
+
+    if producer.get("commandId") != "static-suite" or replay.get("commandId") != "static-suite":
+        return {}
+    diagnostic: dict[str, Any] = {}
+    context_categories = _replay_producer_observation_context_categories(
+        producer, replay, producer_source=producer_source, replay_source=replay_source,
+    )
+    if context_categories:
+        diagnostic["producerObservationContextCategories"] = context_categories
+    if not any("validatedStaticMachineReport" in record for record in (producer, replay)):
+        return diagnostic
+    left = _replay_validated_static_report(producer, producer_source)
+    right = _replay_validated_static_report(replay, replay_source)
+    if left is None or right is None:
+        diagnostic["staticMachineReport"] = {
+            "validationStatus": (
+                "both-unavailable" if left is None and right is None
+                else "producer-unavailable" if left is None else "replay-unavailable"
+            ),
+            "changedCategories": ["other"],
+        }
+        return diagnostic
+    report_diagnostic: dict[str, Any] = {
+        "validationStatus": "both-validated",
+        "changedCategories": _replay_static_changed_categories(
+            left, right, _STATIC_REPORT_DIAGNOSTIC_FIELDS,
+        ),
+    }
+    diagnostic["staticMachineReport"] = report_diagnostic
+    if "observations" not in report_diagnostic["changedCategories"]:
+        return diagnostic
+    left_observations, right_observations = left["observations"], right["observations"]
+    # Existing report validation bounds each list to 10,000 entries. Keep the
+    # diagnostic ordinal independently bounded and include only its first change.
+    for index in range(min(10_000, max(len(left_observations), len(right_observations)))):
+        left_item = left_observations[index] if index < len(left_observations) else None
+        right_item = right_observations[index] if index < len(right_observations) else None
+        if canonical_failure_digest(left_item) == canonical_failure_digest(right_item):
+            continue
+        report_diagnostic["firstObservationDifference"] = {
+            "ordinal": index,
+            "producerObservationIdentityDigest": (
+                "sha256:" + hashlib.sha256(left_item["name"].encode("utf-8")).hexdigest()
+                if left_item is not None else None
+            ),
+            "replayObservationIdentityDigest": (
+                "sha256:" + hashlib.sha256(right_item["name"].encode("utf-8")).hexdigest()
+                if right_item is not None else None
+            ),
+            "changedSemanticCategories": (
+                ["membership"] if left_item is None or right_item is None
+                else _replay_static_changed_categories(
+                    left_item, right_item, _STATIC_OBSERVATION_DIAGNOSTIC_FIELDS,
+                )
+            ),
+            "producerObservationDigest": canonical_failure_digest(left_item),
+            "replayObservationDigest": canonical_failure_digest(right_item),
+        }
+        break
+    return diagnostic
+
+
+def replay_failure_diagnostics(
+    hard_failures: Sequence[Mapping[str, Any]],
+    violations: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Bound rejection details to eight identities per kind and canonical digests."""
+
+    diagnostics: list[str] = []
+    for records, id_key, allowed_ids, prefix in (
+        (hard_failures, "hardGateId", _REPLAY_DIAGNOSTIC_HARD_GATE_IDS,
+         "verification replay failed hard gate: "),
+        (violations, "violationId", _REPLAY_DIAGNOSTIC_VIOLATION_IDS,
+         "verification replay violation: "),
+    ):
+        for record in records[:_MAX_REPLAY_FAILURE_DIAGNOSTICS]:
+            record_id = record.get("id")
+            diagnostic = {
+                id_key: (record_id if isinstance(record_id, str) and record_id in allowed_ids
+                         else "OTHER"),
+                "diagnosticDigest": canonical_failure_digest(record),
+            }
+            command_id = record.get("commandId")
+            if (id_key == "violationId" and isinstance(command_id, str)
+                    and command_id in _DIAGNOSTIC_COMMAND_IDS):
+                diagnostic["commandId"] = command_id
+            diagnostics.append(prefix + json.dumps(
+                diagnostic, sort_keys=True, separators=(",", ":"),
+            ))
+    return diagnostics
+
+
+def _first_authority_mismatch_diagnostic(
+    command_records: Sequence[Mapping[str, Any]],
+    expected_authority: Sequence[Mapping[str, Any]],
+    *,
+    cross_job: bool = False,
+) -> tuple[Any, list[str]]:
+    """Locate the first unequal authority projection; return no raw values."""
+
+    if expected_authority and not isinstance(expected_authority[0], Mapping):
+        return None, ["OTHER"]
+    authority_fields = set(expected_authority[0]) if expected_authority else set()
+    for index in range(max(len(command_records), len(expected_authority))):
+        expected = expected_authority[index] if index < len(expected_authority) else {}
+        observed = command_records[index] if index < len(command_records) else {}
+        if not isinstance(expected, Mapping) or not isinstance(observed, Mapping):
+            return None, ["OTHER"]
+        command_id = expected.get("commandId", observed.get("commandId"))
+        if index >= len(command_records) or index >= len(expected_authority):
+            return command_id, ["command-membership"]
+        actual = {key: observed.get(key) for key in authority_fields}
+        if cross_job:
+            actual = _portable_command_plan_value([actual])[0]
+            expected = _portable_command_plan_value([expected])[0]
+        if actual == expected:
+            continue
+        categories: set[str] = set()
+        for key in set(actual) | set(expected):
+            if key in actual and key in expected and actual[key] == expected[key]:
+                continue
+            category = key if key in _DIAGNOSTIC_AUTHORITY_FIELDS else "OTHER"
+            if key == "targets":
+                left, right = actual.get(key), expected.get(key)
+                if (
+                    isinstance(left, list) and isinstance(right, list)
+                    and len(left) == len(right)
+                    and all(isinstance(item, Mapping) for item in [*left, *right])
+                    and [dict(item, fileIdentity=None) for item in left]
+                    == [dict(item, fileIdentity=None) for item in right]
+                ):
+                    category = "targets.fileIdentity"
+            categories.add(category)
+        fields = sorted(categories)
+        if len(fields) > _MAX_DIAGNOSTIC_AUTHORITY_FIELDS:
+            fields = fields[:_MAX_DIAGNOSTIC_AUTHORITY_FIELDS - 1] + ["additional-fields"]
+        return command_id, fields or ["OTHER"]
+    return None, ["OTHER"]
+
+
+def missing_derived_violation_diagnostic(
+    violation: Mapping[str, Any],
+    *,
+    command_records: Sequence[Mapping[str, Any]] | None = None,
+    expected_authority: Sequence[Mapping[str, Any]] | None = None,
+    cross_job: bool = False,
+) -> str:
+    """Identify a rejected claim without rendering producer-controlled content.
+
+    The digest uses the exact canonical JSON used by the membership check.
+    Command IDs with candidate-controlled suffixes (including paths) are hashed;
+    only fixed, path-free vocabulary is rendered verbatim. This projection is
+    diagnostic only and is never used to compare or authorize evidence.
+    """
+
+    canonical = json.dumps(
+        violation, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    command_id = violation.get("commandId")
+    mismatch_fields: list[str] | None = None
+    if (
+        violation.get("id") == "COMMAND-AUTHORITY-MISMATCH"
+        and command_records is not None and expected_authority is not None
+    ):
+        command_id, mismatch_fields = _first_authority_mismatch_diagnostic(
+            command_records, expected_authority, cross_job=cross_job
+        )
+    if isinstance(command_id, str) and command_id not in _DIAGNOSTIC_COMMAND_IDS:
+        command_id = "sha256:" + hashlib.sha256(
+            command_id.encode("utf-8", errors="surrogatepass")
+        ).hexdigest()
+    elif not isinstance(command_id, str):
+        command_id = None
+    violation_type = violation.get("id")
+    if (
+        not isinstance(violation_type, str)
+        or violation_type not in _DIAGNOSTIC_DERIVED_VIOLATION_TYPES
+    ):
+        violation_type = "OTHER"
+    return json.dumps(
+        {
+            "commandId": command_id,
+            "violationType": violation_type,
+            "violationDigest": "sha256:" + hashlib.sha256(
+                canonical.encode("utf-8", errors="surrogatepass")
+            ).hexdigest(),
+            **({"authorityFields": mismatch_fields} if mismatch_fields is not None else {}),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def verify_evidence_file_set(
     output_dir: Path = OUTPUT_DIR,
     *,
     repo_root: Path = REPO_ROOT,
     expected_command_plan: Sequence[Mapping[str, Any]] | None = None,
     expected_context: ExternallyExpectedVerificationContext | None = None,
+) -> list[str]:
+    return _verify_evidence_file_set(output_dir, repo_root=repo_root,
+        expected_command_plan=expected_command_plan, expected_context=expected_context)
+
+
+def _verify_evidence_file_set(
+    output_dir: Path = OUTPUT_DIR,
+    *,
+    repo_root: Path = REPO_ROOT,
+    expected_command_plan: Sequence[Mapping[str, Any]] | None = None,
+    expected_context: ExternallyExpectedVerificationContext | None = None,
+    observation_runner: Any | None = None,
 ) -> list[str]:
     errors = validate_evidence_root(output_dir, repo_root=repo_root)
     if errors:
@@ -18193,14 +21371,12 @@ def verify_evidence_file_set(
             documents[name] = document
     if errors:
         return sorted(set(errors))
-    errors.extend(
-        _validate_evidence_semantics(
-            documents,
-            snapshots,
-            expected_command_plan=expected_command_plan,
-            expected_context=expected_context,
-        )
-    )
+    semantic_verifier = (_validate_evidence_semantics_with_authority
+                         if observation_runner is not None else _validate_evidence_semantics)
+    private = ({"observation_runner": observation_runner, "observation_root": output_dir}
+               if observation_runner is not None else {})
+    errors.extend(semantic_verifier(documents, snapshots,
+        expected_command_plan=expected_command_plan, expected_context=expected_context, **private))
 
     try:
         final_entries = list(os.scandir(output_dir))
@@ -18848,12 +22024,22 @@ def _validate_command_record(
         "closureWatcherActive",
         "closureMutationState",
         "runtimeClosureGuard",
+        "validatedStaticMachineReport",
+        "directNodeTestRawStreams",
     }
     if not isinstance(record, dict):
         errors.append(f"{label}: record must be an object")
         return True
     if not required.issubset(record) or set(record) - required - optional:
         errors.append(f"{label}: command record keys are not valid")
+    if "directNodeTestRawStreams" in record:
+        stream_errors = _direct_node_test_raw_stream_errors(record)
+        errors.extend(f"{label}: {error}" for error in stream_errors)
+        if not stream_errors and parse_node_test_semantic_result(
+            record["directNodeTestRawStreams"]["stdout"], command_id=record["commandId"],
+            authorized_test_paths=_direct_node_test_authorized_paths(record),
+        ) is None:
+            errors.append(f"{label}: successful direct Node test reporter/payload is invalid")
     if (
         not isinstance(record.get("commandId"), str)
         or not isinstance(record.get("commandClass"), str)
@@ -18981,31 +22167,8 @@ def _validate_command_record(
         }
         if not isinstance(executable_identity, dict) or set(executable_identity) != identity_keys:
             errors.append(f"{label}: executable stable identity is invalid")
-    if execution_lease is not None:
-        lease_keys = {
-            "canonicalPath",
-            "trustedGitRoot",
-            "size",
-            "volumeSerial",
-            "fileIndex",
-            "links",
-            "creationTime",
-            "writeTime",
-            "reparsePoint",
-            "sha256",
-        }
-        if (
-            record.get("commandId") != "git-bash-version"
-            or not isinstance(execution_lease, dict)
-            or set(execution_lease) != lease_keys
-            or execution_lease.get("reparsePoint") is not False
-            or execution_lease.get("links") != 1
-            or execution_lease.get("canonicalPath") != resolved_executable
-            or execution_lease.get("size") != executable_size
-            or execution_lease.get("sha256") != executable_hash
-            or not re.fullmatch(r"[0-9a-f]{64}", str(execution_lease.get("sha256", "")))
-        ):
-            errors.append(f"{label}: trusted Bash execution lease is invalid")
+    if execution_lease is not None and not _git_bash_execution_lease_valid(record):
+        errors.append(f"{label}: trusted Bash execution lease is invalid")
     targets = record.get("targets")
     if not isinstance(targets, list) or len(targets) > MAX_EVIDENCE_COLLECTION_ITEMS:
         errors.append(f"{label}: targets must be a bounded array")
@@ -19324,6 +22487,20 @@ def _validate_command_record(
         errors.append(f"{label}: producerObservations must be a bounded array")
     elif record.get("producerObservationSetDigest") != producer_observation_set_digest(producer):
         errors.append(f"{label}: producerObservationSetDigest is invalid")
+    if "validatedStaticMachineReport" in record:
+        static_identity = _validated_static_machine_output_identity(record)
+        if not _static_machine_record_evidence_is_safe(record):
+            errors.append(_STATIC_MACHINE_REPORT_PRIVACY_ERROR)
+        elif static_identity is None:
+            errors.append(f"{label}: validated static machine report does not bind local execution authority")
+        elif isinstance(producer, list) and [
+            raw.get("rawStructuredFields") if isinstance(raw, Mapping) else None
+            for raw in producer
+        ] != [
+            raw_observation_json_value(result)
+            for result in record["validatedStaticMachineReport"]["observations"]
+        ]:
+            errors.append(f"{label}: static machine observations are incomplete or differ from validated output")
     if not isinstance(record.get("resultSemantics"), str) or not record.get("resultSemantics"):
         errors.append(f"{label}: resultSemantics is invalid")
     allowed_exits = record.get("allowedExecutionExits")
@@ -19528,6 +22705,55 @@ def _validate_evidence_semantics(
     *,
     expected_command_plan: Sequence[Mapping[str, Any]] | None = None,
     expected_context: ExternallyExpectedVerificationContext | None = None,
+) -> list[str]:
+    return _validate_evidence_semantics_with_authority(documents, snapshots,
+        expected_command_plan=expected_command_plan, expected_context=expected_context)
+
+
+def _preflight_command_record_positions(records, command_plan):
+    """Validate original JSON positions without reconstructing observations."""
+    if not isinstance(records, list):
+        return None, ["command-results.json: records must be an array"]
+    for index, record in enumerate(records):
+        if not isinstance(record, Mapping):
+            return None, [f"command-results.json.records[{index}]: record must be an object"]
+    errors = []
+    portable_plan = _portable_command_plan_value(command_plan)
+    for index, record in enumerate(records):
+        if type(record.get("ordinal")) is not int or record["ordinal"] != index:
+            errors.append(f"command-results.json.records[{index}]: ordinal does not match order")
+        # Ordinary FAIL evidence may report extra zero-observation commands or
+        # replace the transcript with the existing bounded size-limit failure.
+        if record.get("commandId") == "command-results-size-limit":
+            sentinel = {
+                "commandClass": "evidence-size-limit", "commandRole": "required-execution",
+                "toolRole": "python-in-process", "resultSemantics": "bounded-evidence-failure-record",
+                "required": True, "exitCode": 125, "outputLimitStatus": "OUTPUT-LIMIT-EXCEEDED",
+                "producerObservations": [],
+            }
+            if len(records) != 1 or _observation_bytes({key: record.get(key) for key in sentinel}) != _observation_bytes(sentinel):
+                errors.append(f"command-results.json.records[{index}]: size-limit sentinel must be a single zero-observation failure record")
+        elif index >= len(command_plan):
+            if record.get("producerObservations") != []:
+                errors.append(f"command-results.json.records[{index}]: unplanned command cannot supply producer observations")
+        else:
+            projection = {key: record.get(key) for key in command_plan[index]}
+            if _observation_bytes(_portable_command_plan_value([projection])) != _observation_bytes([portable_plan[index]]):
+                errors.append(
+                    f"command-results.json.records[{index}]: execution record does not bind the immutable command authority"
+                )
+    # Return the same list, including its original length and positions.
+    return (None, errors) if errors else (records, [])
+
+
+def _validate_evidence_semantics_with_authority(
+    documents: Mapping[str, dict[str, Any]],
+    snapshots: Mapping[str, _FileSnapshot],
+    *,
+    expected_command_plan: Sequence[Mapping[str, Any]] | None = None,
+    expected_context: ExternallyExpectedVerificationContext | None = None,
+    observation_runner: Any | None = None,
+    observation_root: Path | None = None,
 ) -> list[str]:
     errors: list[str] = []
     summary = documents["summary.json"]
@@ -19757,11 +22983,7 @@ def _validate_evidence_semantics(
             errors.append(f"summary.json: {field_name} must be an array")
     if not isinstance(observed.get("records"), list) or not isinstance(resolved.get("records"), list):
         errors.append("debt/candidate evidence records must be arrays")
-    if not isinstance(commands.get("records"), list):
-        errors.append("command-results.json: records must be an array")
-        command_records: list[Any] = []
-    else:
-        command_records = commands["records"]
+    command_records = commands.get("records")
     command_observations = commands.get("observations")
     if not isinstance(command_observations, list) or len(command_observations) > MAX_EVIDENCE_COLLECTION_ITEMS:
         errors.append("command-results.json: observations must be a bounded array")
@@ -19791,9 +23013,26 @@ def _validate_evidence_semantics(
         errors.append("command-results.json: commandPlanDigest does not match the immutable profile plan")
     if isinstance(execution_binding, dict) and execution_binding.get("commandPlanDigest") != expected_plan_digest:
         errors.append("execution binding command-plan digest differs from external profile authority")
-    valid_command_records = [
-        record for record in command_records if isinstance(record, Mapping)
-    ]
+    valid_command_records, positional_errors = _preflight_command_record_positions(
+        command_records, expected_authority)
+    if positional_errors:
+        if isinstance(command_records, list) and all(isinstance(record, Mapping) for record in command_records):
+            # Preserve the existing safe diagnostic without deriving evidence.
+            violation = {
+                "id": "COMMAND-AUTHORITY-MISMATCH",
+                "expectedCommandIds": [item["commandId"] for item in expected_authority],
+                "observedCommandIds": [item.get("commandId") for item in command_records],
+            }
+            claimed = summary.get("policyViolations")
+            if not isinstance(claimed, list) or violation not in claimed:
+                errors.append(
+                    "summary.json: derived command/baseline violation is missing: "
+                    + missing_derived_violation_diagnostic(
+                        violation, command_records=command_records,
+                        expected_authority=expected_authority, cross_job=True,
+                    )
+                )
+        return sorted(set(errors + positional_errors))
     independently_expected_classes = expected_completed_command_classes(expected_authority)
     independently_actual_classes = actual_completed_command_classes(
         expected_authority,
@@ -19867,6 +23106,21 @@ def _validate_evidence_semantics(
         errors.append(
             "command-results.json: PASS transcript has missing, extra, or duplicate command IDs"
         )
+    admissions = ()
+    authority_sensitive = _has_standalone_observation(command_records, command_observations, expected_authority)
+    if authority_sensitive:
+        if errors:
+            return sorted(set(errors))
+        if observation_runner is None:
+            return ["standalone observation lacks independently prepared execution authority"]
+        try:
+            admissions = _admit_standalone_observations(_ObservationValidation(
+                observation_runner, expected_context, valid_command_records,
+                expected_authority, documents, snapshots, observation_root))
+        except (OSError, AttributeError, KeyError, TypeError, ValueError) as exc:
+            return [f"standalone observation admission failed: {exc}"]
+        if not admissions:
+            return ["standalone observation has no admission"]
     reconstructed_command_observations: list[dict[str, Any]] = []
     observation_context = {
         "producerObservationUniverseDigest": universe_digest,
@@ -19880,15 +23134,24 @@ def _validate_evidence_semantics(
         producer_items = record.get("producerObservations")
         if not isinstance(producer_items, list):
             continue
+        direct_node_success = (
+            _direct_node_test_authorized_paths(record) is not None
+            and type(record.get("exitCode")) is int and record.get("exitCode") == 0)
         for raw in producer_items:
             if not isinstance(raw, Mapping):
                 continue
+            if (direct_node_success and raw.get("observationKind") == "process-output-v1"
+                and not _direct_node_process_observation_fields_are_safe(raw.get("rawStructuredFields"))):
+                # A declared policy violation cannot authorize this closed schema.
+                # Reject before reconstruction, without echoing attacker fields.
+                return [_DIRECT_NODE_OBSERVATION_PRIVACY_ERROR]
             try:
                 reconstructed_command_observations.append(
-                    _rederive_observation_record(
+                    _reconstruct_observation_with_admission(
                         {"rawObservation": raw},
                         record,
                         profile_context=observation_context,
+                        admissions=admissions,
                     )
                 )
             except (TypeError, ValueError) as exc:
@@ -19990,26 +23253,11 @@ def _validate_evidence_semantics(
             errors,
             expected_record=independently_expected_record,
         )
-        if isinstance(record, dict) and record.get("ordinal") != index:
-            errors.append(f"command-results.json.records[{index}]: ordinal does not match order")
-        if (
-            isinstance(record, dict)
-            and record.get("commandId") != "command-results-size-limit"
-            and index < len(expected_authority)
-        ):
-            expected_record = expected_authority[index]
-            authority_projection = {
-                key: record.get(key) for key in expected_record
-            }
-            if _portable_command_plan_value([authority_projection]) != (
-                [portable_expected_authority[index]]
-            ):
-                errors.append(
-                    f"command-results.json.records[{index}]: execution record does not bind the immutable command authority"
-                )
     if command_hard_failure and summary.get("status") == "PASS":
         errors.append("summary.json reports PASS while command-results records an execution failure")
 
+    if authority_sensitive and errors:
+        return sorted(set(errors))
     try:
         baseline = read_json(BASELINE_PATH)
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
@@ -20018,7 +23266,9 @@ def _validate_evidence_semantics(
         baseline_errors = validate_baseline_document(baseline)
         errors.extend(f"immutable baseline authority: {error}" for error in baseline_errors)
         if not baseline_errors:
-            derived = derive_authoritative_evidence(
+            operation = _derive_authoritative_evidence_with_admission if admissions else derive_authoritative_evidence
+            private = {"admissions": admissions} if admissions else {}
+            derived = operation(
                 authority_profile,
                 command_observations,
                 completed_command_classes,
@@ -20028,6 +23278,8 @@ def _validate_evidence_semantics(
                 expected_authority,
                 authorization_context_binding_digest_value,
                 release_gate_required=authoritative_release_gate_required,
+                cross_job=True,
+                **private,
             )
             derived_sets = {
                 "knownDebtsObserved": derived["observedDebts"],
@@ -20048,7 +23300,15 @@ def _validate_evidence_semantics(
             for violation in derived["violations"]:
                 key = json.dumps(violation, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
                 if key not in policy_keys:
-                    errors.append("summary.json: derived command/baseline violation is missing")
+                    errors.append(
+                        "summary.json: derived command/baseline violation is missing: "
+                        + missing_derived_violation_diagnostic(
+                            violation,
+                            command_records=command_records,
+                            expected_authority=expected_authority,
+                            cross_job=True,
+                        )
+                    )
 
     manifest = summary.get("evidenceManifest")
     if not isinstance(manifest, list) or len(manifest) != len(EVIDENCE_MANIFEST_FILE_NAMES):
@@ -20188,12 +23448,47 @@ def _read_evidence_documents_for_replay(
     return documents, snapshots, sorted(set(errors))
 
 
+def _portable_replay_observations(
+    observations: Any, records: Sequence[Mapping[str, Any]],
+) -> Any:
+    """Project only reconstructed observation sources; keep claimed derived fields."""
+    if not isinstance(observations, list):
+        return observations
+    by_id = {record.get("commandId"): record for record in records}
+    result = []
+    for item in observations:
+        if not isinstance(item, Mapping):
+            result.append(item)
+            continue
+        source = by_id.get(item.get("commandId"))
+        portable = _portable_node_test_observation_source(source) if source is not None else source
+        if (source is not None and portable is not source
+            and item.get("rawObservation") == source["producerObservations"][0]
+            and item.get("producerObservationSetDigest") == source["producerObservationSetDigest"]):
+            result.append({
+                **item, "rawObservation": portable["producerObservations"][0],
+                "producerObservationSetDigest": portable["producerObservationSetDigest"],
+            })
+        else:
+            result.append(item)
+    return result
+
+
 def compare_verification_replay_claims(
     documents: Mapping[str, dict[str, Any]],
     runner: FoundationRunner,
     comparison: Mapping[str, Any] | None,
 ) -> tuple[dict[str, Any], list[str]]:
-    """Compare mutable evidence claims with independently replayed facts."""
+    """Compare raw claims only; this public API has no backend portable capability."""
+    return _compare_verification_replay_claims(documents, runner, comparison)
+
+
+def _verification_replay_eligibility(
+    documents: Mapping[str, dict[str, Any]],
+    runner: FoundationRunner,
+    comparison: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Check safety, authority and execution state before result derivation."""
 
     errors: list[str] = []
     summary = documents.get("summary.json", {})
@@ -20221,6 +23516,7 @@ def compare_verification_replay_claims(
             "verification replay profile is non-PASS: "
             f"hardFailures={len(hard_failures)} violations={len(runner.violations)}"
         )
+        errors.extend(replay_failure_diagnostics(hard_failures, runner.violations))
 
     if summary.get("profile") != runner.profile or transcript.get("profile") != runner.profile:
         errors.append("verification replay profile selector mismatch")
@@ -20256,6 +23552,154 @@ def compare_verification_replay_claims(
     if commands.get("commandPlanDigest") != transcript["commandPlanDigest"]:
         errors.append("verification replay commandPlanDigest mismatch")
     evidence_records = commands.get("records")
+    if not isinstance(evidence_records, list):
+        errors.append("verification replay evidence command records are unavailable")
+    elif len(evidence_records) != transcript["commandCount"]:
+        errors.append("verification replay commandCount mismatch")
+    for field_name in (
+        "expectedCompletedCommandClasses",
+        "actualCompletedCommandClasses",
+        "expectedCompletedCommandClassSetDigest",
+        "completedCommandClassSetDigest",
+        "missingCommandIds",
+        "extraCommandIds",
+        "duplicateCommandIds",
+    ):
+        if commands.get(field_name) != transcript.get(field_name):
+            errors.append(f"verification replay {field_name} mismatch")
+    if commands.get("completedCommandClasses") != transcript.get(
+        "actualCompletedCommandClasses"
+    ):
+        errors.append("verification replay completedCommandClasses mismatch")
+    return transcript, sorted(set(errors))
+
+
+def _replay_collection_comparison_views(documents, runner, comparison, comparison_views):
+    """Detach collection identity only from already validated portable command views.
+
+    The verifier calls this after ordinary evidence validation, completed replay,
+    authority/cleanup checks and portable result derivation. It grants no new
+    observation admission and never changes persisted or runner-derived facts.
+    Every replaced digest must first be reconstructed from its own raw source.
+    Missing, ambiguous or unequal portable authority leaves comparison exact.
+    """
+    if comparison is None or comparison_views is None:
+        return None
+    fields = {
+        "knownDebtsObserved": "observedDebts",
+        "resolvedCandidates": "resolvedCandidates",
+        "expectedOmissions": "expectedOmissions",
+        "releaseOnlySkips": "releaseOnlySkips",
+    }
+    digest_fields = {"derivedFailureDigest", "currentFullContextDigest"}
+    try:
+        producer_view, replay_view = (comparison_views[side] for side in ("producer", "replay"))
+        for key in ("records", "producerObservationUniverseDigest", "producerTranscriptDigest"):
+            if producer_view[key] != replay_view[key]:
+                return None
+        commands = documents["command-results.json"]
+        contexts = {
+            "producer": {
+                "producerObservationUniverseDigest": commands["producerObservationUniverseDigest"],
+                "producerTranscriptDigest": commands["producerTranscriptDigest"],
+                "profileCompletedCommandClassSetDigest": commands["completedCommandClassSetDigest"],
+                "authorizationContextBindingDigest": commands["authorizationContextBindingDigest"],
+            },
+            "replay": {
+                "producerObservationUniverseDigest": runner.producer_observation_universe_digest,
+                "producerTranscriptDigest": runner.producer_transcript_digest,
+                "profileCompletedCommandClassSetDigest": runner.completed_command_class_set_digest,
+                "authorizationContextBindingDigest": runner.authorization_context_binding_digest,
+            },
+        }
+        views = {}
+        for side, records in (("producer", commands["records"]), ("replay", runner.command_results)):
+            view = comparison_views[side]
+            projected_records = view["records"]
+            if not isinstance(records, list) or not isinstance(projected_records, list):
+                return None
+            if len(records) != len(projected_records):
+                return None
+            by_id = {}
+            for source, portable in zip(records, projected_records):
+                command_id = source["commandId"]
+                if (command_id in by_id or command_id != portable["commandId"]
+                    or source["ordinal"] != portable["ordinal"]):
+                    return None
+                by_id[command_id] = (source, portable)
+            portable_context = {
+                **contexts[side],
+                "producerObservationUniverseDigest": view["producerObservationUniverseDigest"],
+                "producerTranscriptDigest": view["producerTranscriptDigest"],
+            }
+            collections = {}
+            for field, replay_field in fields.items():
+                items = (documents["summary.json"][field] if side == "producer"
+                         else comparison[replay_field])
+                if not isinstance(items, list):
+                    return None
+                detached = []
+                for item in items:
+                    source, portable = by_id[item["sourceCommandId"]]
+                    matches = []
+                    for raw in source["producerObservations"]:
+                        derived = _rederive_observation_record(
+                            {"rawObservation": raw}, source, profile_context=contexts[side])
+                        if all(item[key] == derived[key] for key in digest_fields):
+                            matches.append((raw, derived))
+                    if len(matches) != 1:
+                        return None
+                    raw, derived = matches[0]
+                    for field_name, derived_field in (
+                        ("sourceCommandId", "commandId"), ("commandClass", "commandClass"),
+                        ("testOrPathScope", "testOrPathScope"), ("observedOutcome", "outcome"),
+                        ("observedSignature", "signature"),
+                        ("legacyBaselineComparisonDigest", "legacyBaselineComparisonDigest"),
+                        ("failureIdentityHash", "failureIdentityHash"),
+                        ("canonicalFailureMaterialVersion", "canonicalFailureMaterialVersion"),
+                        ("derivedFailureMembers", "derivedFailureMembers"),
+                    ):
+                        if item[field_name] != derived[derived_field]:
+                            return None
+                    portable_raw = [candidate for candidate in portable["producerObservations"]
+                                    if all(candidate[key] == raw[key] for key in
+                                           ("commandId", "commandOrdinal", "observationOrdinal"))]
+                    if len(portable_raw) != 1:
+                        return None
+                    # Keep every other field, including future/unknown fields,
+                    # exact. Aggregated occurrences and resolved status stay here.
+                    retained = {key: copy.deepcopy(value) for key, value in item.items()
+                                if key not in digest_fields}
+                    semantic_digest = canonical_failure_digest({
+                        "digestDomain": "ieltmps-replay-baseline-collection-v1",
+                        "collectionField": field,
+                        "baselineBoundFields": retained,
+                        "portableCommand": portable,
+                        "portableObservation": portable_raw[0],
+                        "portableProfileContext": portable_context,
+                    })
+                    detached.append({**retained, **{key: semantic_digest for key in digest_fields}})
+                collections[field] = detached
+            views[side] = collections
+        return views
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _compare_verification_replay_claims(
+    documents: Mapping[str, dict[str, Any]],
+    runner: FoundationRunner,
+    comparison: Mapping[str, Any] | None,
+    *,
+    comparison_views: Mapping[str, Any] | None = None,
+    collection_views: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Aggregate exact command differences, with only proven portable views."""
+    transcript, errors = _verification_replay_eligibility(documents, runner, comparison)
+    collections_eligible = not errors and comparison_views is not None
+    summary = documents.get("summary.json", {})
+    commands = documents.get("command-results.json", {})
+    evidence_records = commands.get("records")
     replay_records = transcript["records"]
     if not isinstance(evidence_records, list):
         errors.append("verification replay evidence command records are unavailable")
@@ -20265,30 +23709,41 @@ def compare_verification_replay_claims(
             for record in evidence_records
             if isinstance(record, Mapping)
         ]
+        if comparison_views is not None:
+            comparable_evidence_records = comparison_views["producer"]["records"]
+            replay_records = comparison_views["replay"]["records"]
         if comparable_evidence_records != replay_records:
             errors.append("verification replay command execution transcript mismatch")
-    if isinstance(evidence_records, list) and len(evidence_records) != transcript["commandCount"]:
-        errors.append("verification replay commandCount mismatch")
+            diagnostics = replay_transcript_difference_diagnostics(
+                comparable_evidence_records, replay_records,
+                producer_source_records=[
+                    record for record in evidence_records if isinstance(record, Mapping)
+                ],
+                replay_source_records=runner.command_results,
+            )
+            if diagnostics:
+                errors.append("verification replay first command differences: " + json.dumps(
+                    diagnostics, sort_keys=True, separators=(",", ":"),
+                ))
     top_level_fields = (
-        "expectedCompletedCommandClasses",
-        "actualCompletedCommandClasses",
-        "expectedCompletedCommandClassSetDigest",
-        "completedCommandClassSetDigest",
         "producerObservationCount",
         "producerObservationUniverseDigest",
         "producerTranscriptDigest",
-        "missingCommandIds",
-        "extraCommandIds",
-        "duplicateCommandIds",
     )
     for field_name in top_level_fields:
-        if commands.get(field_name) != transcript.get(field_name):
+        claimed_value, replay_value = commands.get(field_name), transcript.get(field_name)
+        if comparison_views is not None and field_name in (
+            "producerObservationUniverseDigest", "producerTranscriptDigest",
+        ):
+            claimed_value = comparison_views["producer"][field_name]
+            replay_value = comparison_views["replay"][field_name]
+        if claimed_value != replay_value:
             errors.append(f"verification replay {field_name} mismatch")
-    if commands.get("completedCommandClasses") != transcript.get(
-        "actualCompletedCommandClasses"
-    ):
-        errors.append("verification replay completedCommandClasses mismatch")
-    if commands.get("observations") not in ([], runner.observations):
+    if _portable_replay_observations(
+        commands.get("observations"),
+        [record for record in evidence_records if isinstance(record, Mapping)]
+        if isinstance(evidence_records, list) else [],
+    ) not in ([], _portable_replay_observations(runner.observations, runner.command_results)):
         errors.append("verification replay producer observations mismatch")
     if comparison is not None:
         replay_sets = {
@@ -20298,7 +23753,11 @@ def compare_verification_replay_claims(
             "releaseOnlySkips": comparison.get("releaseOnlySkips", []),
         }
         for field_name, replay_value in replay_sets.items():
-            if summary.get(field_name) != replay_value:
+            claimed_value = summary.get(field_name)
+            if collections_eligible and collection_views is not None:
+                claimed_value = collection_views["producer"][field_name]
+                replay_value = collection_views["replay"][field_name]
+            if claimed_value != replay_value:
                 errors.append(
                     f"verification replay {field_name} differs from replay-backed facts"
                 )
@@ -20355,6 +23814,47 @@ def run_verification_replay(
     verification_runner: FoundationRunner,
     repo_root: Path = REPO_ROOT,
 ) -> tuple[dict[str, Any] | None, list[str]]:
+    """Source-only raw replay; prepared packaging admission stays private."""
+    commands = documents.get("command-results.json", {})
+    records, errors = _preflight_command_record_positions(
+        commands.get("records"), verification_runner.command_plan)
+    if errors:
+        # Retain the source-only API's rejection result without running replay.
+        return {"finalAcceptance": "REJECT"}, errors
+    if _has_standalone_observation(records, commands.get("observations", []), verification_runner.command_plan):
+        return None, ["standalone observation is unauthorized in source-only replay"]
+    return _run_verification_replay(documents, expected_context=expected_context,
+        verification_runner=verification_runner, repo_root=repo_root)
+
+
+def _run_verification_replay(
+    documents: Mapping[str, dict[str, Any]],
+    *,
+    expected_context: ExternallyExpectedVerificationContext,
+    verification_runner: FoundationRunner,
+    repo_root: Path = REPO_ROOT,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    comparison, errors = _execute_verification_replay(
+        expected_context=expected_context, verification_runner=verification_runner,
+        repo_root=repo_root,
+    )
+    if comparison is None:
+        return None, errors
+    transcript, comparison_errors = compare_verification_replay_claims(
+        documents, verification_runner, comparison,
+    )
+    errors.extend(comparison_errors)
+    return _finish_verification_replay(
+        transcript, errors, expected_context=expected_context, runner=verification_runner,
+    )
+
+
+def _execute_verification_replay(
+    *,
+    expected_context: ExternallyExpectedVerificationContext,
+    verification_runner: FoundationRunner,
+    repo_root: Path = REPO_ROOT,
+) -> tuple[dict[str, Any] | None, list[str]]:
     """Re-execute only the externally selected profile and command plan."""
 
     errors: list[str] = []
@@ -20405,12 +23905,19 @@ def run_verification_replay(
         runner.close_execution_leases()
     if comparison is None:
         return None, errors or ["verification replay did not produce a comparison"]
-    transcript, comparison_errors = compare_verification_replay_claims(
-        documents,
-        runner,
-        comparison,
+    return comparison, errors
+
+
+def _finish_verification_replay(
+    transcript: dict[str, Any],
+    errors: list[str],
+    *,
+    expected_context: ExternallyExpectedVerificationContext,
+    runner: FoundationRunner,
+) -> tuple[dict[str, Any], list[str]]:
+    expected_authorization_digest = authorization_context_binding_digest(
+        expected_context.authorization_context_binding()
     )
-    errors.extend(comparison_errors)
     try:
         replay_binding = build_verifier_replay_context_binding(
             expected_context,
@@ -20447,6 +23954,431 @@ def run_verification_replay(
     return transcript, sorted(set(errors))
 
 
+# Standalone portability is deliberately private to the outer replay verifier. The ordinary
+# observation writer, source-only APIs and canonical record generator stay raw.
+_STANDALONE_PACKAGING_METHODS = (
+    "test_archive_entries_are_unique_portable_relative_and_not_symlinks",
+    "test_archive_list_verifier_rejects_duplicate_and_unsafe_entries",
+    "test_authorized_reading_has_real_windows_unix_parity_and_hashes",
+    "test_clean_no_git_source_archive_still_releases_safely",
+    "test_default_windows_and_unix_release_use_one_positive_manifest",
+    "test_extracted_payload_is_self_contained_and_serves_required_styles",
+    "test_git_manifest_and_payload_dirty_changes_fail_closed",
+    "test_main_manifest_missing_malformed_schema_and_paths_fail_closed",
+    "test_manifest_listed_path_reparse_fails_closed",
+    "test_private_listening_switch_fails_and_root_is_not_scanned",
+    "test_reading_file_and_external_manifest_reparse_fail_closed",
+    "test_reading_hash_missing_duplicate_and_unsafe_paths_fail_closed",
+    "test_reading_root_requires_explicit_manifest",
+    "test_reading_unknown_and_hidden_files_fail_closed",
+    "test_required_and_manifest_listed_files_fail_closed_when_missing",
+    "test_required_root_fails_before_zip_on_windows_and_unix",
+    "test_scripts_consume_only_the_shared_manifest_helper_staging_contract",
+    "test_unknown_files_in_every_managed_root_fail_before_staging",
+)
+_STANDALONE_PACKAGING_PROTOCOL = b"windows-standalone-packaging-verbose-unittest-duration-v1"
+_STANDALONE_PACKAGING_REPORTERS = {
+    "windows": (b"\r\n", _STANDALONE_PACKAGING_PROTOCOL),
+    "ubuntu": (b"\n", b"ubuntu-standalone-packaging-verbose-unittest-duration-v1"),
+}
+
+
+@dataclass(frozen=True)
+class _StandalonePackagingReporter:
+    prefix: bytes
+    suffix: bytes
+    duration_span: tuple[int, int]
+    platform: str = "windows"
+
+
+def _parse_standalone_packaging_stderr(stderr, *, platform="windows"):
+    """Recognize the complete, byte-exact reporter for the bound platform."""
+    if type(stderr) is not bytes or len(stderr) > MAX_EVIDENCE_STRING_BYTES:
+        raise ValueError("standalone reporter bytes unavailable or oversized")
+    if platform not in _STANDALONE_PACKAGING_REPORTERS:
+        raise ValueError("standalone reporter platform is unavailable")
+    newline, _ = _STANDALONE_PACKAGING_REPORTERS[platform]
+    stderr.decode("utf-8", errors="strict")
+    prefix = b"".join(
+        f"{name} (__main__.StandalonePackagingTest.{name}) ... ok".encode("ascii") + newline
+        for name in _STANDALONE_PACKAGING_METHODS
+    ) + newline + b"-" * 70 + newline + b"Ran 18 tests in "
+    suffix = b"s" + newline + newline + b"OK" + newline
+    if not stderr.startswith(prefix) or not stderr.endswith(suffix):
+        raise ValueError("standalone verbose reporter grammar differs")
+    start, end = len(prefix), len(stderr) - len(suffix)
+    # Only after exact ordered membership, framing and EOF are established is
+    # the one remaining field examined. Never substitute/search across stderr.
+    if end <= start or re.fullmatch(rb"[0-9]+\.[0-9]{3}", stderr[start:end]) is None:
+        raise ValueError("standalone footer duration grammar differs")
+    return _StandalonePackagingReporter(stderr[:start], stderr[end:], (start, end), platform)
+
+
+def _standalone_packaging_semantic_identity(reporter):
+    """Length-frame exact retained bytes and the explicit protocol identity."""
+    if type(reporter) is not _StandalonePackagingReporter:
+        raise ValueError("standalone reporter is unavailable")
+    _, protocol = _STANDALONE_PACKAGING_REPORTERS[reporter.platform]
+    digest = hashlib.sha256()
+    for segment in (protocol, reporter.prefix, reporter.suffix):
+        digest.update(len(segment).to_bytes(8, "big"))
+        digest.update(segment)
+    return {
+        "protocol": protocol.decode("ascii"),
+        "prefixHex": reporter.prefix.hex(),
+        "suffixHex": reporter.suffix.hex(),
+        "identityDigest": "sha256:" + digest.hexdigest(),
+    }
+
+
+@dataclass(frozen=True)
+class _StandalonePortableProducer:
+    validation: _ObservationValidation
+    admissions: tuple
+    ordinal: int
+
+
+@dataclass(frozen=True)
+class _StandalonePortablePair:
+    ordinal: int
+    producer_stderr: bytes
+    replay_stderr: bytes
+    authority_seal: bytes
+    platform: str = "windows"
+
+
+def _bind_standalone_portable_producer(validation):
+    """Hold the already validated ordinary evidence; never acquire other bytes."""
+    try:
+        admissions = _admit_standalone_observations(validation)
+        slots = [index for index, item in enumerate(validation.plan)
+                 if item["commandId"] == "standalone-packaging"]
+        if len(admissions) != 1 or len(slots) != 1:
+            return None
+        return _StandalonePortableProducer(validation, admissions, slots[0])
+    except (OSError, AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _standalone_packaging_runtime_binding(closure, guard, runtime, record):
+    errors = []
+    _validate_runtime_dependency_closure(closure, guard, runtime,
+        profile="all", status="PASS", errors=errors)
+    runner_os, _, _, _, watcher = _STANDALONE_EXECUTION_PLATFORMS[record["platform"]]
+    if (errors or closure["measurementStatus"] != "measured-complete"
+            or closure["runnerOS"] != runner_os or guard["active"] is not False
+            or guard["watcherBackend"] != watcher):
+        raise ValueError("standalone runtime closure is not current")
+    python = closure["pythonExecutable"]
+    if (python.get("role") != "python-verifier" or python.get("leaseHeld") is not True
+            or type(python.get("size")) is not int or python["size"] <= 0
+            or not isinstance(python.get("stableIdentity"), dict)
+            or python["stableIdentity"].get("reparsePoint") is not False
+            or record["resolvedExecutablePath"] != python["canonicalPath"]
+            or record["resolvedExecutableSize"] != python["size"]
+            or record["resolvedExecutableSha256"] != python["sha256"]
+            or record["executionArgv"] != [python["canonicalPath"], "-B",
+                                          "developer/tests/ci/test_standalone_packaging.py"]):
+        raise ValueError("standalone Python tool does not bind the executed command")
+    # Physical tool identities are checked locally. Existing portable command
+    # authority binds the executable content; all runtime versions/dependencies
+    # and every nonphysical tool field must additionally agree across jobs.
+    tools = {}
+    for key in ("pythonExecutable", "nodeExecutable", "npmEntrypoint", "gitExecutable"):
+        tool = closure[key]
+        if tool is None and key == "gitExecutable":
+            tools[key] = None
+            continue
+        if (not isinstance(tool, dict) or tool.get("leaseHeld") is not True
+                or type(tool.get("size")) is not int or tool["size"] <= 0
+                or not isinstance(tool.get("stableIdentity"), dict)
+                or tool["stableIdentity"].get("reparsePoint") is not False):
+            raise ValueError("standalone runtime tool lease is invalid")
+        tools[key] = {name: value for name, value in tool.items()
+                      if name not in {"canonicalPath", "stableIdentity"}}
+    return _observation_bytes({
+        "runtime": {key: value for key, value in runtime.items() if key != "runtimeClosureDigest"},
+        "tools": tools, "dependencyClosureDigest": closure["dependencyClosureDigest"],
+        "guard": guard,
+    })
+
+
+def _bind_standalone_portable_replay(producer):
+    """Recheck held admission, complete fresh authority and exact raw capture."""
+    try:
+        if type(producer) is not _StandalonePortableProducer:
+            return None
+        validation, ordinal = producer.validation, producer.ordinal
+        runner, context = validation.runner, validation.context
+        if (_observation_authority_for_runner(runner, context) is None
+                or runner.platform not in _STANDALONE_EXECUTION_PLATFORMS
+                or context.runner_os != _STANDALONE_EXECUTION_PLATFORMS[runner.platform][0]
+                or runner.runtime_closure_digest != context.fresh_runtime_closure_digest):
+            return None
+        source = validation.records[ordinal]
+        raw, = source["producerObservations"]
+        if not _matching_observation_admission(producer.admissions, raw, source,
+                records=validation.records, plan=runner.command_plan):
+            return None
+        records, errors = _preflight_command_record_positions(runner.command_results, runner.command_plan)
+        if errors or _command_authority_violations(runner.profile, records, runner.observations,
+                                                   expected_plan=runner.command_plan):
+            return None
+        for index, record in enumerate(records):
+            _validate_command_record(record, index, errors, expected_record=runner.command_plan[index])
+        if errors or runner.violations or any(r.get("status") != "pass" for r in runner.hard_gate_results):
+            return None
+        replay = records[ordinal]
+        captures = [capture for capture in runner.captures if capture.command_id == "standalone-packaging"]
+        if len(captures) != 1 or type(captures[0]) is not CommandCapture:
+            return None
+        capture = captures[0]
+        if (capture.target_execution_lease is not None or not capture.execution_passed()
+                or capture.error is not None or capture.process_tree_error is not None
+                or capture.limit_reason is not None):
+            return None
+        # Both records are still local authority, not reporter projections.
+        for record in (source, replay):
+            if (record["commandId"] != "standalone-packaging"
+                    or record["commandClass"] != "standalone-packaging"
+                    or record["toolRole"] != "python-standalone-test"
+                    or record["platform"] != runner.platform or record["profile"] != "all"
+                    or record["executionInputMode"] != "PROTECTED-TARGET-BUNDLE"
+                    or record["actualExecutionInputMode"] != "PROTECTED-TARGET-BUNDLE"
+                    or not _required_command_execution_passed(record)
+                    or type(record["exitCode"]) is not int or record["exitCode"] != 0
+                    or record["containment"] != _STANDALONE_EXECUTION_PLATFORMS[runner.platform][3]
+                    or record["processTreeStatus"] != "contained-clean"
+                    or any(type(record[key]) is not int or not 0 <= record[key] <= 4096
+                           for key in ("descendantsObserved", "descendantsReaped",
+                                       "descendantsTerminated", "descendantsSurviving"))
+                    or record["descendantsTerminated"] != 0 or record["descendantsSurviving"] != 0
+                    or any(record.get(key) is not None for key in ("error", "processTreeError", "limitReason"))):
+                return None
+            if runner.platform == "windows":
+                if (record["containmentDisposition"] != "no-descendants"
+                        or record["descendantsObserved"] != 0 or record["descendantsReaped"] != 0):
+                    return None
+            # The trusted Linux supervisor emits natural-exit-reaped only when
+            # neither TERM nor KILL was sent. contained-clean additionally binds
+            # cleanupOk/cleanupComplete; exitCode is its unforced rootExitCode.
+            # Each execution must prove its own complete observed/reaped set.
+            elif (record["containmentDisposition"] != "natural-exit-reaped"
+                    or record["descendantsObserved"] <= 0
+                    or record["descendantsObserved"] != record["descendantsReaped"]):
+                return None
+        expected = runner.command_plan[ordinal]
+        if (_portable_command_plan_value([{key: source[key] for key in expected}])
+                != _portable_command_plan_value([expected])):
+            return None
+        source_bundle = _validated_portable_protected_input_bundle_digest(source)
+        if source_bundle is None or source_bundle != _validated_portable_protected_input_bundle_digest(replay):
+            return None
+        commands = validation.documents["command-results.json"]
+        producer_runtime = _standalone_packaging_runtime_binding(commands["runtimeDependencyClosure"],
+            commands["runtimeDependencyGuard"], commands["runtime"], source)
+        replay_runtime = _standalone_packaging_runtime_binding(runner.runtime_closure_document,
+            runner.runtime_closure_guard_evidence, runner.runtime, replay)
+        if (producer_runtime != replay_runtime
+                or runner.runtime_closure_document["closureDigest"] != runner.runtime_closure_digest
+                or runner.runtime_closure_document["dependencyClosureDigest"] != runner.dependency_closure_digest):
+            return None
+        streams = []
+        for stream in ("stdout", "stderr"):
+            exact = raw["rawStructuredFields"][stream].encode("utf-8", errors="strict")
+            fresh = getattr(capture, stream + "_raw")
+            if (type(fresh) is not bytes or len(fresh) != getattr(capture, stream + "_bytes")
+                    or len(fresh) > min(replay[stream + "ByteLimit"], MAX_EVIDENCE_STRING_BYTES)):
+                return None
+            for record, data in ((source, exact), (replay, fresh)):
+                if (len(data) != record[stream + "BytesObserved"]
+                        or hashlib.sha256(data).hexdigest() != record[stream + "Sha256"]):
+                    return None
+            if stream == "stdout" and (exact != b"" or fresh != b""):
+                return None
+            streams.append((exact, fresh))
+        replay_raw, = replay["producerObservations"]
+        if (_validate_raw_observation_structure(replay_raw, label="standalone replay", source=replay)
+                or replay_raw["rawStructuredFields"] != {
+                    "executed": True, "exitCode": 0, "stdout": "",
+                    "stderr": streams[1][1].decode("utf-8", errors="strict"), "error": None}
+                or any(replay_raw[key] != raw[key] for key in raw
+                       if key not in {"rawStructuredFields", "sourceOutputDigest", "producerRecordDigest"})):
+            return None
+        runner_added = {"executionInputs", "executionInputBundleDigest", "protectedTargetBundle",
+                        "producerObservations", "producerObservationSetDigest", "completedCommandClass"}
+        if any(replay.get(key) != value for key, value in capture.evidence().items() if key not in runner_added):
+            return None
+        seal = _observation_bytes({
+            "records": records, "observations": runner.observations,
+            "plan": runner.command_plan, "runtime": runner.runtime,
+            "closure": runner.runtime_closure_document, "guard": runner.runtime_closure_guard_evidence,
+            "capture": capture.evidence(), "context": vars(context),
+            "producerAdmission": producer.admissions[0].validation.hex(),
+        })
+        return _StandalonePortablePair(ordinal, *streams[1], seal, runner.platform)
+    except (OSError, AttributeError, IndexError, KeyError, TypeError, ValueError, UnicodeError, OverflowError):
+        return None
+
+
+def _derive_standalone_packaging_equal_result(pair):
+    """Parse both complete reporters before computing either semantic identity."""
+    try:
+        if type(pair) is not _StandalonePortablePair:
+            return None
+        parser = globals().get("_parse_standalone_packaging_stderr")
+        identity = globals().get("_standalone_packaging_semantic_identity")
+        if not callable(parser) or not callable(identity):
+            return None
+        reporters = [parser(data, platform=pair.platform) for data in (pair.producer_stderr, pair.replay_stderr)]
+        if any(type(reporter) is not _StandalonePackagingReporter for reporter in reporters):
+            return None
+        identities = [identity(reporter) for reporter in reporters]
+        return identities[0] if identities[0] == identities[1] else None
+    except (AttributeError, TypeError, ValueError, UnicodeError, OverflowError):
+        return None
+
+
+def _standalone_packaging_comparison_views(documents, runner, prior_views, pair, result):
+    """Compose an ephemeral 702 comparison with any existing backend view."""
+    views = copy.deepcopy(prior_views) if prior_views is not None else {}
+    encoded = _observation_bytes(result)
+    for side, records in (("producer", documents["command-results.json"]["records"]),
+                          ("replay", runner.command_results)):
+        projected = (views[side]["records"] if side in views else
+                     [_canonical_transcript_record(record) for record in records])
+        record = projected[pair.ordinal]
+        if pair.platform == "ubuntu":
+            # Only the pair bound above can reach this private comparison view.
+            # Raw sampled counts, cleanup, authority and streams remain retained.
+            for key in ("descendantsObserved", "descendantsReaped"):
+                record[key] = "<VALIDATED-NATURALLY-REAPED-COUNT>"
+        record["stderrSha256"] = hashlib.sha256(encoded).hexdigest()
+        record["stderrBytesObserved"] = len(encoded)
+        observation = copy.deepcopy(records[pair.ordinal]["producerObservations"][0])
+        observation["rawStructuredFields"]["stderr"] = copy.deepcopy(result)
+        observation["sourceOutputDigest"] = result["identityDigest"]
+        observation["producerRecordDigest"] = _producer_record_digest({
+            key: value for key, value in observation.items() if key != "producerRecordDigest"})
+        record["producerObservations"] = [observation]
+        record["producerObservationSetDigest"] = producer_observation_set_digest([observation])
+        universe = producer_observation_universe(records)
+        for index, (item, command) in enumerate(zip(universe, projected)):
+            if index == pair.ordinal or (prior_views is not None
+                                          and command["commandId"] == "backend-canonical"):
+                for key in ("producerObservations", "producerObservationSetDigest"):
+                    item[key] = command[key]
+        universe_digest = canonical_failure_digest(universe)
+        classes = runner.actual_completed_command_classes
+        transcript_digest = canonical_failure_digest({
+            "commandPlanDigest": runner.command_plan_digest, "orderedCommandTranscript": projected,
+            "orderedProducerObservationUniverse": universe,
+            "producerObservationUniverseDigest": universe_digest,
+            "completedCommandClasses": sorted(set(classes)),
+            "completedCommandClassSetDigest": completed_command_class_set_digest(classes),
+        })
+        views[side] = {"records": projected, "producerObservationUniverseDigest": universe_digest,
+                       "producerTranscriptDigest": transcript_digest}
+    return views
+
+
+_BACKEND_PORTABLE_UNAVAILABLE = (
+    "verification replay backend-canonical portable result unavailable or mismatched"
+)
+
+
+class _BackendPortableVerifierUnavailable(ValueError):
+    """A bounded failure at the frozen backend implementation boundary."""
+
+
+@contextmanager
+def _frozen_backend_portable_verifier(
+    verification_runner: FoundationRunner,
+    expected_context: ExternallyExpectedVerificationContext,
+    *,
+    repo_root: Path,
+):
+    """Execute only cross-bound held source bytes; keep their lease through use."""
+
+    relative = "developer/tests/ci/backend_canonical_portable_result.py"
+    lease = module = None
+    module_name = None
+    registered = False
+    try:
+        try:
+            authority = None
+            for command in verification_runner.command_plan:
+                members = [target for target in command["targets"] if target.get("path") == relative]
+                if len(members) > 1:
+                    raise ValueError("duplicate backend source target")
+                if members:
+                    target = members[0]
+                    if authority is None:
+                        authority = copy.deepcopy(target)
+                    elif _canonical_frame(target) != _canonical_frame(authority):
+                        raise ValueError("conflicting backend source targets")
+            if (
+                authority is None
+                or set(authority) != {"path", "canonicalSourcePath", "size", "sha256",
+                                      "fileIdentity", "modeType", "reparsePoint"}
+                or type(authority["size"]) is not int
+                or not 0 < authority["size"] <= MAX_SCANNED_FILE_BYTES
+                or not isinstance(authority["sha256"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", authority["sha256"]) is None
+                or not isinstance(authority["fileIdentity"], dict)
+                or not isinstance(authority["canonicalSourcePath"], str)
+                or not authority["canonicalSourcePath"]
+                or authority["modeType"] != "regular-file"
+                or authority["reparsePoint"] is not False
+                or command_plan_digest(verification_runner.command_plan) != expected_context.command_plan_digest
+            ):
+                raise ValueError("backend source target authority unavailable")
+            trust_records, trust_digest = ci_trust_file_set_authority(
+                git=_runner_required_tool(verification_runner, "git", phase="EXECUTION_BINDING"),
+                environment=verification_runner.child_environment,
+                repo_root=repo_root,
+            )
+            members = [record for record in trust_records if record.get("relativePath") == relative]
+            if (trust_digest != expected_context.trust_file_digest or len(members) != 1
+                    or members[0].get("byteLength") != authority["size"]
+                    or members[0].get("sha256") != authority["sha256"]):
+                raise ValueError("backend source trust and target authority disagree")
+            lease = TargetExecutionLease(
+                authority, repo_root=repo_root, execution_adapter="PROTECTED-TARGET-BUNDLE")
+            source_bytes = lease.materialize()
+            if (type(source_bytes) is not bytes or len(source_bytes) != authority["size"]
+                    or hashlib.sha256(source_bytes).hexdigest() != authority["sha256"]):
+                raise ValueError("backend source materialization differs from authority")
+            module_name = "_ci_backend_portable_" + authority["sha256"] + "_" + uuid.uuid4().hex
+            module = ModuleType(module_name)
+            module.__file__ = relative
+            if sys.modules.setdefault(module_name, module) is not module:
+                raise ValueError("backend source module namespace collision")
+            registered = True
+            code = compile(source_bytes, relative, "exec", dont_inherit=True)
+            exec(code, module.__dict__)
+            if any(not callable(getattr(module, name, None)) for name in (
+                    "_bind_producer", "_bind_replay", "_derive_equal_result", "_comparison_views")):
+                raise ValueError("backend source acceptance implementation unavailable")
+            yield module
+        finally:
+            try:
+                if lease is not None and not lease.verify()[0]:
+                    raise ValueError("backend source post-use verification failed")
+                if registered and sys.modules.get(module_name) is not module:
+                    raise ValueError("backend source module namespace changed")
+            finally:
+                try:
+                    if registered and sys.modules.get(module_name) is module:
+                        del sys.modules[module_name]
+                finally:
+                    if lease is not None:
+                        lease.close()
+    except Exception:
+        # Neither source paths nor exception text become public diagnostics.
+        raise _BackendPortableVerifierUnavailable(_BACKEND_PORTABLE_UNAVAILABLE) from None
+
+
 def verify_evidence_with_replay(
     output_dir: Path = OUTPUT_DIR,
     *,
@@ -20464,55 +24396,224 @@ def verify_evidence_with_replay(
         return ["verification runner release authority differs from external expected context"], None
     if verification_runner.command_plan_digest != expected_context.command_plan_digest:
         return ["verification runner command plan differs from external expected context"], None
-    errors = verify_evidence_file_set(
+    observation_authority = _observation_authority_for_runner(verification_runner, expected_context)
+    initial_snapshots = None
+    if observation_authority is not None:
+        # Retain the first exact snapshot across both existing validation stages.
+        # A coherently resealed replacement is still a change, not fresh authority.
+        try:
+            initial_root_identity = _stat_identity(output_dir.lstat())
+        except OSError as exc:
+            return ["evidence directory identity unavailable: " + type(exc).__name__], None
+        _, initial_snapshots, initial_errors = _read_evidence_documents_for_replay(output_dir)
+        if initial_errors:
+            return initial_errors, None
+    file_verifier = _verify_evidence_file_set if observation_authority is not None else verify_evidence_file_set
+    private = {"observation_runner": verification_runner} if observation_authority is not None else {}
+    errors = file_verifier(
         output_dir,
         repo_root=evidence_authority_root or repo_root,
         expected_command_plan=verification_runner.command_plan,
         expected_context=expected_context,
+        **private,
     )
     if errors:
         return errors, None
     documents, snapshots, snapshot_errors = _read_evidence_documents_for_replay(output_dir)
     if snapshot_errors:
         return snapshot_errors, None
+    if initial_snapshots is not None:
+        try:
+            root_unchanged = _stat_identity(output_dir.lstat()) == initial_root_identity
+        except OSError:
+            root_unchanged = False
+        if initial_snapshots != snapshots or not root_unchanged:
+            return ["evidence changed between first and second verification snapshots"], None
+    records, positional_errors = _preflight_command_record_positions(
+        documents["command-results.json"].get("records"), verification_runner.command_plan)
+    if positional_errors:
+        return positional_errors, None
+    backend_plan = (
+        expected_context.expected_profile in {"backend", "all"}
+        and any(record.get("commandId") == "backend-canonical"
+                for record in verification_runner.command_plan)
+    )
+    if backend_plan or observation_authority is not None or _has_standalone_observation(
+            records, documents["command-results.json"].get("observations", []),
+            verification_runner.command_plan):
+        # The replay reader takes a second snapshot. Validate the exact documents
+        # used below, not merely the earlier file-set validation's snapshots.
+        errors.extend(validate_evidence_root(output_dir, repo_root=evidence_authority_root or repo_root))
+        try:
+            if {entry.name for entry in os.scandir(output_dir)} != set(EVIDENCE_FILE_NAMES):
+                errors.append("evidence file membership changed before backend binding")
+        except OSError as exc:
+            errors.append(f"evidence directory cannot be enumerated: {type(exc).__name__}")
+        if errors:
+            return sorted(set(errors)), None
+        semantic_verifier = (_validate_evidence_semantics_with_authority
+                             if observation_authority is not None else _validate_evidence_semantics)
+        private = ({"observation_runner": verification_runner, "observation_root": output_dir}
+                   if observation_authority is not None else {})
+        errors.extend(semantic_verifier(documents, snapshots,
+            expected_command_plan=verification_runner.command_plan,
+            expected_context=expected_context, **private))
+        if errors:
+            return sorted(set(errors)), None
     if documents.get("summary.json", {}).get("status") != "PASS":
         return [], None
-    transcript, replay_errors = run_verification_replay(
-        documents,
-        expected_context=expected_context,
-        verification_runner=verification_runner,
-        repo_root=repo_root,
+    # Select from validated ordinary evidence, never a caller-supplied preimage.
+    # Nonpassing backend results keep their existing exact replay comparison.
+    backend_portability = backend_plan and any(
+        record["commandId"] == "backend-canonical" and record["exitCode"] == 0
+        for record in documents["command-results.json"]["records"]
     )
-    errors.extend(replay_errors)
-    if transcript is not None and transcript.get("finalAcceptance") != "PASS":
-        errors.append(
-            "verification replay lacks a PASS ReplayAuthorizationEnvelope"
-        )
+    packaging_portability = observation_authority is not None and any(
+        planned["commandId"] == "standalone-packaging" for planned in verification_runner.command_plan)
+    packaging_context = (_bind_standalone_portable_producer(_ObservationValidation(
+        verification_runner, expected_context, records, verification_runner.command_plan,
+        documents, snapshots, output_dir)) if packaging_portability else None)
+    deferred_portability = backend_portability or packaging_portability
     try:
-        rebuilt_context = rebuild_external_verification_context(
-            expected_context,
-            verification_runner,
-            repo_root=repo_root,
-        )
-    except (OSError, ValueError) as exc:
-        errors.append(
-            f"verification replay external context could not be revalidated: {type(exc).__name__}: {sanitize_text(str(exc))}"
-        )
-    else:
-        if rebuilt_context != expected_context:
-            errors.append("verification replay external context changed during replay")
-    for name, original in snapshots.items():
-        current, current_errors = _read_evidence_file_snapshot(
-            output_dir / name,
-            output_dir=output_dir,
-            byte_limit=EVIDENCE_FILE_BYTE_LIMITS[name],
-        )
-        errors.extend(f"{name}: {error}" for error in current_errors)
-        if current is not None and (
-            current.identity != original.identity or current.data != original.data
-        ):
-            errors.append(f"{name}: evidence changed during verification replay")
-    return sorted(set(errors)), transcript
+        with (_frozen_backend_portable_verifier(verification_runner, expected_context, repo_root=repo_root)
+              if backend_portability else nullcontext()) as backend_portable:
+            bound_pair = packaging_pair = None
+            comparison = None
+            if not deferred_portability:
+                replay_operation = _run_verification_replay if observation_authority is not None else run_verification_replay
+                transcript, replay_errors = replay_operation(
+                    documents, expected_context=expected_context,
+                    verification_runner=verification_runner, repo_root=repo_root,
+                )
+            else:
+                if backend_portability:
+                    unavailable = _BACKEND_PORTABLE_UNAVAILABLE
+                    backend_context = backend_portable._bind_producer(
+                        sys.modules[__name__], documents["command-results.json"],
+                        verification_runner.command_plan, repo_root,
+                    )
+                    if backend_context is None:
+                        return [unavailable], None
+                comparison, replay_errors = _execute_verification_replay(
+                    expected_context=expected_context, verification_runner=verification_runner,
+                    repo_root=repo_root,
+                )
+                transcript = None
+                if comparison is not None:
+                    if backend_portability:
+                        bound_pair = backend_portable._bind_replay(
+                            sys.modules[__name__], backend_context,
+                            documents["command-results.json"], verification_runner,
+                        )
+                        if bound_pair is None:
+                            replay_errors.append(unavailable)
+                    # Authority, execution state and cleanup remain ahead of parsing.
+                    # Semantic inequality in another command is collected afterward.
+                    try:
+                        transcript, comparison_errors = _verification_replay_eligibility(
+                            documents, verification_runner, comparison,
+                        )
+                    except (OSError, AttributeError, KeyError, TypeError, ValueError) as exc:
+                        return sorted(set(replay_errors + [
+                            "verification replay authority finalization failed: " + type(exc).__name__])), None
+                    replay_errors.extend(comparison_errors)
+                    transcript, replay_errors = _finish_verification_replay(
+                        transcript, replay_errors, expected_context=expected_context,
+                        runner=verification_runner,
+                    )
+                    if packaging_portability and not replay_errors:
+                        # Freeze only the completed replay, after its ordinary finalizer
+                        # has rebound observation context and cleanup has succeeded.
+                        packaging_pair = _bind_standalone_portable_replay(packaging_context)
+            errors.extend(replay_errors)
+            if transcript is not None and transcript.get("finalAcceptance") != "PASS":
+                errors.append(
+                    "verification replay lacks a PASS ReplayAuthorizationEnvelope"
+                )
+            try:
+                rebuilt_context = rebuild_external_verification_context(
+                    expected_context,
+                    verification_runner,
+                    repo_root=repo_root,
+                )
+            except (OSError, ValueError) as exc:
+                errors.append(
+                    f"verification replay external context could not be revalidated: {type(exc).__name__}: {sanitize_text(str(exc))}"
+                )
+            else:
+                if rebuilt_context != expected_context:
+                    errors.append("verification replay external context changed during replay")
+            for name, original in snapshots.items():
+                current, current_errors = _read_evidence_file_snapshot(
+                    output_dir / name,
+                    output_dir=output_dir,
+                    byte_limit=EVIDENCE_FILE_BYTE_LIMITS[name],
+                )
+                errors.extend(f"{name}: {error}" for error in current_errors)
+                if current is not None and (
+                    current.identity != original.identity or current.data != original.data
+                ):
+                    errors.append(f"{name}: evidence changed during verification replay")
+            if deferred_portability:
+                # Evidence/context/cleanup and authority eligibility precede parsing.
+                try:
+                    if {entry.name for entry in os.scandir(output_dir)} != set(EVIDENCE_FILE_NAMES):
+                        errors.append("evidence file membership changed during verification replay")
+                except OSError as exc:
+                    errors.append(f"evidence directory cannot be re-enumerated: {type(exc).__name__}")
+                result = packaging_result = None
+                packaging_rebound = None
+                if not errors and packaging_pair is not None:
+                    packaging_rebound = _bind_standalone_portable_replay(packaging_context)
+                    if packaging_rebound != packaging_pair:
+                        errors.append("verification replay standalone-packaging authority changed")
+                if not errors and backend_portability and bound_pair is not None:
+                    rebound = backend_portable._bind_replay(
+                        sys.modules[__name__], backend_context,
+                        documents["command-results.json"], verification_runner,
+                    )
+                    if rebound != bound_pair:
+                        errors.append(unavailable)
+                    else:
+                        result = backend_portable._derive_equal_result(sys.modules[__name__], rebound)
+                        if result is None:
+                            errors.append(unavailable)
+                if not errors and packaging_rebound is not None:
+                    packaging_result = _derive_standalone_packaging_equal_result(packaging_rebound)
+                if packaging_portability and packaging_result is None:
+                    errors.append("verification replay standalone-packaging portable result unavailable or mismatched")
+                if comparison is not None:
+                    # A backend record loses its raw difference only after both full
+                    # results were derived and compared equal. Every unavailable or
+                    # unequal result retains the raw comparison, even on another error.
+                    views = (backend_portable._comparison_views(sys.modules[__name__], rebound, result)
+                             if result is not None else None)
+                    if packaging_result is not None:
+                        views = _standalone_packaging_comparison_views(
+                            documents, verification_runner, views, packaging_rebound, packaging_result)
+                    try:
+                        collection_views = (_replay_collection_comparison_views(
+                            documents, verification_runner, comparison, views) if not errors else None)
+                        transcript, comparison_errors = _compare_verification_replay_claims(
+                            documents, verification_runner, comparison, comparison_views=views,
+                            collection_views=collection_views,
+                        )
+                    except (OSError, AttributeError, KeyError, TypeError, ValueError) as exc:
+                        return sorted(set(errors + [
+                            "verification replay comparison authority became unavailable: " + type(exc).__name__])), None
+                    errors.extend(comparison_errors)
+                    if result is not None and not errors:
+                        transcript["backendCanonicalPortableResult"] = result
+                    transcript, errors = _finish_verification_replay(
+                        transcript, errors, expected_context=expected_context,
+                        runner=verification_runner,
+                    )
+                if errors and transcript is not None:
+                    transcript.pop("backendCanonicalPortableResult", None)
+                    transcript["finalAcceptance"] = "REJECT"
+            return sorted(set(errors)), transcript
+    except _BackendPortableVerifierUnavailable:
+        return [_BACKEND_PORTABLE_UNAVAILABLE], None
 
 
 def render_markdown_text(value: Any) -> str:
@@ -20811,17 +24912,7 @@ def write_evidence(
         raise RuntimeError("; ".join(sorted(set(binding_errors))))
     observations = list(getattr(runner, "observations", []))
     completed_command_classes = sorted(set(getattr(runner, "completed_classes", set())))
-    comparison = derive_authoritative_evidence(
-        runner.profile,
-        observations,
-        completed_command_classes,
-        runner.command_results,
-        runner.baseline,
-        runner.platform,
-        runner.command_plan,
-        getattr(runner, "authorization_context_binding_digest", None),
-        release_gate_required=runner.release_gate_required,
-    )
+    comparison = _derive_runner_authoritative_evidence(runner)
     existing_violation_keys = {
         json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         for item in runner.violations
@@ -21143,10 +25234,13 @@ def write_evidence(
         )
     if active_containment_count() != 0:
         raise RuntimeError("repository-controlled process containment became active before evidence verification")
-    verification_errors = verify_evidence_file_set(
-        output_dir,
-        repo_root=evidence_authority_root,
-        expected_command_plan=runner.command_plan,
+    context = getattr(runner, "external_verification_context", None)
+    capability = _observation_authority_for_runner(runner, context)
+    file_verifier = _verify_evidence_file_set if capability is not None else verify_evidence_file_set
+    private = {"observation_runner": runner, "expected_context": context} if capability is not None else {}
+    verification_errors = file_verifier(
+        output_dir, repo_root=evidence_authority_root,
+        expected_command_plan=runner.command_plan, **private,
     )
     if verification_errors:
         raise RuntimeError("; ".join(verification_errors))
@@ -21327,6 +25421,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--expected-runner-os",
         "--expected-invocation-id",
         "--untrusted-evidence-root",
+        "--require-replay-pass",
         "--release-authoritative",
     ):
         occurrences = sum(
@@ -21365,6 +25460,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--untrusted-evidence-root")
     parser.add_argument("--require-linux-containment-self-test", action="store_true")
     parser.add_argument("--require-fresh-runtime-closure", action="store_true")
+    parser.add_argument(
+        "--require-replay-pass", action="store_true",
+        help="Require an accepted fresh replay for evidence-verifier success.",
+    )
     try:
         args = parser.parse_args(selected_argv)
     except argparse.ArgumentError as exc:
@@ -21390,6 +25489,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     elif any(value is not None for value in expected_options) or (
         args.require_linux_containment_self_test
         or args.require_fresh_runtime_closure
+        or args.require_replay_pass
     ):
         raise ValueError("expected verification context options require --verify-evidence")
     return args
@@ -21495,6 +25595,7 @@ def prepare_verification_authority(
     runner.authorization_context_binding_digest = authorization_context_binding_digest(
         runner.authorization_context_binding
     )
+    _prepare_verifier_observation_authority(runner, context, external_authority)
     return context, runner
 
 
@@ -21511,7 +25612,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_SUCCESS
     source_environment = dict(os.environ)
     try:
-        external_authority = capture_live_external_authority(source_environment)
+        external_authority = capture_live_external_authority()
     except ValueError as exc:
         print(
             "CI foundation external-authority configuration error: "
@@ -21586,6 +25687,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("CI foundation evidence verification failed:", file=sys.stderr)
             for error in verification_errors:
                 print(f"- {sanitize_text(error)}", file=sys.stderr)
+            return EXIT_POLICY_VIOLATION
+        if args.require_replay_pass and (
+            not isinstance(replay_transcript, Mapping)
+            or replay_transcript.get("finalAcceptance") != "PASS"
+        ):
+            print(
+                "CI foundation evidence verification failed: required fresh replay gate=REJECT",
+                file=sys.stderr,
+            )
             return EXIT_POLICY_VIOLATION
         replay_status = "PASS" if replay_transcript is not None else "NOT-REQUIRED"
         print(

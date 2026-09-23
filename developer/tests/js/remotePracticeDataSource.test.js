@@ -692,25 +692,10 @@ async function testRemoteApiClientHandlesTotpFlow() {
                 }
             };
         }
-        if (url === '/api/auth/totp/disable') {
-            const body = JSON.parse(options.body);
-            assert.strictEqual(body.password, 'StrongPass1');
-            assert.strictEqual(body.token, '123456');
-            return {
-                status: 200,
-                ok: true,
-                async text() {
-                    return JSON.stringify({
-                        user: { id: 'user-1', username: 'alice' },
-                        csrfToken: 'csrf-after-disable',
-                        status: { enabled: false, recoveryCodesRemaining: 0 }
-                    });
-                }
-            };
-        }
         throw new Error(`unexpected fetch: ${url}`);
     });
     const apiClient = new window.ExamData.RemoteApiClient();
+    assert.strictEqual(typeof apiClient.disableTotp, 'undefined');
 
     const passwordStep = await apiClient.login('alice', 'StrongPass1');
     assert.strictEqual(passwordStep.requiresTotp, true);
@@ -733,10 +718,6 @@ async function testRemoteApiClientHandlesTotpFlow() {
     assert.strictEqual(apiClient.csrfToken, 'csrf-after-setup');
     const regenerated = await apiClient.regenerateTotpRecoveryCodes();
     assert.deepStrictEqual(regenerated.recoveryCodes, ['CCCC-DDDD']);
-    const disabled = await apiClient.disableTotp('StrongPass1', '123456');
-    assert.strictEqual(disabled.enabled, false);
-    assert.strictEqual(apiClient.csrfToken, 'csrf-after-disable');
-    assert.strictEqual(apiClient.user.username, 'alice');
 
     assert(fetchCalls.some(([url]) => url === '/api/auth/totp/login'));
     assert(fetchCalls.some(([url]) => url === '/api/auth/totp/verify-setup'));

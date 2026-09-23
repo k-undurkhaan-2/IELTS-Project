@@ -1438,7 +1438,41 @@ def _run_json_subprocess(
     return True, payload
 
 
-def run_checks() -> Tuple[List[dict], bool]:
+def _check_standalone_release_manifest_security_tests(
+    *, machine_mode: bool = False,
+) -> Tuple[bool, dict]:
+    standalone_packaging_test = REPO_ROOT / "developer" / "tests" / "ci" / "test_standalone_packaging.py"
+    try:
+        standalone_completed = subprocess.run(
+            [sys.executable, str(standalone_packaging_test)],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=900,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        standalone_output_lines = (
+            (standalone_completed.stdout or "") + (standalone_completed.stderr or "")
+        ).splitlines()
+        passed = type(standalone_completed.returncode) is int and standalone_completed.returncode == 0
+        detail = {"returnCode": standalone_completed.returncode}
+        # Successful machine semantics bind the test execution result. The tail
+        # remains useful to humans and for every non-successful execution.
+        if not (machine_mode and passed):
+            detail["outputTail"] = standalone_output_lines[-80:]
+        return passed, detail
+    except subprocess.TimeoutExpired as exc:
+        return False, {
+            "error": "standalone packaging security tests timed out",
+            "timeoutSeconds": 900,
+            "stdoutTail": (exc.stdout or "").splitlines()[-40:] if isinstance(exc.stdout, str) else [],
+            "stderrTail": (exc.stderr or "").splitlines()[-40:] if isinstance(exc.stderr, str) else [],
+        }
+
+
+def run_checks(*, machine_mode: bool = False) -> Tuple[List[dict], bool]:
     results: List[dict] = []
     all_passed = True
 
@@ -1484,34 +1518,9 @@ def run_checks() -> Tuple[List[dict], bool]:
     release_script_passed, release_script_detail = _check_release_script_runtime_guards(REPO_ROOT / "developer" / "release.sh")
     results.append(_format_result("Release 脚本运行时守卫", release_script_passed, release_script_detail))
     all_passed &= release_script_passed
-    standalone_packaging_test = REPO_ROOT / "developer" / "tests" / "ci" / "test_standalone_packaging.py"
-    try:
-        standalone_completed = subprocess.run(
-            [sys.executable, str(standalone_packaging_test)],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=900,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        )
-        standalone_output_lines = (
-            (standalone_completed.stdout or "") + (standalone_completed.stderr or "")
-        ).splitlines()
-        standalone_packaging_passed = standalone_completed.returncode == 0
-        standalone_packaging_detail = {
-            "returnCode": standalone_completed.returncode,
-            "outputTail": standalone_output_lines[-80:],
-        }
-    except subprocess.TimeoutExpired as exc:
-        standalone_packaging_passed = False
-        standalone_packaging_detail = {
-            "error": "standalone packaging security tests timed out",
-            "timeoutSeconds": 900,
-            "stdoutTail": (exc.stdout or "").splitlines()[-40:] if isinstance(exc.stdout, str) else [],
-            "stderrTail": (exc.stderr or "").splitlines()[-40:] if isinstance(exc.stderr, str) else [],
-        }
+    standalone_packaging_passed, standalone_packaging_detail = (
+        _check_standalone_release_manifest_security_tests(machine_mode=machine_mode)
+    )
     results.append(_format_result(
         "Standalone release manifest security tests",
         standalone_packaging_passed,
@@ -2840,7 +2849,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
 
     try:
-        results, all_passed = run_checks()
+        results, all_passed = run_checks(machine_mode=machine_mode)
     except Exception as exc:
         if machine_mode:
             diagnostic = f"static machine execution error: {type(exc).__name__}"
