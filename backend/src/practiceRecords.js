@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Kevin
+// SPDX-License-Identifier: AGPL-3.0-only
+
 const crypto = require('node:crypto');
 const { z } = require('zod');
 const { requireAuth, verifyCsrfToken } = require('./auth');
@@ -579,14 +582,17 @@ function createPracticeRecordsRouter(options = {}) {
         authActionStart: '/auth/business/data/start'
     }));
 
-    router.get('/', async (req, res, next) => {
+    async function sendCompletePracticeRecords(req, res, next) {
         try {
             const records = await service.list(req.session.user.id);
             return res.json({ records });
         } catch (error) {
             return next(error);
         }
-    });
+    }
+
+    router.get('/export', requireDataManageStepUp, sendCompletePracticeRecords);
+    router.get('/', requireDataManageStepUp, sendCompletePracticeRecords);
 
     router.put('/', verifyCsrfToken, async (req, res, next) => {
         try {

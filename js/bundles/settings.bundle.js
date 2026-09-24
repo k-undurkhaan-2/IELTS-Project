@@ -1143,6 +1143,16 @@ function resolveTrustedImportFetchUrl(rawUrl) {
     return null;
 }
 
+function getDataBackupRemoteApiClient() {
+    if (window.remoteApiClient && typeof window.remoteApiClient.isAuthenticated === 'function') {
+        return window.remoteApiClient;
+    }
+    if (window.ExamData && window.ExamData.remoteApiClient && typeof window.ExamData.remoteApiClient.isAuthenticated === 'function') {
+        return window.ExamData.remoteApiClient;
+    }
+    return null;
+}
+
 function getBackupTextByteLength(value) {
     const text = String(value ?? '');
     if (typeof TextEncoder === 'function') {
@@ -1336,6 +1346,22 @@ class DataBackupManager {
         return normalized;
     }
 
+    async readPracticeRecordsForExport() {
+        const apiClient = getDataBackupRemoteApiClient();
+        if (apiClient && apiClient.isAuthenticated()) {
+            if (typeof apiClient.exportPracticeRecords !== 'function') {
+                throw new Error('Remote practice export API is unavailable');
+            }
+            return apiClient.exportPracticeRecords();
+        }
+
+        if (window.practiceRecorder && typeof window.practiceRecorder.getPracticeRecords === 'function') {
+            const maybe = window.practiceRecorder.getPracticeRecords();
+            return typeof maybe?.then === 'function' ? await maybe : maybe;
+        }
+        return storage.get('practice_records', []);
+    }
+
     async exportPracticeRecords(options = {}) {
         const {
             format = 'json',
@@ -1351,13 +1377,7 @@ class DataBackupManager {
             throw new Error(`Unsupported export format: ${format}`);
         }
 
-        let practiceRecords = [];
-        if (window.practiceRecorder && typeof window.practiceRecorder.getPracticeRecords === 'function') {
-            const maybe = window.practiceRecorder.getPracticeRecords();
-            practiceRecords = typeof maybe?.then === 'function' ? await maybe : maybe;
-        } else {
-            practiceRecords = await storage.get('practice_records', []);
-        }
+        let practiceRecords = await this.readPracticeRecordsForExport();
 
         practiceRecords = this.normalizeExportRecords(practiceRecords);
 

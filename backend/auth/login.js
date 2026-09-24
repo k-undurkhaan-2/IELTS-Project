@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Kevin
+// SPDX-License-Identifier: AGPL-3.0-only
+
 (function() {
     const params = new URLSearchParams(window.location.search || '');
     const expectedAudience = getExpectedAudience(window.location.pathname);

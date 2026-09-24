@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Kevin
+# SPDX-License-Identifier: AGPL-3.0-only
+
 DataDirectory /var/lib/tor
 User debian-tor
 HiddenServiceDir /var/lib/tor/admin_hidden_service

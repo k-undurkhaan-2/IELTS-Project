@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Kevin
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';

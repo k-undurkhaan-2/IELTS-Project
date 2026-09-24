@@ -49,61 +49,6 @@ function Get-ReleaseVersion {
     return 'snapshot'
 }
 
-function ConvertTo-ZipPath {
-    param([string]$RelativePath)
-    return ($RelativePath -replace '\\', '/').TrimStart('/')
-}
-
-function Join-RelativePath {
-    param(
-        [string]$BasePath,
-        [string]$ChildPath
-    )
-
-    $baseFullPath = [System.IO.Path]::GetFullPath($BasePath)
-    $childFullPath = [System.IO.Path]::GetFullPath($ChildPath)
-    if (-not $baseFullPath.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
-        $baseFullPath += [System.IO.Path]::DirectorySeparatorChar
-    }
-
-    $baseUri = [System.Uri]::new($baseFullPath)
-    $childUri = [System.Uri]::new($childFullPath)
-    $relative = [System.Uri]::UnescapeDataString($baseUri.MakeRelativeUri($childUri).ToString())
-    return ConvertTo-ZipPath $relative
-}
-
-function Test-ZipExcluded {
-    param(
-        [string]$EntryName,
-        [bool]$IsDirectory,
-        [bool]$IncludeLocalListening
-    )
-
-    $entry = $EntryName.TrimEnd('/')
-    $name = Split-Path -Leaf $entry
-
-    if (-not $IsDirectory) {
-        if ($name -eq '.DS_Store') { return $true }
-        if ($name -like '~$*') { return $true }
-
-        $extension = [System.IO.Path]::GetExtension($name)
-        if ($extension -in @('.MOV', '.mov', '.MP4', '.mp4', '.md', '.py')) { return $true }
-    }
-
-    if ($entry -eq '.gitignore') { return $true }
-    if ($entry -eq '.git' -or $entry.StartsWith('.git/', [System.StringComparison]::Ordinal)) { return $true }
-    if ($entry -eq '.claude' -or $entry.StartsWith('.claude/', [System.StringComparison]::Ordinal)) { return $true }
-    if ($entry -eq 'node_modules' -or $entry.StartsWith('node_modules/', [System.StringComparison]::Ordinal)) { return $true }
-    if ($entry -eq 'assets/developer' -or $entry.StartsWith('assets/developer/', [System.StringComparison]::Ordinal)) { return $true }
-
-    if (-not $IncludeLocalListening) {
-        if ($entry -eq 'assets/generated/listening-exams' -or $entry.StartsWith('assets/generated/listening-exams/', [System.StringComparison]::Ordinal)) { return $true }
-        if ($entry -eq 'ListeningPractice' -or $entry.StartsWith('ListeningPractice/', [System.StringComparison]::Ordinal)) { return $true }
-    }
-
-    return $false
-}
-
 function Add-ZipDirectoryEntry {
     param(
         [System.IO.Compression.ZipArchive]$Archive,
@@ -132,48 +77,6 @@ function Add-ZipFileEntry {
             $EntryName,
             [System.IO.Compression.CompressionLevel]::Optimal
         )
-    }
-}
-
-function Add-ZipInput {
-    param(
-        [System.IO.Compression.ZipArchive]$Archive,
-        [string]$InputPath,
-        [string]$RootPath,
-        [bool]$IncludeLocalListening,
-        [System.Collections.Generic.HashSet[string]]$SeenEntries
-    )
-
-    $fullPath = Join-Path $RootPath $InputPath
-    if (-not (Test-Path -LiteralPath $fullPath)) {
-        return
-    }
-
-    $item = Get-Item -LiteralPath $fullPath
-    if (-not $item.PSIsContainer) {
-        $entryName = ConvertTo-ZipPath $InputPath
-        if (-not (Test-ZipExcluded $entryName $false $IncludeLocalListening)) {
-            Add-ZipFileEntry $Archive $item.FullName $entryName $SeenEntries
-        }
-        return
-    }
-
-    $rootEntry = ConvertTo-ZipPath $InputPath
-    if (-not (Test-ZipExcluded $rootEntry $true $IncludeLocalListening)) {
-        Add-ZipDirectoryEntry $Archive $rootEntry $SeenEntries
-    }
-
-    Get-ChildItem -LiteralPath $item.FullName -Recurse -Force | ForEach-Object {
-        $entryName = Join-RelativePath $RootPath $_.FullName
-        if (Test-ZipExcluded $entryName $_.PSIsContainer $IncludeLocalListening) {
-            return
-        }
-
-        if ($_.PSIsContainer) {
-            Add-ZipDirectoryEntry $Archive $entryName $SeenEntries
-        } else {
-            Add-ZipFileEntry $Archive $_.FullName $entryName $SeenEntries
-        }
     }
 }
 
@@ -221,16 +124,34 @@ function Format-ReleaseSize {
     return "$Bytes B"
 }
 
+function Get-ZipEntrySha256 {
+    param([System.IO.Compression.ZipArchiveEntry]$Entry)
+
+    $stream = $Entry.Open()
+    try {
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return ([System.BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+        } finally {
+            $sha256.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 $Version = Get-ReleaseVersion $Version
 $Version = [regex]::Replace($Version, '[^A-Za-z0-9._-]', '-')
 
 $DistDir = Join-Path $ProjectRoot 'dist'
 $ZipName = "ielts-practice-$Version.zip"
 $ZipPath = Join-Path $DistDir $ZipName
-$IncludeLocalListening = $env:INCLUDE_LOCAL_LISTENING -eq '1'
+$ReceiptName = "ielts-practice-$Version.release-receipt.json"
+$ReceiptPath = Join-Path $DistDir $ReceiptName
+$ManifestHelper = Join-Path $ProjectRoot 'developer/standalone-release-manifest.mjs'
 
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-    throw 'node is required to build release bundles.'
+    throw 'node is required to build bundles and enforce the standalone release manifest.'
 }
 
 Write-Host '============================================'
@@ -260,83 +181,106 @@ if (Test-Path -LiteralPath $DistDir) {
 }
 [void](New-Item -ItemType Directory -Path $DistDir)
 
-$zipInputs = [System.Collections.Generic.List[string]]::new()
-@('index.html', 'css', 'js/bundles', 'assets', 'ReadingPractice') | ForEach-Object {
-    $zipInputs.Add($_)
-}
-
-if ($IncludeLocalListening) {
-    $manifestPath = Join-Path $ProjectRoot 'assets/generated/listening-exams/manifest.js'
-    $compatPath = Join-Path $ProjectRoot 'assets/generated/listening-exams/listening-index.compat.js'
-    if (-not (Test-Path -LiteralPath $manifestPath) -or -not (Test-Path -LiteralPath $compatPath)) {
-        throw 'INCLUDE_LOCAL_LISTENING=1 requires both assets/generated/listening-exams/manifest.js and listening-index.compat.js'
-    }
-
-    foreach ($part in @('P1', 'P2', 'P3', 'P4')) {
-        $partPath = Join-Path $ProjectRoot "ListeningPractice/$part"
-        if (Test-Path -LiteralPath $partPath) {
-            $zipInputs.Add("ListeningPractice/$part")
-        }
-    }
-}
-
-$archive = [System.IO.Compression.ZipFile]::Open($ZipPath, [System.IO.Compression.ZipArchiveMode]::Create)
+$StagingDir = $null
 try {
+$stageOutput = @(& node $ManifestHelper stage --project-root $ProjectRoot --receipt $ReceiptPath 2>&1)
+if ($LASTEXITCODE -ne 0) {
+    throw "standalone release manifest staging failed:`n$($stageOutput -join "`n")"
+}
+$StagingDir = ($stageOutput -join "`n").Trim()
+if ([string]::IsNullOrWhiteSpace($StagingDir) -or -not (Test-Path -LiteralPath $StagingDir -PathType Container)) {
+    throw "standalone release manifest helper returned an invalid staging directory: $StagingDir"
+}
+
+$Receipt = Get-Content -Raw -LiteralPath $ReceiptPath | ConvertFrom-Json
+$archive = $null
+try {
+    $archive = [System.IO.Compression.ZipFile]::Open($ZipPath, [System.IO.Compression.ZipArchiveMode]::Create)
     $seenEntries = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-    foreach ($inputPath in $zipInputs) {
-        Add-ZipInput $archive $inputPath $ProjectRoot $IncludeLocalListening $seenEntries
+    foreach ($directory in @($Receipt.archiveDirectories)) {
+        Add-ZipDirectoryEntry $archive $directory $seenEntries
+    }
+    foreach ($file in @($Receipt.files)) {
+        $nativeRelativePath = $file.archivePath -replace '/', [System.IO.Path]::DirectorySeparatorChar
+        $sourcePath = Join-Path $StagingDir $nativeRelativePath
+        Add-ZipFileEntry $archive $sourcePath $file.archivePath $seenEntries
     }
 } finally {
-    $archive.Dispose()
+    if ($null -ne $archive) {
+        $archive.Dispose()
+    }
+    $temporaryStageRoot = Split-Path -Parent $StagingDir
+    if (Test-Path -LiteralPath $temporaryStageRoot) {
+        Remove-Item -LiteralPath $temporaryStageRoot -Recurse -Force
+    }
 }
 
 $verifyArchive = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
 try {
     $zipEntries = @($verifyArchive.Entries | ForEach-Object { $_.FullName })
+    $zipFileHashes = @{}
+    foreach ($entry in @($verifyArchive.Entries | Where-Object { -not $_.FullName.EndsWith('/') })) {
+        $zipFileHashes[$entry.FullName] = Get-ZipEntrySha256 $entry
+    }
 } finally {
     $verifyArchive.Dispose()
 }
 
-Require-ZipEntry $zipEntries 'index.html'
-Require-ZipEntry $zipEntries 'css/main.css'
-Require-ZipEntry $zipEntries 'css/heroui-bridge.css'
-Require-ZipEntry $zipEntries 'css/onboarding.css'
-Require-ZipEntry $zipEntries 'assets/vendor/three.min.js'
-Require-ZipEntry $zipEntries 'assets/scripts/complete-exam-data.js'
-Require-ZipEntry $zipEntries 'assets/generated/reading-exams/manifest.js'
-Require-ZipEntry $zipEntries 'assets/generated/reading-exams/reading-practice-unified.html'
-Require-ZipEntry $zipEntries 'js/bundles/runtime-entry.bundle.js'
-Require-ZipEntry $zipEntries 'js/bundles/core-foundation.bundle.js'
-Require-ZipEntry $zipEntries 'js/bundles/ui-shell.bundle.js'
-Require-ZipEntry $zipEntries 'js/bundles/legacy-app.bundle.js'
-Require-ZipEntry $zipEntries 'js/bundles/browse.bundle.js'
-Require-ZipEntry $zipEntries 'js/bundles/practice.bundle.js'
-Require-ZipEntry $zipEntries 'js/bundles/session.bundle.js'
-Require-ZipEntry $zipEntries 'js/bundles/settings.bundle.js'
-Require-ZipEntry $zipEntries 'js/bundles/diagnostics.bundle.js'
-Require-ZipEntry $zipEntries 'js/bundles/more.bundle.js'
-Require-ZipEntry $zipEntries 'js/bundles/theme.bundle.js'
-Require-ZipEntry $zipEntries 'js/bundles/reading-page.bundle.js'
-Require-ZipEntry $zipEntries 'js/bundles/practice-page-enhancer.bundle.js'
-Require-ZipEntry $zipEntries 'js/bundles/listening-record-bridge.bundle.js'
-
-if ($IncludeLocalListening -and (Test-Path -LiteralPath (Join-Path $ProjectRoot 'assets/generated/listening-exams/manifest.js'))) {
-    Require-ZipEntry $zipEntries 'assets/generated/listening-exams/manifest.js'
-    Require-ZipEntry $zipEntries 'assets/generated/listening-exams/listening-index.compat.js'
-} else {
-    Reject-ZipEntryPrefix $zipEntries 'assets/generated/listening-exams/'
-}
-
-if ($IncludeLocalListening -and (Test-Path -LiteralPath (Join-Path $ProjectRoot 'ListeningPractice'))) {
-    foreach ($part in @('P1', 'P2', 'P3', 'P4')) {
-        if (Test-Path -LiteralPath (Join-Path $ProjectRoot "ListeningPractice/$part")) {
-            Require-ZipEntry $zipEntries "ListeningPractice/$part/"
-        }
+$zipListPath = Join-Path ([System.IO.Path]::GetTempPath()) ("ielts-release-zip-list-{0}.txt" -f ([guid]::NewGuid().ToString('N')))
+try {
+    [System.IO.File]::WriteAllText(
+        $zipListPath,
+        (($zipEntries -join "`n") + "`n"),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $verifyOutput = @(& node $ManifestHelper verify-archive-list --receipt $ReceiptPath --archive-list $zipListPath 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw "release archive manifest verification failed:`n$($verifyOutput -join "`n")"
+    }
+} finally {
+    if (Test-Path -LiteralPath $zipListPath) {
+        Remove-Item -LiteralPath $zipListPath -Force
     }
 }
 
+foreach ($file in @($Receipt.files)) {
+    if (-not $zipFileHashes.ContainsKey($file.archivePath)) {
+        throw "release zip missing receipt file: $($file.archivePath)"
+    }
+    if ($zipFileHashes[$file.archivePath] -ne $file.sha256) {
+        throw "release zip content hash differs from staged source: $($file.archivePath)"
+    }
+}
+
+$duplicateEntries = @($zipEntries | Group-Object | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
+if ($duplicateEntries) {
+    throw "release zip contains duplicate entries:`n$($duplicateEntries -join "`n")"
+}
+
+$unsafeEntries = @($zipEntries | Where-Object {
+    $_.Contains('\') -or
+    $_.StartsWith('/', [System.StringComparison]::Ordinal) -or
+    [regex]::IsMatch($_, '^[A-Za-z]:') -or
+    [regex]::IsMatch($_, '(^|/)\.\.(/|$)')
+})
+if ($unsafeEntries) {
+    throw "release zip contains unsafe entry paths:`n$($unsafeEntries -join "`n")"
+}
+
+foreach ($requiredFile in @($Receipt.requiredFiles)) {
+    Require-ZipEntry $zipEntries $requiredFile
+}
+
 Reject-ZipEntryPrefix $zipEntries 'templates/'
-Reject-ZipEntryPrefix $zipEntries 'ListeningPractice/vip/'
+Reject-ZipEntryPrefix $zipEntries 'ListeningPractice/'
+Reject-ZipEntryPrefix $zipEntries 'assets/generated/listening-exams/'
+Reject-ZipEntryPrefix $zipEntries '.git/'
+Reject-ZipEntryPrefix $zipEntries 'node_modules/'
+Reject-ZipEntryPrefix $zipEntries 'developer/tests/'
+Reject-ZipEntryPrefix $zipEntries 'backend/'
+Reject-ZipEntryPattern $zipEntries '(^|/)\.env($|\.)'
+Reject-ZipEntryPattern $zipEntries '(^|/)[^/]*\.(key|pem|p12|pfx|kdbx|log|tmp|temp|bak)$'
+Reject-ZipEntryPattern $zipEntries '(^|/)\.ssh(/|$)'
 Reject-ZipEntryPattern $zipEntries '(^|/)~\$[^/]*$'
 Reject-ZipEntryPattern $zipEntries '^ListeningPractice/.*\.(MOV|mov|MP4|mp4)$'
 Reject-ZipEntryPattern $zipEntries '^assets/scripts/.*\.py$'
@@ -348,7 +292,20 @@ Write-Host ''
 Write-Host '============================================'
 Write-Host " Done: dist/$ZipName"
 Write-Host " Size : $zipSize"
+Write-Host " Receipt: dist/$ReceiptName"
 Write-Host ''
 Write-Host ' Extract the archive and open index.html directly.'
 Write-Host ' No Node.js or build tools are required after packaging.'
 Write-Host '============================================'
+} catch {
+    if (-not [string]::IsNullOrWhiteSpace($StagingDir)) {
+        $temporaryStageRoot = Split-Path -Parent $StagingDir
+        if (Test-Path -LiteralPath $temporaryStageRoot) {
+            Remove-Item -LiteralPath $temporaryStageRoot -Recurse -Force
+        }
+    }
+    if (Test-Path -LiteralPath $ZipPath) {
+        Remove-Item -LiteralPath $ZipPath -Force
+    }
+    throw
+}

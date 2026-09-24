@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2026 Kevin
+-- SPDX-License-Identifier: AGPL-3.0-only
+
 ALTER TABLE users
     ADD COLUMN IF NOT EXISTS security_epoch integer NOT NULL DEFAULT 0;
 

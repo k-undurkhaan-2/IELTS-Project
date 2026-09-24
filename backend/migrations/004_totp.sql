@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2026 Kevin
+-- SPDX-License-Identifier: AGPL-3.0-only
+
 DROP TABLE IF EXISTS user_passkeys;
 
 CREATE TABLE IF NOT EXISTS user_totp_settings (

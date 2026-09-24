@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2026 Kevin
+-- SPDX-License-Identifier: AGPL-3.0-only
+
 CREATE TABLE IF NOT EXISTS auth_sessions (
     id uuid PRIMARY KEY,
     session_handle_hash text NOT NULL UNIQUE,

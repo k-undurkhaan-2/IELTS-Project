@@ -26,6 +26,33 @@ const MAX_DATA_INTEGRITY_SCORE = 100;
 const MAX_DATA_INTEGRITY_DURATION_SECONDS = 365 * 24 * 60 * 60;
 const MAX_DATA_INTEGRITY_QUESTION_COUNT = 10000;
 const IMPORT_POLLUTION_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+const DATA_INTEGRITY_EXPORT_SENSITIVE_KEYS = new Set([
+    'password',
+    'passwordhash',
+    'currentpassword',
+    'newpassword',
+    'secret',
+    'secretkey',
+    'csrf',
+    'csrftoken',
+    'totp',
+    'totpsecret',
+    'recoverycode',
+    'recoverycodes',
+    'authorization',
+    'cookie',
+    'apikey',
+    'privatekey',
+    'authtoken',
+    'accesstoken',
+    'refreshtoken',
+    'session',
+    'sessionid',
+    'sid',
+    'state',
+    'ticket',
+    'token'
+]);
 
 function normalizeImportSourceByteLimit(value) {
     const number = Number(value);
@@ -75,6 +102,14 @@ function summarizeDataIntegrityErrorForLog(error) {
         summary.code = error.code;
     }
     return summary;
+}
+
+function isSensitiveDataIntegrityExportKey(key) {
+    const normalized = String(key || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '');
+    return DATA_INTEGRITY_EXPORT_SENSITIVE_KEYS.has(normalized);
 }
 
 function getSafeDataIntegrityImportError(error, phase) {
@@ -554,11 +589,11 @@ class DataIntegrityManager {
             }
             const output = {};
             for (const rawKey of keys.slice(0, MAX_DATA_INTEGRITY_EXPORT_OBJECT_KEYS)) {
-                if (IMPORT_POLLUTION_KEYS.has(rawKey)) {
+                if (IMPORT_POLLUTION_KEYS.has(rawKey) || isSensitiveDataIntegrityExportKey(rawKey)) {
                     continue;
                 }
                 const key = this._limitText(rawKey, MAX_DATA_INTEGRITY_RECORD_ID_LENGTH).trim();
-                if (!key || IMPORT_POLLUTION_KEYS.has(key)) {
+                if (!key || IMPORT_POLLUTION_KEYS.has(key) || isSensitiveDataIntegrityExportKey(key)) {
                     continue;
                 }
                 let safeValue;
@@ -1108,6 +1143,16 @@ function resolveTrustedImportFetchUrl(rawUrl) {
     return null;
 }
 
+function getDataBackupRemoteApiClient() {
+    if (window.remoteApiClient && typeof window.remoteApiClient.isAuthenticated === 'function') {
+        return window.remoteApiClient;
+    }
+    if (window.ExamData && window.ExamData.remoteApiClient && typeof window.ExamData.remoteApiClient.isAuthenticated === 'function') {
+        return window.ExamData.remoteApiClient;
+    }
+    return null;
+}
+
 function getBackupTextByteLength(value) {
     const text = String(value ?? '');
     if (typeof TextEncoder === 'function') {
@@ -1301,6 +1346,22 @@ class DataBackupManager {
         return normalized;
     }
 
+    async readPracticeRecordsForExport() {
+        const apiClient = getDataBackupRemoteApiClient();
+        if (apiClient && apiClient.isAuthenticated()) {
+            if (typeof apiClient.exportPracticeRecords !== 'function') {
+                throw new Error('Remote practice export API is unavailable');
+            }
+            return apiClient.exportPracticeRecords();
+        }
+
+        if (window.practiceRecorder && typeof window.practiceRecorder.getPracticeRecords === 'function') {
+            const maybe = window.practiceRecorder.getPracticeRecords();
+            return typeof maybe?.then === 'function' ? await maybe : maybe;
+        }
+        return storage.get('practice_records', []);
+    }
+
     async exportPracticeRecords(options = {}) {
         const {
             format = 'json',
@@ -1316,13 +1377,7 @@ class DataBackupManager {
             throw new Error(`Unsupported export format: ${format}`);
         }
 
-        let practiceRecords = [];
-        if (window.practiceRecorder && typeof window.practiceRecorder.getPracticeRecords === 'function') {
-            const maybe = window.practiceRecorder.getPracticeRecords();
-            practiceRecords = typeof maybe?.then === 'function' ? await maybe : maybe;
-        } else {
-            practiceRecords = await storage.get('practice_records', []);
-        }
+        let practiceRecords = await this.readPracticeRecordsForExport();
 
         practiceRecords = this.normalizeExportRecords(practiceRecords);
 

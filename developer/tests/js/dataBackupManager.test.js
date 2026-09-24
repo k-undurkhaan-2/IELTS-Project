@@ -287,6 +287,49 @@ assert.equal(/[\uD800-\uDFFF]/.test([
     unicodeBoundaryRecord.source
 ].join('')), false);
 
+const remoteExportContext = createContext();
+const remoteExportManager = new remoteExportContext.window.DataBackupManager();
+let remoteExportCalls = 0;
+let localExportCalls = 0;
+remoteExportContext.window.practiceRecorder = {
+    getPracticeRecords() {
+        localExportCalls += 1;
+        return [{ id: 'local-only-record' }];
+    }
+};
+remoteExportContext.window.remoteApiClient = {
+    isAuthenticated() {
+        return true;
+    },
+    async exportPracticeRecords() {
+        remoteExportCalls += 1;
+        return [{
+            id: 'remote-export-record',
+            examId: 'reading-remote',
+            title: 'Remote export',
+            status: 'completed',
+            startTime: '2026-07-11T00:00:00.000Z'
+        }];
+    }
+};
+const remoteExportResult = await remoteExportManager.exportPracticeRecords({ includeStats: false });
+const remoteExportPayload = JSON.parse(remoteExportResult.data);
+assert.equal(remoteExportCalls, 1);
+assert.equal(localExportCalls, 0);
+assert.deepEqual(remoteExportPayload.practiceRecords.map((record) => record.id), ['remote-export-record']);
+
+const remoteStepUpError = new Error('Recent authentication required');
+remoteStepUpError.status = 403;
+remoteStepUpError.payload = { requiresDataManageStepUp: true };
+remoteExportContext.window.remoteApiClient.exportPracticeRecords = async () => {
+    throw remoteStepUpError;
+};
+await assert.rejects(
+    () => remoteExportManager.exportPracticeRecords({ includeStats: false }),
+    (error) => error === remoteStepUpError
+);
+assert.equal(localExportCalls, 0, 'authenticated remote export failures must not fall back to cached local records');
+
 const circularRecord = {
     id: 'export-record',
     examId: 'reading-export',
