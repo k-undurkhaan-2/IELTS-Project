@@ -1133,8 +1133,8 @@ test('login, logout, and authenticated practice API access', async () => {
         assert.equal(created.response.status, 201);
 
         const loggedInRecords = await client.request('GET', '/api/practice-records');
-        assert.equal(loggedInRecords.response.status, 403);
-        assert.equal(loggedInRecords.json.requiresDataManageStepUp, true);
+        assert.equal(loggedInRecords.response.status, 200);
+        assert.deepEqual(loggedInRecords.json.records, []);
 
         const logout = await client.request('POST', '/api/auth/logout');
         assert.equal(logout.response.status, 200);
@@ -1195,8 +1195,8 @@ test('authenticated APIs require the session verifier companion cookie', async (
         const fullReplayMe = await fullCookieReplay.request('GET', '/api/auth/me');
         assert.equal(fullReplayMe.response.status, 200);
         const fullReplayRecords = await fullCookieReplay.request('GET', '/api/practice-records');
-        assert.equal(fullReplayRecords.response.status, 403);
-        assert.equal(fullReplayRecords.json.requiresDataManageStepUp, true);
+        assert.equal(fullReplayRecords.response.status, 200);
+        assert.deepEqual(fullReplayRecords.json.records, []);
 
         const logout = await client.request('POST', '/api/auth/logout');
         assert.equal(logout.response.status, 200);
@@ -1508,8 +1508,8 @@ test('sensitive API responses are not cacheable', async () => {
         assert.equal(created.response.status, 201);
 
         const records = await client.request('GET', '/api/practice-records');
-        assert.equal(records.response.status, 403);
-        assert.equal(records.json.requiresDataManageStepUp, true);
+        assert.equal(records.response.status, 200);
+        assert.deepEqual(records.json.records, []);
         assert.equal(records.response.headers.get('cache-control'), 'no-store');
 
         await seedAdmin(client, 'cache_admin', 'StrongPass1');
@@ -2519,8 +2519,8 @@ test('TOTP login requires a second factor before full session access', async () 
         assert.equal(login.json.user.username, 'totp_login');
 
         const records = await client.request('GET', '/api/practice-records');
-        assert.equal(records.response.status, 403);
-        assert.equal(records.json.requiresDataManageStepUp, true);
+        assert.equal(records.response.status, 200);
+        assert.deepEqual(records.json.records, []);
     } finally {
         await client.close();
     }
@@ -3084,6 +3084,87 @@ test('practice API requires authentication', async () => {
     }
 });
 
+test('ordinary practice sync preserves remote history without data-manage step-up', async () => {
+    const client = await createClient();
+    try {
+        const created = await register(client, 'ordinary_sync_user', 'StrongPass1');
+        assert.equal(created.response.status, 201);
+        const existing = { id: 'existing-record', sessionId: 'existing-session', type: 'reading', score: 60 };
+        const seeded = await client.request('PUT', '/api/practice-records', { records: [existing] });
+        assert.equal(seeded.response.status, 200);
+        const status = await client.request('GET', '/api/practice-records/data-manage/status');
+        assert.equal(status.json.fresh, false);
+
+        const calls = [];
+        const windowStub = { ExamData: {}, console: { warn() {} } };
+        const context = vm.createContext({ window: windowStub, console: windowStub.console, JSON });
+        for (const relativePath of [
+            'js/data/remoteApiClient.js',
+            'js/data/dataSources/remotePracticeDataSource.js',
+            'js/core/practiceCore.js'
+        ]) {
+            vm.runInContext(fs.readFileSync(path.join(__dirname, '../..', relativePath), 'utf8'), context);
+        }
+        const api = new windowStub.ExamData.RemoteApiClient({
+            fetchImpl: async (requestPath, options = {}) => {
+                const response = await fetch(client.baseUrl + requestPath, {
+                    ...options,
+                    headers: { ...options.headers, cookie: client.getCookieHeader() }
+                });
+                calls.push([options.method, requestPath, response.status]);
+                return response;
+            }
+        });
+        api.user = created.json.user;
+        api.csrfToken = client.csrfToken;
+        assert.equal(api.isAuthenticated(), true);
+        await assert.rejects(() => api.exportPracticeRecords(), (error) => (
+            error.status === 403 && error.payload.requiresDataManageStepUp === true
+        ));
+
+        const local = new Map();
+        let fallbackReads = 0;
+        const dataSource = new windowStub.ExamData.RemotePracticeDataSource({
+            async read(key, fallback) {
+                fallbackReads += 1;
+                return local.has(key) ? local.get(key) : fallback;
+            },
+            async write(key, value) { local.set(key, value); return true; }
+        }, api);
+        await windowStub.PracticeCore.store.savePracticeRecord({
+            id: 'new-record', sessionId: 'new-session', type: 'listening', score: 80
+        }, {
+            storageManager: {
+                get: (key, fallback) => dataSource.read(key, fallback),
+                writePersistentValue: (key, value) => dataSource.write(key, value)
+            }
+        });
+
+        const listed = await client.request('GET', '/api/practice-records');
+        assert.equal(listed.response.status, 200);
+        assert.deepEqual(listed.json.records.map((record) => record.id), ['new-record', 'existing-record']);
+        assert.deepEqual(listed.json.records[1], existing);
+        assert.equal(fallbackReads, 0, 'ordinary sync must not read the empty local fallback');
+        assert.deepEqual(calls, [
+            ['GET', '/api/practice-records/export', 403],
+            ['GET', '/api/practice-records', 200],
+            ['PUT', '/api/practice-records', 200]
+        ]);
+
+        api.csrfToken = 'invalid-csrf-token';
+        await assert.rejects(() => api.replacePracticeRecords([]), (error) => (
+            error.status === 403 && error.payload.error === 'CSRF token invalid'
+        ));
+        const afterRejectedWrite = await client.request('GET', '/api/practice-records');
+        assert.deepEqual(afterRejectedWrite.json.records, listed.json.records);
+        await assert.rejects(() => api.exportPracticeRecords(), (error) => (
+            error.status === 403 && error.payload.requiresDataManageStepUp === true
+        ));
+    } finally {
+        await client.close();
+    }
+});
+
 test('practice destructive data management requires data step-up bound to the business browser', async () => {
     const client = await createClient();
     const businessHeaders = {
@@ -3118,8 +3199,8 @@ test('practice destructive data management requires data step-up bound to the bu
         assert.equal(exportWithoutStepUp.json.authActionStart, '/auth/business/data/start');
 
         const fullListWithoutStepUp = await client.request('GET', '/api/practice-records');
-        assert.equal(fullListWithoutStepUp.response.status, 403);
-        assert.equal(fullListWithoutStepUp.json.requiresDataManageStepUp, true);
+        assert.equal(fullListWithoutStepUp.response.status, 200);
+        assert.deepEqual(fullListWithoutStepUp.json.records.map((record) => record.id), ['record-a']);
 
         const importWithoutStepUp = await client.request('POST', '/api/practice-records/import', {
             records: [{ id: 'record-b', sessionId: 'session-b', type: 'listening', score: 70, date: '2026-03-02T00:00:00.000Z' }]
@@ -6908,8 +6989,8 @@ test('admin user changes invalidate target sessions and stale admin roles', asyn
         const createdUser = await register(userSession, 'reset_target', 'StrongPass1');
         assert.equal(createdUser.response.status, 201);
         const userRecords = await userSession.request('GET', '/api/practice-records');
-        assert.equal(userRecords.response.status, 403);
-        assert.equal(userRecords.json.requiresDataManageStepUp, true);
+        assert.equal(userRecords.response.status, 200);
+        assert.deepEqual(userRecords.json.records, []);
 
         const resetPassword = await adminSession.request('PATCH', `/api/admin/users/${createdUser.json.user.id}`, {
             password: 'StrongerPass2'

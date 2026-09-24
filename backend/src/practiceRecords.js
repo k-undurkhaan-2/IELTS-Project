@@ -592,7 +592,7 @@ function createPracticeRecordsRouter(options = {}) {
     }
 
     router.get('/export', requireDataManageStepUp, sendCompletePracticeRecords);
-    router.get('/', requireDataManageStepUp, sendCompletePracticeRecords);
+    router.get('/', sendCompletePracticeRecords);
 
     router.put('/', verifyCsrfToken, async (req, res, next) => {
         try {

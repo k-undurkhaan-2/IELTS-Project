@@ -145,7 +145,7 @@ function extractBundleSection(bundleSource, sourcePath) {
 {
     const backendSource = fs.readFileSync(path.join(repoRoot, 'backend/src/practiceRecords.js'), 'utf8');
     assert(backendSource.includes("router.get('/export', requireDataManageStepUp, sendCompletePracticeRecords);"));
-    assert(backendSource.includes("router.get('/', requireDataManageStepUp, sendCompletePracticeRecords);"));
+    assert(backendSource.includes("router.get('/', sendCompletePracticeRecords);"));
     assert(!backendSource.includes("router.get('/', async (req, res, next) =>"));
 }
 
