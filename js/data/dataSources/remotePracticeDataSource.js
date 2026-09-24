@@ -146,9 +146,9 @@
             return value;
         }
 
-        set(key, value) {
+        set(key, value, options = {}) {
             this.cache.set(key, value);
-            this.operations.push({ type: 'set', key, value });
+            this.operations.push({ type: 'set', key, value, options: cloneValue(options) });
         }
 
         remove(key) {
@@ -159,9 +159,9 @@
         async commit() {
             for (const operation of this.operations) {
                 if (operation.type === 'set') {
-                    await this.dataSource.write(operation.key, operation.value);
+                    await this.dataSource._write(operation.key, operation.value, operation.options);
                 } else if (operation.type === 'remove') {
-                    await this.dataSource.remove(operation.key);
+                    await this.dataSource._remove(operation.key);
                 }
             }
             this.operations = [];
@@ -207,45 +207,59 @@
             }
         }
 
-        async write(key, value) {
+        async write(key, value, options = {}) {
+            const snapshot = cloneValue(options);
+            return this._enqueue(() => this._write(key, value, snapshot));
+        }
+
+        async _write(key, value, options = {}) {
             if (!this.isPracticeKey(key) || !this.apiClient.isAuthenticated()) {
                 return this.localDataSource.write(key, value);
             }
-            return this._enqueue(async () => {
-                try {
-                    const records = await this.apiClient.replacePracticeRecords(Array.isArray(value) ? value : []);
-                    await this.localDataSource.write(key, cloneValue(records));
-                    return true;
-                } catch (error) {
-                    if (isUnauthorized(error)) {
-                        clearApiAuthState(this.apiClient);
-                    }
-                    console.warn('[RemotePracticeDataSource] 写入远端练习记录失败，回退本地:', summarizeRemotePracticeErrorForLog(error));
-                    return this.localDataSource.write(key, value);
+            try {
+                let records;
+                if (Array.isArray(options.syncRecords)) {
+                    await this.apiClient.syncPracticeRecords(options.syncRecords);
+                    records = Array.isArray(value) ? value : [];
+                } else {
+                    records = await this.apiClient.replacePracticeRecords(Array.isArray(value) ? value : []);
                 }
-            });
+                await this.localDataSource.write(key, cloneValue(records));
+                return true;
+            } catch (error) {
+                if (error?.status === 403 && error.payload?.requiresDataManageStepUp) {
+                    throw error;
+                }
+                if (isUnauthorized(error)) {
+                    clearApiAuthState(this.apiClient);
+                }
+                console.warn('[RemotePracticeDataSource] 写入远端练习记录失败，回退本地:', summarizeRemotePracticeErrorForLog(error));
+                return this.localDataSource.write(key, value);
+            }
         }
 
         async remove(key) {
+            return this._enqueue(() => this._remove(key));
+        }
+
+        async _remove(key) {
             if (!this.isPracticeKey(key) || !this.apiClient.isAuthenticated()) {
                 return this.localDataSource.remove(key);
             }
-            return this._enqueue(async () => {
-                try {
-                    const records = await this.apiClient.clearPracticeRecords();
-                    await this.localDataSource.write(key, cloneValue(records));
-                    return true;
-                } catch (error) {
-                    if (redirectToDataManageStepUp(error)) {
-                        return false;
-                    }
-                    if (isUnauthorized(error)) {
-                        clearApiAuthState(this.apiClient);
-                    }
-                    console.warn('[RemotePracticeDataSource] 清空远端练习记录失败，回退本地:', summarizeRemotePracticeErrorForLog(error));
-                    return this.localDataSource.remove(key);
+            try {
+                const records = await this.apiClient.clearPracticeRecords();
+                await this.localDataSource.write(key, cloneValue(records));
+                return true;
+            } catch (error) {
+                if (redirectToDataManageStepUp(error)) {
+                    throw error;
                 }
-            });
+                if (isUnauthorized(error)) {
+                    clearApiAuthState(this.apiClient);
+                }
+                console.warn('[RemotePracticeDataSource] 清空远端练习记录失败，回退本地:', summarizeRemotePracticeErrorForLog(error));
+                return this.localDataSource.remove(key);
+            }
         }
 
         async runTransaction(handler) {
