@@ -11,7 +11,14 @@
 /.pnpm-store/
 /.vscode/
 /documents/
-/docs/
+/docs/*
+!/docs/USAGE.md
+!/docs/STATUS.md
+!/docs/ARCHITECTURE.md
+!/docs/DEVELOPMENT.md
+!/docs/CONTENT_POLICY.md
+!/docs/SERVICE_MODEL.md
+!/docs/TOR_ACCESS.md
 /tools/
 /dist/
 /apps/

@@ -4000,6 +4000,42 @@ const MAX_JSON_EXPORT_STRING_LENGTH = 20000;
 const MAX_JSON_EXPORT_DEPTH = 8;
 const MAX_JSON_EXPORT_NODES = 50000;
 const JSON_EXPORT_POLLUTION_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+const JSON_EXPORT_SENSITIVE_KEYS = new Set([
+    'password',
+    'passwordhash',
+    'currentpassword',
+    'newpassword',
+    'secret',
+    'secretkey',
+    'csrf',
+    'csrftoken',
+    'totp',
+    'totpsecret',
+    'recoverycode',
+    'recoverycodes',
+    'authorization',
+    'cookie',
+    'apikey',
+    'privatekey',
+    'authtoken',
+    'accesstoken',
+    'refreshtoken',
+    'session',
+    'sessionid',
+    'sid',
+    'state',
+    'ticket',
+    'token'
+]);
+
+function isSensitiveJsonExportKey(key) {
+    const normalized = String(key || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '');
+    return JSON_EXPORT_SENSITIVE_KEYS.has(normalized);
+}
+
 function summarizePracticeHistoryErrorForLog(error) {
     if (!error || typeof error !== 'object') {
         return { name: typeof error };
@@ -4009,6 +4045,84 @@ function summarizePracticeHistoryErrorForLog(error) {
         name: typeof error.name === 'string' && error.name ? error.name.slice(0, 80) : 'Error',
         status: Number.isFinite(status) ? status : undefined
     };
+}
+
+function getPracticeHistoryDataManageReturnTo() {
+    const path = window.location && window.location.pathname ? window.location.pathname : '/';
+    const search = window.location && window.location.search ? window.location.search : '';
+    return `${path}${search}` || '/';
+}
+
+function redirectPracticeHistoryDataManageStepUp(startPath = '/auth/business/data/start') {
+    const safeStartPath = typeof startPath === 'string' && startPath.startsWith('/auth/business/data/start')
+        ? startPath
+        : '/auth/business/data/start';
+    window.location.href = `${safeStartPath}?return_to=${encodeURIComponent(getPracticeHistoryDataManageReturnTo())}`;
+}
+
+function getPracticeHistoryRemoteApiClient() {
+    if (window.remoteApiClient && typeof window.remoteApiClient.request === 'function') {
+        return window.remoteApiClient;
+    }
+    if (window.ExamData && window.ExamData.remoteApiClient && typeof window.ExamData.remoteApiClient.request === 'function') {
+        return window.ExamData.remoteApiClient;
+    }
+    return null;
+}
+
+async function requestPracticeHistoryDataManageStatus() {
+    const apiClient = getPracticeHistoryRemoteApiClient();
+    if (apiClient) {
+        return apiClient.request('/api/practice-records/data-manage/status', { method: 'GET', csrf: false });
+    }
+    if (typeof window.fetch !== 'function') {
+        throw new Error('Remote API client is unavailable');
+    }
+    const response = await window.fetch('/api/practice-records/data-manage/status', {
+        method: 'GET',
+        credentials: 'same-origin',
+        headers: { Accept: 'application/json' }
+    });
+    let payload = null;
+    try {
+        payload = await response.json();
+    } catch (_) { }
+    if (!response.ok) {
+        const error = new Error((payload && payload.error) || 'Data management step-up check failed');
+        error.status = response.status;
+        error.payload = payload;
+        throw error;
+    }
+    return payload || {};
+}
+
+async function ensurePracticeHistoryDataExportStepUp() {
+    if (typeof window.ensureBusinessDataManageStepUp === 'function') {
+        return window.ensureBusinessDataManageStepUp();
+    }
+    try {
+        const payload = await requestPracticeHistoryDataManageStatus();
+        if (payload && payload.fresh === true) {
+            return true;
+        }
+        window.showMessage && window.showMessage('Confirm your password before exporting practice history.', 'info');
+        redirectPracticeHistoryDataManageStepUp(payload && payload.authActionStart);
+        return false;
+    } catch (error) {
+        if (error && error.status === 401) {
+            window.showMessage && window.showMessage('Please sign in before exporting practice history.', 'warning');
+            window.location.href = `/auth/business/start?return_to=${encodeURIComponent(getPracticeHistoryDataManageReturnTo())}`;
+            return false;
+        }
+        if (error && error.status === 403 && error.payload && error.payload.authActionStart) {
+            window.showMessage && window.showMessage('Confirm your password before exporting practice history.', 'info');
+            redirectPracticeHistoryDataManageStepUp(error.payload.authActionStart);
+            return false;
+        }
+        console.error('[PracticeHistoryEnhancer] data export step-up check failed:', summarizePracticeHistoryErrorForLog(error));
+        window.showMessage && window.showMessage('Unable to confirm data export access. Please sign in again.', 'error');
+        return false;
+    }
 }
 
 
@@ -4123,7 +4237,7 @@ class PracticeHistoryEnhancer {
             }
             const keys = allKeys.slice(0, MAX_JSON_EXPORT_OBJECT_KEYS);
             for (const key of keys) {
-                if (JSON_EXPORT_POLLUTION_KEYS.has(key)) {
+                if (JSON_EXPORT_POLLUTION_KEYS.has(key) || isSensitiveJsonExportKey(key)) {
                     continue;
                 }
                 try {
@@ -4406,6 +4520,10 @@ class PracticeHistoryEnhancer {
      */
     async performExport() {
         try {
+            if (!(await ensurePracticeHistoryDataExportStepUp())) {
+                return;
+            }
+
             const selectedFormat = document.querySelector('input[name="export-format"]:checked')?.value;
 
             if (selectedFormat === 'markdown') {

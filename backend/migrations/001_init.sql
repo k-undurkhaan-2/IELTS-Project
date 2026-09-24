@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2026 Kevin
+-- SPDX-License-Identifier: AGPL-3.0-only
+
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 CREATE TABLE IF NOT EXISTS users (

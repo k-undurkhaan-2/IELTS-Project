@@ -1,1 +1,3 @@
 developer/release.sh text eol=lf
+js/bundles/*.bundle.js text eol=lf
+"ListeningPractice/vip special/js/bundles/*.bundle.js" text eol=lf

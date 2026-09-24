@@ -718,6 +718,89 @@
 })(typeof window !== 'undefined' ? window : globalThis);
 
 
+/* ===== js/utils/practiceTimerPreferences.js ===== */
+(function initPracticeTimerPreferences(global) {
+    'use strict';
+
+    var READING_KEY = 'ielts_reading_timer_preferences_v2';
+    var LISTENING_KEY = 'ielts_listening_timer_preferences_v1';
+    var VERSION = 1;
+    var DEFAULTS = {
+        version: VERSION,
+        mode: 'elapsed',
+        countdownMinutes: 60,
+        limitEnabled: false,
+        limitMinutes: 60,
+        expiryAction: 'warn'
+    };
+    var VALID_MODES = { elapsed: true, countdown: true };
+    var VALID_ACTIONS = { warn: true, 'auto-submit': true, lock: true };
+    var MAX_MINUTES = 240;
+    var MIN_MINUTES = 1;
+
+    function clampMinutes(value, fallback) {
+        var number = Number(value);
+        if (!Number.isFinite(number)) {
+            number = fallback;
+        }
+        return Math.min(MAX_MINUTES, Math.max(MIN_MINUTES, Math.round(number)));
+    }
+
+    function normalize(raw) {
+        var source = raw && typeof raw === 'object' ? raw : {};
+        var mode = VALID_MODES[source.mode] ? source.mode : DEFAULTS.mode;
+        var expiryAction = VALID_ACTIONS[source.expiryAction] ? source.expiryAction : DEFAULTS.expiryAction;
+        return {
+            version: VERSION,
+            mode: mode,
+            countdownMinutes: clampMinutes(source.countdownMinutes, DEFAULTS.countdownMinutes),
+            limitEnabled: Boolean(source.limitEnabled),
+            limitMinutes: clampMinutes(source.limitMinutes, DEFAULTS.limitMinutes),
+            expiryAction: expiryAction
+        };
+    }
+
+    function keyFor(scope) {
+        return String(scope || '').toLowerCase() === 'listening' ? LISTENING_KEY : READING_KEY;
+    }
+
+    function read(scope) {
+        try {
+            var raw = global.localStorage && global.localStorage.getItem(keyFor(scope));
+            return normalize(raw ? JSON.parse(raw) : null);
+        } catch (_) {
+            return normalize(null);
+        }
+    }
+
+    function save(scope, preferences) {
+        var next = normalize(preferences);
+        try {
+            if (global.localStorage) {
+                global.localStorage.setItem(keyFor(scope), JSON.stringify(next));
+            }
+        } catch (_) { }
+        return next;
+    }
+
+    function minutesToSeconds(value) {
+        return clampMinutes(value, DEFAULTS.countdownMinutes) * 60;
+    }
+
+    global.PracticeTimerPreferences = {
+        VERSION: VERSION,
+        READING_KEY: READING_KEY,
+        LISTENING_KEY: LISTENING_KEY,
+        DEFAULTS: Object.freeze(Object.assign({}, DEFAULTS)),
+        normalize: normalize,
+        read: read,
+        save: save,
+        keyFor: keyFor,
+        minutesToSeconds: minutesToSeconds
+    };
+})(typeof window !== 'undefined' ? window : globalThis);
+
+
 /* ===== js/utils/answerSanitizer.js ===== */
 (function (global) {
     'use strict';
@@ -2316,11 +2399,8 @@
     const MAX_SIMULATION_DRAFT_HIGHLIGHT_TEXT_CHARS = 1000;
     const MAX_SIMULATION_DRAFT_SCROLL_Y = 10000000;
     const SIMULATION_DRAFT_UNSAFE_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
-    const READING_TIMER_PREF_KEY = 'ielts_reading_timer_preferences_v1';
-    const TIMER_MODE_VALUES = new Set(['elapsed', 'ielts', 'custom']);
-    const DEFAULT_CUSTOM_TIMER_MINUTES = 60;
-    const MIN_CUSTOM_TIMER_MINUTES = 1;
-    const MAX_CUSTOM_TIMER_MINUTES = 240;
+    const READING_CANDIDATE_CODE_PREF_KEY = 'ielts_reading_candidate_code_preferences_v1';
+    const READING_CANDIDATE_CODE_PATTERN = /^\d{6}$/;
     const EXPLANATION_NODE_SELECTOR = [
         '.reading-explanation-card',
         '.reading-group-explanation',
@@ -2395,8 +2475,9 @@
         endlessCountdownSeconds: 0,
         endlessCountdownEndTime: null,
         suiteTimerLimitSeconds: null,
-        timerDisplayMode: 'ielts',
-        customTimerMinutes: DEFAULT_CUSTOM_TIMER_MINUTES,
+        timerExpired: false,
+        timerExpiryHandled: false,
+        timerLocked: false,
         currentActiveQuestionId: '',
         ready: false,
         submitted: false,
@@ -2428,8 +2509,6 @@
         nav: null,
         partQuestions: [],
         partStatuses: [],
-        floatingPrevBtn: null,
-        floatingNextBtn: null,
         submitBtn: null,
         resetBtn: null,
         exitBtn: null
@@ -2548,113 +2627,117 @@
         return `${minutes}:${seconds}`;
     }
 
-    function clampCustomTimerMinutes(value) {
-        const minutes = Math.round(Number(value));
-        if (!Number.isFinite(minutes)) {
-            return DEFAULT_CUSTOM_TIMER_MINUTES;
+    function readReadingTimerPreferences() {
+        const manager = global.PracticeTimerPreferences;
+        if (manager && typeof manager.read === 'function') {
+            return manager.read('reading');
         }
-        return Math.max(MIN_CUSTOM_TIMER_MINUTES, Math.min(MAX_CUSTOM_TIMER_MINUTES, minutes));
-    }
-
-    function readTimerPreferences() {
-        const fallback = {
-            mode: 'ielts',
-            customMinutes: DEFAULT_CUSTOM_TIMER_MINUTES
+        return {
+            version: 1,
+            mode: 'elapsed',
+            countdownMinutes: 60,
+            limitEnabled: false,
+            limitMinutes: 60,
+            expiryAction: 'warn'
         };
-        if (!global.localStorage) {
-            return fallback;
-        }
-        try {
-            const raw = global.localStorage.getItem(READING_TIMER_PREF_KEY);
-            if (!raw) {
-                return fallback;
-            }
-            if (String(raw).length > 4096) {
-                return fallback;
-            }
-            const preferences = JSON.parse(raw);
-            const mode = TIMER_MODE_VALUES.has(preferences?.mode) ? preferences.mode : fallback.mode;
-            return {
-                mode,
-                customMinutes: clampCustomTimerMinutes(preferences?.customMinutes)
-            };
-        } catch (_) {
-            return fallback;
-        }
     }
 
-    function writeTimerPreferences() {
-        if (!global.localStorage) {
+    function minutesToSeconds(value, fallbackMinutes = 60) {
+        const manager = global.PracticeTimerPreferences;
+        if (manager && typeof manager.minutesToSeconds === 'function') {
+            return manager.minutesToSeconds(value);
+        }
+        const numeric = Number(value);
+        const minutes = Number.isFinite(numeric)
+            ? Math.min(240, Math.max(1, Math.round(numeric)))
+            : fallbackMinutes;
+        return minutes * 60;
+    }
+
+    function setTimerLockMode(enabled) {
+        const locked = Boolean(enabled);
+        state.timerLocked = locked;
+        document.body.classList.toggle('timer-locked-mode', locked);
+        document.querySelectorAll('input, textarea, select').forEach((control) => {
+            if (control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement || control instanceof HTMLSelectElement) {
+                control.disabled = locked || state.readOnly;
+            }
+        });
+        disableDragInteractions();
+    }
+
+    function handleTimerExpired(preferences) {
+        if (state.timerExpiryHandled || state.submitted || state.readOnly || state.reviewMode || state.memorizeMode) {
             return;
         }
+        state.timerExpiryHandled = true;
+        const action = preferences && preferences.expiryAction ? preferences.expiryAction : 'warn';
+        if (action === 'auto-submit') {
+            global.setTimeout(() => {
+                if (!state.submitted && !state.readOnly) {
+                    handleSubmit();
+                }
+            }, 0);
+            return;
+        }
+        if (action === 'lock') {
+            setTimerLockMode(true);
+        }
+    }
+
+    function hashReadingCandidateCode(sourceId) {
+        const source = String(sourceId || '');
+        if (!source) {
+            return '';
+        }
+        let hash = 0;
+        source.split('').forEach((char) => {
+            hash = ((hash << 5) - hash) + char.charCodeAt(0);
+            hash |= 0;
+        });
+        return String(Math.abs(hash) % 900000 + 100000);
+    }
+
+    function readReadingCandidateCodePreferences() {
         try {
-            global.localStorage.setItem(READING_TIMER_PREF_KEY, JSON.stringify({
-                mode: TIMER_MODE_VALUES.has(state.timerDisplayMode) ? state.timerDisplayMode : 'ielts',
-                customMinutes: clampCustomTimerMinutes(state.customTimerMinutes)
-            }));
+            const raw = global.localStorage?.getItem(READING_CANDIDATE_CODE_PREF_KEY);
+            const parsed = raw ? JSON.parse(raw) : null;
+            const mode = parsed?.mode === 'custom' ? 'custom' : 'auto';
+            const customCode = typeof parsed?.customCode === 'string'
+                ? parsed.customCode.replace(/\D/g, '').slice(0, 6)
+                : '';
+            return {
+                mode,
+                customCode: READING_CANDIDATE_CODE_PATTERN.test(customCode) ? customCode : ''
+            };
         } catch (_) {
-            // Ignore storage failures in restricted browsers.
+            return { mode: 'auto', customCode: '' };
         }
     }
 
-    function resolveTimerDisplayMode() {
-        if (state.endlessCountdownEndTime && Number.isFinite(state.endlessCountdownEndTime)) {
-            return 'countdown';
+    function resolveReadingCandidateCode() {
+        const preferences = readReadingCandidateCodePreferences();
+        if (preferences.mode === 'custom' && preferences.customCode) {
+            return preferences.customCode;
         }
-        return TIMER_MODE_VALUES.has(state.timerDisplayMode) ? state.timerDisplayMode : 'ielts';
-    }
-
-    function resolveTimerDisplaySeconds(mode) {
-        const elapsedSeconds = getPageElapsedSeconds();
-        if (mode === 'elapsed') {
-            return elapsedSeconds;
-        }
-        if (mode === 'custom') {
-            return Math.max(0, clampCustomTimerMinutes(state.customTimerMinutes) * 60 - elapsedSeconds);
-        }
-        const suiteLimit = Number(state.suiteTimerLimitSeconds);
-        const limitSeconds = state.suiteTimerMode === 'countdown' && Number.isFinite(suiteLimit) && suiteLimit > 0
-            ? Math.floor(suiteLimit)
-            : 60 * 60;
-        return Math.max(0, limitSeconds - elapsedSeconds);
-    }
-
-    function formatTimerDisplay(totalSeconds, mode) {
-        const safeSeconds = Math.max(0, Math.floor(Number(totalSeconds) || 0));
-        if (mode === 'elapsed') {
-            return `${formatTimerSeconds(safeSeconds)} elapsed`;
-        }
-        if (safeSeconds <= 0) {
-            return 'Time is up';
-        }
-        if (safeSeconds < 60) {
-            return `${safeSeconds} seconds remaining`;
-        }
-        const minutes = Math.ceil(safeSeconds / 60);
-        return `${minutes} minutes remaining`;
-    }
-
-    function syncTimerSettingsControls() {
-        const mode = TIMER_MODE_VALUES.has(state.timerDisplayMode) ? state.timerDisplayMode : 'ielts';
-        document.querySelectorAll('[data-timer-mode]').forEach((button) => {
-            if (!(button instanceof HTMLElement)) return;
-            button.classList.toggle('active', button.dataset.timerMode === mode);
-        });
-        const input = document.getElementById('timer-custom-minutes');
-        if (input instanceof HTMLInputElement) {
-            input.value = String(clampCustomTimerMinutes(state.customTimerMinutes));
-            input.disabled = mode !== 'custom';
-        }
-        document.querySelectorAll('.timer-custom-control').forEach((control) => {
-            control.classList.toggle('is-visible', mode === 'custom');
-        });
+        return hashReadingCandidateCode(state.suiteSessionId || state.sessionId || '');
     }
 
     function renderTimer() {
         const timer = document.getElementById('timer');
         if (!timer) return;
+        const preferences = readReadingTimerPreferences();
         var displaySeconds;
-        var displayMode = resolveTimerDisplayMode();
+        var elapsed = getPageElapsedSeconds();
+        var limitSeconds;
+        const rawLimitSeconds = Number(state.suiteTimerLimitSeconds);
+        if (Number.isFinite(rawLimitSeconds) && rawLimitSeconds > 0) {
+            limitSeconds = Math.floor(rawLimitSeconds);
+        } else if (preferences.limitEnabled) {
+            limitSeconds = minutesToSeconds(preferences.limitMinutes, 60);
+        } else {
+            limitSeconds = null;
+        }
         if (state.endlessCountdownEndTime && Number.isFinite(state.endlessCountdownEndTime)) {
             var remainingMs = state.endlessCountdownEndTime - Date.now();
             displaySeconds = Math.max(0, Math.ceil(remainingMs / 1000));
@@ -2663,16 +2746,32 @@
                 state.endlessCountdownEndTime = null;
                 timer.classList.remove('endless-countdown');
             }
+            var remainingMinutes = Math.max(0, Math.ceil(displaySeconds / 60));
+            timer.textContent = remainingMinutes + ' minutes remaining';
+        } else if (preferences.mode === 'countdown') {
+            const countdownSeconds = minutesToSeconds(preferences.countdownMinutes, 60);
+            displaySeconds = Math.max(0, countdownSeconds - elapsed);
+            timer.textContent = formatTimerSeconds(displaySeconds);
+        } else if (state.suiteSessionId && Number.isFinite(Number(limitSeconds)) && Number(limitSeconds) > 0) {
+            displaySeconds = Math.max(0, limitSeconds - elapsed);
+            var remainingMinutes = Math.max(0, Math.ceil(displaySeconds / 60));
+            timer.textContent = remainingMinutes + ' minutes remaining';
         } else {
-            displaySeconds = resolveTimerDisplaySeconds(displayMode);
+            displaySeconds = elapsed;
+            timer.textContent = formatTimerSeconds(displaySeconds);
         }
-        timer.textContent = formatTimerDisplay(displaySeconds, displayMode);
-        timer.dataset.timerMode = displayMode;
         var hasEndlessCountdown = state.endlessCountdownEndTime && Number.isFinite(state.endlessCountdownEndTime);
+        var countdownExpired = preferences.mode === 'countdown' && !hasEndlessCountdown && displaySeconds <= 0;
+        var limitExpired = Number.isFinite(Number(limitSeconds)) && Number(limitSeconds) > 0 && elapsed >= Number(limitSeconds);
+        var expired = Boolean(countdownExpired || limitExpired);
+        state.timerExpired = expired;
+        if (expired) {
+            handleTimerExpired(preferences);
+        }
         timer.classList.toggle('paused', !interaction.timerRunning && !hasEndlessCountdown);
-        timer.classList.toggle('timer-mode-elapsed', displayMode === 'elapsed');
-        timer.classList.toggle('timer-mode-countdown', displayMode !== 'elapsed');
-        timer.classList.toggle('timer-expired', displayMode !== 'elapsed' && displaySeconds <= 0);
+        timer.classList.toggle('timer-expired', expired);
+        timer.dataset.timerMode = preferences.mode;
+        timer.dataset.expiryAction = preferences.expiryAction;
         timer.style.opacity = (interaction.timerRunning || hasEndlessCountdown) ? '1' : '0.5';
     }
 
@@ -2721,10 +2820,6 @@
         const settingsBtn = document.getElementById('settings-btn');
         const noteBtn = document.getElementById('note-btn');
         const closeNoteBtn = document.getElementById('close-note');
-        const timerPrefs = readTimerPreferences();
-        state.timerDisplayMode = timerPrefs.mode;
-        state.customTimerMinutes = timerPrefs.customMinutes;
-        syncTimerSettingsControls();
 
         settingsBtn?.addEventListener('click', (event) => {
             event.stopPropagation();
@@ -2755,26 +2850,6 @@
                 button.classList.add('active');
             });
         });
-        document.querySelectorAll('.settings-option[data-timer-mode]').forEach((button) => {
-            button.addEventListener('click', () => {
-                const nextMode = TIMER_MODE_VALUES.has(button.dataset.timerMode) ? button.dataset.timerMode : 'ielts';
-                state.timerDisplayMode = nextMode;
-                writeTimerPreferences();
-                syncTimerSettingsControls();
-                renderTimer();
-            });
-        });
-        const customMinutesInput = document.getElementById('timer-custom-minutes');
-        if (customMinutesInput instanceof HTMLInputElement) {
-            const updateCustomMinutes = () => {
-                state.customTimerMinutes = clampCustomTimerMinutes(customMinutesInput.value);
-                customMinutesInput.value = String(state.customTimerMinutes);
-                writeTimerPreferences();
-                renderTimer();
-            };
-            customMinutesInput.addEventListener('change', updateCustomMinutes);
-            customMinutesInput.addEventListener('blur', updateCustomMinutes);
-        }
     }
 
     function positionSelectionToolbar(rect) {
@@ -3157,8 +3232,6 @@
             document.getElementById('part2-status-text'),
             document.getElementById('part3-status-text')
         ];
-        dom.floatingPrevBtn = document.getElementById('float-prev-btn');
-        dom.floatingNextBtn = document.getElementById('float-next-btn');
         dom.submitBtn = document.getElementById('submit-btn');
         dom.resetBtn = document.getElementById('reset-btn');
         dom.exitBtn = document.getElementById('exit-btn');
@@ -3887,16 +3960,6 @@
         }).join('');
     }
 
-    function syncFloatingNavigationState() {
-        const ctx = state.simulationCtx && typeof state.simulationCtx === 'object' ? state.simulationCtx : null;
-        if (dom.floatingPrevBtn) {
-            dom.floatingPrevBtn.disabled = !(state.simulationMode && ctx && ctx.canPrev);
-        }
-        if (dom.floatingNextBtn) {
-            dom.floatingNextBtn.disabled = !(state.simulationMode && ctx && ctx.canNext);
-        }
-    }
-
     function buildQuestionNav() {
         updateRedesignedSubHeader();
         const currentOrder = Array.isArray(state.dataset?.questionOrder) ? state.dataset.questionOrder : [];
@@ -3918,7 +3981,6 @@
                 }
             });
             updatePartSectionState(currentPart);
-            syncFloatingNavigationState();
             updateActiveQuestionHighlight(state.currentActiveQuestionId);
             return;
         }
@@ -4342,19 +4404,6 @@
             });
             if (matched) {
                 updateActiveQuestionHighlight(matched);
-            }
-        });
-    }
-
-    function attachFloatingNavListeners() {
-        dom.floatingPrevBtn?.addEventListener('click', () => {
-            if (state.simulationMode && state.simulationCtx?.canPrev) {
-                dispatchSimulationNavigate('prev', buildSubmissionSnapshot());
-            }
-        });
-        dom.floatingNextBtn?.addEventListener('click', () => {
-            if (state.simulationMode && state.simulationCtx?.canNext) {
-                dispatchSimulationNavigate('next', buildSubmissionSnapshot());
             }
         });
     }
@@ -5673,9 +5722,7 @@
         document.body.classList.toggle('review-readonly-mode', state.readOnly);
         if (dom.submitBtn) {
             if (!dom.submitBtn.dataset.defaultLabel) {
-                dom.submitBtn.dataset.defaultLabel = dom.submitBtn.classList.contains('nav-submit-circle-btn')
-                    ? (dom.submitBtn.getAttribute('aria-label') || dom.submitBtn.title || 'Submit')
-                    : (dom.submitBtn.textContent || 'Submit');
+                dom.submitBtn.dataset.defaultLabel = dom.submitBtn.textContent || dom.submitBtn.getAttribute('aria-label') || dom.submitBtn.title || 'Submit';
             }
             dom.submitBtn.disabled = state.readOnly;
             if (state.readOnly) {
@@ -5690,7 +5737,7 @@
         const controls = document.querySelectorAll('input, textarea, select');
         controls.forEach((control) => {
             if (control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement || control instanceof HTMLSelectElement) {
-                control.disabled = state.readOnly;
+                control.disabled = state.readOnly || state.timerLocked;
             }
         });
         syncPrimaryActionButtons();
@@ -5699,10 +5746,11 @@
     }
 
     function disableDragInteractions() {
+        const locked = Boolean(state.readOnly || state.timerLocked);
         document.querySelectorAll('.drag-item, .draggable-word, .card').forEach((item) => {
             if (!(item instanceof HTMLElement)) return;
-            item.setAttribute('draggable', state.readOnly ? 'false' : 'true');
-            item.classList.toggle('drag-item-locked', state.readOnly);
+            item.setAttribute('draggable', locked ? 'false' : 'true');
+            item.classList.toggle('drag-item-locked', locked);
         });
     }
 
@@ -5738,12 +5786,9 @@
             return;
         }
         const text = String(label || '').trim() || 'Submit';
-        if (button.classList.contains('nav-submit-circle-btn')) {
-            button.title = text;
-            button.setAttribute('aria-label', text);
-            return;
-        }
         button.textContent = text;
+        button.title = text;
+        button.setAttribute('aria-label', text);
     }
 
     function syncSubmitButtonVariant(variant = '') {
@@ -5755,9 +5800,7 @@
 
     function syncPrimaryActionButtons() {
         if (dom.submitBtn && !dom.submitBtn.dataset.defaultLabel) {
-            dom.submitBtn.dataset.defaultLabel = dom.submitBtn.classList.contains('nav-submit-circle-btn')
-                ? (dom.submitBtn.getAttribute('aria-label') || dom.submitBtn.title || 'Submit')
-                : (dom.submitBtn.textContent || 'Submit');
+            dom.submitBtn.dataset.defaultLabel = dom.submitBtn.textContent || dom.submitBtn.getAttribute('aria-label') || dom.submitBtn.title || 'Submit';
         }
         if (dom.submitBtn && !dom.submitBtn.dataset.defaultType) {
             dom.submitBtn.dataset.defaultType = dom.submitBtn.getAttribute('type') || '';
@@ -5816,7 +5859,6 @@
                 }
                 dom.resetBtn.disabled = state.readOnly && !canResetSubmittedSingle;
             }
-            syncFloatingNavigationState();
             return;
         }
         if (dom.resetBtn) {
@@ -5831,7 +5873,6 @@
             setPrimaryButtonLabel(dom.submitBtn, ctx.isLast ? 'Submit' : 'Next passage');
             dom.submitBtn.disabled = state.readOnly;
         }
-            syncFloatingNavigationState();
     }
 
     function ensureReviewNavStyle() {
@@ -5905,6 +5946,9 @@
         state.lastResults = null;
         state.submitted = false;
         state.readOnly = false;
+        state.timerLocked = false;
+        state.timerExpired = false;
+        state.timerExpiryHandled = false;
         closeReviewHighlightDictionary();
         if (dom.results) {
             dom.results.style.display = 'none';
@@ -5912,6 +5956,7 @@
         }
         clearExplanations();
         document.body.classList.remove('review-readonly-mode');
+        document.body.classList.remove('timer-locked-mode');
         enhanceReviewHighlights();
         document.querySelectorAll('input, textarea, select').forEach((control) => {
             if (control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement || control instanceof HTMLSelectElement) {
@@ -6867,6 +6912,17 @@
         if (document.body && document.body.dataset) {
             document.body.dataset.suiteMode = isSuiteMode ? 'true' : 'false';
         }
+        const candidateId = document.getElementById('candidate-id');
+        if (candidateId) {
+            const candidateCode = resolveReadingCandidateCode();
+            if (candidateCode) {
+                candidateId.textContent = candidateCode;
+                candidateId.hidden = false;
+            } else {
+                candidateId.textContent = '';
+                candidateId.hidden = true;
+            }
+        }
         if (typeof global.updatePracticeSuiteModeUI === 'function') {
             try {
                 global.updatePracticeSuiteModeUI(isSuiteMode);
@@ -7147,7 +7203,6 @@
         renderDataset(dataset);
         buildQuestionNav();
         attachNavListeners();
-        attachFloatingNavListeners();
         attachMemorizeLocatorListeners();
         attachDragDrop();
         attachPaneResizer();
@@ -7205,6 +7260,7 @@
     "js/runtime/readingExamRegistry.js",
     "js/runtime/readingExplanationRegistry.js",
     "js/runtime/readingHighlightShared.js",
+    "js/utils/practiceTimerPreferences.js",
     "js/utils/answerSanitizer.js",
     "js/utils/answerMatchCore.js",
     "js/core/dictionaryService.js",

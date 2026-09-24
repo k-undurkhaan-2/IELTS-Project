@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Kevin
+// SPDX-License-Identifier: AGPL-3.0-only
+
 (function() {
     const MAX_ADMIN_STATUS_CHARS = 240;
     const MAX_ADMIN_RESPONSE_JSON_LENGTH = 1024 * 1024;

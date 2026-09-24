@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Kevin
+// SPDX-License-Identifier: AGPL-3.0-only
+
 const path = require('node:path');
 const fs = require('node:fs');
 const vm = require('node:vm');

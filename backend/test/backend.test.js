@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Kevin
+// SPDX-License-Identifier: AGPL-3.0-only
+
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const http = require('node:http');
@@ -16,7 +19,7 @@ const { MemoryAuthSessionStore } = require('../src/authSessions');
 const { MemoryAdminStore, PostgresAdminStore, createTrafficMiddleware, normalizeAdminSearchQuery, normalizeTrafficEvent, serializeRecord } = require('../src/admin');
 const { bootstrapAdmin } = require('../src/bootstrapAdmin');
 const { runMigrations } = require('../src/migrations');
-const { MemoryPracticeRecordStore, extractColumns, mergePracticeRecords, normalizePracticeRecord } = require('../src/practiceRecords');
+const { MemoryPracticeRecordStore, PostgresPracticeRecordStore, createPracticeRecordService, extractColumns, mergePracticeRecords, normalizePracticeRecord } = require('../src/practiceRecords');
 const { MemoryTotpStore, PostgresTotpStore } = require('../src/totp');
 
 test('docker image hardening excludes secrets and runs app as non-root', () => {
@@ -733,7 +736,7 @@ async function register(client, username = 'alice', password = 'StrongPass1') {
     return client.request('POST', '/api/auth/register', { username, password });
 }
 
-async function completeBusinessDataManageStepUp(client, username, password, returnTo = '/?view=settings') {
+async function completeBusinessDataManageStepUp(client, username, password, returnTo = '/?view=settings', browserSession = client) {
     const businessHeaders = {
         host: 'business.local',
         'x-forwarded-host': 'business.local',
@@ -746,7 +749,7 @@ async function completeBusinessDataManageStepUp(client, username, password, retu
         'x-forwarded-proto': 'http',
         'x-ielts-onion-audience': 'auth'
     };
-    const dataStart = await client.request('GET', `/auth/business/data/start?return_to=${encodeURIComponent(returnTo)}`, undefined, {
+    const dataStart = await browserSession.request('GET', `/auth/business/data/start?return_to=${encodeURIComponent(returnTo)}`, undefined, {
         redirect: 'manual',
         headers: businessHeaders
     });
@@ -773,7 +776,7 @@ async function completeBusinessDataManageStepUp(client, username, password, retu
     assert.equal(stepUp.json.intent, 'data-manage');
     assert(stepUp.json.actionProof);
 
-    const callback = await client.request('GET', `/auth/business/data/callback?state=${encodeURIComponent(dataState)}&proof=${encodeURIComponent(stepUp.json.actionProof)}`, undefined, {
+    const callback = await browserSession.request('GET', `/auth/business/data/callback?state=${encodeURIComponent(dataState)}&proof=${encodeURIComponent(stepUp.json.actionProof)}`, undefined, {
         redirect: 'manual',
         headers: businessHeaders
     });
@@ -1130,7 +1133,8 @@ test('login, logout, and authenticated practice API access', async () => {
         assert.equal(created.response.status, 201);
 
         const loggedInRecords = await client.request('GET', '/api/practice-records');
-        assert.equal(loggedInRecords.response.status, 200);
+        assert.equal(loggedInRecords.response.status, 403);
+        assert.equal(loggedInRecords.json.requiresDataManageStepUp, true);
 
         const logout = await client.request('POST', '/api/auth/logout');
         assert.equal(logout.response.status, 200);
@@ -1191,7 +1195,8 @@ test('authenticated APIs require the session verifier companion cookie', async (
         const fullReplayMe = await fullCookieReplay.request('GET', '/api/auth/me');
         assert.equal(fullReplayMe.response.status, 200);
         const fullReplayRecords = await fullCookieReplay.request('GET', '/api/practice-records');
-        assert.equal(fullReplayRecords.response.status, 200);
+        assert.equal(fullReplayRecords.response.status, 403);
+        assert.equal(fullReplayRecords.json.requiresDataManageStepUp, true);
 
         const logout = await client.request('POST', '/api/auth/logout');
         assert.equal(logout.response.status, 200);
@@ -1503,7 +1508,8 @@ test('sensitive API responses are not cacheable', async () => {
         assert.equal(created.response.status, 201);
 
         const records = await client.request('GET', '/api/practice-records');
-        assert.equal(records.response.status, 200);
+        assert.equal(records.response.status, 403);
+        assert.equal(records.json.requiresDataManageStepUp, true);
         assert.equal(records.response.headers.get('cache-control'), 'no-store');
 
         await seedAdmin(client, 'cache_admin', 'StrongPass1');
@@ -2008,6 +2014,7 @@ test('legacy self-delete route is retired and preserves account data', async () 
     try {
         const created = await register(client, 'delete_user', 'StrongPass1');
         assert.equal(created.response.status, 201);
+        await completeBusinessDataManageStepUp(client, 'delete_user', 'StrongPass1');
         const userId = created.json.user.id;
 
         const replaced = await client.request('PUT', '/api/practice-records', {
@@ -2513,7 +2520,8 @@ test('TOTP login requires a second factor before full session access', async () 
         assert.equal(login.json.user.username, 'totp_login');
 
         const records = await client.request('GET', '/api/practice-records');
-        assert.equal(records.response.status, 200);
+        assert.equal(records.response.status, 403);
+        assert.equal(records.json.requiresDataManageStepUp, true);
     } finally {
         await client.close();
     }
@@ -3077,6 +3085,565 @@ test('practice API requires authentication', async () => {
     }
 });
 
+test('ordinary practice sync preserves unseen history without exporting it', async () => {
+    const client = await createClient();
+    try {
+        const created = await register(client, 'ordinary_sync_user', 'StrongPass1');
+        assert.equal(created.response.status, 201);
+        const existing = { id: 'existing-record', sessionId: 'existing-session', type: 'reading', score: 60, privateNote: 'unseen-history' };
+        await client.practiceStore.replace(created.json.user.id, [existing]);
+        const status = await client.request('GET', '/api/practice-records/data-manage/status');
+        assert.equal(status.json.fresh, false);
+
+        const calls = [];
+        const responses = [];
+        const windowStub = { ExamData: {}, console: { warn() {} } };
+        const context = vm.createContext({ window: windowStub, console: windowStub.console, JSON });
+        for (const relativePath of [
+            'js/data/remoteApiClient.js',
+            'js/data/dataSources/remotePracticeDataSource.js',
+            'js/data/repositories/baseRepository.js',
+            'js/data/repositories/practiceRepository.js',
+            'js/core/practiceCore.js'
+        ]) {
+            vm.runInContext(fs.readFileSync(path.join(__dirname, '../..', relativePath), 'utf8'), context);
+        }
+        const api = new windowStub.ExamData.RemoteApiClient({
+            fetchImpl: async (requestPath, options = {}) => {
+                const response = await fetch(client.baseUrl + requestPath, {
+                    ...options,
+                    headers: { ...options.headers, cookie: client.getCookieHeader() }
+                });
+                calls.push([options.method, requestPath, response.status]);
+                responses.push(await response.clone().json());
+                return response;
+            }
+        });
+        api.user = created.json.user;
+        api.csrfToken = client.csrfToken;
+        for (const read of [() => api.exportPracticeRecords(), () => api.listPracticeRecords()]) {
+            await assert.rejects(read, (error) => (
+                error.status === 403 && error.payload.requiresDataManageStepUp === true
+                && !Object.hasOwn(error.payload, 'records')
+                && !JSON.stringify(error.payload).includes('existing-record')
+            ));
+        }
+
+        const local = new Map();
+        let fallbackReads = 0;
+        const dataSource = new windowStub.ExamData.RemotePracticeDataSource({
+            async read(key, fallback) {
+                fallbackReads += 1;
+                return local.has(key) ? local.get(key) : fallback;
+            },
+            async write(key, value) { local.set(key, value); return true; }
+        }, api);
+        windowStub.dataRepositories = {
+            practice: new windowStub.ExamData.PracticeRepository(dataSource)
+        };
+        await windowStub.PracticeCore.store.savePracticeRecord({
+            id: 'new-record', sessionId: 'new-session', type: 'listening', score: 80
+        });
+
+        const records = await client.practiceStore.list(created.json.user.id);
+        assert.deepEqual(records.map((record) => record.id), ['existing-record', 'new-record']);
+        assert.deepEqual(records[0], existing);
+        assert.equal(fallbackReads, 1, 'denied complete read may use the empty local store');
+        assert.deepEqual(calls, [
+            ['GET', '/api/practice-records/export', 403],
+            ['GET', '/api/practice-records', 403],
+            ['GET', '/api/practice-records', 403],
+            ['POST', '/api/practice-records/sync', 200]
+        ]);
+        assert.deepEqual(responses.at(-1), { ok: true });
+        assert(!JSON.stringify(responses).includes('existing-record'));
+        assert(!JSON.stringify(responses).includes('unseen-history'));
+        assert.deepEqual(Array.from(local.get('practice_records'), (record) => record.id), ['new-record']);
+
+        api.csrfToken = 'invalid-csrf-token';
+        await assert.rejects(() => api.syncPracticeRecords([{ id: 'csrf-rejected-record' }]), (error) => (
+            error.status === 403 && error.payload.error === 'CSRF token invalid'
+        ));
+        assert.deepEqual(await client.practiceStore.list(created.json.user.id), records);
+        assert.equal((await client.request('GET', '/api/practice-records/data-manage/status')).json.fresh, false);
+
+        await completeBusinessDataManageStepUp(client, 'ordinary_sync_user', 'StrongPass1');
+        for (const read of [() => api.exportPracticeRecords(), () => api.listPracticeRecords()]) {
+            assert.deepEqual(JSON.parse(JSON.stringify(await read())), records);
+        }
+    } finally {
+        await client.close();
+    }
+});
+
+test('copied authenticated session cannot export through sync or destructive routes', async () => {
+    const client = await createClient();
+    try {
+        const anonymous = await client.request('POST', '/api/practice-records/sync', { records: [] });
+        assert.equal(anonymous.response.status, 401);
+        const created = await register(client, 'copied_sync_user', 'StrongPass1');
+        const existing = { id: 'existing-record', sessionId: 'hidden-session', privateNote: 'private-server-only', date: '2026-09-24T00:00:00Z' };
+        await client.practiceStore.replace(created.json.user.id, [existing]);
+        const copied = client.createSession();
+        copied.setCookie('ielts.sid', client.getCookie('ielts.sid'));
+        copied.setCookie('ielts.sv', client.getCookie('ielts.sv'));
+        await copied.csrf();
+        assert.equal((await copied.request('GET', '/api/auth/me')).response.status, 200);
+        for (const [method, route, body] of [
+            ['GET', '/api/practice-records'],
+            ['GET', '/api/practice-records/export'],
+            ['PUT', '/api/practice-records', { records: [] }],
+            ['POST', '/api/practice-records/import', { records: [] }],
+            ['DELETE', '/api/practice-records/existing-record'],
+            ['DELETE', '/api/practice-records']
+        ]) {
+            const denied = await copied.request(method, route, body);
+            assert.equal(denied.response.status, 403, method + ' ' + route);
+            assert.equal(denied.json.requiresDataManageStepUp, true);
+            assert.equal(denied.json.records, undefined);
+            assert(!denied.text.includes('private-server-only'));
+        }
+        for (const records of [[{ id: 'existing-record' }], [{ sessionId: 'hidden-session' }]]) {
+            const synced = await copied.request('POST', '/api/practice-records/sync?export=true', { records });
+            assert.equal(synced.response.status, 200);
+            assert.deepEqual(synced.json, { ok: true }, 'even matching server records must never be echoed');
+        }
+        const readSync = await copied.request('GET', '/api/practice-records/sync');
+        assert.notEqual(readSync.response.status, 200);
+        assert(!readSync.text.includes('private-server-only'));
+        assert.deepEqual(await client.practiceStore.list(created.json.user.id), [existing]);
+
+        for (const options of [{ csrf: false }, { csrf: false, headers: { 'x-csrf-token': 'invalid' } }]) {
+            const denied = await copied.request('POST', '/api/practice-records/sync', { records: [{ id: 'blocked' }] }, options);
+            assert.equal(denied.response.status, 403);
+            assert.equal(denied.json.error, 'CSRF token invalid');
+        }
+        for (const [body, status] of [
+            [{ records: 'not-an-array' }, 400],
+            [{ records: [] }, 400],
+            [{ records: [{ id: 'bulk-a' }, { id: 'bulk-b' }] }, 400],
+            [{ records: [{ id: 'x'.repeat(513) }] }, 400],
+            [{ records: JSON.parse('[{"id":"polluted","payload":{"constructor":{"bad":true}}}]') }, 400],
+            [{ records: Array.from({ length: 5001 }, (_, i) => ({ id: 'r' + i })) }, 400]
+        ]) {
+            const rejected = await copied.request('POST', '/api/practice-records/sync', body);
+            assert.equal(rejected.response.status, status);
+        }
+        assert.deepEqual(await client.practiceStore.list(created.json.user.id), [existing]);
+        const other = client.createSession();
+        const otherUser = await register(other, 'other_sync_user', 'StrongPass1');
+        assert.deepEqual((await other.request('POST', '/api/practice-records/sync', {
+            userId: created.json.user.id, records: [{ id: 'other-record' }]
+        })).json, { ok: true });
+        assert.deepEqual(await client.practiceStore.list(created.json.user.id), [existing]);
+        assert.deepEqual((await client.practiceStore.list(otherUser.json.user.id)).map((record) => record.id), ['other-record']);
+    } finally {
+        await client.close();
+    }
+});
+
+test('practice sync merges concurrent mutations and rejects identity collisions atomically', async () => {
+    const client = await createClient();
+    try {
+        const created = await register(client, 'sync_merge_user', 'StrongPass1');
+        const baseline = [
+            { id: 'known', sessionId: 'known-session', date: '2026-01-01', privateNote: 'retained' },
+            { id: 'unknown', sessionId: 'unknown-session', date: '2026-01-01' }
+        ];
+        await client.practiceStore.replace(created.json.user.id, baseline);
+        const results = await Promise.all(['a', 'b', 'c'].map((id) => client.request(
+            'POST', '/api/practice-records/sync', { records: [{ id, sessionId: 'session-' + id }] }
+        )));
+        results.forEach((result) => assert.deepEqual(result.json, { ok: true }));
+        const stored = await client.practiceStore.list(created.json.user.id);
+        assert.deepEqual(stored.map((record) => record.id).sort(), ['a', 'b', 'c', 'known', 'unknown']);
+        for (const alias of [
+            { sessionId: 'unknown-session' },
+            { session_id: 'unknown-session' },
+            { realData: { sessionId: 'unknown-session' } }
+        ]) {
+            const conflict = await client.request('POST', '/api/practice-records/sync', {
+                records: [{ id: 'known', date: '2026-02-01', ...alias }]
+            });
+            assert.equal(conflict.response.status, 409);
+            assert.deepEqual(await client.practiceStore.list(created.json.user.id), stored);
+        }
+        const update = await client.request('POST', '/api/practice-records/sync', {
+            records: [{ id: 'known', score: 85, date: '2026-02-01' }]
+        });
+        assert.deepEqual(update.json, { ok: true });
+        const afterUpdate = await client.practiceStore.list(created.json.user.id);
+        assert.equal(afterUpdate.find((record) => record.id === 'known').privateNote, 'retained');
+        assert.equal(afterUpdate.find((record) => record.id === 'known').score, 85);
+        const retry = await client.request('POST', '/api/practice-records/sync', {
+            records: [{ id: 'retry-id', sessionId: 'known-session', score: 90, date: '2026-03-01' }]
+        });
+        assert.deepEqual(retry.json, { ok: true });
+        const afterRetry = await client.practiceStore.list(created.json.user.id);
+        assert.equal(afterRetry.length, stored.length);
+        assert.equal(afterRetry.find((record) => record.sessionId === 'known-session').id, 'retry-id');
+        assert.deepEqual(afterRetry.find((record) => record.id === 'unknown'), baseline[1]);
+        await client.practiceStore.replace(created.json.user.id, Array.from({ length: 5000 }, (_, i) => ({ id: 'full-' + i })));
+        const overflow = await client.request('POST', '/api/practice-records/sync', { records: [{ id: 'overflow' }] });
+        assert.equal(overflow.response.status, 413);
+        assert.equal((await client.practiceStore.list(created.json.user.id)).length, 5000);
+    } finally {
+        await client.close();
+    }
+});
+
+test('Postgres practice sync locks before reading and only writes merged changes', async () => {
+    const existing = [
+        { id: 'unseen', sessionId: 'unseen-session', privateNote: 'never-return-to-sync-client' },
+        { id: 'known', sessionId: 'known-session', date: '2026-01-01', privateNote: 'keep' }
+    ];
+    const queries = [];
+    let inTransaction = false;
+    const db = {
+        query() { throw new Error('sync must use its transaction client'); },
+        async withTransaction(handler) {
+            inTransaction = true;
+            try {
+                return await handler({
+                    async query(sql, params) {
+                        assert.equal(inTransaction, true);
+                        queries.push([sql, params]);
+                        if (sql.startsWith('SELECT id FROM users')) return { rows: [{ id: 'owner' }] };
+                        if (sql.startsWith('SELECT payload')) {
+                            assert.match(queries[0][0], /users WHERE id = \$1 FOR UPDATE/);
+                            assert.match(sql, /FOR UPDATE$/);
+                            return { rows: existing.map((payload, sort_order) => ({ payload, sort_order })) };
+                        }
+                        return { rows: [], rowCount: 1 };
+                    }
+                });
+            } finally {
+                inTransaction = false;
+            }
+        }
+    };
+    const store = new PostgresPracticeRecordStore(db);
+    const merged = await store.merge('owner', [
+        { id: 'known', score: 88, date: '2026-02-01' }, { id: 'new-record' }
+    ]);
+    assert.deepEqual(merged[0], existing[0]);
+    assert.equal(merged[1].privateNote, 'keep');
+    assert.equal(merged[1].score, 88);
+    assert.equal(merged[2].id, 'new-record');
+    assert.deepEqual(queries.filter(([sql]) => sql.startsWith('DELETE')).map(([, params]) => params), [
+        ['owner', 'known']
+    ], 'only the changed row may be rewritten; unseen rows must remain untouched');
+    const inserts = queries.filter(([sql]) => sql.startsWith('INSERT'));
+    assert.deepEqual(inserts.map(([, params]) => params[1]), ['known', 'new-record']);
+    assert(queries.every(([, params]) => params[0] === 'owner'));
+
+    queries.length = 0;
+    await assert.rejects(
+        () => store.merge('owner', [{ id: 'known', sessionId: 'unseen-session' }]),
+        (error) => error.status === 409
+    );
+    assert.equal(queries.length, 2, 'conflict must be rejected before any write');
+    queries.length = 0;
+    await store.merge('owner', []);
+    assert.equal(queries.length, 2, 'empty sync must not replace or delete the collection');
+});
+
+test('Postgres practice import supports valid session moves without intermediate uniqueness conflicts', async () => {
+    const rows = new Map([
+        ['a', { id: 'a', sessionId: 'session-a', date: '2026-01-01' }],
+        ['b', { id: 'b', sessionId: 'session-b', date: '2026-01-01' }],
+        ['unseen', { id: 'unseen', sessionId: 'unseen-session', privateNote: 'retained' }]
+    ]);
+    const writes = [];
+    const store = new PostgresPracticeRecordStore({
+        async withTransaction(handler) {
+            return handler({
+                async query(sql, params) {
+                    if (sql.startsWith('SELECT id FROM users')) return { rows: [{ id: 'owner' }] };
+                    if (sql.startsWith('SELECT payload')) return { rows: Array.from(rows.values(), (payload, sort_order) => ({ payload, sort_order })) };
+                    writes.push([sql, params]);
+                    if (sql.startsWith('DELETE')) {
+                        assert.equal(params.length, 2, 'merge must not delete the whole collection');
+                        rows.delete(params[1]);
+                    } else if (sql.startsWith('INSERT')) {
+                        const record = JSON.parse(params[10]);
+                        assert(!Array.from(rows.values()).some((stored) => (
+                            stored.id !== record.id && stored.sessionId && stored.sessionId === record.sessionId
+                        )), 'practice_records_user_session_unique must hold after each statement');
+                        rows.set(record.id, record);
+                    } else {
+                        assert.fail('unexpected write');
+                    }
+                    return { rowCount: 1, rows: [] };
+                }
+            });
+        }
+    });
+    const result = await createPracticeRecordService(store).import('owner', [
+        { id: 'b', sessionId: 'session-c', date: '2026-02-01' },
+        { id: 'a', sessionId: 'session-b', date: '2026-02-01' }
+    ]);
+    assert.deepEqual(result.map((record) => [record.id, record.sessionId]), [
+        ['a', 'session-b'], ['b', 'session-c'], ['unseen', 'unseen-session']
+    ]);
+    assert.deepEqual(rows.get('unseen'), { id: 'unseen', sessionId: 'unseen-session', privateNote: 'retained' });
+    assert(writes.every(([, params]) => params[1] !== 'unseen'));
+});
+
+// Exercise the production store SQL, including persisted keys and the UPDATE
+// trigger. The schema does not make sort_order unique: ordering collisions must
+// remain observable here rather than being hidden by an artificial constraint.
+function createPracticeOrderingDb() {
+    let rows = new Map();
+    let clock = 0;
+    let pending = Promise.resolve();
+    const events = [];
+    const key = (userId, id) => JSON.stringify([userId, id]);
+    const snapshot = (userId) => Array.from(rows.values())
+        .filter((row) => userId === undefined || row.user_id === userId)
+        .sort((a, b) => a.sort_order - b.sort_order || b.updated_at - a.updated_at)
+        .map((row) => structuredClone(row));
+
+    async function query(sql, params = [], transaction = null) {
+        const statement = sql.replace(/\s+/g, ' ').trim();
+        events.push(statement);
+        if (statement === 'SELECT id FROM users WHERE id = $1 FOR UPDATE') {
+            assert(transaction);
+            transaction.owner = params[0];
+            return { rows: [{ id: params[0] }] };
+        }
+        if (transaction) assert.equal(transaction.owner, params[0], 'owner lock must precede record access');
+        if (/^SELECT payload(?:, sort_order)? FROM practice_records /.test(statement)) {
+            assert.match(statement, /ORDER BY sort_order ASC, updated_at DESC/);
+            if (transaction) assert.match(statement, /FOR UPDATE$/);
+            const selected = snapshot(params[0]);
+            return { rows: selected.map(({ payload, sort_order }) => (
+                statement.startsWith('SELECT payload, sort_order') ? { payload, sort_order } : { payload }
+            )) };
+        }
+        assert(transaction, 'writes must use the locked transaction client');
+        if (statement.startsWith('DELETE FROM practice_records WHERE user_id = $1')) {
+            const selected = snapshot(params[0]).filter((row) => params.length === 1 || row.id === params[1]);
+            for (const row of selected) rows.delete(key(row.user_id, row.id));
+            return { rows: [], rowCount: selected.length };
+        }
+        if (statement.startsWith('INSERT INTO practice_records')) {
+            assert.match(statement, /ON CONFLICT \(user_id, id\) DO UPDATE SET/);
+            const [userId, id, sessionId] = params;
+            const sortOrder = params[11];
+            assert(Number.isInteger(sortOrder) && sortOrder >= -2147483648 && sortOrder <= 2147483647);
+            if (snapshot(userId).some((row) => row.id !== id && sessionId !== null && row.session_id === sessionId)) {
+                throw Object.assign(new Error('practice_records_user_session_unique'), { code: '23505' });
+            }
+            const previous = rows.get(key(userId, id));
+            rows.set(key(userId, id), {
+                user_id: userId, id, session_id: sessionId, payload: JSON.parse(params[10]),
+                sort_order: sortOrder, created_at: previous?.created_at ?? transaction.timestamp,
+                // INSERT defaults and ON CONFLICT's UPDATE trigger both use now().
+                updated_at: transaction.timestamp
+            });
+            return { rows: [], rowCount: 1 };
+        }
+        assert.fail('unmodeled production SQL: ' + statement);
+    }
+
+    return {
+        events,
+        snapshot,
+        query,
+        setSortOrder(userId, id, sortOrder) {
+            assert(Number.isInteger(sortOrder) && sortOrder >= -2147483648 && sortOrder <= 2147483647);
+            const row = rows.get(key(userId, id));
+            assert(row);
+            row.sort_order = sortOrder;
+            row.updated_at = ++clock; // Model the schema's BEFORE UPDATE trigger.
+        },
+        withTransaction(handler) {
+            const operation = pending.then(async () => {
+                const before = structuredClone(rows);
+                const transaction = { owner: null, timestamp: ++clock };
+                events.push('BEGIN');
+                try {
+                    const result = await handler({ query: (sql, params) => query(sql, params, transaction) });
+                    events.push('COMMIT');
+                    return result;
+                } catch (error) {
+                    rows = before;
+                    events.push('ROLLBACK');
+                    throw error;
+                }
+            });
+            pending = operation.catch(() => {});
+            return operation;
+        }
+    };
+}
+
+function assertPersistedPracticeOrder(db, expected, userId = 'owner') {
+    const actual = db.snapshot(userId).map((row) => [row.id, row.sort_order]);
+    assert.deepEqual(actual, expected);
+    assert.equal(new Set(actual.map(([, order]) => order)).size, actual.length, 'partial merge must not duplicate order keys');
+}
+
+test('Postgres partial merge preserves persisted ordering after deleting the first slot (P2 reproducer)', async () => {
+    for (const method of ['sync', 'import']) {
+        const db = createPracticeOrderingDb();
+        const postgres = createPracticeRecordService(new PostgresPracticeRecordStore(db));
+        const memory = createPracticeRecordService(new MemoryPracticeRecordStore());
+        const original = ['a', 'b', 'c'].map((id) => ({ id, sessionId: 'session-' + id }));
+        for (const service of [postgres, memory]) {
+            await service.replace('owner', original);
+            await service.deleteById('owner', 'a');
+        }
+        assertPersistedPracticeOrder(db, [['b', 1], ['c', 2]]);
+        const untouched = db.snapshot('owner');
+        for (const service of [postgres, memory]) await service[method]('owner', [{ id: 'd' }]);
+        assert.deepEqual((await postgres.list('owner')).map((record) => record.id), ['b', 'c', 'd'], method);
+        assert.deepEqual(await postgres.list('owner'), await memory.list('owner'));
+        assertPersistedPracticeOrder(db, [['b', 1], ['c', 2], ['d', 3]]);
+        assert.deepEqual(db.snapshot('owner').slice(0, 2), untouched, 'unrelated timestamps and rows must remain unchanged');
+    }
+});
+
+test('Postgres partial merge preserves an updated slot after a middle deletion', async () => {
+    const db = createPracticeOrderingDb();
+    const postgres = createPracticeRecordService(new PostgresPracticeRecordStore(db));
+    const memory = createPracticeRecordService(new MemoryPracticeRecordStore());
+    for (const service of [postgres, memory]) {
+        await service.replace('owner', ['a', 'b', 'c'].map((id) => ({ id, date: '2026-01-01' })));
+        await service.deleteById('owner', 'b');
+    }
+    const untouched = db.snapshot('owner')[0];
+    for (const service of [postgres, memory]) {
+        await service.sync('owner', [{ id: 'c', date: '2026-02-01', score: 91 }]);
+    }
+    assertPersistedPracticeOrder(db, [['a', 0], ['c', 2]]);
+    for (const service of [postgres, memory]) await service.sync('owner', [{ id: 'd' }]);
+    assertPersistedPracticeOrder(db, [['a', 0], ['c', 2], ['d', 3]]);
+    assert.deepEqual(db.snapshot('owner')[0], untouched);
+    assert.deepEqual(await postgres.list('owner'), await memory.list('owner'));
+});
+
+test('Postgres partial merge keeps session replacements in their persisted logical slot', async () => {
+    const db = createPracticeOrderingDb();
+    const postgres = createPracticeRecordService(new PostgresPracticeRecordStore(db));
+    const memory = createPracticeRecordService(new MemoryPracticeRecordStore());
+    for (const service of [postgres, memory]) {
+        await service.replace('owner', [
+            { id: 'old-id', sessionId: 'same-session', date: '2026-01-01' },
+            { id: 'untouched', sessionId: 'another-session' }
+        ]);
+    }
+    db.setSortOrder('owner', 'old-id', 17);
+    db.setSortOrder('owner', 'untouched', 23);
+    const untouched = db.snapshot('owner')[1];
+    for (const service of [postgres, memory]) {
+        await service.sync('owner', [{ id: 'new-id', sessionId: 'same-session', date: '2026-02-01' }]);
+        await service.import('owner', [{ id: 'newer-id', sessionId: 'same-session', date: '2026-03-01' }]);
+    }
+    assertPersistedPracticeOrder(db, [['newer-id', 17], ['untouched', 23]]);
+    assert.deepEqual(db.snapshot('owner')[1], untouched);
+    assert.deepEqual(await postgres.list('owner'), await memory.list('owner'));
+});
+
+test('Postgres partial import appends several new records after the persisted maximum', async () => {
+    const db = createPracticeOrderingDb();
+    const postgres = createPracticeRecordService(new PostgresPracticeRecordStore(db));
+    const memory = createPracticeRecordService(new MemoryPracticeRecordStore());
+    for (const service of [postgres, memory]) {
+        await service.replace('owner', ['a', 'b', 'c'].map((id) => ({ id })));
+        await service.deleteById('owner', 'b');
+    }
+    db.setSortOrder('owner', 'c', 12);
+    const untouched = db.snapshot('owner');
+    for (const service of [postgres, memory]) {
+        await service.import('owner', [
+            { id: 'd', sessionId: 'new-session', date: '2026-01-01' },
+            { id: 'e' },
+            { id: 'replacement-d', sessionId: 'new-session', date: '2026-02-01' }
+        ]);
+    }
+    assertPersistedPracticeOrder(db, [['a', 0], ['c', 12], ['replacement-d', 13], ['e', 14]]);
+    assert.deepEqual(db.snapshot('owner').slice(0, 2), untouched);
+    assert.deepEqual(await postgres.list('owner'), await memory.list('owner'));
+    await postgres.clear('owner');
+    await postgres.sync('owner', [{ id: 'first' }]);
+    assertPersistedPracticeOrder(db, [['first', 0]]);
+    await postgres.replace('owner', [{ id: 'replacement-b' }, { id: 'replacement-a' }]);
+    assertPersistedPracticeOrder(db, [['replacement-b', 0], ['replacement-a', 1]]);
+});
+
+test('Postgres partial merge rejects identity conflicts without changing records or order', async () => {
+    const db = createPracticeOrderingDb();
+    const service = createPracticeRecordService(new PostgresPracticeRecordStore(db));
+    await service.replace('owner', [{ id: 'a', sessionId: 's-a' }, { id: 'b', sessionId: 's-b' }]);
+    db.setSortOrder('owner', 'b', 7);
+    await service.replace('other-owner', [{ id: 'a', sessionId: 's-a' }]);
+    const before = db.snapshot();
+    const eventStart = db.events.length;
+    await assert.rejects(() => service.import('owner', [
+        { id: 'new' }, { id: 'a', sessionId: 's-b' }
+    ]), (error) => error.status === 409);
+    assert.deepEqual(db.snapshot(), before);
+    assert.equal(db.events.at(-1), 'ROLLBACK');
+    assert(!db.events.slice(eventStart).some((sql) => /^(INSERT|DELETE|UPDATE)/.test(sql)));
+    await service.sync('other-owner', [{ id: 'a', score: 92 }]);
+    assertPersistedPracticeOrder(db, [['a', 0], ['b', 7]]);
+    assert.deepEqual(db.snapshot('owner'), before.filter((row) => row.user_id === 'owner'));
+});
+
+test('Postgres partial merge guards integer exhaustion before any record mutation', async () => {
+    const db = createPracticeOrderingDb();
+    const service = createPracticeRecordService(new PostgresPracticeRecordStore(db));
+    await service.replace('owner', [{ id: 'a' }]);
+    db.setSortOrder('owner', 'a', 2147483646);
+    const before = db.snapshot('owner');
+    const eventStart = db.events.length;
+    await assert.rejects(() => service.import('owner', [{ id: 'a', score: 1 }, { id: 'b' }, { id: 'c' }]),
+        (error) => error.status === 409 && /order/.test(error.message));
+    assert.deepEqual(db.snapshot('owner'), before);
+    assert(!db.events.slice(eventStart).some((sql) => /^(INSERT|DELETE|UPDATE)/.test(sql)));
+    await service.sync('owner', [{ id: 'b' }]);
+    assertPersistedPracticeOrder(db, [['a', 2147483646], ['b', 2147483647]]);
+    await service.sync('owner', [{ id: 'b', score: 93 }]);
+    assertPersistedPracticeOrder(db, [['a', 2147483646], ['b', 2147483647]]);
+    const atLimit = db.snapshot('owner');
+    await assert.rejects(() => service.sync('owner', [{ id: 'c' }]), (error) => error.status === 409);
+    assert.deepEqual(db.snapshot('owner'), atLimit);
+});
+
+test('Postgres partial import preserves logical slots when an old ID is reused after session moves', async () => {
+    const db = createPracticeOrderingDb();
+    const postgres = createPracticeRecordService(new PostgresPracticeRecordStore(db));
+    const memory = createPracticeRecordService(new MemoryPracticeRecordStore());
+    for (const service of [postgres, memory]) {
+        await service.replace('owner', [
+            { id: 'a', sessionId: 'sa' }, { id: 'gap' }, { id: 'b', sessionId: 'sb' }
+        ]);
+        await service.deleteById('owner', 'gap');
+        await service.import('owner', [
+            { id: 'a', sessionId: 'sc' },
+            { id: 'x', sessionId: 'sc' },
+            { id: 'b', sessionId: 'sa' },
+            { id: 'a', sessionId: 'sa' }
+        ]);
+    }
+    assertPersistedPracticeOrder(db, [['x', 0], ['a', 2]]);
+    assert.deepEqual(await postgres.list('owner'), await memory.list('owner'));
+});
+
+test('Postgres partial merge serializes same-user appends without duplicate order keys', async () => {
+    const db = createPracticeOrderingDb();
+    const service = createPracticeRecordService(new PostgresPracticeRecordStore(db));
+    await service.replace('owner', [{ id: 'deleted' }, { id: 'existing' }]);
+    await service.deleteById('owner', 'deleted');
+    await Promise.all(Array.from({ length: 8 }, (_, index) => service.sync('owner', [{ id: 'new-' + index }])));
+    assertPersistedPracticeOrder(db, [['existing', 1], ...Array.from({ length: 8 }, (_, index) => ['new-' + index, index + 2])]);
+    const before = db.snapshot('owner');
+    await service.import('owner', []);
+    assert.deepEqual(db.snapshot('owner'), before);
+});
+
 test('practice destructive data management requires data step-up bound to the business browser', async () => {
     const client = await createClient();
     const businessHeaders = {
@@ -3095,7 +3662,7 @@ test('practice destructive data management requires data step-up bound to the bu
         const created = await register(client, 'data_manage_user', 'StrongPass1');
         assert.equal(created.response.status, 201);
 
-        const replaced = await client.request('PUT', '/api/practice-records', {
+        const replaced = await client.request('POST', '/api/practice-records/sync', {
             records: [{ id: 'record-a', sessionId: 'session-a', type: 'reading', score: 60, date: '2026-03-01T00:00:00.000Z' }]
         });
         assert.equal(replaced.response.status, 200);
@@ -3104,6 +3671,19 @@ test('practice destructive data management requires data step-up bound to the bu
         assert.equal(statusWithoutStepUp.response.status, 200);
         assert.equal(statusWithoutStepUp.json.fresh, false);
         assert.equal(statusWithoutStepUp.json.authActionStart, '/auth/business/data/start');
+
+        const exportWithoutStepUp = await client.request('GET', '/api/practice-records/export');
+        assert.equal(exportWithoutStepUp.response.status, 403);
+        assert.equal(exportWithoutStepUp.json.requiresDataManageStepUp, true);
+        assert.equal(exportWithoutStepUp.json.authActionStart, '/auth/business/data/start');
+
+        const fullListWithoutStepUp = await client.request('GET', '/api/practice-records');
+        assert.equal(fullListWithoutStepUp.response.status, 403);
+        assert.equal(fullListWithoutStepUp.json.requiresDataManageStepUp, true);
+
+        const replacementWithoutStepUp = await client.request('PUT', '/api/practice-records', { records: [] });
+        assert.equal(replacementWithoutStepUp.response.status, 403);
+        assert.equal(replacementWithoutStepUp.json.requiresDataManageStepUp, true);
 
         const importWithoutStepUp = await client.request('POST', '/api/practice-records/import', {
             records: [{ id: 'record-b', sessionId: 'session-b', type: 'listening', score: 70, date: '2026-03-02T00:00:00.000Z' }]
@@ -3161,6 +3741,9 @@ test('practice destructive data management requires data step-up bound to the bu
             password: 'StrongPass1'
         }, { headers: businessHeaders });
         assert.equal(unrelatedLogin.response.status, 200);
+        const unrelatedExport = await unrelatedBusinessSession.request('GET', '/api/practice-records/export');
+        assert.equal(unrelatedExport.response.status, 403);
+        assert.equal(unrelatedExport.json.requiresDataManageStepUp, true);
         const crossBrowserCallback = await unrelatedBusinessSession.request('GET', `/auth/business/data/callback?state=${encodeURIComponent(dataState)}&proof=${encodeURIComponent(dataStepUp.json.actionProof)}`, undefined, {
             redirect: 'manual',
             headers: businessHeaders
@@ -3180,10 +3763,39 @@ test('practice destructive data management requires data step-up bound to the bu
         assert.equal(statusAfterStepUp.json.fresh, true);
         assert.equal(statusAfterStepUp.json.authActionStart, '/auth/business/data/start');
 
+        const exported = await client.request('GET', '/api/practice-records/export');
+        assert.equal(exported.response.status, 200);
+        assert.equal(exported.response.headers.get('cache-control'), 'no-store');
+        assert.deepEqual(exported.json.records.map((record) => record.id), ['record-a']);
+
+        const fullListAfterStepUp = await client.request('GET', '/api/practice-records');
+        assert.equal(fullListAfterStepUp.response.status, 200);
+        assert.deepEqual(fullListAfterStepUp.json.records.map((record) => record.id), ['record-a']);
+
+        const expiredExport = await withDateNowOffset(5 * 60 * 1000 + 1, () => (
+            client.request('GET', '/api/practice-records/export')
+        ));
+        assert.equal(expiredExport.response.status, 403);
+        assert.equal(expiredExport.json.requiresDataManageStepUp, true);
+
         const imported = await client.request('POST', '/api/practice-records/import', {
             records: [{ id: 'record-b', sessionId: 'session-b', type: 'listening', score: 70, date: '2026-03-02T00:00:00.000Z' }]
         });
         assert.equal(imported.response.status, 201);
+
+        const otherUserSession = client.createSession();
+        const otherUser = await register(otherUserSession, 'other_data_user', 'StrongPass1');
+        assert.equal(otherUser.response.status, 201);
+        const otherUserRecords = await otherUserSession.request('POST', '/api/practice-records/sync', {
+            records: [{ id: 'record-other', sessionId: 'session-other', type: 'reading', score: 80 }]
+        });
+        assert.equal(otherUserRecords.response.status, 200);
+        await completeBusinessDataManageStepUp(client, 'other_data_user', 'StrongPass1', '/?view=settings', otherUserSession);
+        const otherUserExport = await otherUserSession.request('GET', '/api/practice-records/export');
+        assert.deepEqual(otherUserExport.json.records.map((record) => record.id), ['record-other']);
+
+        const originalUserExport = await client.request('GET', '/api/practice-records/export');
+        assert.deepEqual(originalUserExport.json.records.map((record) => record.id).sort(), ['record-a', 'record-b']);
 
         const removed = await client.request('DELETE', '/api/practice-records/record-a');
         assert.equal(removed.response.status, 200);
@@ -3192,6 +3804,11 @@ test('practice destructive data management requires data step-up bound to the bu
         const cleared = await client.request('DELETE', '/api/practice-records');
         assert.equal(cleared.response.status, 200);
         assert.deepEqual(cleared.json.records, []);
+
+        const storedUser = client.authStore.users.get('data_manage_user');
+        await client.authStore.bumpSecurityEpoch(storedUser.id);
+        const invalidatedBySecurityEpoch = await client.request('GET', '/api/practice-records/export');
+        assert.equal(invalidatedBySecurityEpoch.response.status, 401);
     } finally {
         await client.close();
     }
@@ -3231,6 +3848,7 @@ test('PUT practice records replaces the list returned by GET', async () => {
     try {
         const created = await register(client, 'replace_user', 'StrongPass1');
         assert.equal(created.response.status, 201);
+        await completeBusinessDataManageStepUp(client, 'replace_user', 'StrongPass1');
 
         const records = [
             { id: 'first', sessionId: 's-first', type: 'reading', score: 55, date: '2026-02-01T00:00:00.000Z' },
@@ -3252,6 +3870,7 @@ test('PUT practice records deduplicates duplicate session ids before storing', a
     try {
         const created = await register(client, 'replace_dedupe_user', 'StrongPass1');
         assert.equal(created.response.status, 201);
+        await completeBusinessDataManageStepUp(client, 'replace_dedupe_user', 'StrongPass1');
 
         const replaced = await client.request('PUT', '/api/practice-records', {
             records: [
@@ -4103,7 +4722,7 @@ test('admin shell and business account menu do not link back through the busines
     assert(dataManagementPanel.includes('/auth/business/data/start'));
     assert(dataManagementPanel.includes('async ensureDataManageStepUp()'));
     assert(dataManagementPanel.includes('async openImportFromSettings()'));
-    assert(dataManagementPanel.includes('includeBackups && !(await this.ensureDataManageStepUp())'));
+    assert(dataManagementPanel.includes('if (!(await this.ensureDataManageStepUp()))'));
     assert(examActions.includes('async function ensureDataExportStepUp()'));
     assert(examActions.includes('await ensureDataExportStepUp()'));
     assert(appActions.includes('function ensureMarkdownExportDataManageStepUp()'));
@@ -5672,6 +6291,7 @@ test('admin can list users, inspect records, and delete one record', async () =>
                 }
             }
         ];
+        await completeBusinessDataManageStepUp(client, 'managed_user', 'StrongPass1');
         const replaced = await client.request('PUT', '/api/practice-records', { records });
         assert.equal(replaced.response.status, 200);
 
@@ -6015,6 +6635,7 @@ test('admin account center and user-list sensitive reads require recent password
         assert.equal(created.response.status, 201);
         const managedUserId = created.json.user.id;
 
+        await completeBusinessDataManageStepUp(client, 'account_read_target', 'StrongPass1');
         const replaced = await client.request('PUT', '/api/practice-records', {
             records: [{
                 id: 'account-read-record',
@@ -6213,6 +6834,7 @@ test('admin can manage users and inspect learning and traffic stats', async () =
                 updatedAt: latestRecordAt
             }
         ];
+        await completeBusinessDataManageStepUp(client, 'stats_user', 'StrongPass1');
         const replaced = await client.request('PUT', '/api/practice-records', { records });
         assert.equal(replaced.response.status, 200);
 
@@ -6851,7 +7473,8 @@ test('admin user changes invalidate target sessions and stale admin roles', asyn
         const createdUser = await register(userSession, 'reset_target', 'StrongPass1');
         assert.equal(createdUser.response.status, 201);
         const userRecords = await userSession.request('GET', '/api/practice-records');
-        assert.equal(userRecords.response.status, 200);
+        assert.equal(userRecords.response.status, 403);
+        assert.equal(userRecords.json.requiresDataManageStepUp, true);
 
         const resetPassword = await adminSession.request('PATCH', `/api/admin/users/${createdUser.json.user.id}`, {
             password: 'StrongerPass2'

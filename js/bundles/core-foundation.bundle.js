@@ -4275,6 +4275,18 @@ storageManager.ready
             return Array.isArray(payload.records) ? payload.records : [];
         }
 
+        async exportPracticeRecords() {
+            const payload = await this.request('/api/practice-records/export', { method: 'GET', csrf: false });
+            return Array.isArray(payload.records) ? payload.records : [];
+        }
+
+        async syncPracticeRecords(records) {
+            return this.request('/api/practice-records/sync', {
+                method: 'POST',
+                body: { records: Array.isArray(records) ? records : [] }
+            });
+        }
+
         async replacePracticeRecords(records) {
             const payload = await this.request('/api/practice-records', {
                 method: 'PUT',
@@ -4526,9 +4538,9 @@ storageManager.ready
             return value;
         }
 
-        set(key, value) {
+        set(key, value, options = {}) {
             this.cache.set(key, value);
-            this.operations.push({ type: 'set', key, value });
+            this.operations.push({ type: 'set', key, value, options: cloneValue(options) });
         }
 
         remove(key) {
@@ -4539,9 +4551,9 @@ storageManager.ready
         async commit() {
             for (const operation of this.operations) {
                 if (operation.type === 'set') {
-                    await this.dataSource.write(operation.key, operation.value);
+                    await this.dataSource._write(operation.key, operation.value, operation.options);
                 } else if (operation.type === 'remove') {
-                    await this.dataSource.remove(operation.key);
+                    await this.dataSource._remove(operation.key);
                 }
             }
             this.operations = [];
@@ -4587,45 +4599,59 @@ storageManager.ready
             }
         }
 
-        async write(key, value) {
+        async write(key, value, options = {}) {
+            const snapshot = cloneValue(options);
+            return this._enqueue(() => this._write(key, value, snapshot));
+        }
+
+        async _write(key, value, options = {}) {
             if (!this.isPracticeKey(key) || !this.apiClient.isAuthenticated()) {
                 return this.localDataSource.write(key, value);
             }
-            return this._enqueue(async () => {
-                try {
-                    const records = await this.apiClient.replacePracticeRecords(Array.isArray(value) ? value : []);
-                    await this.localDataSource.write(key, cloneValue(records));
-                    return true;
-                } catch (error) {
-                    if (isUnauthorized(error)) {
-                        clearApiAuthState(this.apiClient);
-                    }
-                    console.warn('[RemotePracticeDataSource] 写入远端练习记录失败，回退本地:', summarizeRemotePracticeErrorForLog(error));
-                    return this.localDataSource.write(key, value);
+            try {
+                let records;
+                if (Array.isArray(options.syncRecords)) {
+                    await this.apiClient.syncPracticeRecords(options.syncRecords);
+                    records = Array.isArray(value) ? value : [];
+                } else {
+                    records = await this.apiClient.replacePracticeRecords(Array.isArray(value) ? value : []);
                 }
-            });
+                await this.localDataSource.write(key, cloneValue(records));
+                return true;
+            } catch (error) {
+                if (error?.status === 403 && error.payload?.requiresDataManageStepUp) {
+                    throw error;
+                }
+                if (isUnauthorized(error)) {
+                    clearApiAuthState(this.apiClient);
+                }
+                console.warn('[RemotePracticeDataSource] 写入远端练习记录失败，回退本地:', summarizeRemotePracticeErrorForLog(error));
+                return this.localDataSource.write(key, value);
+            }
         }
 
         async remove(key) {
+            return this._enqueue(() => this._remove(key));
+        }
+
+        async _remove(key) {
             if (!this.isPracticeKey(key) || !this.apiClient.isAuthenticated()) {
                 return this.localDataSource.remove(key);
             }
-            return this._enqueue(async () => {
-                try {
-                    const records = await this.apiClient.clearPracticeRecords();
-                    await this.localDataSource.write(key, cloneValue(records));
-                    return true;
-                } catch (error) {
-                    if (redirectToDataManageStepUp(error)) {
-                        return false;
-                    }
-                    if (isUnauthorized(error)) {
-                        clearApiAuthState(this.apiClient);
-                    }
-                    console.warn('[RemotePracticeDataSource] 清空远端练习记录失败，回退本地:', summarizeRemotePracticeErrorForLog(error));
-                    return this.localDataSource.remove(key);
+            try {
+                const records = await this.apiClient.clearPracticeRecords();
+                await this.localDataSource.write(key, cloneValue(records));
+                return true;
+            } catch (error) {
+                if (redirectToDataManageStepUp(error)) {
+                    throw error;
                 }
-            });
+                if (isUnauthorized(error)) {
+                    clearApiAuthState(this.apiClient);
+                }
+                console.warn('[RemotePracticeDataSource] 清空远端练习记录失败，回退本地:', summarizeRemotePracticeErrorForLog(error));
+                return this.localDataSource.remove(key);
+            }
         }
 
         async runTransaction(handler) {
@@ -5947,10 +5973,10 @@ storageManager.ready
             }
             const dataToPersist = clone ? cloneValue(preparedValue) : preparedValue;
             if (transaction) {
-                transaction.set(this.key, dataToPersist);
+                transaction.set(this.key, dataToPersist, { syncRecords: options.syncRecords });
                 return true;
             }
-            await this.dataSource.write(this.key, dataToPersist);
+            await this.dataSource.write(this.key, dataToPersist, { syncRecords: options.syncRecords });
             return true;
         }
 
@@ -6258,7 +6284,7 @@ storageManager.ready
                 if (this.maxRecords && records.length > this.maxRecords) {
                     records = records.slice(0, this.maxRecords);
                 }
-                await this.write(records, { transaction: tx, skipValidation: true, clone: false });
+                await this.write(records, { transaction: tx, skipValidation: true, clone: false, syncRecords: [normalized] });
                 return normalized;
             }, { label: 'practice-upsert' });
         }
@@ -6304,7 +6330,7 @@ storageManager.ready
                 const updated = sanitizeRepositoryValue({ ...records[index], ...safeUpdates });
                 this._assertRecord(updated);
                 records[index] = updated;
-                await this.write(records, { transaction: tx, skipValidation: true, clone: false });
+                await this.write(records, { transaction: tx, skipValidation: true, clone: false, syncRecords: [updated] });
                 return updated;
             }, { label: 'practice-update' });
         }
@@ -8143,17 +8169,17 @@ storageManager.ready
         return [];
     }
 
-    async function writePracticeRecords(records, storageManager) {
+    async function writePracticeRecords(records, storageManager, options = {}) {
         const finalRecords = Array.isArray(records) ? records : [];
         const repos = getRepositories();
         if (repos && repos.practice && typeof repos.practice.overwrite === 'function') {
-            await repos.practice.overwrite(finalRecords);
+            await repos.practice.overwrite(finalRecords, options);
             syncPracticeRecordState(finalRecords);
             return true;
         }
         const storage = getStorageManager(storageManager);
         if (storage && typeof storage.writePersistentValue === 'function') {
-            const result = await storage.writePersistentValue(STORAGE_KEYS.practiceRecords, finalRecords);
+            const result = await storage.writePersistentValue(STORAGE_KEYS.practiceRecords, finalRecords, options);
             syncPracticeRecordState(finalRecords);
             return result;
         }
@@ -8269,7 +8295,7 @@ storageManager.ready
         if (Number.isFinite(options.maxRecords) && options.maxRecords > 0 && records.length > options.maxRecords) {
             records.splice(options.maxRecords);
         }
-        await writePracticeRecords(records, options.storageManager);
+        await writePracticeRecords(records, options.storageManager, { syncRecords: [standardizedRecord] });
         return standardizedRecord;
     }
 

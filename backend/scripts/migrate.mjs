@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Kevin
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import dbModule from '../src/db.js';
 import migrationsModule from '../src/migrations.js';
 

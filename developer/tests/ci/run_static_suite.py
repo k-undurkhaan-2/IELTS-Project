@@ -224,6 +224,7 @@ def _check_build_bundles_no_deleted_refs(build_script: Path) -> Tuple[bool, dict
     ]
     try:
         source = build_script.read_text(encoding="utf-8")
+        source += "\n" + build_script.with_name("bundle-manifest.mjs").read_text(encoding="utf-8")
     except Exception as exc:  # pragma: no cover - defensive guard
         return False, {"error": f"读取失败：{exc}"}
 
@@ -236,6 +237,7 @@ def _check_build_bundles_no_deleted_refs(build_script: Path) -> Tuple[bool, dict
 def _check_optional_listening_assets_not_bundled(build_script: Path, core_bundle: Path) -> Tuple[bool, dict]:
     try:
         build_source = build_script.read_text(encoding="utf-8")
+        build_source += "\n" + build_script.with_name("bundle-manifest.mjs").read_text(encoding="utf-8")
     except Exception as exc:  # pragma: no cover - defensive guard
         return False, {"error": f"读取 build-bundles 失败：{exc}"}
 
@@ -549,35 +551,28 @@ def _check_release_script_runtime_guards(release_script: Path) -> Tuple[bool, di
         return False, {"error": f"读取失败：{exc}"}
 
     required_snippets = [
-        'require_entry "js/bundles/runtime-entry.bundle.js"',
-        'require_entry "js/bundles/core-foundation.bundle.js"',
-        'require_entry "js/bundles/ui-shell.bundle.js"',
-        'require_entry "js/bundles/legacy-app.bundle.js"',
-        'require_entry "js/bundles/browse.bundle.js"',
-        'require_entry "js/bundles/practice.bundle.js"',
-        'require_entry "js/bundles/session.bundle.js"',
-        'require_entry "js/bundles/settings.bundle.js"',
-        'require_entry "js/bundles/diagnostics.bundle.js"',
-        'require_entry "js/bundles/more.bundle.js"',
-        'require_entry "js/bundles/theme.bundle.js"',
-        'require_entry "js/bundles/reading-page.bundle.js"',
-        'require_entry "js/bundles/practice-page-enhancer.bundle.js"',
-        'require_entry "js/bundles/listening-record-bridge.bundle.js"',
-        'LISTENING_EXCLUDE_PATTERNS=("assets/generated/listening-exams/" "assets/generated/listening-exams/*" "ListeningPractice/" "ListeningPractice/*")',
-        'if [ "${INCLUDE_LOCAL_LISTENING:-0}" = "1" ]; then',
-        'INCLUDE_LOCAL_LISTENING=1 requires both assets/generated/listening-exams/manifest.js and listening-index.compat.js',
-        'if [ "${INCLUDE_LOCAL_LISTENING:-0}" = "1" ] && [ -f "assets/generated/listening-exams/manifest.js" ]; then',
+        'standalone-release-manifest.mjs',
+        'stage --project-root',
+        'archive-paths --receipt',
+        'verify-archive-list',
+        'zip -T',
         'reject_entry_prefix "assets/generated/listening-exams/"',
-        'if [ "${INCLUDE_LOCAL_LISTENING:-0}" = "1" ] && [ -d "ListeningPractice" ]; then',
         'reject_entry_prefix "templates/"',
-        'reject_entry_prefix "ListeningPractice/vip/"',
+        'reject_entry_prefix "ListeningPractice/"',
         "reject_entry_pattern '(^|/)~\\$[^/]*$'",
-        "reject_entry_pattern '^ListeningPractice/.*\\.(MOV|mov|MP4|mp4)$'",
+        "reject_entry_pattern '(^|/)\\.ssh(/|$)'",
         "reject_entry_pattern '^assets/scripts/.*\\.py$'",
         "reject_entry_pattern '^js/(app|core|data|runtime|services|utils|components|presentation|views)/'",
     ]
     missing = [snippet for snippet in required_snippets if snippet not in source]
-    return not missing, {"missing": missing}
+    forbidden_snippets = [
+        "zip -r",
+        "READING_ZIP_INPUTS",
+        "LISTENING_ZIP_INPUTS",
+        "LISTENING_EXCLUDE_PATTERNS",
+    ]
+    forbidden = [snippet for snippet in forbidden_snippets if snippet in source]
+    return not missing and not forbidden, {"missing": missing, "forbidden": forbidden}
 
 
 def _extract_js_json_assignment(source: str, marker: str, end_marker: str) -> Any:
@@ -863,12 +858,14 @@ def _check_lazy_loader_dedupe(loader_path: Path) -> Tuple[bool, str]:
 
 def _check_settings_tools_split() -> Tuple[bool, dict]:
     build_script = REPO_ROOT / "scripts" / "build-bundles.mjs"
+    bundle_manifest = REPO_ROOT / "scripts" / "bundle-manifest.mjs"
     lazy_loader = REPO_ROOT / "js" / "runtime" / "lazyLoader.js"
     boot_fallbacks = REPO_ROOT / "js" / "boot-fallbacks.js"
     exam_actions = REPO_ROOT / "js" / "app" / "examActions.js"
 
     try:
         build_source = build_script.read_text(encoding="utf-8")
+        build_source += "\n" + bundle_manifest.read_text(encoding="utf-8")
         loader_source = lazy_loader.read_text(encoding="utf-8")
         fallback_source = boot_fallbacks.read_text(encoding="utf-8")
         actions_source = exam_actions.read_text(encoding="utf-8")
@@ -1407,6 +1404,40 @@ def run_checks() -> Tuple[List[dict], bool]:
     release_script_passed, release_script_detail = _check_release_script_runtime_guards(REPO_ROOT / "developer" / "release.sh")
     results.append(_format_result("Release 脚本运行时守卫", release_script_passed, release_script_detail))
     all_passed &= release_script_passed
+    standalone_packaging_test = REPO_ROOT / "developer" / "tests" / "ci" / "test_standalone_packaging.py"
+    try:
+        standalone_completed = subprocess.run(
+            [sys.executable, str(standalone_packaging_test)],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=900,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        standalone_output_lines = (
+            (standalone_completed.stdout or "") + (standalone_completed.stderr or "")
+        ).splitlines()
+        standalone_packaging_passed = standalone_completed.returncode == 0
+        standalone_packaging_detail = {
+            "returnCode": standalone_completed.returncode,
+            "outputTail": standalone_output_lines[-80:],
+        }
+    except subprocess.TimeoutExpired as exc:
+        standalone_packaging_passed = False
+        standalone_packaging_detail = {
+            "error": "standalone packaging security tests timed out",
+            "timeoutSeconds": 900,
+            "stdoutTail": (exc.stdout or "").splitlines()[-40:] if isinstance(exc.stdout, str) else [],
+            "stderrTail": (exc.stderr or "").splitlines()[-40:] if isinstance(exc.stderr, str) else [],
+        }
+    results.append(_format_result(
+        "Standalone release manifest security tests",
+        standalone_packaging_passed,
+        standalone_packaging_detail,
+    ))
+    all_passed &= standalone_packaging_passed
     release_zip_passed, release_zip_detail = _check_release_zip_runtime_payload()
     results.append(_format_result("Release ZIP 运行时内容守卫", release_zip_passed, release_zip_detail))
     all_passed &= release_zip_passed

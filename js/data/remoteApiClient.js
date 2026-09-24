@@ -181,6 +181,18 @@
             return Array.isArray(payload.records) ? payload.records : [];
         }
 
+        async exportPracticeRecords() {
+            const payload = await this.request('/api/practice-records/export', { method: 'GET', csrf: false });
+            return Array.isArray(payload.records) ? payload.records : [];
+        }
+
+        async syncPracticeRecords(records) {
+            return this.request('/api/practice-records/sync', {
+                method: 'POST',
+                body: { records: Array.isArray(records) ? records : [] }
+            });
+        }
+
         async replacePracticeRecords(records) {
             const payload = await this.request('/api/practice-records', {
                 method: 'PUT',

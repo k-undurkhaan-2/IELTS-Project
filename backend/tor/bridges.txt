@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Kevin
+# SPDX-License-Identifier: AGPL-3.0-only
+
 # Template for obfs4 bridges.
 #
 # Do not commit real bridges here. Publicly publishing bridges makes them less
