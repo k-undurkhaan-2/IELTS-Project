@@ -8076,8 +8076,14 @@ def check_workflow_text(text: str) -> list[str]:
     if not _require_exact_keys(triggers, ("pull_request", "push", "workflow_dispatch"), "workflow.on", errors):
         pass
     elif triggers != {
-        "pull_request": {"branches": ["main"]},
-        "push": {"branches": ["main", "ci/phase2-foundation"]},
+        "pull_request": {"branches-ignore": ["codex/**"]},
+        "push": {
+            "branches": [
+                "main",
+                "dev/current-mainline",
+                "ci/phase2-foundation",
+            ]
+        },
         "workflow_dispatch": None,
     }:
         errors.append("workflow triggers are not the exact approved trigger set")

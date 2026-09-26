@@ -730,10 +730,22 @@ not authenticate those jobs or authorize a merge.
 
 ## Workflow architecture and lifecycle order
 
-The workflow covers pull requests to `main`, pushes to `main` and
-`ci/phase2-foundation`, and manual dispatch. It has read-only contents
-permission, concurrency cancellation, explicit job timeouts, no
-`continue-on-error`, and this graph:
+The workflow follows the promotion chain
+`codex/{feature} -> persistent feature -> dev/current-mainline -> main`.
+Pull requests run when their base branch does not match `codex/**`:
+`pull_request.branches-ignore` filters the base, not the head. Temporary
+`codex/{feature}` branches may therefore open covered pull requests into
+persistent branches with arbitrary non-`codex/**` names. Pull requests into
+those persistent branches, `dev/current-mainline`, `main`, and
+`ci/phase2-foundation` are covered; pull requests whose base matches `codex/**`
+are excluded.
+
+Push CI is limited to `main`, `dev/current-mainline`, and
+`ci/phase2-foundation`; pushes to other persistent feature branches do not
+trigger it. Manual dispatch remains available.
+
+The workflow has read-only contents permission, concurrency cancellation,
+explicit job timeouts, no `continue-on-error`, and this graph:
 
 ```text
 repository-policy-producer     -> repository-policy --------+

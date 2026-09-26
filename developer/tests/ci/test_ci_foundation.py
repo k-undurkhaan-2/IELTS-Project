@@ -4326,6 +4326,51 @@ class WorkflowPolicyTest(unittest.TestCase):
 
     def test_current_workflow_passes_narrow_policy(self) -> None:
         self.assertEqual(ci.check_workflow_text(self.workflow), [])
+        self.assertEqual(
+            ci.parse_canonical_workflow_yaml(self.workflow)["on"],
+            {
+                "pull_request": {"branches-ignore": ["codex/**"]},
+                "push": {
+                    "branches": [
+                        "main",
+                        "dev/current-mainline",
+                        "ci/phase2-foundation",
+                    ]
+                },
+                "workflow_dispatch": None,
+            },
+        )
+        trigger_block, separator, remainder = self.workflow.partition("\npermissions:\n")
+        self.assertTrue(separator)
+        trigger_mutations = (
+            ("old-pr-allowlist", "    branches-ignore:\n      - codex/**\n",
+             "    branches:\n      - main\n"),
+            ("altered-pr-exclusion", "      - codex/**\n", "      - codex/*\n"),
+            ("missing-main-push", "      - main\n", ""),
+            ("missing-dev-push", "      - dev/current-mainline\n", ""),
+            ("missing-ci-push", "      - ci/phase2-foundation\n", ""),
+            ("extra-push-branch", "      - ci/phase2-foundation\n",
+             "      - ci/phase2-foundation\n      - feature/unrelated\n"),
+            ("wildcard-push", "      - main\n", '      - "**"\n'),
+            ("extra-persistent-push-branch",
+             "      - ci/phase2-foundation\n",
+             "      - ci/phase2-foundation\n      - feature/review-probe\n"),
+            ("missing-manual-dispatch", "  workflow_dispatch:\n", ""),
+            ("extra-event", "  workflow_dispatch:\n",
+             "  workflow_dispatch:\n  workflow_call:\n"),
+            ("extra-pr-key", "  pull_request:\n",
+             "  pull_request:\n    types:\n      - opened\n"),
+        )
+        for label, old, new in trigger_mutations:
+            with self.subTest(trigger_mutation=label):
+                self.assertEqual(trigger_block.count(old), 1)
+                candidate = trigger_block.replace(old, new, 1) + separator + remainder
+                errors = ci.check_workflow_text(candidate)
+                self.assertTrue(
+                    any("workflow triggers" in error or "workflow.on" in error
+                        for error in errors),
+                    errors,
+                )
         exact_node_selector = 'node-version: "24.20.0"'
         selectors = list(re.finditer(re.escape(exact_node_selector), self.workflow))
         self.assertEqual(len(selectors), 6)

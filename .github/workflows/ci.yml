@@ -2,11 +2,12 @@ name: Baseline-aware CI
 
 on:
   pull_request:
-    branches:
-      - main
+    branches-ignore:
+      - codex/**
   push:
     branches:
       - main
+      - dev/current-mainline
       - ci/phase2-foundation
   workflow_dispatch:
 
