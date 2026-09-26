@@ -1723,8 +1723,10 @@ PACKAGING_METHODS = (
     "test_archive_entries_are_unique_portable_relative_and_not_symlinks",
     "test_archive_list_verifier_rejects_duplicate_and_unsafe_entries",
     "test_authorized_reading_has_real_windows_unix_parity_and_hashes",
+    "test_authorized_reading_releases_preserve_hashes",
+    "test_available_releases_use_one_positive_manifest",
     "test_clean_no_git_source_archive_still_releases_safely",
-    "test_default_windows_and_unix_release_use_one_positive_manifest",
+    "test_default_windows_unix_release_parity",
     "test_extracted_payload_is_self_contained_and_serves_required_styles",
     "test_git_manifest_and_payload_dirty_changes_fail_closed",
     "test_main_manifest_missing_malformed_schema_and_paths_fail_closed",
@@ -1739,76 +1741,122 @@ PACKAGING_METHODS = (
     "test_scripts_consume_only_the_shared_manifest_helper_staging_contract",
     "test_unknown_files_in_every_managed_root_fail_before_staging",
 )
+PACKAGING_UBUNTU_SKIPS = (
+    "test_authorized_reading_has_real_windows_unix_parity_and_hashes",
+    "test_default_windows_unix_release_parity",
+)
+PACKAGING_SKIP_REASON = "Windows/Unix parity requires unavailable shell(s): windows"
+
 PACKAGING_DURATIONS = (("0.000", "0.001"), ("1.000", "9.999"), ("9.999", "10.000"),
                        ("69.940", "76.421"), ("71.630", "100.000"))
 
 
-def packaging_reporter(duration="69.940", *, platform="windows"):
+def packaging_reporter(duration="69.940", *, platform="windows", methods=PACKAGING_METHODS,
+                       statuses=None, footer_count=None):
+    # Independent measured unittest grammar; never copy the production parser.
     newline = {"windows": b"\r\n", "ubuntu": b"\n"}[platform]
-    return (b"".join(f"{method} (__main__.StandalonePackagingTest.{method}) ... ok".encode() + newline
-                    for method in PACKAGING_METHODS)
-            + newline + b"-" * 70 + newline + b"Ran 18 tests in " + duration.encode()
-            + b"s" + newline + newline + b"OK" + newline)
+    if statuses is None:
+        statuses = ({method: f"skipped '{PACKAGING_SKIP_REASON}'" for method in PACKAGING_UBUNTU_SKIPS}
+                    if platform == "ubuntu" else {})
+    skipped = sum(statuses.get(method, "ok").startswith("skipped ") for method in methods)
+    footer = f"OK (skipped={skipped})" if skipped else "OK"
+    count = len(methods) if footer_count is None else footer_count
+    return (b"".join(f"{method} (__main__.StandalonePackagingTest.{method}) ... {statuses.get(method, 'ok')}".encode()
+                    + newline for method in methods)
+            + newline + b"-" * 70 + newline + f"Ran {count} tests in ".encode() + duration.encode()
+            + b"s" + newline + newline + footer.encode() + newline)
 
 
 def packaging_reporter_mutations(platform="windows"):
-    good = packaging_reporter()
-    lines = good.split(b"\r\n")
+    good = packaging_reporter(platform=platform)
+    newline = {"windows": b"\r\n", "ubuntu": b"\n"}[platform]
+    lines = good.split(newline)
     first = PACKAGING_METHODS[0].encode()
+    # Historical v1 inventory, including its replaced fifth member.
+    old_methods = (*PACKAGING_METHODS[:3], PACKAGING_METHODS[5],
+                   "test_default_windows_and_unix_release_use_one_positive_manifest",
+                   *PACKAGING_METHODS[7:])
     cases = {
+        "old-18-methods": packaging_reporter(platform=platform, methods=old_methods, statuses={}),
+        "19-methods": packaging_reporter(platform=platform, methods=PACKAGING_METHODS[:-1]),
+        "21-methods": packaging_reporter(platform=platform, methods=(*PACKAGING_METHODS, "test_unexpected_extra")),
         "method-name": good.replace(first, b"test_changed"),
         "fully-qualified-id": good.replace(b"." + first + b")", b".test_changed)", 1),
         "class-name": good.replace(b"StandalonePackagingTest", b"OtherPackagingTest", 1),
         "module-name": good.replace(b"__main__", b"alternate", 1),
         "left-right-disagree": good.replace(first, b"test_changed", 1),
-        "missing-method": b"\r\n".join(lines[1:]),
-        "additional-method": lines[0] + b"\r\n" + good,
-        "duplicate-method": b"\r\n".join([lines[0], *lines]),
-        "reordered-methods": b"\r\n".join([lines[1], lines[0], *lines[2:]]),
-        "17-tests": good.replace(b"18 tests", b"17 tests"),
-        "19-tests": good.replace(b"18 tests", b"19 tests"),
+        "missing-method": newline.join(lines[1:]),
+        "additional-method": lines[0] + newline + good,
+        "duplicate-method": newline.join([lines[0], lines[0], *lines[2:]]),
+        "reordered-methods": newline.join([lines[1], lines[0], *lines[2:]]),
+        "17-tests": good.replace(b"20 tests", b"17 tests"),
+        "19-tests": good.replace(b"20 tests", b"19 tests"),
+        "21-tests": good.replace(b"20 tests", b"21 tests"),
         "separator-69": good.replace(b"-" * 70, b"-" * 69),
         "separator-71": good.replace(b"-" * 70, b"-" * 71),
         "separator-character": good.replace(b"-" * 70, b"-" * 35 + b"=" + b"-" * 34),
-        "missing-blank-before-separator": good.replace(b"\r\n\r\n---", b"\r\n---"),
-        "extra-blank-before-separator": good.replace(b"\r\n\r\n---", b"\r\n\r\n\r\n---"),
-        "missing-blank-before-OK": good.replace(b"s\r\n\r\nOK", b"s\r\nOK"),
-        "extra-blank-before-OK": good.replace(b"s\r\n\r\nOK", b"s\r\n\r\n\r\nOK"),
+        "missing-blank-before-separator": good.replace(newline * 2 + b"---", newline + b"---"),
+        "extra-blank-before-separator": good.replace(newline * 2 + b"---", newline * 3 + b"---"),
+        "missing-blank-before-OK": good.replace(b"s" + newline * 2 + b"OK", b"s" + newline + b"OK"),
+        "extra-blank-before-OK": good.replace(b"s" + newline * 2 + b"OK", b"s" + newline * 3 + b"OK"),
         "Ran-literal": good.replace(b"Ran ", b"ran "),
-        "tests-literal": good.replace(b"18 tests", b"18 Tests"),
+        "tests-literal": good.replace(b"20 tests", b"20 Tests"),
         "in-literal": good.replace(b" in ", b" at "),
         "missing-s": good.replace(b"69.940s", b"69.940"),
-        "OK-literal": good.replace(b"\r\nOK\r\n", b"\r\nok\r\n"),
-        "suffix-text": good + b"extra\r\n",
-        "prefix-text": b"extra\r\n" + good,
-        "warning": good.replace(b"\r\n\r\n---", b"\r\nwarning\r\n\r\n---"),
-        "traceback": good.replace(b"\r\n\r\n---", b"\r\nTraceback (most recent call last):\r\n\r\n---"),
-        "LF-only": good.replace(b"\r\n", b"\n"),
-        "mixed-line-endings": good.replace(b"\r\n", b"\n", 1),
-        "missing-final-CRLF": good[:-2],
-        "trailing-spaces": good.replace(b" ... ok\r\n", b" ... ok \r\n", 1),
+        "OK-literal": good.replace(newline + b"OK", newline + b"ok"),
+        "suffix-text": good + b"extra" + newline,
+        "prefix-text": b"extra" + newline + good,
+        "warning": good.replace(newline * 2 + b"---", newline + b"warning" + newline * 2 + b"---"),
+        "traceback": good.replace(newline * 2 + b"---",
+                                  newline + b"Traceback (most recent call last):" + newline * 2 + b"---"),
+        "trailing-spaces": good.replace(b" ... ok" + newline, b" ... ok " + newline, 1),
         "leading-spaces": b" " + good,
         "unicode-outside-duration": good.replace(b"test_archive", "test_archiv\u00e9".encode(), 1),
         "invalid-UTF8": b"\xff" + good[1:],
-        "per-test-duration": good.replace(b" ... ok\r\n", b" ... ok (0.123s)\r\n", 1),
-        "extra-final-blank": good + b"\r\n",
-        "dots-mechanism": b"." * 18 + b"\r\n" + b"-" * 70 + b"\r\nRan 18 tests in 0.125s\r\n\r\nOK\r\n",
+        "per-test-duration": good.replace(b" ... ok" + newline, b" ... ok (0.123s)" + newline, 1),
+        "extra-final-blank": good + newline,
+        "dots-mechanism": b"." * 20 + newline + b"-" * 70 + newline + b"Ran 20 tests in 0.125s" + newline * 2 + b"OK" + newline,
+        "other-platform-reporter": packaging_reporter(platform="ubuntu" if platform == "windows" else "windows"),
     }
-    for status in ("skipped", "expected failure", "unexpected success", "FAIL", "ERROR",
-                   "OK", "Ok", "oK", "success"):
-        cases["status-" + status] = good.replace(b" ... ok\r\n", b" ... " + status.encode() + b"\r\n", 1)
+    if platform == "windows":
+        cases.update({
+            "LF-only": good.replace(b"\r\n", b"\n"),
+            "mixed-line-endings": good.replace(b"\r\n", b"\n", 1),
+            "missing-final-CRLF": good[:-2],
+            "foreign-shell-absence": packaging_reporter(platform=platform, statuses={
+                method: f"skipped '{PACKAGING_SKIP_REASON}'" for method in PACKAGING_UBUNTU_SKIPS}),
+        })
+    else:
+        expected = {method: f"skipped '{PACKAGING_SKIP_REASON}'" for method in PACKAGING_UBUNTU_SKIPS}
+        cases.update({
+            "CRLF-only": good.replace(b"\n", b"\r\n"),
+            "mixed-line-endings": good.replace(b"\n", b"\r\n", 1),
+            "missing-final-LF": good[:-1],
+            "missing-both-skips": packaging_reporter(platform=platform, statuses={}),
+            "unexpected-skipped-method": packaging_reporter(platform=platform, statuses={
+                PACKAGING_METHODS[0]: expected[PACKAGING_UBUNTU_SKIPS[0]],
+                PACKAGING_UBUNTU_SKIPS[1]: expected[PACKAGING_UBUNTU_SKIPS[1]]}),
+            "three-skips": packaging_reporter(platform=platform, statuses={
+                **expected, PACKAGING_METHODS[0]: f"skipped '{PACKAGING_SKIP_REASON}'"}),
+            "skip-reason-one-byte": good.replace(b"shell(s): windows'", b"shell(s): windowt'", 1),
+            "skip-footer-one": good.replace(b"OK (skipped=2)", b"OK (skipped=1)"),
+            "skip-footer-three": good.replace(b"OK (skipped=2)", b"OK (skipped=3)"),
+            "skip-footer-absent": good.replace(b"OK (skipped=2)", b"OK"),
+            "skip-quote-syntax": good.replace(b"skipped '" + PACKAGING_SKIP_REASON.encode() + b"'",
+                                             b'skipped "' + PACKAGING_SKIP_REASON.encode() + b'"', 1),
+        })
+        for method in PACKAGING_UBUNTU_SKIPS:
+            cases["only-one-skip-" + method] = packaging_reporter(platform=platform,
+                statuses={key: status for key, status in expected.items() if key != method})
+    for status in ("skipped", "skipped 'native shell missing'", "expected failure", "unexpected success",
+                   "FAIL", "ERROR", "OK", "Ok", "oK", "success"):
+        cases["status-" + status] = good.replace(b" ... ok" + newline, b" ... " + status.encode() + newline, 1)
     for name, value in (("integer", "1"), ("fraction-1", "1.0"), ("fraction-2", "1.00"),
                         ("fraction-4", "1.0000"), ("exponent", "1e3"),
                         ("negative", "-1.000"), ("plus", "+1.000"),
                         ("whitespace", "1 .000"), ("non-ASCII-digit", "\u0661.000"),
                         ("empty", ""), ("nan", "nan"), ("infinite", "inf")):
         cases["duration-" + name] = good.replace(b"69.940", value.encode())
-    if platform == "ubuntu":
-        cases = {name: data.replace(b"\r\n", b"\n") for name, data in cases.items()
-                 if name not in {"LF-only", "mixed-line-endings", "missing-final-CRLF"}}
-        cases.update({"CRLF-only": good,
-                      "mixed-line-endings": packaging_reporter(platform="ubuntu").replace(b"\n", b"\r\n", 1),
-                      "missing-final-LF": packaging_reporter(platform="ubuntu")[:-1]})
     return cases
 
 
@@ -1908,6 +1956,43 @@ class StandalonePackagingPortableParserTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual([(kw.arg, ast.literal_eval(kw.value)) for kw in calls[0].keywords], [("verbosity", 2)])
 
+    def test_v2_exact_platform_forms_and_protocol_identity(self):
+        self.assertEqual(len(PACKAGING_METHODS), 20)
+        self.assertEqual(hashlib.sha256(json.dumps(list(PACKAGING_METHODS),
+            ensure_ascii=False, separators=(",", ":")).encode()).hexdigest(),
+            "615f411328a3a6b16486ff43c1493b2aa029bce19007b51ac35729bf96a3c269")
+        identities = {}
+        for platform in ("windows", "ubuntu"):
+            data = packaging_reporter(platform=platform)
+            lines = data.splitlines()
+            ok = [line for line in lines if line.endswith(b" ... ok")]
+            skipped = [line for line in lines if b" ... skipped " in line]
+            self.assertEqual((len(ok), len(skipped)), (20, 0) if platform == "windows" else (18, 2))
+            if platform == "ubuntu":
+                self.assertEqual(skipped, [
+                    f"{method} (__main__.StandalonePackagingTest.{method}) ... skipped '{PACKAGING_SKIP_REASON}'".encode()
+                    for method in PACKAGING_UBUNTU_SKIPS])
+                self.assertEqual(lines[-1], b"OK (skipped=2)")
+            parsed = ci._parse_standalone_packaging_stderr(data, platform=platform)
+            identity = ci._standalone_packaging_semantic_identity(parsed)
+            protocol = platform + "-standalone-packaging-verbose-unittest-duration-v2"
+            self.assertEqual(identity["protocol"], protocol)
+            identities[platform] = identity["identityDigest"]
+            digest = hashlib.sha256()
+            for segment in (protocol.encode(), parsed.prefix, parsed.suffix):
+                digest.update(len(segment).to_bytes(8, "big"))
+                digest.update(segment)
+            self.assertEqual(identity["identityDigest"], "sha256:" + digest.hexdigest())
+            old = hashlib.sha256()
+            for segment in (protocol.replace("-v2", "-v1").encode(), parsed.prefix, parsed.suffix):
+                old.update(len(segment).to_bytes(8, "big"))
+                old.update(segment)
+            self.assertNotEqual(identity["identityDigest"], "sha256:" + old.hexdigest())
+            other = "ubuntu" if platform == "windows" else "windows"
+            with self.assertRaises(ValueError):
+                ci._parse_standalone_packaging_stderr(data, platform=other)
+        self.assertNotEqual(identities["windows"], identities["ubuntu"])
+
     def test_structural_variable_length_duration_pairs_and_exact_retained_bytes(self):
         for left, right in PACKAGING_DURATIONS:
             with self.subTest(left=left, right=right), packaging_counters() as calls:
@@ -1923,7 +2008,7 @@ class StandalonePackagingPortableParserTest(unittest.TestCase):
                     self.assertEqual(value[:start] + value[end:], parsed.prefix + parsed.suffix)
                     self.assertEqual(bytes.fromhex(result["prefixHex"]), value[:start])
                     self.assertEqual(bytes.fromhex(result["suffixHex"]), value[end:])
-                    self.assertEqual(len(parsed.prefix) + len(parsed.suffix), 3039)
+                    self.assertEqual(len(parsed.prefix) + len(parsed.suffix), 3277)
                     spans.append({"excluded": [start, end], "retained": [[0, start], [end, len(value)]]})
                 print("W702_E2_POSITIVE_SPANS " + json.dumps({"durations": [left, right], "spans": spans}))
 
@@ -2259,7 +2344,7 @@ class UbuntuStandalonePackagingPortableAuthorityTest(StandalonePackagingPortable
 
 class UbuntuStandalonePackagingPortableTest(StandalonePackagingFixtureTestBase):
     def test_explicit_platform_grammar_duration_and_every_retained_byte(self):
-        for platform, retained in (("windows", 3039), ("ubuntu", 3016)):
+        for platform, retained in (("windows", 3277), ("ubuntu", 3396)):
             good = packaging_reporter(platform=platform)
             parsed = ci._parse_standalone_packaging_stderr(good, platform=platform)
             start, end = parsed.duration_span

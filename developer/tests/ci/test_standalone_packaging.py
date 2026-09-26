@@ -80,7 +80,7 @@ class _IndexAssetParser(HTMLParser):
             self.paths.add(href)
 
 
-def _command(name: str, env_name: str | None = None) -> str:
+def _command(name: str, env_name: str | None = None, *, required: bool = True) -> str | None:
     configured = os.environ.get(env_name, "") if env_name else ""
     if configured:
         return configured
@@ -90,8 +90,12 @@ def _command(name: str, env_name: str | None = None) -> str:
             return str(git_bash)
     resolved = shutil.which(name)
     if not resolved:
+        if not required:
+            return None
         raise RuntimeError(f"required command not found: {name}")
     if name == "bash" and Path(resolved).resolve() == Path(r"C:\Windows\System32\bash.exe"):
+        if not required:
+            return None
         raise RuntimeError("Git Bash is required; WSL launcher is not a usable Bash runtime")
     return resolved
 
@@ -231,19 +235,27 @@ class StandalonePackagingTest(unittest.TestCase):
         cls.receipt_root = cls.temp_root / "r"
         cls.receipt_root.mkdir()
         cls.node = Path(_command("node", "NODE_EXE"))
-        cls.powershell = _command("powershell", "POWERSHELL_EXE")
-        cls.bash = _command("bash", "BASH_EXE")
+        cls.native_platform = "windows" if os.name == "nt" else "unix"
+        cls.powershell = _command("powershell", "POWERSHELL_EXE", required=os.name == "nt")
+        cls.bash = _command("bash", "BASH_EXE", required=os.name != "nt")
+        cls.platforms = tuple(
+            platform for platform, shell in (("windows", cls.powershell), ("unix", cls.bash))
+            if shell is not None
+        )
         cls.git = _trusted_git_command()
         cls._copy_candidate_tree(cls.source_root)
         cls._initialize_temporary_git_repo(cls.source_root)
         cls.zip_shim_dir = cls._create_zip_shim()
         cls.manifest = json.loads((cls.source_root / MANIFEST_PATH).read_text(encoding="utf-8"))
 
-        cls.absent_windows = cls._build_release("windows", "focused-default-windows")
-        cls.absent_unix = cls._build_release("unix", "focused-default-unix")
+        cls.default_releases = {
+            platform: cls._build_release(platform, f"focused-default-{platform}")
+            for platform in cls.platforms
+        }
+        cls.native_release = cls.default_releases[cls.native_platform]
         cls.source_file_hashes = _source_file_hashes(cls.source_root, cls.manifest["files"])
         cls.extract_root = cls.temp_root / "x"
-        with zipfile.ZipFile(io.BytesIO(cls.absent_windows["archive_bytes"])) as archive:
+        with zipfile.ZipFile(io.BytesIO(cls.native_release["archive_bytes"])) as archive:
             archive.extractall(cls.extract_root)
 
     @classmethod
@@ -586,7 +598,12 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
                 f"hash-mismatch paths={hash_mismatch_paths}"
             )
 
-    def test_default_windows_and_unix_release_use_one_positive_manifest(self) -> None:
+    def _require_parity_shells(self) -> None:
+        missing = {"windows", "unix"} - set(self.platforms)
+        if missing:
+            self.skipTest(f"Windows/Unix parity requires unavailable shell(s): {', '.join(sorted(missing))}")
+
+    def test_available_releases_use_one_positive_manifest(self) -> None:
         manifest_files = set(self.manifest["files"])
         self.assertEqual(len(manifest_files), 430)
         self.assertEqual(self.manifest["managedRoots"], MANAGED_ROOTS)
@@ -594,10 +611,7 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
         self.assertSetEqual(set(self.source_file_hashes), manifest_files)
         source_content_manifest_sha256 = _content_manifest_sha256(self.source_file_hashes)
 
-        for platform, snapshot in (
-            ("Windows", self.absent_windows),
-            ("Unix", self.absent_unix),
-        ):
+        for platform, snapshot in self.default_releases.items():
             file_names = {
                 entry.filename for entry in snapshot["entries"]
                 if not entry.is_dir()
@@ -633,14 +647,12 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
             self.assertFalse(any(name.startswith("assets/generated/listening-exams/") for name in file_names))
             self.assertIn("js/bundles/listening-wrapper.bundle.js", file_names)
 
-        self.assertEqual(
-            self.absent_windows["file_hashes"],
-            self.absent_unix["file_hashes"],
-        )
-        self.assertSetEqual(
-            set(self._entry_names(self.absent_windows)),
-            set(self._entry_names(self.absent_unix)),
-        )
+    def test_default_windows_unix_release_parity(self) -> None:
+        self._require_parity_shells()
+        windows = self.default_releases["windows"]
+        unix = self.default_releases["unix"]
+        self.assertEqual(windows["file_hashes"], unix["file_hashes"])
+        self.assertSetEqual(set(self._entry_names(windows)), set(self._entry_names(unix)))
 
     def test_main_manifest_missing_malformed_schema_and_paths_fail_closed(self) -> None:
         manifest_path = self.source_root / MANIFEST_PATH
@@ -703,7 +715,7 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
         backup = self.temp_root / f"styles-missing-{uuid.uuid4().hex}"
         source.rename(backup)
         try:
-            for platform in ("windows", "unix"):
+            for platform in self.platforms:
                 with self.subTest(platform=platform):
                     result, archive_path, _receipt_path = self._run_release(
                         platform,
@@ -784,7 +796,7 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
             actual_label="no-Git source map",
         )
         snapshot = self._build_release(
-            "windows",
+            self.native_platform,
             "focused-no-git",
             root=no_git_root,
         )
@@ -832,7 +844,7 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
         finally:
             self._clear_reading()
 
-    def test_authorized_reading_has_real_windows_unix_parity_and_hashes(self) -> None:
+    def _build_authorized_reading_releases(self):
         entries = self._create_reading_files([
             "nested/public-example.html",
             "public-example.txt",
@@ -840,36 +852,40 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
         manifest_path = self._write_reading_manifest(entries)
         overrides = {"READING_PRACTICE_PUBLIC_MANIFEST": str(manifest_path)}
         try:
-            windows = self._build_release(
-                "windows",
-                "focused-reading-windows",
-                overrides=overrides,
-            )
-            unix = self._build_release(
-                "unix",
-                "focused-reading-unix",
-                overrides=overrides,
-            )
+            snapshots = {
+                platform: self._build_release(
+                    platform, f"focused-reading-{platform}", overrides=overrides,
+                )
+                for platform in self.platforms
+            }
         finally:
             self._clear_reading()
 
-        self.assertEqual(windows["file_hashes"], unix["file_hashes"])
-        self.assertSetEqual(
-            set(self._entry_names(windows)),
-            set(self._entry_names(unix)),
-        )
+        return snapshots, entries, manifest_path
+
+    def test_authorized_reading_releases_preserve_hashes(self) -> None:
+        snapshots, entries, manifest_path = self._build_authorized_reading_releases()
         reading_paths = {f"ReadingPractice/{entry['path']}" for entry in entries}
-        self.assertSetEqual(
-            {path for path in windows["file_hashes"] if path.startswith("ReadingPractice/")},
-            reading_paths,
-        )
-        for entry in entries:
-            self.assertEqual(
-                windows["file_hashes"][f"ReadingPractice/{entry['path']}"],
-                entry["sha256"],
-            )
-        self.assertNotIn(manifest_path.name, self._entry_names(windows))
-        self.assertEqual(windows["receipt"]["effectiveReadingFiles"], sorted(reading_paths))
+        for platform, snapshot in snapshots.items():
+            with self.subTest(platform=platform):
+                self.assertSetEqual(
+                    {path for path in snapshot["file_hashes"] if path.startswith("ReadingPractice/")},
+                    reading_paths,
+                )
+                for entry in entries:
+                    self.assertEqual(
+                        snapshot["file_hashes"][f"ReadingPractice/{entry['path']}"],
+                        entry["sha256"],
+                    )
+                self.assertNotIn(manifest_path.name, self._entry_names(snapshot))
+                self.assertEqual(snapshot["receipt"]["effectiveReadingFiles"], sorted(reading_paths))
+
+    def test_authorized_reading_has_real_windows_unix_parity_and_hashes(self) -> None:
+        self._require_parity_shells()
+        snapshots, _entries, _manifest_path = self._build_authorized_reading_releases()
+        windows, unix = snapshots["windows"], snapshots["unix"]
+        self.assertEqual(windows["file_hashes"], unix["file_hashes"])
+        self.assertSetEqual(set(self._entry_names(windows)), set(self._entry_names(unix)))
 
     def test_reading_hash_missing_duplicate_and_unsafe_paths_fail_closed(self) -> None:
         valid_entries = self._create_reading_files(["public-example.txt"])
@@ -1001,8 +1017,8 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
             shutil.rmtree(self.source_root / "ListeningPractice")
 
     def test_archive_list_verifier_rejects_duplicate_and_unsafe_entries(self) -> None:
-        receipt_path = Path(self.absent_windows["receipt_path"])
-        expected = self._entry_names(self.absent_windows)
+        receipt_path = Path(self.native_release["receipt_path"])
+        expected = self._entry_names(self.native_release)
         cases = {
             "duplicate": [*expected, expected[0]],
             "absolute": [*expected[:-1], "C:/absolute.txt"],
@@ -1035,7 +1051,7 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
                 self.assertNotEqual(result.returncode, 0, result.stdout)
 
     def test_archive_entries_are_unique_portable_relative_and_not_symlinks(self) -> None:
-        for snapshot in (self.absent_windows, self.absent_unix):
+        for snapshot in self.default_releases.values():
             names = self._entry_names(snapshot)
             self.assertEqual(len(names), len(set(names)))
             self.assertEqual(len(names), len({name.lower() for name in names}))

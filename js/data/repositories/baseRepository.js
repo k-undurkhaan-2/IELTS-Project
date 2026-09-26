@@ -188,10 +188,10 @@
             }
             const dataToPersist = clone ? cloneValue(preparedValue) : preparedValue;
             if (transaction) {
-                transaction.set(this.key, dataToPersist);
+                transaction.set(this.key, dataToPersist, { syncRecords: options.syncRecords });
                 return true;
             }
-            await this.dataSource.write(this.key, dataToPersist);
+            await this.dataSource.write(this.key, dataToPersist, { syncRecords: options.syncRecords });
             return true;
         }
 

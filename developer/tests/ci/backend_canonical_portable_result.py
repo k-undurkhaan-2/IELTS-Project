@@ -16,8 +16,8 @@ from pathlib import Path
 
 
 SCHEMA = "BackendCanonicalPortableResult"
-VERSION = 1
-TEST_COUNT = 128
+VERSION = 2
+TEST_COUNT = 141
 MAX_STREAM_BYTES = 2 * 1024 * 1024
 COUNTS = ("tests", "suites", "pass", "fail", "cancelled", "skipped", "todo")
 EXPECTED_COUNTS = dict(zip(COUNTS, (TEST_COUNT, 0, TEST_COUNT, 0, 0, 0, 0)))
@@ -85,15 +85,15 @@ def _json_bytes(value):
 def _identity(ci, value):
     # A bytes frame prevents the general canonical codec from folding Unicode.
     return ci.canonical_failure_digest({
-        "digestDomain": "ieltmps-backend-canonical-portable-result-v1",
+        "digestDomain": "ieltmps-backend-canonical-portable-result-v2",
         "resultUtf8": _json_bytes(value),
     })
 
 
 def _parse_stdout(stdout, package):
-    """Consume every byte, returning ordered members and the 130 exact gaps.
+    """Consume every byte, returning ordered members and the 143 exact gaps.
 
-    Only the numeric spans in 128 terminal '(Dms)' fields and the one terminal
+    Only the numeric spans in 141 terminal '(Dms)' fields and the one terminal
     'duration_ms D' footer are omitted. Units, punctuation, whitespace, names,
     line endings, and even the optional initial npm newline stay in the gaps.
     """
@@ -134,7 +134,7 @@ def _parse_stdout(stdout, package):
         gaps.append(stdout[offset:begin].hex())
         offset = end
     gaps.append(stdout[offset:].hex())
-    _require(len(spans) == 129 and len(gaps) == 130)
+    _require(len(spans) == TEST_COUNT + 1 and len(gaps) == TEST_COUNT + 2)
     return members, gaps
 
 

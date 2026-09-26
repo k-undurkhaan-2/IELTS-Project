@@ -5380,10 +5380,10 @@ storageManager.ready
             }
             const dataToPersist = clone ? cloneValue(preparedValue) : preparedValue;
             if (transaction) {
-                transaction.set(this.key, dataToPersist);
+                transaction.set(this.key, dataToPersist, { syncRecords: options.syncRecords });
                 return true;
             }
-            await this.dataSource.write(this.key, dataToPersist);
+            await this.dataSource.write(this.key, dataToPersist, { syncRecords: options.syncRecords });
             return true;
         }
 
@@ -5691,7 +5691,7 @@ storageManager.ready
                 if (this.maxRecords && records.length > this.maxRecords) {
                     records = records.slice(0, this.maxRecords);
                 }
-                await this.write(records, { transaction: tx, skipValidation: true, clone: false });
+                await this.write(records, { transaction: tx, skipValidation: true, clone: false, syncRecords: [normalized] });
                 return normalized;
             }, { label: 'practice-upsert' });
         }
@@ -5737,7 +5737,7 @@ storageManager.ready
                 const updated = sanitizeRepositoryValue({ ...records[index], ...safeUpdates });
                 this._assertRecord(updated);
                 records[index] = updated;
-                await this.write(records, { transaction: tx, skipValidation: true, clone: false });
+                await this.write(records, { transaction: tx, skipValidation: true, clone: false, syncRecords: [updated] });
                 return updated;
             }, { label: 'practice-update' });
         }
@@ -7576,17 +7576,17 @@ storageManager.ready
         return [];
     }
 
-    async function writePracticeRecords(records, storageManager) {
+    async function writePracticeRecords(records, storageManager, options = {}) {
         const finalRecords = Array.isArray(records) ? records : [];
         const repos = getRepositories();
         if (repos && repos.practice && typeof repos.practice.overwrite === 'function') {
-            await repos.practice.overwrite(finalRecords);
+            await repos.practice.overwrite(finalRecords, options);
             syncPracticeRecordState(finalRecords);
             return true;
         }
         const storage = getStorageManager(storageManager);
         if (storage && typeof storage.writePersistentValue === 'function') {
-            const result = await storage.writePersistentValue(STORAGE_KEYS.practiceRecords, finalRecords);
+            const result = await storage.writePersistentValue(STORAGE_KEYS.practiceRecords, finalRecords, options);
             syncPracticeRecordState(finalRecords);
             return result;
         }
@@ -7702,7 +7702,7 @@ storageManager.ready
         if (Number.isFinite(options.maxRecords) && options.maxRecords > 0 && records.length > options.maxRecords) {
             records.splice(options.maxRecords);
         }
-        await writePracticeRecords(records, options.storageManager);
+        await writePracticeRecords(records, options.storageManager, { syncRecords: [standardizedRecord] });
         return standardizedRecord;
     }
 

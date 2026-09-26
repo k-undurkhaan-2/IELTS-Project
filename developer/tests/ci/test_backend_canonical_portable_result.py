@@ -33,7 +33,7 @@ def json_bytes(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 
-NAMES = [f"backend case {i:03d} preserves value {1000 + i}" for i in range(128)]
+NAMES = [f"backend case {i:03d} preserves value {1000 + i}" for i in range(141)]
 PACKAGE = json_bytes({"name": "fixture-backend", "version": "1.0.0",
                       "scripts": {"test": "node --test"}})
 
@@ -1064,7 +1064,7 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
         payload = r"\tmp/private-fixture/runner-output.txt"
         reporter = npm_stdout(names=[payload, *NAMES[1:]])
         members, _segments = portable._parse_stdout(reporter, json.loads(PACKAGE))
-        self.assertEqual(len(members), 128)
+        self.assertEqual(len(members), 141)
         self.assertEqual(members[0]["name"], payload)
         for platform in ("ubuntu", "windows"):
             for placement in ("stdout", "stderr", "reporter-name"):
@@ -1441,7 +1441,7 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
             ci._validate_command_record(forged, 0, errors)
             self.assertTrue(any("keys are not valid" in e for e in errors))
 
-    def test_6169_retained_bytes_and_129_duration_span_controls(self):
+    def test_v2_retained_bytes_and_142_duration_span_controls(self):
         stdout = npm_stdout(initial=False)
         package = json.loads(PACKAGE)
         members, gaps = portable._parse_stdout(stdout, package)
@@ -1458,7 +1458,7 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
             offset += len(line)
         excluded = {i for begin, end in spans for i in range(begin, end)}
         retained = [i for i in range(len(stdout)) if i not in excluded]
-        self.assertEqual((len(spans), len(gaps), len(excluded), len(retained)), (129, 130, 516, 6169))
+        self.assertEqual((len(spans), len(gaps), len(excluded), len(retained)), (142, 143, 568, 6780))
         self.assertEqual(b"".join(bytes.fromhex(gap) for gap in gaps), bytes(stdout[i] for i in retained))
         for position in retained:
             changed = stdout[:position] + bytes([stdout[position] ^ 1]) + stdout[position + 1:]
@@ -1471,13 +1471,42 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
         for index, (begin, end) in enumerate(spans):
             changed = stdout[:begin] + b"98765.4321" + stdout[end:]
             self.assertEqual(portable._parse_stdout(changed, package), (members, gaps), index)
-        print("BACKEND_BYTES retained=6169 excluded_spans=129 excluded_bytes=516 segments=130 duration_controls=129")
+        print("BACKEND_BYTES retained=6780 excluded_spans=142 excluded_bytes=568 segments=143 duration_controls=142")
+
+    def test_v2_exact_count_order_and_domain_are_bound(self):
+        self.assertEqual((portable.VERSION, portable.TEST_COUNT), (2, 141))
+        members, gaps = portable._parse_stdout(npm_stdout(), json.loads(PACKAGE))
+        self.assertEqual(members, [{"name": name, "status": "pass"} for name in NAMES])
+        self.assertEqual(len(gaps), 143)
+        value = {"version": 2, "orderedTests": members, "stdoutNonDurationSegmentsHex": gaps}
+        expected = ci.canonical_failure_digest({
+            "digestDomain": "ieltmps-backend-canonical-portable-result-v2",
+            "resultUtf8": json_bytes(value),
+        })
+        self.assertEqual(portable._identity(ci, value), expected)
+        self.assertNotEqual(expected, ci.canonical_failure_digest({
+            "digestDomain": "ieltmps-backend-canonical-portable-result-v1",
+            "resultUtf8": json_bytes(value),
+        }))
+        # Order remains a retained semantic input, not a permitted normalization.
+        reordered = npm_stdout(names=[NAMES[1], NAMES[0], *NAMES[2:]])
+        reordered_members, reordered_gaps = portable._parse_stdout(reordered, json.loads(PACKAGE))
+        self.assertEqual([member["name"] for member in reordered_members],
+                         [NAMES[1], NAMES[0], *NAMES[2:]])
+        self.assertNotEqual(portable._identity(ci, {
+            "version": 2, "orderedTests": reordered_members,
+            "stdoutNonDurationSegmentsHex": reordered_gaps}), expected)
+        with outer_fixture(replay=fixture(stdout=reordered)) as case:
+            self.assert_rejected(case, "reordered v2 inventory", parser_calls=2, identity_calls=2)
 
     def test_strict_reporter_grammar_matrix(self):
         source = npm_stdout()
         variants = {
-            "127 tests": npm_stdout(names=NAMES[:-1]),
-            "129 tests": npm_stdout(names=[*NAMES, "extra case"]),
+            "old 128 tests": npm_stdout(names=NAMES[:128]),
+            "140 tests": npm_stdout(names=NAMES[:-1]),
+            "142 tests": npm_stdout(names=[*NAMES, "extra case"]),
+            "missing member with 141 footer": source.replace(
+                f"\u2714 {NAMES[70]} (1.25ms)\n".encode(), b"", 1),
             "duplicate member": npm_stdout(names=[NAMES[0], *NAMES[:-1]]),
             "missing footer": source.rsplit("ℹ duration_ms".encode(), 1)[0],
             "missing final newline": source[:-1],

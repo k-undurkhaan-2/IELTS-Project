@@ -428,3 +428,62 @@ classes, with 911 targets and 19,876 references. Its inventory expectations,
 plan builder, and fixed size limits remain unchanged.
 This transaction ends with one signed, verified local commit and
 stops before push, hosted CI, or any PR modification.
+
+
+## P1A current-contract v2 addendum
+
+The preceding v1 descriptions, measurements and receipts are historical evidence.
+They describe the 128-member backend contract and the earlier 18-method standalone
+reporter. Those receipts have not been rewritten or promoted to v2 acceptance.
+
+P1A reconciles the accepted CI foundation with the accepted P0 development changes.
+The backend suite retains its former tests and adds 13 accepted tests, for 141.
+The standalone suite replaces
+`test_default_windows_and_unix_release_use_one_positive_manifest` with
+`test_available_releases_use_one_positive_manifest`,
+`test_default_windows_unix_release_parity`, and
+`test_authorized_reading_releases_preserve_hashes`; the other 17 names remain.
+The independently observed ordered inventory is authoritative, including the
+fully qualified `__main__.StandalonePackagingTest` reporter identities.
+
+The current backend contract is `BackendCanonicalPortableResult`, version **2**,
+using digest domain `ieltmps-backend-canonical-portable-result-v2`. It requires
+exactly 141 unique ordered passing members, tests/pass 141, suites 0, and zero
+failures, cancellations, skips or todo. There are 142 excluded numeric duration
+spans (141 member durations plus the terminal duration), leaving 143 exact byte
+segments. Every name, ordering, framing byte and non-duration value remains bound.
+An old 128-member report is unavailable under v2; wrong counts, duplicate or
+missing members and malformed framing reject. Reordering changes identity and
+cannot compare equal to the accepted ordered report.
+
+The current standalone protocols are:
+
+- `windows-standalone-packaging-verbose-unittest-duration-v2`: exactly 20 ordered
+  methods, all `ok`, CRLF framing, `Ran 20 tests in <duration>s`, and `OK`.
+- `ubuntu-standalone-packaging-verbose-unittest-duration-v2`: exactly 20 ordered
+  methods, 18 `ok` and the two exact foreign-shell parity skips below, LF framing,
+  `Ran 20 tests in <duration>s`, and `OK (skipped=2)`.
+
+The Ubuntu skipped methods are
+`test_authorized_reading_has_real_windows_unix_parity_and_hashes` and
+`test_default_windows_unix_release_parity`. Each verbose line ends exactly with
+`... skipped 'Windows/Unix parity requires unavailable shell(s): windows'`.
+This is the measured Python unittest reporter form, including the single quotes.
+Only the footer's numeric duration is excluded. The protocol, ordered names,
+per-method statuses, skip identities/reason, line endings and all other framing
+remain in the semantic identity. Windows allows no skips; Ubuntu requires both
+named skips and rejects an all-ok report under this native-only contract.
+
+Unexpected/missing/extra skips, another reason, native-shell failures, wrong
+counts, warnings, extra output, duplicate/reordered/missing methods and malformed
+footers remain rejecting. Nonzero execution cannot acquire portability. These
+reporter forms grant no execution or replay authority: ordinary raw/local
+validation, source/trust binding, runtime/dependency closure, containment, privacy
+and fresh replay authorization still precede semantic comparison.
+
+The immutable Phase-1 baseline and known-debt authority are unchanged. These two
+Ubuntu parity skips are current platform/capability protocol semantics, not
+historical baseline debt or release-only skips. The accepted 12-file reconciliation
+candidate remains unchanged; this addendum versions only the current portable
+contracts. Local v2 validation is separate from any future exact-head hosted
+acceptance.

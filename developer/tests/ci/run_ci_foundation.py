@@ -23960,8 +23960,10 @@ _STANDALONE_PACKAGING_METHODS = (
     "test_archive_entries_are_unique_portable_relative_and_not_symlinks",
     "test_archive_list_verifier_rejects_duplicate_and_unsafe_entries",
     "test_authorized_reading_has_real_windows_unix_parity_and_hashes",
+    "test_authorized_reading_releases_preserve_hashes",
+    "test_available_releases_use_one_positive_manifest",
     "test_clean_no_git_source_archive_still_releases_safely",
-    "test_default_windows_and_unix_release_use_one_positive_manifest",
+    "test_default_windows_unix_release_parity",
     "test_extracted_payload_is_self_contained_and_serves_required_styles",
     "test_git_manifest_and_payload_dirty_changes_fail_closed",
     "test_main_manifest_missing_malformed_schema_and_paths_fail_closed",
@@ -23976,10 +23978,17 @@ _STANDALONE_PACKAGING_METHODS = (
     "test_scripts_consume_only_the_shared_manifest_helper_staging_contract",
     "test_unknown_files_in_every_managed_root_fail_before_staging",
 )
-_STANDALONE_PACKAGING_PROTOCOL = b"windows-standalone-packaging-verbose-unittest-duration-v1"
+_STANDALONE_PACKAGING_UBUNTU_SKIPS = (
+    "test_authorized_reading_has_real_windows_unix_parity_and_hashes",
+    "test_default_windows_unix_release_parity",
+)
+_STANDALONE_PACKAGING_SKIP_REASON = (
+    "Windows/Unix parity requires unavailable shell(s): windows"
+)
+_STANDALONE_PACKAGING_PROTOCOL = b"windows-standalone-packaging-verbose-unittest-duration-v2"
 _STANDALONE_PACKAGING_REPORTERS = {
     "windows": (b"\r\n", _STANDALONE_PACKAGING_PROTOCOL),
-    "ubuntu": (b"\n", b"ubuntu-standalone-packaging-verbose-unittest-duration-v1"),
+    "ubuntu": (b"\n", b"ubuntu-standalone-packaging-verbose-unittest-duration-v2"),
 }
 
 
@@ -23999,11 +24008,21 @@ def _parse_standalone_packaging_stderr(stderr, *, platform="windows"):
         raise ValueError("standalone reporter platform is unavailable")
     newline, _ = _STANDALONE_PACKAGING_REPORTERS[platform]
     stderr.decode("utf-8", errors="strict")
-    prefix = b"".join(
-        f"{name} (__main__.StandalonePackagingTest.{name}) ... ok".encode("ascii") + newline
+    # The Ubuntu v2 form is native-only: exactly these two foreign-shell
+    # parity skips. Every native check must still report ok. This is reporter
+    # identity only; execution, capability and replay authority stay upstream.
+    statuses = {
+        name: (f"skipped '{_STANDALONE_PACKAGING_SKIP_REASON}'"
+               if platform == "ubuntu" and name in _STANDALONE_PACKAGING_UBUNTU_SKIPS
+               else "ok")
         for name in _STANDALONE_PACKAGING_METHODS
-    ) + newline + b"-" * 70 + newline + b"Ran 18 tests in "
-    suffix = b"s" + newline + newline + b"OK" + newline
+    }
+    prefix = b"".join(
+        f"{name} (__main__.StandalonePackagingTest.{name}) ... {statuses[name]}".encode("ascii") + newline
+        for name in _STANDALONE_PACKAGING_METHODS
+    ) + newline + b"-" * 70 + newline + b"Ran 20 tests in "
+    footer = b"OK (skipped=2)" if platform == "ubuntu" else b"OK"
+    suffix = b"s" + newline + newline + footer + newline
     if not stderr.startswith(prefix) or not stderr.endswith(suffix):
         raise ValueError("standalone verbose reporter grammar differs")
     start, end = len(prefix), len(stderr) - len(suffix)

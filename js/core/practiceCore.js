@@ -1244,17 +1244,17 @@
         return [];
     }
 
-    async function writePracticeRecords(records, storageManager) {
+    async function writePracticeRecords(records, storageManager, options = {}) {
         const finalRecords = Array.isArray(records) ? records : [];
         const repos = getRepositories();
         if (repos && repos.practice && typeof repos.practice.overwrite === 'function') {
-            await repos.practice.overwrite(finalRecords);
+            await repos.practice.overwrite(finalRecords, options);
             syncPracticeRecordState(finalRecords);
             return true;
         }
         const storage = getStorageManager(storageManager);
         if (storage && typeof storage.writePersistentValue === 'function') {
-            const result = await storage.writePersistentValue(STORAGE_KEYS.practiceRecords, finalRecords);
+            const result = await storage.writePersistentValue(STORAGE_KEYS.practiceRecords, finalRecords, options);
             syncPracticeRecordState(finalRecords);
             return result;
         }
@@ -1370,7 +1370,7 @@
         if (Number.isFinite(options.maxRecords) && options.maxRecords > 0 && records.length > options.maxRecords) {
             records.splice(options.maxRecords);
         }
-        await writePracticeRecords(records, options.storageManager);
+        await writePracticeRecords(records, options.storageManager, { syncRecords: [standardizedRecord] });
         return standardizedRecord;
     }
 

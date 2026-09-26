@@ -806,7 +806,94 @@ async function testAuthOverlayValidationAndErrorFormatting() {
     assert(formattedLongError.endsWith('...'));
 }
 
+async function testMutationOnlySyncAcknowledgement() {
+    const fetchCalls = [];
+    const { window } = createRemoteApiContext(async (url, options) => {
+        fetchCalls.push([url, options]);
+        return { status: 200, ok: true, async text() { return '{"ok":true}'; } };
+    });
+    const client = new window.ExamData.RemoteApiClient();
+    client.user = { id: 'user-1' };
+    client.csrfToken = 'current-csrf';
+    const submitted = [{ id: 'new-record', score: 80 }];
+    assert.deepStrictEqual(await client.syncPracticeRecords(submitted), { ok: true });
+    assert.equal(fetchCalls.length, 1);
+    assert.equal(fetchCalls[0][0], '/api/practice-records/sync');
+    assert.equal(fetchCalls[0][1].method, 'POST');
+    assert.equal(fetchCalls[0][1].headers['X-CSRF-Token'], 'current-csrf');
+    assert.deepStrictEqual(JSON.parse(fetchCalls[0][1].body), { records: submitted });
+
+    const dsContext = createContext();
+    const local = createLocalDataSource();
+    const dataSource = new dsContext.window.ExamData.RemotePracticeDataSource(local, client);
+    await dataSource.write('practice_records', submitted, { syncRecords: submitted });
+    assert.deepStrictEqual(local.state.get('practice_records'), submitted, 'acknowledgement is not a replacement collection');
+    assert(fetchCalls.every(([url]) => url.endsWith('/sync')));
+}
+
+async function testDeniedReplacementPreservesLocalMirror() {
+    const { window } = createContext();
+    const history = [{ id: 'cached-history' }];
+    const local = createLocalDataSource({ practice_records: history });
+    const denied = Object.assign(new Error('Recent authentication required'), {
+        status: 403, payload: { requiresDataManageStepUp: true }
+    });
+    const dataSource = new window.ExamData.RemotePracticeDataSource(local, {
+        isAuthenticated() { return true; },
+        async replacePracticeRecords() { throw denied; }
+    });
+    await assert.rejects(() => dataSource.write('practice_records', []), (error) => error === denied);
+    assert.deepStrictEqual(local.state.get('practice_records'), history);
+    await assert.rejects(() => dataSource.runTransaction(async (tx) => {
+        tx.set('practice_records', []);
+    }), (error) => error === denied);
+    assert.deepStrictEqual(local.state.get('practice_records'), history);
+}
+
+async function testRepositorySyncTransactionsCompleteWithoutReplacement() {
+    const { context, window } = createContext();
+    loadScript('js/data/repositories/baseRepository.js', context);
+    loadScript('js/data/repositories/practiceRepository.js', context);
+    const local = createLocalDataSource();
+    const mutations = [];
+    const api = {
+        isAuthenticated() { return true; },
+        async listPracticeRecords() {
+            throw Object.assign(new Error('Step-up required'), { status: 403 });
+        },
+        async syncPracticeRecords(records) { mutations.push(records); return { ok: true }; },
+        async replacePracticeRecords() { throw new Error('ordinary save must not replace'); },
+        async clearPracticeRecords() { return []; }
+    };
+    const dataSource = new window.ExamData.RemotePracticeDataSource(local, api);
+    const repository = new window.ExamData.PracticeRepository(dataSource);
+    let timer;
+    try {
+        await Promise.race([
+            (async () => {
+                await repository.upsert({ id: 'saved', type: 'reading', score: 70, date: '2026-01-01' });
+                await repository.update('saved', { score: 85 });
+                await dataSource.runTransaction(async (tx) => { tx.remove('practice_records'); });
+            })(),
+            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('remote transaction deadlocked')), 2000); })
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
+    assert.deepEqual(mutations.map((records) => records.map((record) => [record.id, record.score])), [
+        [['saved', 70]], [['saved', 85]]
+    ]);
+    assert.deepStrictEqual(Array.from(local.state.get('practice_records')), []);
+}
+
 async function main() {
+    await testMutationOnlySyncAcknowledgement();
+    await testDeniedReplacementPreservesLocalMirror();
+    await testRepositorySyncTransactionsCompleteWithoutReplacement();
+    if (process.argv.includes('--sync-only')) {
+        console.log(JSON.stringify({ status: 'pass', tests: 3, detail: 'mutation-only sync regressions passed' }));
+        return;
+    }
     await testPracticeRecordsUseRemoteAndMirrorLocal();
     await testStandaloneFallbackCloneSanitizesRemoteMirror();
     await testUnauthorizedReadFallsBackToLocal();
