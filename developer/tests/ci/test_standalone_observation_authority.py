@@ -1767,8 +1767,9 @@ def packaging_reporter(duration="69.940", *, platform="windows", methods=PACKAGI
             + b"s" + newline + newline + footer.encode() + newline)
 
 
-def packaging_reporter_mutations(platform="windows"):
-    good = packaging_reporter(platform=platform)
+def packaging_reporter_mutations(platform="windows", *, full_capability=False):
+    statuses = {} if full_capability else None
+    good = packaging_reporter(platform=platform, statuses=statuses)
     newline = {"windows": b"\r\n", "ubuntu": b"\n"}[platform]
     lines = good.split(newline)
     first = PACKAGING_METHODS[0].encode()
@@ -1778,8 +1779,8 @@ def packaging_reporter_mutations(platform="windows"):
                    *PACKAGING_METHODS[7:])
     cases = {
         "old-18-methods": packaging_reporter(platform=platform, methods=old_methods, statuses={}),
-        "19-methods": packaging_reporter(platform=platform, methods=PACKAGING_METHODS[:-1]),
-        "21-methods": packaging_reporter(platform=platform, methods=(*PACKAGING_METHODS, "test_unexpected_extra")),
+        "19-methods": packaging_reporter(platform=platform, methods=PACKAGING_METHODS[:-1], statuses=statuses),
+        "21-methods": packaging_reporter(platform=platform, methods=(*PACKAGING_METHODS, "test_unexpected_extra"), statuses=statuses),
         "method-name": good.replace(first, b"test_changed"),
         "fully-qualified-id": good.replace(b"." + first + b")", b".test_changed)", 1),
         "class-name": good.replace(b"StandalonePackagingTest", b"OtherPackagingTest", 1),
@@ -1828,21 +1829,23 @@ def packaging_reporter_mutations(platform="windows"):
         })
     else:
         expected = {method: f"skipped '{PACKAGING_SKIP_REASON}'" for method in PACKAGING_UBUNTU_SKIPS}
+        native = packaging_reporter(platform=platform)
+        full = packaging_reporter(platform=platform, statuses={})
         cases.update({
             "CRLF-only": good.replace(b"\n", b"\r\n"),
             "mixed-line-endings": good.replace(b"\n", b"\r\n", 1),
             "missing-final-LF": good[:-1],
-            "missing-both-skips": packaging_reporter(platform=platform, statuses={}),
+            "all-ok-skip-footer": full.replace(b"OK\n", b"OK (skipped=2)\n"),
             "unexpected-skipped-method": packaging_reporter(platform=platform, statuses={
                 PACKAGING_METHODS[0]: expected[PACKAGING_UBUNTU_SKIPS[0]],
                 PACKAGING_UBUNTU_SKIPS[1]: expected[PACKAGING_UBUNTU_SKIPS[1]]}),
             "three-skips": packaging_reporter(platform=platform, statuses={
                 **expected, PACKAGING_METHODS[0]: f"skipped '{PACKAGING_SKIP_REASON}'"}),
-            "skip-reason-one-byte": good.replace(b"shell(s): windows'", b"shell(s): windowt'", 1),
-            "skip-footer-one": good.replace(b"OK (skipped=2)", b"OK (skipped=1)"),
-            "skip-footer-three": good.replace(b"OK (skipped=2)", b"OK (skipped=3)"),
-            "skip-footer-absent": good.replace(b"OK (skipped=2)", b"OK"),
-            "skip-quote-syntax": good.replace(b"skipped '" + PACKAGING_SKIP_REASON.encode() + b"'",
+            "skip-reason-one-byte": native.replace(b"shell(s): windows'", b"shell(s): windowt'", 1),
+            "skip-footer-one": native.replace(b"OK (skipped=2)", b"OK (skipped=1)"),
+            "skip-footer-three": native.replace(b"OK (skipped=2)", b"OK (skipped=3)"),
+            "skip-footer-absent": native.replace(b"OK (skipped=2)", b"OK"),
+            "skip-quote-syntax": native.replace(b"skipped '" + PACKAGING_SKIP_REASON.encode() + b"'",
                                              b'skipped "' + PACKAGING_SKIP_REASON.encode() + b'"', 1),
         })
         for method in PACKAGING_UBUNTU_SKIPS:
@@ -1857,6 +1860,9 @@ def packaging_reporter_mutations(platform="windows"):
                         ("whitespace", "1 .000"), ("non-ASCII-digit", "\u0661.000"),
                         ("empty", ""), ("nan", "nan"), ("infinite", "inf")):
         cases["duration-" + name] = good.replace(b"69.940", value.encode())
+    if platform == "ubuntu" and full_capability:
+        # CRLF-only already covers this exact malformed full-capability stream.
+        del cases["other-platform-reporter"]
     return cases
 
 
@@ -1956,7 +1962,7 @@ class StandalonePackagingPortableParserTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual([(kw.arg, ast.literal_eval(kw.value)) for kw in calls[0].keywords], [("verbosity", 2)])
 
-    def test_v2_exact_platform_forms_and_protocol_identity(self):
+    def test_exact_platform_forms_and_versioned_protocol_identity(self):
         self.assertEqual(len(PACKAGING_METHODS), 20)
         self.assertEqual(hashlib.sha256(json.dumps(list(PACKAGING_METHODS),
             ensure_ascii=False, separators=(",", ":")).encode()).hexdigest(),
@@ -1975,16 +1981,22 @@ class StandalonePackagingPortableParserTest(unittest.TestCase):
                 self.assertEqual(lines[-1], b"OK (skipped=2)")
             parsed = ci._parse_standalone_packaging_stderr(data, platform=platform)
             identity = ci._standalone_packaging_semantic_identity(parsed)
-            protocol = platform + "-standalone-packaging-verbose-unittest-duration-v2"
+            version = "v2" if platform == "windows" else "v3"
+            protocol = platform + "-standalone-packaging-verbose-unittest-duration-" + version
             self.assertEqual(identity["protocol"], protocol)
             identities[platform] = identity["identityDigest"]
             digest = hashlib.sha256()
-            for segment in (protocol.encode(), parsed.prefix, parsed.suffix):
+            segments = (protocol.encode(), parsed.prefix, parsed.suffix)
+            if platform == "ubuntu":
+                self.assertEqual(identity["capabilityForm"], "native-only")
+                segments = (protocol.encode(), b"native-only", parsed.prefix, parsed.suffix)
+            for segment in segments:
                 digest.update(len(segment).to_bytes(8, "big"))
                 digest.update(segment)
             self.assertEqual(identity["identityDigest"], "sha256:" + digest.hexdigest())
             old = hashlib.sha256()
-            for segment in (protocol.replace("-v2", "-v1").encode(), parsed.prefix, parsed.suffix):
+            previous = "v1" if platform == "windows" else "v2"
+            for segment in (protocol.replace(version, previous).encode(), parsed.prefix, parsed.suffix):
                 old.update(len(segment).to_bytes(8, "big"))
                 old.update(segment)
             self.assertNotEqual(identity["identityDigest"], "sha256:" + old.hexdigest())
@@ -1992,6 +2004,69 @@ class StandalonePackagingPortableParserTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ci._parse_standalone_packaging_stderr(data, platform=other)
         self.assertNotEqual(identities["windows"], identities["ubuntu"])
+
+    def test_historical_hosted_ubuntu_20_ok_reporter_and_duration_only_identity(self):
+        # Synthetic reconstruction from the independently preserved run 36286087393
+        # reporter facts; the whole-stream hash proves equality to its raw stderr.
+        good = packaging_reporter("26.075", platform="ubuntu", statuses={})
+        self.assertEqual(len(good), 3258)
+        self.assertEqual(hashlib.sha256(good).hexdigest(),
+            "f40a9a0ed346f6d45ae4d62497c4eb627fe86d6c94e734ccee12e66d25148ace")
+        parsed = ci._parse_standalone_packaging_stderr(good, platform="ubuntu")
+        self.assertEqual(parsed.capability_form, "full-capability")
+        self.assertEqual(parsed.duration_span, (3246, 3252))
+        self.assertEqual(hashlib.sha256(parsed.prefix).hexdigest(),
+            "3be2f05a4a16549dda25c77b32ac8445d174276298bc3d6e5bd77d320f883699")
+        self.assertEqual(parsed.suffix, b"s\n\nOK\n")
+        identity = ci._standalone_packaging_semantic_identity(parsed)
+        self.assertEqual(identity["protocol"], "ubuntu-standalone-packaging-verbose-unittest-duration-v3")
+        self.assertEqual(identity["capabilityForm"], "full-capability")
+        digest = hashlib.sha256()
+        for segment in (identity["protocol"].encode(), b"full-capability", parsed.prefix, parsed.suffix):
+            digest.update(len(segment).to_bytes(8, "big"))
+            digest.update(segment)
+        self.assertEqual(identity["identityDigest"], "sha256:" + digest.hexdigest())
+        for duration in ("0.000", "9.999", "26.075", "100.000"):
+            other = packaging_reporter(duration, platform="ubuntu", statuses={})
+            self.assertEqual(ci._derive_standalone_packaging_equal_result(
+                ci._StandalonePortablePair(702, good, other, b"parser-fixture", "ubuntu")), identity)
+        native = packaging_reporter("26.075", platform="ubuntu")
+        native_identity = ci._standalone_packaging_semantic_identity(
+            ci._parse_standalone_packaging_stderr(native, platform="ubuntu"))
+        self.assertEqual(native_identity["capabilityForm"], "native-only")
+        self.assertNotEqual(identity["identityDigest"], native_identity["identityDigest"])
+        for streams in ((good, native), (native, good)):
+            with packaging_counters() as calls:
+                self.assertIsNone(ci._derive_standalone_packaging_equal_result(
+                    ci._StandalonePortablePair(702, *streams, b"parser-fixture", "ubuntu")))
+                self.assertEqual((calls.parser.call_count, calls.identity.call_count), (2, 2))
+
+    def test_ubuntu_full_capability_negative_matrix_and_every_retained_byte(self):
+        for platform, full in (("windows", False), ("ubuntu", False), ("ubuntu", True)):
+            cases = packaging_reporter_mutations(platform, full_capability=full)
+            with self.subTest(platform=platform, full_capability=full):
+                self.assertEqual(len(cases), len(set(cases.values())))
+        good = packaging_reporter(platform="ubuntu", statuses={})
+        parsed = ci._parse_standalone_packaging_stderr(good, platform="ubuntu")
+        start, end = parsed.duration_span
+        positions = [*range(start), *range(end, len(good))]
+        with packaging_counters() as calls:
+            for index in positions:
+                for replacement in (bytes([good[index] ^ 1]), "\u00e9".encode()):
+                    bad = good[:index] + replacement + good[index + 1:]
+                    self.assertIsNone(ci._derive_standalone_packaging_equal_result(
+                        ci._StandalonePortablePair(702, good, bad, b"parser-fixture", "ubuntu")), index)
+            self.assertEqual(calls.identity.call_count, 0)
+        mutations = packaging_reporter_mutations("ubuntu", full_capability=True)
+        for name, bad in mutations.items():
+            for streams in ((good, bad), (bad, good)):
+                with self.subTest(name=name), packaging_counters() as calls:
+                    self.assertIsNone(ci._derive_standalone_packaging_equal_result(
+                        ci._StandalonePortablePair(702, *streams, b"parser-fixture", "ubuntu")))
+                    self.assertEqual(calls.identity.call_count, 0)
+        print("U702_FULL_REPORTER_MATRIX " + json.dumps({"cases": sorted(mutations),
+            "mutations": len(mutations), "both_sides": 2 * len(mutations),
+            "retained_positions": len(positions), "byte_mutations": 2 * len(positions)}))
 
     def test_structural_variable_length_duration_pairs_and_exact_retained_bytes(self):
         for left, right in PACKAGING_DURATIONS:
@@ -2343,6 +2418,37 @@ class UbuntuStandalonePackagingPortableAuthorityTest(StandalonePackagingPortable
 
 
 class UbuntuStandalonePackagingPortableTest(StandalonePackagingFixtureTestBase):
+    def test_full_capability_outer_pass_preserves_raw_authority(self):
+        producer = packaging_reporter("26.075", platform="ubuntu", statuses={})
+        replay = packaging_reporter("100.000", platform="ubuntu", statuses={})
+        with self.fixture("ubuntu", producer_stderr=producer, replay_stderr=replay) as case:
+            for ordinal in case.frontend:
+                case.runner.command_results[ordinal] = copy.deepcopy(case.producer.command_results[ordinal])
+            files = {name: (case.output / name).read_bytes() for name in ci.EVIDENCE_FILE_NAMES}
+            records = ci._observation_bytes(case.runner.command_results)
+            captures = [(c.stdout_raw, c.stderr_raw, c.evidence()) for c in case.runner.captures]
+            with packaging_counters() as calls:
+                errors, transcript = backend.verify(case)
+            self.assertEqual(errors, [])
+            self.assertEqual(transcript["finalAcceptance"], "PASS")
+            self.assertEqual((calls.parser.call_count, calls.identity.call_count), (2, 2))
+            self.assertEqual((calls.backend_parser.call_count, calls.backend_identity.call_count), (2, 2))
+            self.assertEqual(files, {name: (case.output / name).read_bytes() for name in ci.EVIDENCE_FILE_NAMES})
+            self.assertEqual(records, ci._observation_bytes(case.runner.command_results))
+            self.assertEqual(captures, [(c.stdout_raw, c.stderr_raw, c.evidence()) for c in case.runner.captures])
+
+    def test_capability_form_drift_rejects_after_real_outer_binding(self):
+        full = packaging_reporter("26.075", platform="ubuntu", statuses={})
+        native = packaging_reporter("100.000", platform="ubuntu")
+        for producer, replay in ((full, native), (native, full)):
+            with self.subTest(producer_full=producer == full), self.fixture("ubuntu",
+                    producer_stderr=producer, replay_stderr=replay) as case, packaging_counters() as calls:
+                errors, transcript = backend.verify(case)
+                self.assertEqual(backend.unequal_ordinals(errors), [*case.frontend, 702], errors)
+                self.assertEqual(transcript["finalAcceptance"], "REJECT")
+                self.assertEqual((calls.parser.call_count, calls.identity.call_count), (2, 2))
+                self.assertIn("verification replay standalone-packaging portable result unavailable or mismatched", errors)
+
     def test_explicit_platform_grammar_duration_and_every_retained_byte(self):
         for platform, retained in (("windows", 3277), ("ubuntu", 3396)):
             good = packaging_reporter(platform=platform)

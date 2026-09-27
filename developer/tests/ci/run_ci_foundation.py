@@ -23994,7 +23994,7 @@ _STANDALONE_PACKAGING_SKIP_REASON = (
 _STANDALONE_PACKAGING_PROTOCOL = b"windows-standalone-packaging-verbose-unittest-duration-v2"
 _STANDALONE_PACKAGING_REPORTERS = {
     "windows": (b"\r\n", _STANDALONE_PACKAGING_PROTOCOL),
-    "ubuntu": (b"\n", b"ubuntu-standalone-packaging-verbose-unittest-duration-v2"),
+    "ubuntu": (b"\n", b"ubuntu-standalone-packaging-verbose-unittest-duration-v3"),
 }
 
 
@@ -24004,6 +24004,7 @@ class _StandalonePackagingReporter:
     suffix: bytes
     duration_span: tuple[int, int]
     platform: str = "windows"
+    capability_form: str = "full-capability"
 
 
 def _parse_standalone_packaging_stderr(stderr, *, platform="windows"):
@@ -24014,29 +24015,32 @@ def _parse_standalone_packaging_stderr(stderr, *, platform="windows"):
         raise ValueError("standalone reporter platform is unavailable")
     newline, _ = _STANDALONE_PACKAGING_REPORTERS[platform]
     stderr.decode("utf-8", errors="strict")
-    # The Ubuntu v2 form is native-only: exactly these two foreign-shell
-    # parity skips. Every native check must still report ok. This is reporter
-    # identity only; execution, capability and replay authority stay upstream.
-    statuses = {
-        name: (f"skipped '{_STANDALONE_PACKAGING_SKIP_REASON}'"
-               if platform == "ubuntu" and name in _STANDALONE_PACKAGING_UBUNTU_SKIPS
-               else "ok")
-        for name in _STANDALONE_PACKAGING_METHODS
-    }
-    prefix = b"".join(
-        f"{name} (__main__.StandalonePackagingTest.{name}) ... {statuses[name]}".encode("ascii") + newline
-        for name in _STANDALONE_PACKAGING_METHODS
-    ) + newline + b"-" * 70 + newline + b"Ran 20 tests in "
-    footer = b"OK (skipped=2)" if platform == "ubuntu" else b"OK"
-    suffix = b"s" + newline + newline + footer + newline
-    if not stderr.startswith(prefix) or not stderr.endswith(suffix):
-        raise ValueError("standalone verbose reporter grammar differs")
-    start, end = len(prefix), len(stderr) - len(suffix)
-    # Only after exact ordered membership, framing and EOF are established is
-    # the one remaining field examined. Never substitute/search across stderr.
-    if end <= start or re.fullmatch(rb"[0-9]+\.[0-9]{3}", stderr[start:end]) is None:
-        raise ValueError("standalone footer duration grammar differs")
-    return _StandalonePackagingReporter(stderr[:start], stderr[end:], (start, end), platform)
+    # These exact forms describe reporter identity, not capability authority.
+    # Trusted execution/admission/runtime/replay binding stays upstream. Neither
+    # output form can grant a shell capability or bypass those checks.
+    forms = ("full-capability", "native-only") if platform == "ubuntu" else ("full-capability",)
+    for form in forms:
+        statuses = {
+            name: (f"skipped '{_STANDALONE_PACKAGING_SKIP_REASON}'"
+                   if form == "native-only" and name in _STANDALONE_PACKAGING_UBUNTU_SKIPS
+                   else "ok")
+            for name in _STANDALONE_PACKAGING_METHODS
+        }
+        prefix = b"".join(
+            f"{name} (__main__.StandalonePackagingTest.{name}) ... {statuses[name]}".encode("ascii") + newline
+            for name in _STANDALONE_PACKAGING_METHODS
+        ) + newline + b"-" * 70 + newline + b"Ran 20 tests in "
+        footer = b"OK (skipped=2)" if form == "native-only" else b"OK"
+        suffix = b"s" + newline + newline + footer + newline
+        if not stderr.startswith(prefix) or not stderr.endswith(suffix):
+            continue
+        start, end = len(prefix), len(stderr) - len(suffix)
+        # Only after exact ordered membership, framing and EOF are established is
+        # the one remaining field examined. Never substitute/search across stderr.
+        if end <= start or re.fullmatch(rb"[0-9]+\.[0-9]{3}", stderr[start:end]) is None:
+            raise ValueError("standalone footer duration grammar differs")
+        return _StandalonePackagingReporter(stderr[:start], stderr[end:], (start, end), platform, form)
+    raise ValueError("standalone verbose reporter grammar differs")
 
 
 def _standalone_packaging_semantic_identity(reporter):
@@ -24044,16 +24048,24 @@ def _standalone_packaging_semantic_identity(reporter):
     if type(reporter) is not _StandalonePackagingReporter:
         raise ValueError("standalone reporter is unavailable")
     _, protocol = _STANDALONE_PACKAGING_REPORTERS[reporter.platform]
+    # Ubuntu v3 explicitly binds the capability form as well as every retained
+    # reporter byte. Keep the frozen Windows v2 framing and identity unchanged.
+    segments = (protocol, reporter.prefix, reporter.suffix)
+    if reporter.platform == "ubuntu":
+        segments = (protocol, reporter.capability_form.encode("ascii"), reporter.prefix, reporter.suffix)
     digest = hashlib.sha256()
-    for segment in (protocol, reporter.prefix, reporter.suffix):
+    for segment in segments:
         digest.update(len(segment).to_bytes(8, "big"))
         digest.update(segment)
-    return {
+    identity = {
         "protocol": protocol.decode("ascii"),
         "prefixHex": reporter.prefix.hex(),
         "suffixHex": reporter.suffix.hex(),
         "identityDigest": "sha256:" + digest.hexdigest(),
     }
+    if reporter.platform == "ubuntu":
+        identity["capabilityForm"] = reporter.capability_form
+    return identity
 
 
 @dataclass(frozen=True)
