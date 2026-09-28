@@ -10,6 +10,7 @@ from html.parser import HTMLParser
 import http.server
 import io
 import json
+import locale
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -79,7 +80,7 @@ class _IndexAssetParser(HTMLParser):
             self.paths.add(href)
 
 
-def _command(name: str, env_name: str | None = None) -> str:
+def _command(name: str, env_name: str | None = None, *, required: bool = True) -> str | None:
     configured = os.environ.get(env_name, "") if env_name else ""
     if configured:
         return configured
@@ -89,10 +90,47 @@ def _command(name: str, env_name: str | None = None) -> str:
             return str(git_bash)
     resolved = shutil.which(name)
     if not resolved:
+        if not required:
+            return None
         raise RuntimeError(f"required command not found: {name}")
     if name == "bash" and Path(resolved).resolve() == Path(r"C:\Windows\System32\bash.exe"):
+        if not required:
+            return None
         raise RuntimeError("Git Bash is required; WSL launcher is not a usable Bash runtime")
     return resolved
+
+
+def _trusted_git_command() -> Path:
+    git = Path(_command("git")).resolve(strict=True)
+    metadata = git.lstat()
+    reparse = bool(
+        getattr(metadata, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+    if not stat.S_ISREG(metadata.st_mode) or reparse:
+        raise RuntimeError("trusted Git must resolve to a regular non-reparse executable")
+    return git
+
+
+def run_fixture_git(
+    git: Path,
+    *arguments: str | Path,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
+    argv = [str(git)]
+    if os.name == "nt":
+        argv.extend(["-c", "core.longpaths=true"])
+    argv.extend(str(argument) for argument in arguments)
+    return subprocess.run(
+        argv,
+        cwd=cwd,
+        env=env,
+        check=check,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
 
 
 def _sha256_bytes(content: bytes) -> str:
@@ -106,6 +144,25 @@ def _sha256_file(file_path: Path) -> str:
 def _content_manifest_sha256(file_hashes: dict[str, str]) -> str:
     source = "".join(f"{path}\t{file_hashes[path]}\n" for path in sorted(file_hashes))
     return _sha256_bytes(source.encode("utf-8"))
+
+
+def _decode_cmd_diagnostics(output: bytes) -> str:
+    """Decode cmd.exe diagnostics without making test control flow locale-dependent."""
+
+    encoding = locale.getpreferredencoding(False) or "utf-8"
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            code_page = int(ctypes.windll.kernel32.GetOEMCP())
+        except (AttributeError, OSError, TypeError, ValueError):
+            code_page = 0
+        if code_page > 0:
+            encoding = f"cp{code_page}"
+    try:
+        return output.decode(encoding, errors="replace")
+    except LookupError:
+        return output.decode("utf-8", errors="replace")
 
 
 def _normalized_file_hashes(
@@ -172,25 +229,33 @@ def _msys_path(file_path: Path | str) -> str:
 class StandalonePackagingTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.temp_dir = tempfile.TemporaryDirectory(prefix="ielts-standalone-manifest-tests-")
+        cls.temp_dir = tempfile.TemporaryDirectory(prefix="st-")
         cls.temp_root = Path(cls.temp_dir.name)
-        cls.source_root = cls.temp_root / "candidate-source"
-        cls.receipt_root = cls.temp_root / "receipts"
+        cls.source_root = cls.temp_root / "s"
+        cls.receipt_root = cls.temp_root / "r"
         cls.receipt_root.mkdir()
         cls.node = Path(_command("node", "NODE_EXE"))
-        cls.powershell = _command("powershell", "POWERSHELL_EXE")
-        cls.bash = _command("bash", "BASH_EXE")
-        cls.git = _command("git")
+        cls.native_platform = "windows" if os.name == "nt" else "unix"
+        cls.powershell = _command("powershell", "POWERSHELL_EXE", required=os.name == "nt")
+        cls.bash = _command("bash", "BASH_EXE", required=os.name != "nt")
+        cls.platforms = tuple(
+            platform for platform, shell in (("windows", cls.powershell), ("unix", cls.bash))
+            if shell is not None
+        )
+        cls.git = _trusted_git_command()
         cls._copy_candidate_tree(cls.source_root)
         cls._initialize_temporary_git_repo(cls.source_root)
         cls.zip_shim_dir = cls._create_zip_shim()
         cls.manifest = json.loads((cls.source_root / MANIFEST_PATH).read_text(encoding="utf-8"))
 
-        cls.absent_windows = cls._build_release("windows", "focused-default-windows")
-        cls.absent_unix = cls._build_release("unix", "focused-default-unix")
+        cls.default_releases = {
+            platform: cls._build_release(platform, f"focused-default-{platform}")
+            for platform in cls.platforms
+        }
+        cls.native_release = cls.default_releases[cls.native_platform]
         cls.source_file_hashes = _source_file_hashes(cls.source_root, cls.manifest["files"])
-        cls.extract_root = cls.temp_root / "extracted-default"
-        with zipfile.ZipFile(io.BytesIO(cls.absent_windows["archive_bytes"])) as archive:
+        cls.extract_root = cls.temp_root / "x"
+        with zipfile.ZipFile(io.BytesIO(cls.native_release["archive_bytes"])) as archive:
             archive.extractall(cls.extract_root)
 
     @classmethod
@@ -200,15 +265,40 @@ class StandalonePackagingTest(unittest.TestCase):
     @classmethod
     def _copy_candidate_tree(cls, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        base_archive = cls.temp_root / f"base-{uuid.uuid4().hex}.zip"
-        subprocess.run(
-            [cls.git, "-C", str(REPO_ROOT), "archive", "--format=zip", "-o", str(base_archive), "HEAD"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        with zipfile.ZipFile(base_archive) as archive:
-            archive.extractall(destination)
+        if (REPO_ROOT / ".git").exists():
+            base_archive = cls.temp_root / f"b-{uuid.uuid4().hex}.zip"
+            run_fixture_git(
+                cls.git,
+                "-C",
+                REPO_ROOT,
+                "archive",
+                "--format=zip",
+                "-o",
+                base_archive,
+                "HEAD",
+            )
+            with zipfile.ZipFile(base_archive) as archive:
+                archive.extractall(destination)
+        else:
+            if os.environ.get("CI_PROTECTED_TARGET_SNAPSHOT") != "1":
+                raise AssertionError("Git-less candidate copy requires protected snapshot authority")
+            for source in sorted(REPO_ROOT.rglob("*")):
+                metadata = source.lstat()
+                reparse = bool(
+                    getattr(metadata, "st_file_attributes", 0)
+                    & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+                )
+                if stat.S_ISLNK(metadata.st_mode) or reparse:
+                    raise AssertionError("protected snapshot contains a link or reparse point")
+                relative = source.relative_to(REPO_ROOT)
+                target = destination / relative
+                if stat.S_ISDIR(metadata.st_mode):
+                    target.mkdir(parents=True, exist_ok=True)
+                elif stat.S_ISREG(metadata.st_mode):
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target)
+                else:
+                    raise AssertionError("protected snapshot contains a non-regular entry")
         for relative_path in CANDIDATE_OVERLAY_PATHS:
             source = REPO_ROOT / relative_path
             if not source.is_file():
@@ -220,20 +310,20 @@ class StandalonePackagingTest(unittest.TestCase):
     @classmethod
     def _initialize_temporary_git_repo(cls, root: Path) -> None:
         commands = [
-            [cls.git, "-C", str(root), "init", "-q"],
-            [cls.git, "-C", str(root), "config", "user.name", "Codex TEMP Validation"],
-            [cls.git, "-C", str(root), "config", "user.email", "codex-temp@example.invalid"],
-            [cls.git, "-C", str(root), "config", "commit.gpgsign", "false"],
-            [cls.git, "-C", str(root), "config", "core.autocrlf", "true"],
-            [cls.git, "-C", str(root), "add", "-f", "--all"],
-            [cls.git, "-C", str(root), "commit", "-q", "-m", "temporary standalone manifest candidate"],
+            ["-C", root, "init", "-q"],
+            ["-C", root, "config", "user.name", "Codex TEMP Validation"],
+            ["-C", root, "config", "user.email", "codex-temp@example.invalid"],
+            ["-C", root, "config", "commit.gpgsign", "false"],
+            ["-C", root, "config", "core.autocrlf", "true"],
+            ["-C", root, "add", "-f", "--all"],
+            ["-C", root, "commit", "-q", "-m", "temporary standalone manifest candidate"],
         ]
         for command in commands:
-            subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            run_fixture_git(cls.git, *command)
 
     @classmethod
     def _create_zip_shim(cls) -> Path:
-        shim_dir = cls.temp_root / "unix-zip-shim"
+        shim_dir = cls.temp_root / "z"
         shim_dir.mkdir()
         python_script = shim_dir / "zip-shim.py"
         python_script.write_text(
@@ -447,24 +537,32 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
     @contextmanager
     def _directory_link(cls, link: Path, target: Path):
         link.parent.mkdir(parents=True, exist_ok=True)
-        if os.name == "nt":
-            completed = subprocess.run(
-                ["cmd", "/c", "mklink", "/J", str(link), str(target)],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-            )
-            if completed.returncode:
-                raise AssertionError(f"failed to create TEMP junction: {completed.stdout}")
-        else:
-            link.symlink_to(target, target_is_directory=True)
         try:
+            if os.name == "nt":
+                completed = subprocess.run(
+                    ["cmd.exe", "/c", "mklink", "/J", str(link), str(target)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                )
+                diagnostics = _decode_cmd_diagnostics(completed.stdout)
+                if completed.returncode:
+                    raise AssertionError(f"failed to create TEMP junction: {diagnostics}")
+                if not link.exists():
+                    raise AssertionError(
+                        "cmd.exe reported junction success but the TEMP junction is absent: "
+                        + diagnostics
+                    )
+            else:
+                link.symlink_to(target, target_is_directory=True)
             yield
         finally:
-            if os.name == "nt":
-                os.rmdir(link)
-            else:
-                link.unlink()
+            if os.path.lexists(link):
+                if os.name == "nt":
+                    os.rmdir(link)
+                else:
+                    link.unlink()
+            if os.path.lexists(link):
+                raise AssertionError("TEMP directory link cleanup left a reparse or symlink artifact")
 
     @staticmethod
     def _entry_names(snapshot: dict[str, object]) -> list[str]:
@@ -500,7 +598,12 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
                 f"hash-mismatch paths={hash_mismatch_paths}"
             )
 
-    def test_default_windows_and_unix_release_use_one_positive_manifest(self) -> None:
+    def _require_parity_shells(self) -> None:
+        missing = {"windows", "unix"} - set(self.platforms)
+        if missing:
+            self.skipTest(f"Windows/Unix parity requires unavailable shell(s): {', '.join(sorted(missing))}")
+
+    def test_available_releases_use_one_positive_manifest(self) -> None:
         manifest_files = set(self.manifest["files"])
         self.assertEqual(len(manifest_files), 430)
         self.assertEqual(self.manifest["managedRoots"], MANAGED_ROOTS)
@@ -508,10 +611,7 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
         self.assertSetEqual(set(self.source_file_hashes), manifest_files)
         source_content_manifest_sha256 = _content_manifest_sha256(self.source_file_hashes)
 
-        for platform, snapshot in (
-            ("Windows", self.absent_windows),
-            ("Unix", self.absent_unix),
-        ):
+        for platform, snapshot in self.default_releases.items():
             file_names = {
                 entry.filename for entry in snapshot["entries"]
                 if not entry.is_dir()
@@ -547,14 +647,12 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
             self.assertFalse(any(name.startswith("assets/generated/listening-exams/") for name in file_names))
             self.assertIn("js/bundles/listening-wrapper.bundle.js", file_names)
 
-        self.assertEqual(
-            self.absent_windows["file_hashes"],
-            self.absent_unix["file_hashes"],
-        )
-        self.assertSetEqual(
-            set(self._entry_names(self.absent_windows)),
-            set(self._entry_names(self.absent_unix)),
-        )
+    def test_default_windows_unix_release_parity(self) -> None:
+        self._require_parity_shells()
+        windows = self.default_releases["windows"]
+        unix = self.default_releases["unix"]
+        self.assertEqual(windows["file_hashes"], unix["file_hashes"])
+        self.assertSetEqual(set(self._entry_names(windows)), set(self._entry_names(unix)))
 
     def test_main_manifest_missing_malformed_schema_and_paths_fail_closed(self) -> None:
         manifest_path = self.source_root / MANIFEST_PATH
@@ -617,7 +715,7 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
         backup = self.temp_root / f"styles-missing-{uuid.uuid4().hex}"
         source.rename(backup)
         try:
-            for platform in ("windows", "unix"):
+            for platform in self.platforms:
                 with self.subTest(platform=platform):
                     result, archive_path, _receipt_path = self._run_release(
                         platform,
@@ -660,30 +758,26 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
             payload_path.write_bytes(original_payload)
 
         payload_path.write_bytes(original_payload + b"\n<!-- SAFE_SENTINEL_NOT_A_REAL_SECRET -->\n")
-        subprocess.run(
-            [self.git, "-C", str(self.source_root), "add", "index.html"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        run_fixture_git(self.git, "-C", self.source_root, "add", "index.html")
         try:
             result, _receipt_path, _receipt = self._run_helper()
             self.assertHelperFailure(result, "clean in git")
         finally:
             payload_path.write_bytes(original_payload)
-            subprocess.run(
-                [self.git, "-C", str(self.source_root), "add", "index.html"],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        cached = subprocess.run(
-            [self.git, "-C", str(self.source_root), "diff", "--cached", "--quiet"],
+            run_fixture_git(self.git, "-C", self.source_root, "add", "index.html")
+        cached = run_fixture_git(
+            self.git,
+            "-C",
+            self.source_root,
+            "diff",
+            "--cached",
+            "--quiet",
+            check=False,
         )
         self.assertEqual(cached.returncode, 0)
 
     def test_clean_no_git_source_archive_still_releases_safely(self) -> None:
-        no_git_root = self.temp_root / "no-git-source"
+        no_git_root = self.temp_root / "n"
         shutil.copytree(
             self.source_root,
             no_git_root,
@@ -702,7 +796,7 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
             actual_label="no-Git source map",
         )
         snapshot = self._build_release(
-            "windows",
+            self.native_platform,
             "focused-no-git",
             root=no_git_root,
         )
@@ -750,7 +844,7 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
         finally:
             self._clear_reading()
 
-    def test_authorized_reading_has_real_windows_unix_parity_and_hashes(self) -> None:
+    def _build_authorized_reading_releases(self):
         entries = self._create_reading_files([
             "nested/public-example.html",
             "public-example.txt",
@@ -758,36 +852,40 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
         manifest_path = self._write_reading_manifest(entries)
         overrides = {"READING_PRACTICE_PUBLIC_MANIFEST": str(manifest_path)}
         try:
-            windows = self._build_release(
-                "windows",
-                "focused-reading-windows",
-                overrides=overrides,
-            )
-            unix = self._build_release(
-                "unix",
-                "focused-reading-unix",
-                overrides=overrides,
-            )
+            snapshots = {
+                platform: self._build_release(
+                    platform, f"focused-reading-{platform}", overrides=overrides,
+                )
+                for platform in self.platforms
+            }
         finally:
             self._clear_reading()
 
-        self.assertEqual(windows["file_hashes"], unix["file_hashes"])
-        self.assertSetEqual(
-            set(self._entry_names(windows)),
-            set(self._entry_names(unix)),
-        )
+        return snapshots, entries, manifest_path
+
+    def test_authorized_reading_releases_preserve_hashes(self) -> None:
+        snapshots, entries, manifest_path = self._build_authorized_reading_releases()
         reading_paths = {f"ReadingPractice/{entry['path']}" for entry in entries}
-        self.assertSetEqual(
-            {path for path in windows["file_hashes"] if path.startswith("ReadingPractice/")},
-            reading_paths,
-        )
-        for entry in entries:
-            self.assertEqual(
-                windows["file_hashes"][f"ReadingPractice/{entry['path']}"],
-                entry["sha256"],
-            )
-        self.assertNotIn(manifest_path.name, self._entry_names(windows))
-        self.assertEqual(windows["receipt"]["effectiveReadingFiles"], sorted(reading_paths))
+        for platform, snapshot in snapshots.items():
+            with self.subTest(platform=platform):
+                self.assertSetEqual(
+                    {path for path in snapshot["file_hashes"] if path.startswith("ReadingPractice/")},
+                    reading_paths,
+                )
+                for entry in entries:
+                    self.assertEqual(
+                        snapshot["file_hashes"][f"ReadingPractice/{entry['path']}"],
+                        entry["sha256"],
+                    )
+                self.assertNotIn(manifest_path.name, self._entry_names(snapshot))
+                self.assertEqual(snapshot["receipt"]["effectiveReadingFiles"], sorted(reading_paths))
+
+    def test_authorized_reading_has_real_windows_unix_parity_and_hashes(self) -> None:
+        self._require_parity_shells()
+        snapshots, _entries, _manifest_path = self._build_authorized_reading_releases()
+        windows, unix = snapshots["windows"], snapshots["unix"]
+        self.assertEqual(windows["file_hashes"], unix["file_hashes"])
+        self.assertSetEqual(set(self._entry_names(windows)), set(self._entry_names(unix)))
 
     def test_reading_hash_missing_duplicate_and_unsafe_paths_fail_closed(self) -> None:
         valid_entries = self._create_reading_files(["public-example.txt"])
@@ -919,8 +1017,8 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
             shutil.rmtree(self.source_root / "ListeningPractice")
 
     def test_archive_list_verifier_rejects_duplicate_and_unsafe_entries(self) -> None:
-        receipt_path = Path(self.absent_windows["receipt_path"])
-        expected = self._entry_names(self.absent_windows)
+        receipt_path = Path(self.native_release["receipt_path"])
+        expected = self._entry_names(self.native_release)
         cases = {
             "duplicate": [*expected, expected[0]],
             "absolute": [*expected[:-1], "C:/absolute.txt"],
@@ -953,7 +1051,7 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
                 self.assertNotEqual(result.returncode, 0, result.stdout)
 
     def test_archive_entries_are_unique_portable_relative_and_not_symlinks(self) -> None:
-        for snapshot in (self.absent_windows, self.absent_unix):
+        for snapshot in self.default_releases.values():
             names = self._entry_names(snapshot)
             self.assertEqual(len(names), len(set(names)))
             self.assertEqual(len(names), len({name.lower() for name in names}))
@@ -1008,6 +1106,7 @@ with zipfile.ZipFile(pathlib.Path(archive_arg), "w", compression=zipfile.ZIP_DEF
             for relative_path in ["index.html", *sorted(REQUIRED_STYLES)]:
                 with urllib.request.urlopen(base_url + relative_path, timeout=5) as response:
                     self.assertEqual(response.status, 200, relative_path)
+                    response.read()
         finally:
             server.shutdown()
             server.server_close()

@@ -145,7 +145,7 @@
                 if (this.maxRecords && records.length > this.maxRecords) {
                     records = records.slice(0, this.maxRecords);
                 }
-                await this.write(records, { transaction: tx, skipValidation: true, clone: false });
+                await this.write(records, { transaction: tx, skipValidation: true, clone: false, syncRecords: [normalized] });
                 return normalized;
             }, { label: 'practice-upsert' });
         }
@@ -191,7 +191,7 @@
                 const updated = sanitizeRepositoryValue({ ...records[index], ...safeUpdates });
                 this._assertRecord(updated);
                 records[index] = updated;
-                await this.write(records, { transaction: tx, skipValidation: true, clone: false });
+                await this.write(records, { transaction: tx, skipValidation: true, clone: false, syncRecords: [updated] });
                 return updated;
             }, { label: 'practice-update' });
         }

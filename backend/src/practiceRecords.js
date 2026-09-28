@@ -7,6 +7,7 @@ const { requireAuth, verifyCsrfToken } = require('./auth');
 
 const practiceRecordSchema = z.object({}).passthrough();
 const MAX_RECORDS_PER_REQUEST = 5000;
+const MAX_SORT_ORDER = 2147483647; // PostgreSQL integer upper bound.
 const MAX_INDEXED_TEXT_LENGTH = 512;
 const MAX_TYPE_LENGTH = 64;
 const MAX_TITLE_LENGTH = 500;
@@ -389,6 +390,10 @@ function mergePracticeRecords(existingRecords = [], incomingRecords = []) {
 
     normalizeRecordList(incomingRecords).forEach((record) => {
         const sessionId = getSessionId(record);
+        if (idIndex.has(record.id) && sessionId && sessionIndex.has(sessionId)
+            && idIndex.get(record.id) !== sessionIndex.get(sessionId)) {
+            throw requestError('record id and sessionId identify different records', 409);
+        }
         const currentIndex = idIndex.has(record.id)
             ? idIndex.get(record.id)
             : (sessionId && sessionIndex.has(sessionId) ? sessionIndex.get(sessionId) : -1);
@@ -449,9 +454,59 @@ class PostgresPracticeRecordStore {
         return result.rows.map((row) => cloneSafeJsonValue(row.payload));
     }
 
+    async withUserLock(userId, handler) {
+        return this.db.withTransaction(async (client) => {
+            await client.query('SELECT id FROM users WHERE id = $1 FOR UPDATE', [userId]);
+            return handler(client);
+        });
+    }
+
+    async merge(userId, records) {
+        const incoming = normalizeRecordList(records);
+        return this.withUserLock(userId, async (client) => {
+            const result = await client.query(
+                `SELECT payload, sort_order FROM practice_records
+                 WHERE user_id = $1 ORDER BY sort_order ASC, updated_at DESC FOR UPDATE`,
+                [userId]
+            );
+            const existing = result.rows.map((row) => row.payload);
+            const merged = mergePracticeRecords(existing, incoming);
+            const nextIds = new Set(merged.map((record) => record.id));
+            const previous = new Map(result.rows.map((row) => [row.payload.id, row]));
+            let lastSortOrder = result.rows.at(-1)?.sort_order ?? -1;
+            const changed = merged.map((record, index) => {
+                // mergePracticeRecords preserves existing logical slots, including
+                // session matches that change IDs. Only appended slots need keys.
+                let sortOrder = result.rows[index]?.sort_order;
+                if (index >= result.rows.length) {
+                    if (!Number.isSafeInteger(lastSortOrder) || lastSortOrder >= MAX_SORT_ORDER) {
+                        throw requestError('practice record order capacity exhausted', 409);
+                    }
+                    sortOrder = ++lastSortOrder;
+                }
+                return { record, sortOrder };
+            }).filter(({ record, sortOrder }) => (
+                previous.get(record.id)?.sort_order !== sortOrder
+                || JSON.stringify(previous.get(record.id)?.payload) !== JSON.stringify(record)
+            ));
+            const changedIds = new Set(changed.map(({ record }) => record.id));
+            // Release changed identities before reinserting so valid session moves
+            // cannot collide with an old unique key. Untouched rows remain intact.
+            for (const record of existing) {
+                if (!nextIds.has(record.id) || changedIds.has(record.id)) {
+                    await client.query('DELETE FROM practice_records WHERE user_id = $1 AND id = $2', [userId, record.id]);
+                }
+            }
+            for (const { record, sortOrder } of changed) {
+                await insertRecord(client, userId, record, sortOrder);
+            }
+            return merged.map((record) => cloneSafeJsonValue(record));
+        });
+    }
+
     async replace(userId, records) {
         const list = deduplicatePracticeRecordList(records);
-        await this.db.withTransaction(async (client) => {
+        await this.withUserLock(userId, async (client) => {
             await client.query('DELETE FROM practice_records WHERE user_id = $1', [userId]);
             for (let index = 0; index < list.length; index += 1) {
                 await insertRecord(client, userId, list[index], index);
@@ -462,15 +517,19 @@ class PostgresPracticeRecordStore {
 
     async deleteById(userId, id) {
         const recordId = requireRecordId(id);
-        const result = await this.db.query(
-            'DELETE FROM practice_records WHERE user_id = $1 AND id = $2',
-            [userId, recordId]
-        );
-        return result.rowCount || 0;
+        return this.withUserLock(userId, async (client) => {
+            const result = await client.query(
+                'DELETE FROM practice_records WHERE user_id = $1 AND id = $2',
+                [userId, recordId]
+            );
+            return result.rowCount || 0;
+        });
     }
 
     async clear(userId) {
-        await this.db.query('DELETE FROM practice_records WHERE user_id = $1', [userId]);
+        await this.withUserLock(userId, (client) => (
+            client.query('DELETE FROM practice_records WHERE user_id = $1', [userId])
+        ));
         return true;
     }
 }
@@ -521,6 +580,13 @@ class MemoryPracticeRecordStore {
         return records.map((record) => cloneSafeJsonValue(record));
     }
 
+    async merge(userId, records) {
+        // Do not yield between reading and storing: parallel syncs must see each other.
+        const merged = mergePracticeRecords(this.recordsByUser.get(userId) || [], records);
+        this.recordsByUser.set(userId, merged.map((record) => cloneSafeJsonValue(record)));
+        return this.list(userId);
+    }
+
     async replace(userId, records) {
         const list = deduplicatePracticeRecordList(records);
         this.recordsByUser.set(userId, list.map((record) => cloneSafeJsonValue(record)));
@@ -549,10 +615,11 @@ function createPracticeRecordService(store) {
         async replace(userId, records) {
             return store.replace(userId, deduplicatePracticeRecordList(records));
         },
+        async sync(userId, records) {
+            await store.merge(userId, records);
+        },
         async import(userId, records) {
-            const existing = await store.list(userId);
-            const merged = mergePracticeRecords(existing, records);
-            return store.replace(userId, merged);
+            return store.merge(userId, records);
         },
         async deleteById(userId, id) {
             return store.deleteById(userId, requireRecordId(id));
@@ -594,7 +661,24 @@ function createPracticeRecordsRouter(options = {}) {
     router.get('/export', requireDataManageStepUp, sendCompletePracticeRecords);
     router.get('/', requireDataManageStepUp, sendCompletePracticeRecords);
 
-    router.put('/', verifyCsrfToken, async (req, res, next) => {
+    router.post('/sync', verifyCsrfToken, async (req, res, next) => {
+        try {
+            const records = getRecordsFromBody(req.body);
+            if (!records) {
+                return res.status(400).json({ error: 'records array required' });
+            }
+            if (records.length !== 1) {
+                return res.status(400).json({ error: 'exactly one sync record required' });
+            }
+            await service.sync(req.session.user.id, records);
+            // Never echo stored fields or the collection, even for matching record IDs.
+            return res.json({ ok: true });
+        } catch (error) {
+            return next(error);
+        }
+    });
+
+    router.put('/', verifyCsrfToken, requireDataManageStepUp, async (req, res, next) => {
         try {
             const records = getRecordsFromBody(req.body);
             if (!records) {

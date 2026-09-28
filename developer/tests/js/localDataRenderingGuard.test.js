@@ -581,7 +581,7 @@ assert(
     vocabStoreSource.includes('return cloneWordList(state.words)') &&
     vocabStoreSource.includes('return cloneListData(cached.data)') &&
     vocabStoreSource.includes('return cloneVocabLists()') &&
-    vocabStoreSource.includes('listWords\\n            .slice(0, MAX_STORED_VOCAB_WORDS)'.replace(/\\n/g, '\n')),
+    /listWords\r?\n            \.slice\(0, MAX_STORED_VOCAB_WORDS\)/.test(vocabStoreSource),
     'vocab store must cap stored list size, normalize long imported word fields, and return defensive clones'
 );
 
