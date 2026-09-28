@@ -853,6 +853,7 @@
 
     if (window.__IELTS_ADMIN_TEST__) {
         window.__IELTS_ADMIN_TEST_HOOKS__ = {
+            bindEvents,
             formatDate,
             sanitizeStatusMessage,
             parseAdminResponseJson,

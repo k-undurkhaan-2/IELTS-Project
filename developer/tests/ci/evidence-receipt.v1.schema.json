@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Local Validation Cache Receipt v1",
+  "description": "LC receipts are local optimization cache records, not authenticated issuer evidence. They cannot satisfy Current Authority required_evidence or any publication/security/release gate. Fingerprint is SHA-256 of run_ci_foundation._json_bytes over the five exact fingerprint fields including assurance_profile; trust_scope is excluded. The evaluator also checks nested/top-level candidate equality and recomputes the digest.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "receipt_id", "trust_scope", "candidate_tree", "assurance_profile", "validation_fingerprint", "fingerprint_inputs", "result", "created_at"],
+  "$defs": {
+    "text": {"type": "string", "minLength": 1, "pattern": "^(?=.*\\S)[^\\u0000-\\u001f]*$"},
+    "oid": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "receipt_id": {"$ref": "#/$defs/text", "pattern": "^LC-"},
+    "trust_scope": {"const": "local-validation-cache-only"},
+    "candidate_tree": {"$ref": "#/$defs/oid"},
+    "assurance_profile": {"$ref": "#/$defs/text"},
+    "validation_fingerprint": {"$ref": "#/$defs/digest"},
+    "fingerprint_inputs": {
+      "type": "object", "additionalProperties": false,
+      "required": ["candidate_tree", "validation_definition_digest", "environment_contract_digest", "fixtures_digest"],
+      "properties": {
+        "candidate_tree": {"$ref": "#/$defs/oid"},
+        "validation_definition_digest": {"$ref": "#/$defs/digest"},
+        "environment_contract_digest": {"$ref": "#/$defs/digest"},
+        "fixtures_digest": {"anyOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]}
+      }
+    },
+    "result": {"enum": ["PASS", "FAIL"]},
+    "created_at": {"type": "string", "format": "date-time"}
+  }
+}

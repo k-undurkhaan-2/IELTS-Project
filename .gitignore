@@ -19,6 +19,7 @@
 !/docs/CONTENT_POLICY.md
 !/docs/SERVICE_MODEL.md
 !/docs/TOR_ACCESS.md
+!/docs/CI_POLICY.md
 /tools/
 /dist/
 /apps/
@@ -163,3 +164,4 @@ developer/tests/reports/listeningpractice-scan.md
 !developer/tests/e2e/fixtures/睡着过项目组(9.4)\[134篇]/
 !developer/tests/e2e/fixtures/睡着过项目组(9.4)\[134篇]/**
 node_modules
+/.ci-results/
