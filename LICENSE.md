@@ -6,9 +6,15 @@ This is a mixed-license repository. Different files and materials are governed b
 
 ## IELTMPS Web Client
 
-The IELTMPS Web Client is derived from IELTS Atlas. Locally available evidence supports GNU GPL Version 3 / GPLv3-family provenance, but the exact `only` versus `or-later` identification and the final frontend file manifest remain under upstream and rightsholder clarification.
+The IELTMPS Web Client is derived from IELTS Atlas / `sallowayma-git/IELTS-practice`. The confirmed upstream-derived frontend source within the upstream maintainer's authorship and authority is licensed under `GPL-3.0-or-later`.
 
-The existing root [`LICENSE`](LICENSE) is preserved. This batch does not assign a new frontend SPDX identifier, and it does not state that every frontend asset or every repository file is GPL-licensed.
+The authority is [upstream issue #96, "Confirmation requested: GPL option and upstream frontend scope"](https://github.com/sallowayma-git/IELTS-practice/issues/96), specifically the [maintainer confirmation by `githubSINGLE`](https://github.com/sallowayma-git/IELTS-practice/issues/96#issuecomment-5141381894) for reference revision `2a1583decb48854a6297220c64de80ec1fcfe410`. That revision identifies the confirmed code set; it is not a claim about the upstream repository's current head.
+
+The confirmation covers the maintainer's self-authored frontend source in that code set, subject to the exclusions in the issue. The upstream-origin portions of `index.html`, `css/**`, `js/**`, `templates/**`, frontend assets, and source inputs to frontend bundles must be classified by their actual provenance. These paths describe where covered source may occur; they are not a blanket license for every file or later contribution in those locations. The confirmed SPDX option is settled; a complete downstream file-by-file provenance manifest remains separate work.
+
+The [downstream closeout clarification](https://github.com/sallowayma-git/IELTS-practice/issues/96#issuecomment-5143866503) preserves the exclusions. The confirmation does not grant rights in third-party vendor files or assets, fonts, wordlists or datasets, media, questions or educational content, generated educational content or data outside that authority, private resources, or material owned by other contributors. It also excludes downstream Server code and independently authored downstream tooling. Those materials retain their independently applicable licenses or rights status; uncertain provenance must be recorded rather than assigned GPL or AGPL by assumption.
+
+The existing root [GNU GPL Version 3 text](LICENSE) is preserved verbatim. The `GPL-3.0-or-later` option for the confirmed scope comes from the upstream confirmation, not from treating that text as a repository-wide license declaration.
 
 ## IELTMPS Server
 
@@ -54,7 +60,9 @@ Each such item requires its own provenance, permission, license, or other lawful
 
 ## Generated artifacts
 
-Generated bundles and outputs follow the licensing and rights status of their inputs. They are not automatically covered by one blanket declaration merely because they are tracked, built, or distributed with the project.
+Generated, minified, and bundled frontend artifacts inherit the applicable license terms and obligations of their identified source inputs and must retain relevant copyright, license, and attribution notices. This includes the confirmed `GPL-3.0-or-later` upstream source and any separately governed inputs; generation does not expand the upstream maintainer's authority or erase third-party rights.
+
+Other generated outputs, including educational content and data, likewise follow the licensing and rights status of their inputs. They are not automatically covered by GPL or AGPL merely because they are tracked, built, or distributed with the project.
 
 ## Copyright ownership
 
