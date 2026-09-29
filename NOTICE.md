@@ -14,7 +14,11 @@ The identified original IELTMPS Server contributions within the scope documented
 
 The IELTMPS Web Client is derived from IELTS Atlas / `sallowayma-git/IELTS-practice`.
 
-Upstream and contributor copyright remains with the respective copyright holders. Current local evidence supports GPLv3-family provenance, while the exact frontend SPDX variant remains unresolved. Usernames and contributor identities are not merged into legal identities by this notice.
+In [upstream issue #96](https://github.com/sallowayma-git/IELTS-practice/issues/96), maintainer `githubSINGLE` [confirmed `GPL-3.0-or-later`](https://github.com/sallowayma-git/IELTS-practice/issues/96#issuecomment-5141381894) for self-authored frontend source code within their authority at reference revision `2a1583decb48854a6297220c64de80ec1fcfe410`. Upstream-derived frontend portions covered by that confirmation retain those terms. Generated bundled and minified frontend files inherit the applicable source license terms and must retain relevant notices.
+
+The [downstream closeout clarification](https://github.com/sallowayma-git/IELTS-practice/issues/96#issuecomment-5143866503) preserves the original exclusions. The confirmation does not blanket-license third-party assets or vendor files, fonts, wordlists or datasets, media, questions or educational content, generated content or data outside the maintainer's authority, private resources, material owned by other contributors, downstream Server code, or independently authored downstream tooling. See [LICENSE.md](LICENSE.md) for the provenance-sensitive scope and the separately identified Server boundary.
+
+Upstream and contributor copyright remains with the respective copyright holders. Usernames and contributor identities are not merged into legal identities by this notice.
 
 ## Known third-party software and data
 
