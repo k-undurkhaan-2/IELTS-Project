@@ -165,3 +165,7 @@ developer/tests/reports/listeningpractice-scan.md
 !developer/tests/e2e/fixtures/睡着过项目组(9.4)\[134篇]/**
 node_modules
 /.ci-results/
+
+# Local CI recovery evidence and worktree metadata
+/.ci-recovery-evidence/
+/.worktrees/
