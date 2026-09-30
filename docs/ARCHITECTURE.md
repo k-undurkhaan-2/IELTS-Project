@@ -6,6 +6,8 @@ This document describes the current high-level architecture and the approved dir
 
 IELTMPS currently combines a substantial browser application with an independently developed server and PostgreSQL database.
 
+`IELTS-Project` maintains this integrated server-backed Web Service, including its production Web UI. [ROADMAP.md](../ROADMAP.md) governs long-term repository scope; current browser-side implementation is not erased by that direction.
+
 The IELTMPS Web Client owns much of the present practice experience: resource loading, question interaction, session state, scoring-related presentation, statistics, import/export, browser backup, local storage, and local fallback. The tracked browser application is delivered partly through generated bundles built from canonical source.
 
 The IELTMPS Server provides authentication, sessions, TOTP, administration functions, protected-resource handling, and practice-record APIs. Authenticated users can store records in PostgreSQL and access them across devices connected to the same deployment.
@@ -17,6 +19,8 @@ The current architecture is therefore server-assisted rather than fully server-a
 ### IELTMPS Web Client
 
 The Web Client is derived from IELTS Atlas and provides the browser interface for Reading, Listening integration, suite/mock practice, records, statistics, settings, and data management.
+
+The production Business, Auth, and Admin UI remains internal, including account/security UX, responsive/accessibility work, multi-device state presentation, Server integration, and production bundles. Generic upstream-client/UI development, standalone/static-only clients, and unrelated local applications are externalized. Upstream revisions, fixes, adaptations, and compatibility needed by the integrated service remain internal work.
 
 It currently uses:
 
@@ -54,11 +58,13 @@ Some learning resources are supplied separately from the public source tree. Pub
 
 The application may contain integration code or a limited tracked shell without containing the complete Listening or other private content set. A public release must not include private resources or content without verified distribution permission.
 
-### Optional third-party APIs
+### Integration contracts and external applications
 
-Third-party APIs, including model providers, are future extension points rather than current product capabilities. No product AI/model API integration is currently evidenced.
+Stable Server/client integration contracts are a core internal architectural objective: schemas, errors, synchronization semantics, compatibility, version negotiation, migration/deprecation contracts, and validation/grading/result authority. Server-owned data direction includes durable records, conflict handling, retention, ownership, trusted import/export, and offline/server reconciliation. Existing remote records do not establish that all these contracts are complete.
 
-A future design should isolate providers behind versioned interfaces, define user-provided versus managed credentials, apply quotas and cost controls, and establish privacy boundaries before sending learner data or content to another service.
+No separately versioned public contract artifact is currently published in [api-contract/](../api-contract/README.md). Future artifacts require explicit version and license metadata; their format and publication timing remain undecided.
+
+Provider/private/local AI applications, including model-provider abstractions and AI-specific UI, credentials, costs, and retention behavior, are externalized. No product AI/model API integration is currently evidenced. Only generic Server interoperability, authentication/authorization, security, privacy/data-release, and contract-required rate/quota boundaries remain internal where applicable. Externalization does not establish an external repository or implemented replacement application.
 
 ### Tor-based service exposure
 
@@ -68,15 +74,16 @@ Tracked configuration and an internal runbook do not verify a live public servic
 
 ## Approved direction
 
-The approved server-first direction is to:
+The approved integrated Web Service direction is to:
 
-- Keep the IELTMPS Web Client focused on interaction and accessible practice UX.
+- Maintain the production Web UI and bundles for service-specific interaction, accessibility, and Server-contract integration.
 - Make the IELTMPS Server authoritative for authentication, durable records, protected-resource decisions, and eventually grading and trusted results.
 - Keep public source code separate from private runtime resources and injected deployment secrets.
 - Preserve a clear business, administration, and authentication service boundary.
-- Use Tor-only access for the maintainer-operated public business layer.
+- Use Docker/container deployment as the intended long-term supported application deployment model.
+- Keep a maintainer-operated Hosted Service Conditional, with intended Tor-only public business access and separate readiness/launch authority.
 - Make release artifacts reproducible and accompanied by applicable licenses, notices, and corresponding source.
-- Introduce third-party extension interfaces only with explicit privacy, security, and cost controls.
+- Establish stable Server integration and data/multi-device contracts with explicit security, authorization, and privacy boundaries.
 
 “Approved direction” is not a claim that each item is implemented.
 
@@ -91,13 +98,13 @@ Migration from the current architecture requires staged work:
 5. Update the Web Client, Server, migrations, and tests together.
 6. Preserve compatibility long enough for existing users and deployments to transition.
 7. Update release, backup, restore, and operational procedures.
-8. Deprecate legacy file/static behavior only through a separate reviewed change.
+8. Carry out planned file/static/standalone decoupling and non-Docker application deployment deprecation only through separately authorized migration and acceptance, including replacement-client availability where needed, support notices, and release communication.
 
 This documentation batch does not modify application behavior.
 
 ## Deployment boundaries
 
-The repository supports a Docker Compose development and self-hosted path. A secure public deployment requires additional reviewed configuration and operating procedures.
+Docker/container deployment is the intended long-term supported application deployment model. Docker Compose is the current tracked development/self-hosting starting point, not proof of production readiness. Current file/static operation, local storage/fallback, and direct runtime paths remain transitional capability. Non-Docker application deployment is a planned deprecation; file/static/standalone use is pending planned decoupling. Actual removal or support withdrawal requires the migration and acceptance described above. Normal development and test tooling may continue outside containers. A secure public deployment requires additional reviewed configuration and operating procedures.
 
 Public documentation must not expose:
 
