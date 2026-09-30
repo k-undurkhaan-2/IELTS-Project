@@ -5754,9 +5754,11 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
         self.assertEqual(len(command_classes), 16)
         # The dedicated W702 authority module adds one protected target and
         # 22 references; the 705 commands and 476-test inventory are unchanged.
-        self.assertEqual(len(target_universe), 912)
-        self.assertEqual(target_reference_count, 19898)
+        # The G2 security policy adds one protected target and 21 references.
+        self.assertEqual(len(target_universe), 913)
+        self.assertEqual(target_reference_count, 19919)
         self.assertTrue({
+            ".github/SECURITY.md",
             "developer/tests/ci/backend_canonical_portable_result.py",
             "developer/tests/ci/test_backend_canonical_portable_result.py",
             "developer/tests/ci/ISSUE13_BACKEND_PORTABLE_RESULT.md",
