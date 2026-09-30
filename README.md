@@ -2,18 +2,17 @@
 
 **Interactive English Language Test Mock Practice System**
 
-English | [简体中文（机器辅助翻译占位页）](README.zh-CN.md)
+English | [简体中文](README.zh-CN.md)
 
-A computer-based and server-first platform for teams providing publicly accessible English-language test mock-practice services.
+`IELTS-Project` maintains the integrated IELTMPS server-backed Web Service for computer-based English-language test mock practice.
 
-IELTMPS is intended for teams providing publicly accessible English-language test mock-practice services while retaining a self-hosted path for independent operators.
+The repository owns the IELTMPS Server, production Web UI, Server/client integration, data and multi-device services, containerized deployment/release, and governance for that integrated service. It serves public-interest service teams and independent self-hosters. A maintainer-operated Hosted Service remains **Conditional**.
 
 > [!NOTE]
-> A complete Simplified Chinese translation is not yet available. The linked
-> Chinese README is a machine-assisted translation placeholder for navigation
-> and accessibility preparation. A full translation will be produced only
-> after the English documentation and license-governance text stabilize.
-> English remains the authoritative project-documentation version.
+> [README.md](README.md) is the canonical English project documentation.
+> The [Simplified Chinese README](README.zh-CN.md) is a machine-assisted
+> localization. If the translation differs, the English source governs
+> project-documentation interpretation.
 >
 > This notice does not replace or modify any applicable software license.
 > The original English texts of the GNU licenses govern the licensed software.
@@ -24,13 +23,13 @@ IELTMPS is intended for teams providing publicly accessible English-language tes
 > Cambridge University Press & Assessment, or IELTS Partners. Do not use
 > official logos or imply that IELTMPS conducts an official examination.
 >
-> The current repository combines the IELTMPS Web Client, which has GPLv3-family
-> upstream provenance through IELTS Atlas, with the independently developed
-> IELTMPS Server. The eligible first-party Server scope is now licensed under
-> `AGPL-3.0-only`; [LICENSE.md](LICENSE.md) defines that mixed-license boundary.
-> The exact frontend GPL identifier remains unresolved. The former proprietary
-> API-contract placeholder has been replaced, but no separately versioned
-> contract artifact exists yet.
+> The production Web UI includes frontend code derived from IELTS Atlas.
+> The confirmed upstream maintainer's self-authored frontend scope uses
+> `GPL-3.0-or-later`; eligible original IELTMPS Server scope uses
+> `AGPL-3.0-only`. [LICENSE.md](LICENSE.md) and [NOTICE.md](NOTICE.md) define
+> the provenance-sensitive boundaries and exclusions. The GPL option is
+> settled; the complete file/contributor provenance inventory remains unfinished.
+> No separately versioned API-contract artifact is currently published.
 >
 > Copyright ownership remains with the respective copyright holders.
 > Open-source permissions are granted only under the applicable licenses;
@@ -47,12 +46,12 @@ IELTMPS is intended for teams providing publicly accessible English-language tes
 > support—not exclusive rights to source code. No payment, donation, or
 > subscription system is currently evidenced in this repository.
 >
-> The maintainer-operated deployment is designed for Tor-only access. The
-> public business-layer onion address has not yet been published. The IELTMPS
-> Project recommends Tor Browser and intends to support it for its
-> maintainer-operated Hosted Service once that service is launched. No public
-> clearnet Hosted Service endpoint is currently published, and live operation
-> has not been independently verified. Third-party Tor-capable browser integrations may
+> The Conditional maintainer-operated Hosted Service is intended to use
+> Tor-only business access. No launch, availability, or public onion identity
+> is promised. The business onion address has not been published. The project
+> recommends Tor Browser and intends to support it if the service launches.
+> No public clearnet Hosted Service endpoint is published or committed to,
+> and live operation has not been independently verified. Third-party Tor-capable browser integrations may
 > work technically, but they are unsupported and are not considered
 > privacy-equivalent to Tor Browser. Source code and public documentation may
 > remain available through ordinary development platforms such as GitHub.
@@ -66,6 +65,9 @@ IELTMPS is intended for teams providing publicly accessible English-language tes
 - [Development status](docs/STATUS.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Development guide](docs/DEVELOPMENT.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security reporting](.github/SECURITY.md)
+- [CI policy](docs/CI_POLICY.md)
 - [Roadmap](ROADMAP.md)
 - [Mixed-license scope](LICENSE.md)
 - [Project notices](NOTICE.md)
@@ -75,7 +77,13 @@ See [Licensing and governance](docs/STATUS.md#licensing-and-governance) for the 
 
 ## About IELTMPS
 
-The IELTMPS Project develops the IELTMPS Web Client and IELTMPS Server as one server-first practice platform. The Web Client provides browser-based Reading, Listening, mock-practice, account, record, statistics, and data-management experiences. The Server provides authentication, session, record, administration, and protected-resource functions backed by PostgreSQL.
+The integrated Web Service combines the production IELTMPS Web Client with the IELTMPS Server. The Web Client provides browser-based Reading, Listening, mock-practice, account, record, statistics, and data-management experiences. The Server provides authentication, session, record, administration, and protected-resource functions backed by PostgreSQL.
+
+Production Web UI remains an internal responsibility: Business, Auth, and Admin UI; account/security UX; server-backed practice; history/statistics; settings/data interfaces; multi-device state presentation; responsive and accessibility work; Server-contract integration; and production bundles.
+
+Generic upstream-client/UI development, standalone/static-only or unrelated local applications, and provider/private/local AI applications are **Externalized** from long-term repository ownership. The repository may consume upstream revisions, integrate fixes, adapt upstream-derived frontend source, preserve compatibility, and build service-specific UI. Externalization does not remove the current integrated frontend or its service-required integration work.
+
+Additional repositories may later exist, and a dedicated IELTMPS organization may later be considered. No such organization is currently established, and no external repository or replacement application is assumed to exist.
 
 The currently shipped interface and several compatibility identifiers still contain historical IELTS Atlas or IELTS Practice naming. Those names are not being mechanically replaced in this documentation batch. Runtime branding, package names, container and database identifiers, browser-storage keys, release artifacts, and tests require separately planned compatibility migrations.
 
@@ -105,21 +113,23 @@ The following capabilities are available in tracked code, although their maturit
 
 “Available” means that implementation and supporting repository evidence are present. It does not certify a particular deployment, content set, security posture, or operating environment.
 
-Several areas remain in active development: Tor deployment documentation and operational consistency, public-service readiness, server-authoritative behavior, release and corresponding-source compliance, and license/provenance governance. A public Hosted Service launch, publication of the business onion address, product AI/model API integration, payment workflows, turnkey PostgreSQL disaster recovery, and production-readiness certification are not currently evidenced.
+Several implemented areas remain incomplete: Tor deployment documentation and operational consistency, public-service readiness, server-authoritative behavior, release and corresponding-source compliance, and license/provenance governance. This describes maturity, not an active implementation campaign. A public Hosted Service launch, publication of the business onion address, product AI/model API integration, payment workflows, turnkey PostgreSQL disaster recovery, and production-readiness certification are not currently evidenced. Future provider-specific AI application implementation is externalized.
 
 ## Hosted service and deployment models
 
-IELTMPS distinguishes two deployment models.
+IELTMPS distinguishes maintainer-operated and independently self-hosted services.
 
-The **IELTMPS Hosted Service** is the intended maintainer-operated service. Its public-interest direction, Tor-only access policy, funding boundaries, and readiness limits are described in the [service model](docs/SERVICE_MODEL.md) and [status document](docs/STATUS.md). The repository does not establish that this service is currently open to the public.
+The **IELTMPS Hosted Service** is **Conditional**. Its public-interest direction, intended Tor-only business access, funding boundaries, and readiness limits are described in the [service model](docs/SERVICE_MODEL.md) and [status document](docs/STATUS.md). Rights/provenance and content review, security review, terms/privacy/acceptable-use policies, monitoring, incident/abuse handling, recovery, upgrade/rollback, support limits, and operator capacity must support a separate readiness and launch decision. No public launch is established or scheduled.
 
 A **third-party self-hosted deployment** is operated independently by another person or organization. Self-hosters are responsible for infrastructure security, lawful content, user support, privacy notices, backups, abuse handling, and compliance with applicable software and content licenses. The project’s intended service policies do not automatically govern or endorse third-party deployments.
 
+Docker/containerized deployment is the intended long-term supported application deployment model, with Docker Compose as the current tracked starting point. Direct non-Docker application deployment remains present but is a **planned deprecation**. File/static/standalone operation remains current transitional capability pending **planned decoupling**. Removal or support withdrawal requires separately authorized migration and acceptance; ordinary development and test tooling may continue outside containers.
+
 ## Access through Tor
 
-The maintainer-operated deployment is designed to expose its public business layer through the Tor network. The IELTMPS Project recommends Tor Browser and intends to support it for its maintainer-operated Hosted Service once that service is launched. The business onion address is not yet published, and no public clearnet Hosted Service endpoint is currently published.
+The Conditional maintainer-operated service is intended to expose its public business layer through the Tor network. The project recommends Tor Browser and intends to support it if the Hosted Service launches. The business onion address is not published or guaranteed, and no public clearnet Hosted Service endpoint is published or committed to.
 
-Other Tor-capable browsers, extensions, proxies, and integrations are unsupported. They may behave differently and are not considered privacy-equivalent to Tor Browser. When an address is eventually published, users should verify it through a signed release announcement and another maintainer-controlled trusted channel. See [Tor access](docs/TOR_ACCESS.md).
+Other Tor-capable browsers, extensions, proxies, and integrations are unsupported. They may behave differently and are not considered privacy-equivalent to Tor Browser. If an address is published, users should verify it through a signed release announcement and another maintainer-controlled trusted channel. See [Tor access](docs/TOR_ACCESS.md).
 
 ## Architecture overview
 
@@ -127,11 +137,11 @@ The current architecture combines substantial browser-side practice logic with s
 
 Tracked deployment configuration separates business, administration, and authentication services, including Tor-based exposure, but live production operation has not been verified. The approved direction moves more trust-sensitive behavior—such as durable state and authoritative grading—toward the Server without pretending that this migration is already complete.
 
-Future extension points may support third-party APIs, including model providers, but no product AI/model API integration is currently evidenced. See the [architecture overview](docs/ARCHITECTURE.md).
+Stable Server/client integration contracts and Server-owned data/multi-device semantics are core architectural objectives; they are not claims that versioned public contract artifacts or complete synchronization behavior already exist. Provider-specific AI applications are externalized. Only generic Server interoperability, security, authorization, privacy/data-release, and contract-required rate/quota boundaries remain internal where applicable. See the [architecture overview](docs/ARCHITECTURE.md).
 
 ## Getting started
 
-The recommended starting point is a server-assisted development or self-hosted environment. From the repository root, create a local backend environment file from the tracked example, review every required placeholder, and start the tracked Compose configuration:
+The current tracked starting point for the integrated service is Docker Compose. From the repository root, create a local backend environment file from the tracked example, review every required placeholder, and start the tracked Compose configuration:
 
 ```powershell
 Copy-Item backend\.env.example backend\.env
@@ -142,33 +152,40 @@ Do not commit the resulting environment file. Do not reuse example or developmen
 
 These commands are development/self-hosted starting points, not a complete production-security procedure. Internet-facing or onion-service operation requires a separate security review covering secrets, content authorization, reverse-proxy behavior, backups, monitoring, incident response, and access boundaries.
 
-Current code still supports direct file and static operation. That behavior is transitional compatibility, not the long-term primary product direction. Removing or deprecating it requires a separate runtime migration; this documentation rewrite does not remove or disable it. See [Usage](docs/USAGE.md) for the current operating models.
+Current code still supports file/static operation, local storage and fallback, and direct runtime paths. File/static/standalone decoupling and non-Docker application deployment deprecation are planned; no removal has occurred. Any removal or support withdrawal requires a separate runtime migration, compatibility and data-preservation plan, and acceptance. See [Usage](docs/USAGE.md) for the current operating models and [Development](docs/DEVELOPMENT.md) for legitimate outside-container tooling.
 
 ## Current status
 
 The repository contains a functional Web Client, server components, database migrations, administration and authentication features, test entry points, generated bundles, and multiple deployment configurations. These parts should not be interpreted as a verified public service or a general production certification.
 
-The [development status](docs/STATUS.md) records available capabilities, active work, planned direction, absent evidence, legacy behavior, governance limits, and documentation gaps. It is the public source of truth for readiness wording in this documentation set.
+The [development status](docs/STATUS.md) records available capabilities, implementation limitations, absent evidence, transitional behavior, established governance, and remaining gaps. It is the public source of truth for present capability and readiness wording. GitHub issues and Projects record execution state. G1–G4 establish the licensing decisions, security/PVR policy, contribution policy, and Roadmap model alongside the accepted CI foundation; Documentation Governance Baseline v1 still requires G5 acceptance and cross-document closeout.
 
 ## Roadmap
 
-Near-term work focuses on identity and license governance, server stabilization, protected-resource boundaries, reproducible delivery, and release compliance. Later phases cover public-service policy, stable Tor access, extensibility, model-provider abstractions, cost controls, community governance, and sustainable operations.
+The accepted Roadmap organizes direction into development tracks:
 
-Roadmap entries describe direction rather than release-date commitments. Planned features are not current features. See [ROADMAP.md](ROADMAP.md).
+- Governance & Compliance.
+- Server Platform & Integration Contracts.
+- Data & Multi-device Services.
+- Web Service UI & Client Integration.
+- Containerized Deployment & Release.
+- Conditional Hosted-Service Operations.
 
-## Funding and paid capabilities
+It also defines externalized workstreams and deprecation/migration boundaries. Roadmap entries describe direction, not current implementation, execution authority, or release-date commitments. See [ROADMAP.md](ROADMAP.md) for the full scope and dependencies.
+
+## Funding and sustainability
 
 The project is public-interest and non-profit-oriented, but it does not claim a particular legal-entity or charitable status. The intended basic public-access model may be supported by voluntary contributions, sponsorship, donated infrastructure, or other operational support.
 
-Managed hosting, resource-intensive processing, third-party services, support, and future model-provider access may create real costs. A maintainer-operated service may charge for those services or resources. Such fees would not provide exclusive rights to the applicable open-source source code and would not change the recipient’s rights under the applicable license.
+Managed hosting, infrastructure, resource-intensive processing, third-party services, and support may create real costs. Optional future service fees would cover operated services or resources, would not provide exclusive rights to applicable open-source source code, and would not change recipients’ rights under the applicable license.
 
-AI model API access is one possible future paid capability. It is not a current product feature. The repository currently provides no evidenced billing, donation, or subscription workflow. See the [service model](docs/SERVICE_MODEL.md).
+These are possible sustainability mechanisms, not an established business model. Provider-specific AI applications are externalized and are not a promised paid IELTMPS capability. The repository currently provides no evidenced payment, billing, donation, or subscription workflow. See the [service model](docs/SERVICE_MODEL.md).
 
-## Contributing direction
+## Contributing
 
-Contribution procedures will be formalized after license scope, notices, and governance responsibilities are settled. Until then, prospective contributors should keep changes focused, preserve the public/private resource boundary, avoid adding content without documented permission, and avoid manually editing generated bundles.
+The accepted [CONTRIBUTING.md](CONTRIBUTING.md) is the public contribution entry point. It covers scope, target branches, validation, licensing/provenance, generated files, review, and the public/private resource boundary. Internal contributions include the Server, production Web UI, integration contracts, data/multi-device services, and container/release integration, including necessary upstream-derived frontend fixes.
 
-Contributors must not assume that adding a file transfers copyright ownership. Future contribution guidance will explain the applicable license, provenance expectations, generated-file rules, review gates, and treatment of third-party material.
+Target the active workstream identified by the relevant issue or maintainer. External contributors may use their own branch names; `codex/*` describes temporary branches in maintainer integration workflows. Public contribution procedures are distinct from maintainer integration transactions. Contributing does not transfer copyright ownership or supply rights in third-party material by assumption.
 
 ## Security and privacy
 
@@ -176,15 +193,17 @@ Tracked authentication, TOTP, session, administration, protected-resource, proxy
 
 Never commit environment files, hidden-service keys, client-auth credentials, database exports, private runtime content, or production overlays. Public security and deployment guidance remains subject to security-owner review.
 
-A dedicated confidential vulnerability-reporting channel has not yet been published. Until one is established, do not place exploit details, credentials, personal data, or other sensitive material in a public issue. A reporter may open a minimal, non-sensitive issue asking the maintainers to establish private contact, without disclosing the vulnerability itself.
+The accepted [Security Policy](.github/SECURITY.md) governs reporting. GitHub Private Vulnerability Reporting is established: open the [repository security page](https://github.com/k-undurkhaan-2/IELTS-Project/security) and select **Report a vulnerability** for an undisclosed vulnerability. Do not open a public issue for it or publish exploit details, credentials, or personal data. Use synthetic data and redact sensitive information even in a private report.
 
-Establishing and documenting a verified confidential reporting channel is required before public-service or security-readiness sign-off. The detailed reporting policy belongs to the future security-governance phase.
+Normal non-security bugs and documentation issues may use public issues. The reporting policy makes no response-time, payment, bounty, or CVE promise; an established reporting channel does not certify service security or readiness.
 
 ## Copyright, licensing and upstream attribution
 
-IELTMPS is a mixed-license repository. The IELTMPS Web Client has GPLv3-family upstream provenance through IELTS Atlas. The exact “only” versus “or-later” identifier and the precise frontend file scope remain unresolved.
+IELTMPS is a mixed-license repository. In [upstream issue #96](https://github.com/sallowayma-git/IELTS-practice/issues/96), the [maintainer confirmation](https://github.com/sallowayma-git/IELTS-practice/issues/96#issuecomment-5141381894) establishes `GPL-3.0-or-later` for the upstream maintainer's self-authored frontend source within their authority at reference revision `2a1583decb48854a6297220c64de80ec1fcfe410`. The [downstream closeout clarification](https://github.com/sallowayma-git/IELTS-practice/issues/96#issuecomment-5143866503) preserves that qualified scope. This settles the SPDX option, not the unfinished file/contributor provenance inventory.
 
-The eligible original IELTMPS Server scope identified in [LICENSE.md](LICENSE.md) is licensed under `AGPL-3.0-only`. See the [canonical AGPL text](LICENSES/AGPL-3.0-only.txt) and [NOTICE.md](NOTICE.md). The proprietary API-contract placeholder has been replaced, but no versioned contract artifact is published. The existing root `LICENSE` is preserved, and no final frontend SPDX identifier is assigned by this change.
+The eligible original IELTMPS Server scope identified in [LICENSE.md](LICENSE.md) is licensed under `AGPL-3.0-only`. See the [canonical AGPL text](LICENSES/AGPL-3.0-only.txt) and [NOTICE.md](NOTICE.md). No separately versioned artifact is published in the [API-contract directory](api-contract/README.md); future artifacts require explicit version and license metadata. The existing root [GNU GPL text](LICENSE) is preserved and is not a repository-wide license declaration.
+
+The upstream confirmation excludes third-party material, fonts, wordlists/datasets, media, educational content, generated content/data outside the maintainer's authority, private resources, other contributors' work, downstream Server code, and independently authored downstream tooling. Independently governed material retains its own terms or unresolved rights status. Frontend bundles inherit the applicable terms and notice obligations of their identified inputs; generation grants no additional rights. Complete provenance, shared-tooling and mixed-input classification, content rights, documentation rights, release notices, and corresponding-source delivery remain unfinished.
 
 Upstream and third-party rights remain with their respective rightsholders. Open-source licenses grant permissions under their terms without transferring copyright ownership. Git authorship, repository maintenance, and distribution do not by themselves establish ownership of every included work.
 

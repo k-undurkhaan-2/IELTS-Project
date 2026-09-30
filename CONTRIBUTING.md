@@ -8,6 +8,19 @@ define the accepted licensing scope and provenance boundaries.
 
 ## Before starting
 
+`IELTS-Project` maintains the integrated IELTMPS server-backed Web Service.
+Internal contribution areas include the Server, production Web UI,
+Server/client integration contracts, data/multi-device services, and
+container/release integration. Service-required upstream-derived frontend
+integration, adaptations, fixes, and compatibility work remain internal.
+
+Generic upstream-only client/UI development, standalone/local applications,
+and provider-specific AI applications are externalized from long-term internal
+ownership under [ROADMAP.md](ROADMAP.md). This does not remove existing
+frontend or transitional runtime code, and it does not imply that external
+repositories already exist. Coordinate migration or scope-separation work
+through its own issue and acceptance criteria.
+
 Check existing issues and relevant branches for overlapping work. A focused PR
 is sufficient for a small, obvious fix; a typo or trivial correction does not
 need a separate issue.
@@ -39,9 +52,9 @@ Choose the base for the work being contributed; there is no universal target.
 Persistent workstreams may use names under `feature/*`, `fix/*`, `security/*`,
 `docs/*`, `ui/*`, `integration/*`, or `release/*`. A matching prefix does not prove
 that a branch is active. Check the issue and maintainer direction rather than
-choosing from historical branch names. For example, multi-device work belongs
-on its dedicated `feature/multi-device-easy-deploy` track unless maintainers
-direct otherwise.
+choosing from historical branch names. Target the active workstream identified
+by the relevant issue or maintainer; a retained or deferred branch is not
+automatically active or the correct contribution target.
 
 The maintainer integration topology is:
 
