@@ -295,7 +295,9 @@ they do not prohibit normal development/test tooling outside containers.
 
 Priorities follow dependencies without calendar promises:
 
-1. Complete Documentation Governance Baseline v1.
+1. Maintain the completed Documentation Governance Baseline v1 as the
+   governance and documentation foundation; later changes remain separately
+   scoped and accepted.
 2. Formalize repository/client scope separation through separately scoped work.
 3. Strengthen stable Server and integration contracts.
 4. Scope and close remaining provenance and release-delivery gaps.

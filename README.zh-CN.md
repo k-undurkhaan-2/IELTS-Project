@@ -149,7 +149,7 @@ docker compose --env-file backend\.env -f backend\docker-compose.yml up --build
 
 仓库包含可运行的 Web Client、服务器组件、数据库迁移、管理和身份验证功能、测试入口、生成的前端构建产物，以及多种部署配置。这些组成部分不应被理解为已经验证的公共服务，也不代表普遍的生产就绪认证。
 
-[开发状态](docs/STATUS.md)记录可用能力、实现限制、缺乏证据的事项、过渡行为、已建立的治理和剩余缺口。它是本组文档中当前能力与就绪表述的公开权威来源。GitHub issues 和 Projects 记录执行状态。G1–G4 已确立许可证决策、安全/PVR 政策、贡献政策和路线图模型，并以已接受的 CI 基础为支撑；Documentation Governance Baseline v1 仍需完成 G5 验收和跨文档收尾。
+[开发状态](docs/STATUS.md)记录可用能力、实现限制、缺乏证据的事项、过渡行为、已建立的治理和剩余缺口。它是本组文档中当前能力与就绪表述的公开权威来源。GitHub issues 和 Projects 记录执行状态。G1–G5 及最终收尾已完成，并确立了许可证决策与来源边界、安全/PVR 政策、贡献政策、路线图模型、规范英文和中文文档以及跨文档一致性，同时保留已接受的 CI 治理基础。Documentation Governance Baseline v1 已完成。向集成分支的 promotion 仍须单独治理。治理完成不代表产品、发布或 Hosted Service 已就绪，也不代表尚未解决的来源、权利或发布工作已经完成。
 
 ## 路线图
 
