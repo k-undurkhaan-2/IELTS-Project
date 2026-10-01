@@ -102,7 +102,7 @@ Eligible original IELTMPS Server files are now licensed under `AGPL-3.0-only`. T
 - CI foundation and rollout accepted at their defined scope under [CI Policy](CI_POLICY.md); this does not imply adoption by every retained branch.
 - G4 Roadmap development-track and repository-scope model accepted.
 
-Documentation Governance Baseline v1 is not yet complete: G5 canonical/localized documentation acceptance and cross-document closeout remain required. Acceptance on the governance branch does not imply promotion to other branches.
+Documentation Governance Baseline v1 is complete: G1–G5, canonical/localized documentation, and final cross-document closeout have been accepted. Governance completion does not by itself imply promotion to other branches, completion of the unresolved provenance/rights/release work below, or product/service readiness.
 
 ### Still unresolved
 
