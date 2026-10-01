@@ -2,6 +2,8 @@
 
 This guide lists tracked development entry points and general repository rules. It does not replace security-reviewed deployment procedures.
 
+The repository maintains the integrated server-backed Web Service, including its Server, production Web UI, integration contracts, data/multi-device services, and container/release integration. Follow [CONTRIBUTING.md](../CONTRIBUTING.md) for contribution scope and target branches and [ROADMAP.md](../ROADMAP.md) for long-term ownership and migration boundaries.
+
 ## Repository structure
 
 The main public areas are:
@@ -25,6 +27,8 @@ Choose tooling according to the work being performed:
 - Playwright and its browser dependencies for E2E flows.
 - Docker with Compose support for the containerized development/self-hosted path.
 - PostgreSQL when running the Server outside Compose.
+
+Development, builds, analysis, and tests may use tooling outside containers. This remains legitimate even as the intended long-term supported application deployment model moves to Docker/containers.
 
 Dependency setup is not fully consolidated into one cross-platform command. In particular, older testing documentation refers to environment assumptions that require local verification. Do not treat an absent dependency manifest or an old task document as an authoritative setup contract.
 
@@ -50,7 +54,7 @@ For backend unit and integration tests:
 npm --prefix backend test
 ```
 
-For a direct local backend workflow, the currently documented tracked commands are:
+For a direct local backend development workflow, the currently documented tracked commands are:
 
 ```text
 npm --prefix backend install
@@ -60,6 +64,8 @@ npm --prefix backend start
 ```
 
 These commands require a locally configured backend environment. Never commit environment files or real credentials. Migration and bootstrap commands change local runtime state and should be run only for an intentional development environment.
+
+This is a local development workflow, not a long-term supported bare-host production deployment path. Non-Docker application deployment is a planned deprecation; current direct operation has not been removed or declared already unsupported.
 
 ## Static and E2E test entry points
 
@@ -91,11 +97,11 @@ npm --prefix developer run test:unit
 
 Python E2E commands require Playwright and a compatible browser installation. Listening tests can also depend on the authorized resource set available to the local environment. A command’s presence does not guarantee that every optional fixture or private resource is available.
 
-Run the narrowest relevant check for an implementation change. This documentation-only batch does not execute builds or tests.
+Run the narrowest relevant check for the change and the required repository/governance and CI checks. Documentation validation does not certify application or deployment behavior.
 
 ## Docker Compose development path
 
-The tracked server-assisted development/self-hosted path starts from the environment example and base Compose file:
+Docker/container deployment is the intended long-term supported model for production and self-hosting. The current tracked Docker Compose starting point uses the environment example and base Compose file:
 
 ```powershell
 Copy-Item backend\.env.example backend\.env
@@ -105,6 +111,8 @@ docker compose --env-file backend\.env -f backend\docker-compose.yml up --build
 Review every required environment placeholder before starting. Do not commit the resulting file.
 
 This path is a development/self-hosted starting point. It is not a complete public-service security procedure. Tor exposure, protected resources, backups, monitoring, reverse proxies, and production secrets require separate security-owner review.
+
+The transition is not complete: non-Docker application deployment has planned deprecation, while file/static/standalone scope has planned decoupling. Existing behavior remains until separately authorized migration and acceptance address compatibility, data preservation, supported replacement paths where needed, and release/support communication. This direction does not prohibit the development/test commands above.
 
 ## Documentation-only validation
 

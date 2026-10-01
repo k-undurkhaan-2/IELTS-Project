@@ -4,7 +4,7 @@ This guide describes the current user-facing operating models of the IELTMPS Pro
 
 ## Primary operating model
 
-The supported primary direction is server-assisted use through either the maintainer-operated IELTMPS Hosted Service or a third-party self-hosted deployment.
+The primary product model is the integrated IELTMPS server-backed Web Service, including the production Web UI and Server. Third-party self-hosting is independently operated; a maintainer-operated IELTMPS Hosted Service remains **Conditional**.
 
 A server-assisted deployment combines the IELTMPS Web Client with accounts, sessions, PostgreSQL-backed practice records, administration functions, and protected runtime resources. This model supports record access across devices and provides a foundation for moving trust-sensitive behavior toward the IELTMPS Server.
 
@@ -64,17 +64,19 @@ Direct file and static operation remain implemented for legacy compatibility. Th
 
 These modes do not provide the full account, PostgreSQL, administration, protected-resource, or multi-device experience. Browser restrictions can also vary when a page is loaded directly from local files.
 
-This documentation change does not remove existing file/static behavior. Deprecation or removal requires a separate runtime migration and compatibility plan.
+File/static/standalone use is transitional pending **planned decoupling** under the [Roadmap](../ROADMAP.md). Existing file/static operation, browser storage/data workflows, and fallback remain present. Actual removal or support withdrawal requires separately authorized migration and acceptance, including compatibility, data preservation, and replacement-client availability where needed. No replacement application or external repository is assumed to exist.
 
 ## Maintainer-operated service
 
-The IELTMPS Hosted Service is the intended maintainer-operated deployment. Its direction is public-interest, non-profit-oriented, and Tor-only for the public business layer.
+The IELTMPS Hosted Service is **Conditional**. Its intended direction is public-interest, non-profit-oriented, and Tor-only for the public business layer. Rights/content, security, policies, recovery, monitoring, support, and operator-capacity prerequisites require a separate readiness and launch decision; see the [Service Model](SERVICE_MODEL.md). No launch date, availability, or public onion identity is promised.
 
 **Business onion address: Not yet published**
 
-No public clearnet Hosted Service endpoint is currently published. Tracked configuration does not verify that a public service is live. Consult [Tor access](TOR_ACCESS.md) and [development status](STATUS.md) for the current public wording.
+No public clearnet Hosted Service endpoint is published or committed to. Tracked configuration does not verify that a public service is live. Consult [Tor access](TOR_ACCESS.md) and [development status](STATUS.md) for the current public wording.
 
 ## Third-party self-hosted deployments
+
+Supported self-hosting is moving toward Docker/containerized application deployment, with Docker Compose as the current tracked starting point in the [Development Guide](DEVELOPMENT.md). Direct non-Docker application deployment remains present but has **planned deprecation**; it has not already been removed or declared unsupported. The transition requires separate migration authority and acceptance. Local development and test tooling may still run outside containers.
 
 A third-party self-hosted deployment is operated independently from the IELTMPS maintainers. Its operator is responsible for:
 
@@ -93,4 +95,4 @@ Tor Browser is the client that the IELTMPS Project recommends and intends to sup
 
 Source code and public project documentation may remain available on ordinary development platforms. That does not create a public clearnet application endpoint.
 
-For a compact list of available, active, planned, and unevidenced capabilities, see [Development Status](STATUS.md).
+For available capabilities, implementation limitations, direction, and absent evidence, see [Development Status](STATUS.md). Its maturity labels do not establish active workstream status.
