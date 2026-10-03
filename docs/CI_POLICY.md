@@ -736,13 +736,17 @@ Pull requests run when their base branch does not match `codex/**`:
 `pull_request.branches-ignore` filters the base, not the head. Temporary
 `codex/{feature}` branches may therefore open covered pull requests into
 persistent branches with arbitrary non-`codex/**` names. Pull requests into
-those persistent branches, `dev/current-mainline`, `main`, and
-`ci/phase2-foundation` are covered; pull requests whose base matches `codex/**`
-are excluded.
+`main`, `dev/current-mainline`, `ci/master`, `docs/master`, `ui/master`,
+`security/server-security`, and future persistent branches are covered;
+pull requests whose base matches `codex/**` are excluded.
 
-Push CI is limited to `main`, `dev/current-mainline`, and
-`ci/phase2-foundation`; pushes to other persistent feature branches do not
-trigger it. Manual dispatch remains available.
+Push CI is limited to the exact allowlist `main`, `dev/current-mainline`,
+`ci/master`, `docs/master`, `ui/master`, and `security/server-security`.
+`ci/phase2-foundation` is no longer a persistent push-authority target;
+pushes to other branches do not trigger CI. Neither pull-request nor push
+events may use path filters to suppress required Baseline-aware CI. Manual
+dispatch remains available. This trigger contract grants no release,
+deployment, artifact publication, or production authority.
 
 The workflow has read-only contents permission, concurrency cancellation,
 explicit job timeouts, no `continue-on-error`, and this graph:
