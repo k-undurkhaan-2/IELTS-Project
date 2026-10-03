@@ -8081,7 +8081,10 @@ def check_workflow_text(text: str) -> list[str]:
             "branches": [
                 "main",
                 "dev/current-mainline",
-                "ci/phase2-foundation",
+                "ci/master",
+                "docs/master",
+                "ui/master",
+                "security/server-security",
             ]
         },
         "workflow_dispatch": None,
