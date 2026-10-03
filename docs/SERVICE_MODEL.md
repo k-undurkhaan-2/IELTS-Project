@@ -4,7 +4,7 @@
 
 This document describes the intended operating and sustainability model of the IELTMPS Project. It separates project direction from capabilities that are evidenced in the current repository.
 
-IELTMPS develops software for computer-based English-language test mock practice. Under the approved future licensing model, components will be made available under their applicable licenses for use in a maintainer-operated service and independently operated third-party self-hosted deployments.
+`IELTS-Project` maintains the integrated IELTMPS server-backed Web Service for computer-based English-language test mock practice. Components are governed by their currently applicable licenses: provenance-qualified upstream frontend scope uses `GPL-3.0-or-later`, and eligible original Server scope uses `AGPL-3.0-only`, as defined in [LICENSE.md](../LICENSE.md) and [NOTICE.md](../NOTICE.md). This does not complete the provenance inventory or grant rights in excluded content and third-party material.
 
 ## Public-interest orientation
 
@@ -16,7 +16,7 @@ The public-interest orientation should be evaluated through actual access, trans
 
 ## Maintainer-operated service
 
-The **IELTMPS Hosted Service** is the intended service operated by project maintainers.
+The **IELTMPS Hosted Service** is a **Conditional** maintainer-operated service direction. No launch, availability, public onion identity, or public clearnet service is promised or scheduled.
 
 Its public business layer is designed for Tor-only access. Tor Browser is the client that the IELTMPS Project recommends and intends to support for its maintainer-operated Hosted Service once that service is launched. The business onion address has not yet been published, and no public clearnet Hosted Service endpoint is currently published.
 
@@ -30,11 +30,13 @@ The maintainer-operated service is expected to define and maintain:
 - Separation of public source, authorized runtime content, and deployment secrets.
 - Transparent descriptions of free, resource-backed, and managed capabilities.
 
-These are readiness requirements and intended practices, not evidence that the service is live.
+These are readiness requirements and intended practices, not evidence that the service is live. Rights/provenance, security review, terms/privacy/acceptable-use policies, monitoring and incident/abuse handling, tested backup/recovery and upgrade/rollback, service/security-support limits, and operator capacity must support an evidence-based readiness review and separate launch decision under [ROADMAP.md](../ROADMAP.md).
 
 ## Third-party self-hosting
 
 Users may self-host software available to them under the applicable open-source licenses. A third-party self-hosted deployment is independent of the IELTMPS Hosted Service unless a separate agreement says otherwise.
+
+Docker/containerized deployment is the intended long-term supported application deployment model; Docker Compose is the current tracked starting point. Direct non-Docker application deployment remains present with planned deprecation, and current file/static/standalone use is transitional pending planned decoupling. Neither removal nor support withdrawal is complete; either requires separately authorized migration and acceptance. Development/test tooling outside containers remains legitimate. See [Development](DEVELOPMENT.md) and [Usage](USAGE.md).
 
 Third-party operators are responsible for:
 
@@ -71,9 +73,8 @@ A maintainer-operated service may in the future charge for capabilities that cre
 - Resource-intensive processing.
 - Specialist support.
 - Third-party provider usage.
-- Managed model API access.
 
-AI model API access is an example of a possible future paid capability, not a current product feature. A future implementation would require provider abstraction, user-provided versus managed credential boundaries, quotas, cost controls, privacy information, retention rules, failure handling, and review of generated educational output.
+These are optional service-cost possibilities, not a selected business model or delivery commitment. Provider/private/local AI applications and managed model API applications are externalized from this repository's long-term implementation scope; they are not a promised paid IELTMPS Hosted Service capability. Generic Server interoperability, security, and privacy boundaries remain internal where applicable. The [Content Policy](CONTENT_POLICY.md) still applies to generated material served or distributed by the Web Service.
 
 Fees would apply to operated services, external costs, resources, or support. They would not convert applicable open-source software into exclusive source code or remove recipients’ license rights.
 
