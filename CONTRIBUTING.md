@@ -27,8 +27,8 @@ need a separate issue.
 
 Coordinate through the relevant issue before substantial changes, new features,
 architecture changes, security-sensitive behavior changes, licensing or
-provenance changes, public/private resource changes, or work affecting an active
-feature track. Describe the purpose and proposed scope, and confirm the target
+provenance changes, public/private resource changes, or work affecting a
+persistent domain. Describe the purpose and proposed scope, and confirm the target
 branch with maintainers when it is unclear.
 
 **Do not open public issues for undisclosed vulnerabilities.** Follow the
@@ -40,27 +40,38 @@ boundaries may require additional security review.
 
 ## Choose the PR base
 
-Choose the base for the work being contributed; there is no universal target.
+Choose the appropriate persistent domain for the subject being contributed.
+[Branch Governance](docs/BRANCH_GOVERNANCE.md) defines the six active
+persistent branches and the canonical integration topology.
 
 | Branch role | Contribution target guidance |
 | --- | --- |
-| `main` | Final integrated branch. Routine contribution PRs should not target it unless maintainers explicitly request that target. |
-| `dev/current-mainline` | Aggregate development integration branch before final promotion to `main`. Target it directly only when the work does not belong to an active persistent workstream, or maintainers explicitly direct it there. |
-| Persistent feature/workstream branch | Target the branch identified by the relevant issue or maintainer. Start from that branch's current head so the PR contains the intended work. |
-| `codex/*` | Temporary implementation branches used by project automation and maintainer workflows; they are not the normal integration target. |
+| `main` | Canonical integrated repository baseline. Routine PRs must not target it; promotion requires separate maintainer authority. |
+| `dev/current-mainline` | Central cross-domain integration authority. Direct PRs are reserved for explicitly authorized integration or explicitly coordinated work whose authority cannot correctly reside in a single existing domain. |
+| `ci/master` | Target for CI, the CI trust contract, and workflow/validator work. |
+| `docs/master` | Target for general documentation and governance work. |
+| `ui/master` | Target for production Web UI and browser interaction work. |
+| `security/server-security` | Target for server-security and protected-resource-boundary work. |
+| `codex/*` | Temporary maintainer implementation branches, not persistent authorities or ordinary contribution targets. |
 
-Persistent workstreams may use names under `feature/*`, `fix/*`, `security/*`,
-`docs/*`, `ui/*`, `integration/*`, or `release/*`. A matching prefix does not prove
-that a branch is active. Check the issue and maintainer direction rather than
-choosing from historical branch names. Target the active workstream identified
-by the relevant issue or maintainer; a retained or deferred branch is not
-automatically active or the correct contribution target.
+Start from the appropriate domain branch's current head so the PR contains the
+intended work. Domain authority follows subject matter, not merely filesystem
+path: `docs/CI_POLICY.md` belongs to CI, and security-sensitive Markdown does
+not automatically belong to Documentation. Cross-domain changes require
+explicit coordination.
+
+A prefix alone establishes no active authority. Historical, retained,
+deferred, salvage-source, and temporary branches may still exist remotely;
+their existence does not make them contribution targets. Use Branch Governance
+and the relevant issue or maintainer authority. In particular,
+`docs/documentation-governance` is a historical audit anchor, not an active
+contribution target.
 
 The maintainer integration topology is:
 
 ```text
-codex/{feature}
-    -> persistent feature / workstream branch
+codex/{task}
+    -> appropriate persistent domain head
     -> dev/current-mainline
     -> main
 ```
@@ -70,6 +81,16 @@ to name branches `codex/*`.** Use a fork branch, a locally named topic branch, o
 another maintainer-approved temporary branch. What matters is the PR's base.
 When using a fork, select the intended branch in the upstream repository as the
 PR base.
+
+`docs/master`, `ui/master`, `ci/master`, and `security/server-security` are peer
+domain authorities. Routine lateral merges are prohibited; cross-domain
+integration belongs to `dev/current-mainline`. Routine dev-to-domain back-merges
+are not required, and a domain being behind dev is not itself a defect. A
+necessary baseline refresh requires separate explicit authorization.
+
+Branch role does not grant release or deployment authority. `main`,
+`dev/current-mainline`, and domain heads do not by themselves authorize release
+publication, production deployment, or Hosted Service operation.
 
 ## Keep the scope focused
 
@@ -96,8 +117,9 @@ with a non-sensitive explanation.
 
 Ensure CI passes where the target branch invokes it. The current PR workflow
 filters the **base** branch: PRs into bases matching `codex/**` are excluded;
-PRs into other bases are covered. A push alone does not trigger CI on every
-persistent branch. See the [CI Policy](docs/CI_POLICY.md) for exact triggers,
+PRs into other bases are covered. Push CI covers exactly the six active
+persistent branches; historical retained branches may lack current CI authority.
+See the [CI Policy](docs/CI_POLICY.md) for exact triggers,
 profiles, evidence, and known-debt handling.
 
 Passing CI is evidence, not merge authorization. CI trust-file changes require
@@ -191,4 +213,4 @@ Maintainers may request revisions, and security, licensing, or CI-trust changes
 may require specialized review. CI success does not guarantee acceptance.
 Maintainers decide the merge method and subsequent promotion. Merging into a
 persistent branch is not promotion to `dev/current-mainline` or `main`; a merged
-contribution may remain on its workstream until broader integration is accepted.
+contribution may remain on its domain branch until broader integration is accepted.
