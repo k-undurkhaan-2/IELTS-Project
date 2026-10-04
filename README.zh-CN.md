@@ -57,6 +57,7 @@
 - [架构](docs/ARCHITECTURE.md)
 - [开发指南](docs/DEVELOPMENT.md)
 - [贡献指南](CONTRIBUTING.md)
+- [分支治理](docs/BRANCH_GOVERNANCE.md)
 - [安全报告](.github/SECURITY.md)
 - [CI 政策](docs/CI_POLICY.md)
 - [路线图](ROADMAP.md)
@@ -176,7 +177,7 @@ docker compose --env-file backend\.env -f backend\docker-compose.yml up --build
 
 已接受的 [CONTRIBUTING.md](CONTRIBUTING.md) 是公开的贡献入口，涵盖贡献范围、目标分支、验证、许可证与来源、生成文件、审查，以及公开/私有资源边界。仓库内部的贡献领域包括 Server、生产 Web UI、集成契约、数据与多设备服务、容器与发布集成，也包括必要的上游衍生前端修复。
 
-请以相关 issue 或维护者指定的当前活跃工作线为目标。外部贡献者可以自行命名分支；`codex/*` 表示维护者集成工作流中的临时分支。公开贡献流程与维护者集成事务有所区别。贡献不会转移著作权，也不能据此假定获得第三方材料的权利。
+请依据[分支治理](docs/BRANCH_GOVERNANCE.md)，结合相关 issue 或维护者授权，选择适当的持久领域分支作为目标。领域归属由工作主题决定，跨领域变更需要明确协调。外部贡献者可以自行命名分支；`codex/*` 表示维护者集成工作流中的临时分支。公开贡献流程与维护者集成事务有所区别。贡献不会转移著作权，也不能据此假定获得第三方材料的权利。
 
 ## 安全与隐私
 
