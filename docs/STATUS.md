@@ -19,6 +19,31 @@ The current product combines browser-side practice logic and local fallback with
 
 The repository maintains the integrated server-backed Web Service. Long-term internal ownership includes the Server, production Web UI, Server/client integration contracts, data/multi-device services, and containerized deployment/release. Generic upstream-client development, standalone/local applications, and provider/private/local AI applications are externalized; this does not remove current code or imply that replacement repositories exist. [ROADMAP.md](../ROADMAP.md) governs direction.
 
+## Persistent-domain branch architecture
+
+The persistent-domain branch architecture is established. CI bootstrap is
+canonical on `main`. [Branch Governance](BRANCH_GOVERNANCE.md) defines exactly
+six active persistent branches: `main`, `dev/current-mainline`, `ci/master`,
+`docs/master`, `ui/master`, and `security/server-security`.
+
+Creation-triggered push validation completed successfully for the three new
+domain heads at commit `4c6c60f04a46f99901d7ff602fc5d2d279c03dcc`:
+
+| Domain | Accepted CI run | Result | State |
+| --- | --- | --- | --- |
+| `docs/master` | [37174187572](https://github.com/k-undurkhaan-2/IELTS-Project/actions/runs/37174187572) | 7-of-7 PASS | ACTIVE / VALIDATED |
+| `ui/master` | [37174234051](https://github.com/k-undurkhaan-2/IELTS-Project/actions/runs/37174234051) | 7-of-7 PASS | ACTIVE / VALIDATED |
+| `security/server-security` | [37174274700](https://github.com/k-undurkhaan-2/IELTS-Project/actions/runs/37174274700) | 7-of-7 PASS | ACTIVE / VALIDATED |
+
+All six canonical persistent branches have Baseline-aware CI coverage under
+[CI Policy](CI_POLICY.md). Historical retained branches may not have current
+CI authority; their existence does not establish an active contribution target.
+This records the accepted architecture and validation, not completion of
+cleanup, archive, salvage, release, deployment, or Hosted Service readiness.
+The historical documentation-governance ref and its still-unperformed archive
+protection are described in
+[Branch Governance](BRANCH_GOVERNANCE.md#documentation-governance-audit-anchor).
+
 ## Available capabilities
 
 | Capability | Status | Qualification |

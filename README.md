@@ -66,6 +66,7 @@ The repository owns the IELTMPS Server, production Web UI, Server/client integra
 - [Architecture](docs/ARCHITECTURE.md)
 - [Development guide](docs/DEVELOPMENT.md)
 - [Contributing](CONTRIBUTING.md)
+- [Branch governance](docs/BRANCH_GOVERNANCE.md)
 - [Security reporting](.github/SECURITY.md)
 - [CI policy](docs/CI_POLICY.md)
 - [Roadmap](ROADMAP.md)
@@ -185,7 +186,7 @@ These are possible sustainability mechanisms, not an established business model.
 
 The accepted [CONTRIBUTING.md](CONTRIBUTING.md) is the public contribution entry point. It covers scope, target branches, validation, licensing/provenance, generated files, review, and the public/private resource boundary. Internal contributions include the Server, production Web UI, integration contracts, data/multi-device services, and container/release integration, including necessary upstream-derived frontend fixes.
 
-Target the active workstream identified by the relevant issue or maintainer. External contributors may use their own branch names; `codex/*` describes temporary branches in maintainer integration workflows. Public contribution procedures are distinct from maintainer integration transactions. Contributing does not transfer copyright ownership or supply rights in third-party material by assumption.
+Target the appropriate persistent domain branch under [Branch Governance](docs/BRANCH_GOVERNANCE.md), using the relevant issue or maintainer authority. Domain ownership follows subject matter, and cross-domain changes require explicit coordination. External contributors may use their own branch names; `codex/*` describes temporary branches in maintainer integration workflows. Public contribution procedures are distinct from maintainer integration transactions. Contributing does not transfer copyright ownership or supply rights in third-party material by assumption.
 
 ## Security and privacy
 
