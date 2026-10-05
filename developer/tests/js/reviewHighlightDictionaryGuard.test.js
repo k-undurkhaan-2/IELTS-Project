@@ -49,9 +49,12 @@ function loadReviewHighlightDictionary(options = {}) {
         module: { exports: {} },
         exports: {}
     };
+    Object.assign(context, options.globals || {});
     context.globalThis = context;
+    context.window = context;
     vm.createContext(context);
-    vm.runInContext(source, context, { filename: 'reviewHighlightDictionary.js' });
+    const testSource = source.replace('    const api = {', '    global.__openDictionaryBubble = openBubble;\n    const api = {');
+    vm.runInContext(testSource, context, { filename: 'reviewHighlightDictionary.js' });
     return { api: context.module.exports, context };
 }
 
@@ -97,6 +100,159 @@ test('review highlight fallback vocab strips unsafe stored keys before saving', 
     assert.equal(Object.prototype.hasOwnProperty.call(oldWord, 'prototype'), false);
     assert.equal(Object.prototype.hasOwnProperty.call(oldWord, 'constructor'), false);
     assert.equal(Object.prototype.pollutedReviewHighlight, undefined);
+});
+
+function bubbleHarness() {
+    function events(target = {}) {
+        const listeners = new Map();
+        target.addEventListener = (type, fn, capture = false) => {
+            const key = `${type}:${Boolean(capture)}`;
+            const entries = listeners.get(key) || [];
+            entries.push(fn);
+            listeners.set(key, entries);
+        };
+        target.removeEventListener = (type, fn, capture = false) => {
+            const key = `${type}:${Boolean(capture)}`;
+            listeners.set(key, (listeners.get(key) || []).filter((entry) => entry !== fn));
+        };
+        target.fire = (type, event = {}) => {
+            for (const capture of [true, false]) {
+                [...(listeners.get(`${type}:${capture}`) || [])].forEach((fn) => fn(event));
+            }
+        };
+        target.count = (type) => [true, false].reduce((sum, capture) => sum + (listeners.get(`${type}:${capture}`) || []).length, 0);
+        return target;
+    }
+    class Element {
+        static ELEMENT_NODE = 1;
+        constructor() {
+            events(this);
+            this.style = {};
+            this.dataset = {};
+            this.children = [];
+            this.nodeType = 1;
+            this.classList = { toggle() {} };
+            this.offsetWidth = 200;
+            this.clientWidth = 184;
+            this.offsetHeight = this.clientHeight = 160;
+            this.scrollHeight = 400;
+            this.scrollWidth = 184;
+        }
+        setAttribute() {}
+        removeAttribute() {}
+        matches(selector) { return selector === '.hl' && this.className === 'hl'; }
+        querySelectorAll(selector) { return this.children.filter((child) => child.matches(selector)); }
+        appendChild(child) { this.children.push(child); return child; }
+        replaceChildren(...children) { this.children = children; }
+        contains(node) { return node === this || this.children.some((child) => child.contains(node)); }
+        closest(selector) { return this.matches(selector) ? this : null; }
+        getBoundingClientRect() { return { left: 100, right: 300, top: 100, bottom: 260, width: 200, height: 160 }; }
+    }
+    const body = new Element();
+    const head = new Element();
+    const document = events({
+        body, head,
+        getElementById(id) { return [...body.children, ...head.children].find((node) => node.id === id) || null; },
+        createElement() { return new Element(); },
+        createDocumentFragment() { return new Element(); }
+    });
+    const globalEvents = events();
+    const { api, context } = loadReviewHighlightDictionary({ globals: {
+        ...globalEvents, document, Node: Element, HTMLElement: Element, HTMLButtonElement: Element,
+        innerWidth: 900, innerHeight: 700,
+        getComputedStyle() {
+            return { overflowY: 'auto', overflowX: 'auto', borderLeftWidth: '1px', borderRightWidth: '1px', borderTopWidth: '1px', borderBottomWidth: '1px' };
+        }
+    } });
+    const highlight = new Element();
+    highlight.textContent = 'example';
+    highlight.className = 'hl';
+    body.appendChild(highlight);
+    const open = () => context.__openDictionaryBubble(highlight);
+    open();
+    const bubble = document.getElementById('review-highlight-dictionary-bubble');
+    return { api, open, bubble, document, highlight, window: globalEvents, outside: new Element(), Element };
+}
+
+test('dictionary inside scroll stays open; outside scroll and resize close it', () => {
+    const h = bubbleHarness();
+    const child = h.bubble.appendChild(new h.Element());
+    for (const target of [h.bubble, child]) {
+        h.window.fire('scroll', { target });
+        assert.equal(h.bubble.style.display, 'block');
+    }
+    h.window.fire('scroll', { target: h.outside });
+    assert.equal(h.bubble.style.display, 'none');
+    h.open();
+    h.window.fire('resize');
+    assert.equal(h.bubble.style.display, 'none');
+});
+
+test('dictionary scrollbar clicks and zero-width overlay edges stay open within bounds', () => {
+    const h = bubbleHarness();
+    const click = (clientX, clientY) => h.document.fire('click', { target: h.outside, clientX, clientY });
+    click(294, 180);
+    assert.equal(h.bubble.style.display, 'block', 'measured vertical scrollbar');
+    h.bubble.clientWidth = h.bubble.offsetWidth - 2;
+    click(294, 180);
+    assert.equal(h.bubble.style.display, 'block', 'zero-width vertical overlay scrollbar with 1px borders');
+    h.bubble.clientHeight = h.bubble.offsetHeight - 2;
+    h.bubble.scrollHeight = h.bubble.clientHeight;
+    h.bubble.scrollWidth = 400;
+    click(180, 255);
+    assert.equal(h.bubble.style.display, 'block', 'horizontal overlay scrollbar with 1px borders');
+    for (const point of [[270, 180], [301, 180], [294, 99], [294, 261]]) {
+        h.open();
+        click(...point);
+        assert.equal(h.bubble.style.display, 'none', `outside bounded edge: ${point}`);
+    }
+    h.open();
+    h.bubble.scrollWidth = h.bubble.clientWidth;
+    click(294, 180);
+    assert.equal(h.bubble.style.display, 'none', 'no overlay edge without overflowing content');
+});
+
+test('dictionary close detaches global handlers and reopen never duplicates them', () => {
+    const h = bubbleHarness();
+    for (let cycle = 0; cycle < 4; cycle += 1) {
+        h.open();
+        h.open();
+        for (const [target, types] of [[h.document, ['click', 'keydown']], [h.window, ['resize', 'scroll']]]) {
+            types.forEach((type) => assert.equal(target.count(type), 1, `${type} attached once`));
+        }
+        h.api.close();
+        for (const [target, types] of [[h.document, ['click', 'keydown']], [h.window, ['resize', 'scroll']]]) {
+            types.forEach((type) => assert.equal(target.count(type), 0, `${type} detached`));
+        }
+    }
+});
+
+test('dictionary content and interactive highlights remain inside-click safe', () => {
+    const h = bubbleHarness();
+    const child = h.bubble.appendChild(new h.Element());
+    h.document.fire('click', { target: child });
+    assert.equal(h.bubble.style.display, 'block');
+    h.outside.closest = () => h.outside;
+    h.document.fire('click', { target: h.outside });
+    assert.equal(h.bubble.style.display, 'block');
+    h.document.fire('keydown', { key: 'Escape' });
+    assert.equal(h.bubble.style.display, 'none');
+});
+
+test('dictionary highlight keyboard activation remains available after close and repeated attach', () => {
+    const h = bubbleHarness();
+    const options = { roots: { left: h.document.body } };
+    h.api.attach(options);
+    h.api.attach(options);
+    for (const key of ['Enter', ' ']) {
+        let prevented = false;
+        h.document.fire('keydown', { key, target: h.highlight, preventDefault() { prevented = true; } });
+        assert.equal(prevented, true);
+        assert.equal(h.bubble.style.display, 'block');
+        h.api.close();
+        assert.equal(h.document.count('keydown'), 1, 'only the single activation delegate remains');
+        assert.equal(h.document.count('click'), 1, 'only the single activation delegate remains');
+    }
 });
 
 test('review highlight context keeps shared references but drops cycles', () => {
