@@ -1550,6 +1550,12 @@
             const section = document.getElementById(`part-section-${part.key.slice(1)}`);
             if (section) {
                 section.classList.toggle('active', part.key === currentPart);
+                const switchable = resolvePartTarget(part.key) !== null;
+                section.dataset.part = part.key;
+                section.tabIndex = switchable ? 0 : -1;
+                section.setAttribute('role', switchable ? 'button' : 'group');
+                section.setAttribute('aria-label', `${switchable ? 'Go to' : 'Questions for'} Part ${part.key.slice(1)}`);
+                section.setAttribute('aria-current', part.key === currentPart ? 'step' : 'false');
             }
             const name = section?.querySelector('.part-nav-name');
             if (name) {
@@ -1570,10 +1576,11 @@
             const status = ['answered', 'correct', 'incorrect'].includes(question.status) ? question.status : '';
             const active = isCurrent && question.qId === state.currentActiveQuestionId ? ' active' : '';
             const disabled = isCurrent ? '' : ' disabled';
+            const controlIdentity = isCurrent ? ` data-question-id="${escapeHtml(question.qId)}"` : '';
             return [
                 `<div class="q-column" data-question-id="${escapeHtml(question.qId)}" data-part="${escapeHtml(partKey)}">`,
                 `<div class="q-bar-segment ${escapeHtml(status)}"></div>`,
-                `<button class="q-item ${escapeHtml(status)}${active}${disabled}" data-question-id="${escapeHtml(question.qId)}" type="button">${escapeHtml(question.label)}</button>`,
+                `<button class="q-item ${escapeHtml(status)}${active}${disabled}"${controlIdentity} type="button">${escapeHtml(question.label)}</button>`,
                 '</div>'
             ].join('');
         }).join('');
@@ -1969,31 +1976,42 @@
         syncPrimaryActionButtons();
     }
 
+    function resolvePartTarget(partKey) {
+        const parts = getPartDefinitions().map((part) => part.key);
+        const targetIndex = parts.indexOf(partKey);
+        const currentIndex = parts.indexOf(resolveCurrentPartKey());
+        const context = state.simulationCtx;
+        if (!state.simulationMode || state.readOnly || !state.suiteSessionId || !state.sessionId || !context
+            || targetIndex < 0 || targetIndex === currentIndex
+            || !Number.isInteger(context.total) || context.total <= 0 || targetIndex >= context.total
+            || context.currentIndex !== currentIndex || currentIndex >= context.total) {
+            return null;
+        }
+        const allowed = targetIndex < currentIndex ? context.canPrev : context.canNext;
+        return allowed === true ? targetIndex : null;
+    }
+
+    function navigatePart(partKey) {
+        const targetIndex = resolvePartTarget(partKey);
+        if (targetIndex === null) return false;
+        const direction = targetIndex < state.simulationCtx.currentIndex ? 'prev' : 'next';
+        return dispatchSimulationNavigate(direction, null, targetIndex);
+    }
+
     function navClickHandler(event) {
         const targetElement = event.target instanceof Element ? event.target : null;
         const column = targetElement?.closest('.q-column[data-question-id]');
         const button = targetElement?.closest('.q-item[data-question-id]');
-        if (!column && !button) return;
+        const sectionPart = event.currentTarget?.dataset?.part || '';
+        if (!column && !button && !sectionPart) return;
         const questionId = column?.dataset.questionId || button?.dataset.questionId || '';
-        const partKey = column?.dataset.part || '';
+        const partKey = column?.dataset.part || sectionPart;
         const currentPart = resolveCurrentPartKey();
         if (partKey && partKey !== currentPart) {
-            if (!state.simulationMode || !state.simulationCtx) {
-                return;
-            }
-            const partIndex = { p1: 0, p2: 1, p3: 2 };
-            const currentIndex = partIndex[currentPart];
-            const targetIndex = partIndex[partKey];
-            if (!Number.isFinite(currentIndex) || !Number.isFinite(targetIndex)) {
-                return;
-            }
-            if (targetIndex === currentIndex + 1 && state.simulationCtx.canNext) {
-                dispatchSimulationNavigate('next');
-            } else if (targetIndex === currentIndex - 1 && state.simulationCtx.canPrev) {
-                dispatchSimulationNavigate('prev', buildSubmissionSnapshot());
-            }
+            navigatePart(partKey);
             return;
         }
+        if (!questionId) return;
         const target = findQuestionAnchor(questionId);
         if (target && typeof global.scrollToElement === 'function') {
             global.scrollToElement(target);
@@ -2007,7 +2025,19 @@
     function attachNavListeners() {
         dom.nav?.addEventListener('click', navClickHandler);
         dom.partQuestions?.forEach((container) => {
-            container?.addEventListener('click', navClickHandler);
+            const section = container?.parentElement;
+            if (section?.dataset.part) {
+                section.addEventListener('click', navClickHandler);
+                section.addEventListener('keydown', (event) => {
+                    if (event.target === section && (event.key === 'Enter' || event.key === ' ')
+                        && resolvePartTarget(section.dataset.part) !== null) {
+                        event.preventDefault();
+                        navigatePart(section.dataset.part);
+                    }
+                });
+            } else {
+                container?.addEventListener('click', navClickHandler);
+            }
         });
         dom.right?.addEventListener('focusin', (event) => {
             const target = event.target instanceof HTMLElement ? event.target : null;
@@ -4369,12 +4399,15 @@
         });
     }
 
-    function dispatchSimulationNavigate(direction, submissionSnapshot = null) {
+    function dispatchSimulationNavigate(direction, submissionSnapshot = null, targetIndex = undefined) {
         if (!state.simulationMode || !state.simulationCtx || state.readOnly) {
-            return;
+            return false;
         }
+        if (targetIndex !== undefined && (!Number.isInteger(targetIndex)
+            || resolvePartTarget(getPartDefinitions()[targetIndex]?.key) !== targetIndex)) return false;
         const snapshot = submissionSnapshot || buildSubmissionSnapshot();
-        postMessage('SIMULATION_NAVIGATE', {
+        return postMessage('SIMULATION_NAVIGATE', {
+            ...(targetIndex !== undefined ? { targetIndex } : {}),
             direction: direction === 'prev' ? 'prev' : 'next',
             draft: {
                 answers: snapshot.answers || {},

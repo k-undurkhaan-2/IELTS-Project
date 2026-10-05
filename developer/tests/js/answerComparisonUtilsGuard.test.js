@@ -9,6 +9,22 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, '..', '..', '..');
 const AnswerComparisonUtils = require(path.join(repoRoot, 'js', 'utils', 'answerComparisonUtils.js'));
+const AnswerMatchCore = require(path.join(repoRoot, 'js', 'utils', 'answerMatchCore.js'));
+
+for (const value of ['A', 'a', 'A. text', 'A) text']) {
+    assert.equal(AnswerMatchCore.normalizeToken(value), 'A', `option token: ${value}`);
+    assert.equal(AnswerMatchCore.compareAnswers(value, 'A'), true);
+}
+for (const value of ['A text', 'B answer', 'A: text', 'A-text', 'A.text']) {
+    assert.equal(AnswerMatchCore.normalizeToken(value), value, `text answer: ${value}`);
+    assert.equal(AnswerMatchCore.compareAnswers(value, value[0]), false);
+}
+assert.equal(AnswerMatchCore.compareAnswers('A text', 'a text'), true);
+assert.equal(AnswerMatchCore.normalizeToken('  “long—term”  '), 'long-term');
+assert.equal(AnswerMatchCore.compareAnswers('long-term', 'long term'), true);
+assert.equal(AnswerMatchCore.normalizeToken('YES'), 'true');
+assert.equal(AnswerMatchCore.normalizeToken('not-given'), 'not given');
+assert.deepEqual(AnswerMatchCore.splitAnswerTokens('A, B'), ['A', 'B']);
 
 const record = JSON.parse(`{
   "answerComparison": {

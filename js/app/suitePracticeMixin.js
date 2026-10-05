@@ -1036,11 +1036,22 @@
             if (!session || session.status !== 'active') return false;
             if (session.flowMode !== 'simulation') return false;
             if (session.simulationNavigateLocked === true) return false;
+            if (!Array.isArray(session.sequence)) return false;
+            if (data && data.suiteSessionId && data.suiteSessionId !== session.id) return false;
+            const windowInfo = this.examWindows && this.examWindows.get(examId);
+            if (windowInfo && (windowInfo.readOnly || windowInfo.reviewMode)) return false;
             const normalizedExamId = examId != null ? String(examId).trim() : '';
             const activeExamId = session.activeExamId != null ? String(session.activeExamId).trim() : '';
             if (!normalizedExamId) return false;
             const currentIdx = session.sequence.findIndex(e => e && e.examId === normalizedExamId);
             if (currentIdx < 0) return false;
+            const hasTarget = data && Object.prototype.hasOwnProperty.call(data, 'targetIndex');
+            const direction = String(data && data.direction || '').toLowerCase();
+            if (!hasTarget && !['next', 'prev', 'previous'].includes(direction)) return false;
+            const targetIdx = hasTarget ? data.targetIndex : currentIdx + (direction === 'next' ? 1 : -1);
+            if (!Number.isInteger(targetIdx) || targetIdx < 0 || targetIdx >= session.sequence.length || targetIdx === currentIdx) return false;
+            const targetEntry = session.sequence[targetIdx];
+            if (!targetEntry || !targetEntry.examId) return false;
             // Self-heal when activeExamId drifts but the index still points to the current page.
             if (activeExamId && normalizedExamId !== activeExamId) {
                 const allowSelfHeal = Number.isInteger(session.currentIndex) && session.currentIndex === currentIdx;
@@ -1095,14 +1106,6 @@
                     const normalizedSnapshot = this._normalizeSuiteResult(currentEntry.exam, snapshot);
                     this._upsertSuiteResult(session, normalizedExamId, normalizedSnapshot);
                 }
-
-                const direction = String(data && data.direction || '').toLowerCase();
-                if (direction !== 'next' && direction !== 'prev' && direction !== 'previous') return false;
-                const targetIdx = direction === 'next' ? currentIdx + 1 : currentIdx - 1;
-                if (targetIdx < 0 || targetIdx >= session.sequence.length) return false;
-
-                const targetEntry = session.sequence[targetIdx];
-                if (!targetEntry || !targetEntry.examId) return false;
 
                 session.currentIndex = targetIdx;
                 session.activeExamId = targetEntry.examId;

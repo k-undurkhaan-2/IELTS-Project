@@ -179,3 +179,176 @@ test('simulation draft sanitizer tolerates hostile runtime objects', () => {
     assert.equal(sanitized.highlights[0].start, 0);
     assert.equal(sanitized.scrollY, 0);
 });
+
+// Part navigation exercises section identity and bubbling targets alongside draft preservation.
+class Element {
+    constructor(dataset = {}, parent = null) {
+        this.dataset = dataset;
+        this.parentElement = parent;
+        this.attributes = new Map();
+        this.listeners = new Map();
+        const classes = new Set();
+        this.classList = {
+            toggle(name, enabled) { enabled ? classes.add(name) : classes.delete(name); },
+            contains(name) { return classes.has(name); }
+        };
+    }
+    setAttribute(name, value) { this.attributes.set(name, String(value)); }
+    getAttribute(name) { return this.attributes.get(name) ?? null; }
+    removeAttribute(name) { this.attributes.delete(name); }
+    querySelector() { return null; }
+    querySelectorAll() { return []; }
+    closest(selector) {
+        if (selector.startsWith('.q-column') && this.dataset.part && this.dataset.questionId) return this;
+        if (selector.startsWith('.q-item') && !this.dataset.part && this.dataset.questionId) return this;
+        return this.parentElement?.closest(selector) || null;
+    }
+    addEventListener(type, listener) { this.listeners.set(type, listener); }
+    fire(type, extra = {}) {
+        const event = { target: this, currentTarget: this, prevented: false, preventDefault() { this.prevented = true; }, ...extra };
+        this.listeners.get(type)?.(event);
+        return event;
+    }
+}
+
+function createPartNavigationHarness() {
+    const sections = ['p1', 'p2', 'p3'].map((part) => new Element({ part }));
+    const messages = [];
+    const parent = { postMessage(envelope, origin) { messages.push({ envelope, origin }); } };
+    const document = {
+        addEventListener() {},
+        getElementById(id) { return sections.find((section) => id === `part-section-${section.dataset.part.slice(1)}`) || null; },
+        querySelector() { return null; },
+        querySelectorAll(selector) {
+            return selector === 'input[type="radio"][name="q1"]' ? [{ checked: true, value: 'B' }] : [];
+        }
+    };
+    const context = vm.createContext({
+        console, document, Element, HTMLElement: Element, URL, URLSearchParams,
+        setTimeout, clearTimeout, setInterval, clearInterval,
+        opener: parent, parent, scrollY: 219,
+        location: { href: 'https://reading.test/reading.html', origin: 'https://reading.test', protocol: 'https:' },
+        __READING_HIGHLIGHT_SHARED__: { snapshotHighlights() { return [{ scope: 'left', text: 'retained highlight' }]; } },
+        __IELTS_PRACTICE_TIMER__: { getSnapshot() { return { durationSeconds: 83, anchorMs: 1000, pausedOffsetMs: 2000, pausedAtMs: 86000, running: false }; } }
+    });
+    context.window = context;
+    const marker = "    document.addEventListener('DOMContentLoaded',";
+    assert(source.includes(marker));
+    vm.runInContext(source.replace(marker, `    global.__navigation = { state, dom, renderPartQuestions, navClickHandler, attachNavListeners, updatePartSectionState, dispatchSimulationNavigate, handleIncoming };\n${marker}`), context);
+    const hooks = context.__navigation;
+    Object.assign(hooks.state, {
+        examId: 'reading-p1', sessionId: 'current-page', suiteSessionId: 'current-suite',
+        simulationMode: true, simulationContextReady: true,
+        simulationCtx: { currentIndex: 0, total: 3, canNext: true, canPrev: false },
+        dataset: { meta: { category: 'P1' }, questionOrder: ['q1'], answerKey: { q1: 'B' }, groups: [] }
+    });
+    hooks.dom.partQuestions = sections.map((section) => new Element({}, section));
+    return { ...hooks, sections, messages, context, parent };
+}
+
+test('active question controls keep IDs; inactive controls delegate through their column', () => {
+    const h = createPartNavigationHarness();
+    const active = h.renderPartQuestions('p1', [{ qId: 'q1', label: '1' }], true);
+    const inactive = h.renderPartQuestions('p3', [{ qId: 'q27', label: '27' }], false);
+    assert.strict.match(active, /<button[^>]*data-question-id="q1"/);
+    assert.strict.doesNotMatch(inactive.match(/<button[^>]*>/)[0], /data-question-id/);
+    assert.strict.match(inactive, /class="q-column" data-question-id="q27" data-part="p3"/);
+    const column = new Element({ questionId: 'q27', part: 'p3' });
+    const inactiveButton = new Element({}, column);
+    h.navClickHandler({ target: inactiveButton });
+    assert.strict.equal(h.messages.length, 1, 'column metadata still navigates');
+    assert.strict.equal(h.messages[0].envelope.data.targetIndex, 2);
+});
+
+test('part section click sends a non-adjacent target through the existing snapshot envelope', () => {
+    const h = createPartNavigationHarness();
+    h.updatePartSectionState('p1');
+    h.attachNavListeners();
+    h.sections[2].fire('click');
+    assert.strict.equal(h.messages.length, 1);
+    const { envelope, origin } = h.messages[0];
+    assert.strict.equal(origin, 'https://reading.test');
+    assert.strict.equal(envelope.type, 'SIMULATION_NAVIGATE');
+    assert.strict.equal(envelope.data.targetIndex, 2);
+    assert.strict.equal(envelope.data.direction, 'next');
+    assert.strict.equal(envelope.data.examId, 'reading-p1');
+    assert.strict.equal(envelope.data.sessionId, 'current-page');
+    assert.strict.equal(envelope.data.suiteSessionId, 'current-suite');
+    assert.strict.equal(envelope.data.draft.answers.q1, 'B');
+    assert.strict.equal(envelope.data.resultSnapshot.answers.q1, 'B');
+    assert.strict.equal(envelope.data.draft.highlights[0].text, 'retained highlight');
+    assert.strict.equal(envelope.data.draft.scrollY, 219);
+    assert.strict.equal(envelope.data.elapsed, 83);
+    assert.strict.equal(envelope.data.timerSnapshot.pausedOffsetMs, 2000);
+    assert.strict.equal(envelope.data.timerSnapshot.running, false);
+});
+
+test('only switchable part sections activate on Enter or Space', () => {
+    const h = createPartNavigationHarness();
+    h.updatePartSectionState('p1');
+    h.attachNavListeners();
+    assert.strict.equal(h.sections[0].getAttribute('role'), 'group');
+    assert.strict.equal(h.sections[0].tabIndex, -1);
+    assert.strict.equal(h.sections[2].getAttribute('role'), 'button');
+    assert.strict.equal(h.sections[2].tabIndex, 0);
+    for (const key of ['Enter', ' ']) {
+        assert.strict.equal(h.sections[2].fire('keydown', { key }).prevented, true);
+    }
+    assert.strict.equal(h.messages.length, 2);
+    h.sections[2].fire('keydown', { key: 'ArrowRight' });
+    h.sections[2].fire('keydown', { key: 'Enter', target: new Element() });
+    assert.strict.equal(h.sections[0].fire('keydown', { key: 'Enter' }).prevented, false);
+    h.state.readOnly = true;
+    h.updatePartSectionState('p1');
+    assert.strict.equal(h.sections[2].fire('keydown', { key: ' ' }).prevented, false);
+    h.sections[2].fire('click');
+    assert.strict.equal(h.messages.length, 2);
+});
+
+test('invalid, same, unavailable and out-of-suite part requests are rejected', () => {
+    const changes = [
+        { readOnly: true }, { simulationMode: false }, { simulationCtx: null },
+        { suiteSessionId: null }, { sessionId: null },
+        { simulationCtx: { currentIndex: 0, total: 3, canNext: false } },
+        { simulationCtx: { currentIndex: 0, total: 2, canNext: true } },
+        { simulationCtx: { currentIndex: 0, total: 0, canNext: true } },
+        { simulationCtx: { currentIndex: 4, total: 3, canNext: true } }
+    ];
+    for (const change of changes) {
+        const h = createPartNavigationHarness();
+        Object.assign(h.state, change);
+        h.navClickHandler({ target: new Element({ part: 'p3', questionId: 'q27' }) });
+        assert.strict.equal(h.messages.length, 0, JSON.stringify(change));
+    }
+    for (const part of ['p0', 'p4', 'P3', 'invalid', 'p1']) {
+        const h = createPartNavigationHarness();
+        h.navClickHandler({ target: new Element({ part, questionId: 'q1' }) });
+        assert.strict.equal(h.messages.length, 0, part);
+    }
+    const h = createPartNavigationHarness();
+    h.state.dataset.meta.category = 'P3';
+    h.state.simulationCtx = { currentIndex: 2, total: 3, canPrev: false };
+    h.navClickHandler({ target: new Element({ part: 'p1', questionId: 'q1' }) });
+    assert.strict.equal(h.messages.length, 0, 'canPrev guard');
+    for (const target of [-1, 0, 3, 1.5, '2', null, NaN]) {
+        const h = createPartNavigationHarness();
+        assert.strict.equal(h.dispatchSimulationNavigate('next', null, target), false);
+        assert.strict.equal(h.messages.length, 0, `invalid dispatch target ${String(target)}`);
+    }
+});
+
+test('incoming navigation retains origin, source, suite and URL checks', () => {
+    const h = createPartNavigationHarness();
+    const original = h.context.location.href;
+    const goodData = { suiteSessionId: 'current-suite', url: '/next.html' };
+    for (const overrides of [
+        { origin: 'https://elsewhere.test' }, { origin: 'null' }, { source: {} },
+        { data: { type: 'SUITE_NAVIGATE', data: { ...goodData, suiteSessionId: 'old-suite' } } },
+        { data: { type: 'SUITE_NAVIGATE', data: { ...goodData, url: 'https://elsewhere.test/next' } } }
+    ]) {
+        h.handleIncoming({ source: h.parent, origin: 'https://reading.test', data: { type: 'SUITE_NAVIGATE', data: goodData }, ...overrides });
+        assert.strict.equal(h.context.location.href, original);
+    }
+    h.handleIncoming({ source: h.parent, origin: 'https://reading.test', data: { type: 'SUITE_NAVIGATE', data: goodData } });
+    assert.strict.equal(h.context.location.href, 'https://reading.test/next.html');
+});

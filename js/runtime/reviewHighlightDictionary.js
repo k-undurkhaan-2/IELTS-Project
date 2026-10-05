@@ -578,11 +578,18 @@
             document.addEventListener('click', handleOutsideClick, true);
             document.addEventListener('keydown', handleDocumentKeydown, true);
             window.addEventListener('resize', closeBubble);
-            window.addEventListener('scroll', closeBubble, true);
+            window.addEventListener('scroll', handleBubbleScroll, true);
         }
     }
 
     function closeBubble() {
+        if (outsideHandlerAttached) {
+            document.removeEventListener('click', handleOutsideClick, true);
+            document.removeEventListener('keydown', handleDocumentKeydown, true);
+            window.removeEventListener('resize', closeBubble);
+            window.removeEventListener('scroll', handleBubbleScroll, true);
+            outsideHandlerAttached = false;
+        }
         const bubble = document.getElementById(BUBBLE_ID);
         if (bubble) {
             bubble.style.display = 'none';
@@ -592,13 +599,41 @@
         activeLookup = null;
     }
 
+    function handleBubbleScroll(event) {
+        const bubble = document.getElementById(BUBBLE_ID);
+        if (bubble && event.target instanceof Node && bubble.contains(event.target)) {
+            return;
+        }
+        closeBubble();
+    }
+
+    function hitsBubbleScrollbar(event, bubble) {
+        const rect = bubble.getBoundingClientRect();
+        const { clientX: x, clientY: y } = event;
+        if (!Number.isFinite(x) || !Number.isFinite(y) || rect.width <= 0 || rect.height <= 0
+            || x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) {
+            return false;
+        }
+        const style = window.getComputedStyle(bubble);
+        // Overlay scrollbars have no layout width; keep their hit area at the edge.
+        const borderWidth = (parseFloat(style.borderLeftWidth) || 0) + (parseFloat(style.borderRightWidth) || 0);
+        const borderHeight = (parseFloat(style.borderTopWidth) || 0) + (parseFloat(style.borderBottomWidth) || 0);
+        const edgeWidth = Math.min(rect.width, Math.max(0, bubble.offsetWidth - bubble.clientWidth - borderWidth) || 14);
+        const edgeHeight = Math.min(rect.height, Math.max(0, bubble.offsetHeight - bubble.clientHeight - borderHeight) || 14);
+        const vertical = ['auto', 'scroll'].includes(style.overflowY)
+            && bubble.scrollHeight > bubble.clientHeight && x >= rect.right - edgeWidth;
+        const horizontal = ['auto', 'scroll'].includes(style.overflowX)
+            && bubble.scrollWidth > bubble.clientWidth && y >= rect.bottom - edgeHeight;
+        return vertical || horizontal;
+    }
+
     function handleOutsideClick(event) {
         const bubble = document.getElementById(BUBBLE_ID);
         const target = event.target instanceof HTMLElement ? event.target : null;
         if (!bubble || bubble.style.display === 'none' || !target) {
             return;
         }
-        if (bubble.contains(target) || target.closest(`.${INTERACTIVE_CLASS}`)) {
+        if (bubble.contains(target) || target.closest(`.${INTERACTIVE_CLASS}`) || hitsBubbleScrollbar(event, bubble)) {
             return;
         }
         closeBubble();
@@ -607,13 +642,15 @@
     function handleDocumentKeydown(event) {
         if (event.key === 'Escape') {
             closeBubble();
-            return;
         }
+    }
+
+    function handleHighlightKeydown(event) {
         if (event.key !== 'Enter' && event.key !== ' ') {
             return;
         }
         const highlight = getHighlightFromEvent(event);
-        if (highlight) {
+        if (highlight && isEnabled()) {
             event.preventDefault();
             openBubble(highlight);
         }
@@ -810,6 +847,7 @@
             return;
         }
         attach._attached = true;
+        document.addEventListener('keydown', handleHighlightKeydown);
         document.addEventListener('click', (event) => {
             const highlight = getHighlightFromEvent(event);
             if (!highlight || !isEnabled()) {
