@@ -22,6 +22,184 @@ const { runMigrations } = require('../src/migrations');
 const { MemoryPracticeRecordStore, PostgresPracticeRecordStore, createPracticeRecordService, extractColumns, mergePracticeRecords, normalizePracticeRecord } = require('../src/practiceRecords');
 const { MemoryTotpStore, PostgresTotpStore } = require('../src/totp');
 
+const protectedPracticeRoots = ['ListeningPractice', 'ReadingPractice'];
+
+function assertProtectedDockerignore(source) {
+    const rules = source.split(/\r\n?|\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith('#'));
+    for (const root of protectedPracticeRoots) {
+        assert(rules.includes(root), `.dockerignore must exclude the ${root} root`);
+        assert(rules.includes(`${root}/**`), `.dockerignore must exclude ${root} descendants`);
+    }
+    // Review new exceptions explicitly: even a broad glob can re-include private descendants.
+    const publicExceptions = new Set(['!.env.example', '!backend/.env.example', '!backend/migrations/*.sql']);
+    for (const rule of rules.filter((line) => line.startsWith('!'))) {
+        assert(publicExceptions.has(rule), `unreviewed .dockerignore re-inclusion: ${rule}`);
+    }
+}
+
+function parseDockerInstructions(source) {
+    let escape = '\\';
+    let pending = '';
+    let parsingDirectives = true;
+    const seenDirectives = new Set();
+    const instructions = [];
+    for (const rawLine of source.replace(/^\uFEFF/, '').split(/\r\n?|\n/)) {
+        // Docker preserves leading whitespace on continuation lines, including operand separators.
+        const line = pending ? rawLine : rawLine.trimStart();
+        if (parsingDirectives) {
+            const directive = line.match(/^#\s*(syntax|escape|check)\s*=\s*(.+?)\s*$/i);
+            if (directive) {
+                const name = directive[1].toLowerCase();
+                assert(!seenDirectives.has(name), `duplicate Docker ${name} directive`);
+                seenDirectives.add(name);
+                if (name === 'escape') {
+                    assert(['\\', '`'].includes(directive[2]), 'unsupported Docker escape directive');
+                    escape = directive[2];
+                }
+                continue;
+            }
+            // An ordinary comment, blank line, or instruction ends Docker's directive preamble.
+            parsingDirectives = false;
+        }
+        if (!line.trim() || line.trimStart().startsWith('#')) continue;
+        const endTrimmed = line.replace(/[ \t]+$/, '');
+        const continued = endTrimmed.endsWith(escape) && endTrimmed.at(-2) !== escape;
+        pending += continued ? endTrimmed.slice(0, -1) : line;
+        if (continued) continue;
+        const instruction = pending.trimEnd().match(/^([a-z]+)(?:\s+([\s\S]*))?$/i);
+        assert(instruction, `unparsed Docker instruction: ${pending}`);
+        instructions.push({ command: instruction[1].toUpperCase(), args: instruction[2] || '' });
+        pending = '';
+    }
+    assert.equal(pending, '', 'unterminated Docker continuation');
+    return { instructions, escape };
+}
+
+function readDockerWord(source, escape) {
+    let word = '';
+    let quote = '';
+    let index = 0;
+    for (; index < source.length; index += 1) {
+        const char = source[index];
+        if (!quote && /\s/.test(char)) break;
+        if (char === escape && quote !== "'") {
+            assert(index + 1 < source.length, 'unterminated Docker escape');
+            if (quote === '"' && !['"', '$', escape].includes(source[index + 1])) {
+                word += char;
+            } else {
+                word += source[++index];
+            }
+        } else if (quote && char === quote) {
+            quote = '';
+        } else if (!quote && (char === '"' || char === "'")) {
+            quote = char;
+        } else {
+            word += char;
+        }
+    }
+    assert.equal(quote, '', 'unterminated Docker quote');
+    return { word, rest: source.slice(index).trimStart() };
+}
+
+function dockerCopyAddSources(source) {
+    const { instructions, escape } = parseDockerInstructions(source);
+    return instructions.filter(({ command }) => command === 'COPY' || command === 'ADD').flatMap(({ command, args }) => {
+        let rest = args.trim();
+        while (rest.startsWith('--')) {
+            const flag = readDockerWord(rest, escape);
+            assert(/^--[a-z][a-z-]*(?:=.+)?$/i.test(flag.word), `unparsed ${command} flag`);
+            rest = flag.rest;
+        }
+        let operands;
+        if (rest.startsWith('[')) {
+            operands = JSON.parse(rest);
+        } else {
+            operands = [];
+            while (rest) {
+                const operand = readDockerWord(rest, escape);
+                operands.push(operand.word);
+                rest = operand.rest;
+            }
+        }
+        assert(Array.isArray(operands) && operands.length >= 2 && operands.every((operand) => typeof operand === 'string' && operand), `${command} needs sources and a destination`);
+        return operands.slice(0, -1).map((operand) => {
+            // Keep this static guard bounded; dynamic sources and heredocs need explicit review.
+            assert(!operand.includes('$') && !operand.startsWith('<<'), `unresolved ${command} source: ${operand}`);
+            return operand;
+        });
+    });
+}
+
+function assertNoProtectedDockerSources(source) {
+    for (const operand of dockerCopyAddSources(source)) {
+        const normalized = path.posix.normalize(operand.replace(/\\/g, '/')).toLowerCase();
+        const components = normalized.split('/');
+        for (const root of protectedPracticeRoots) {
+            assert(!components.includes(root.toLowerCase()), `protected Docker source: ${operand}`);
+        }
+    }
+}
+
+function assertProtectedDockerignoreRegressionCoverage(source) {
+    assertProtectedDockerignore(source);
+    for (const root of protectedPracticeRoots) {
+        for (const requiredRule of [root, `${root}/**`]) {
+            const missingRule = source.split(/\r?\n/).filter((line) => line !== requiredRule).join('\n');
+            assert.throws(() => assertProtectedDockerignore(missingRule), /must exclude/);
+        }
+    }
+    for (const rule of [
+        '!ListeningPractice', '!ReadingPractice/**', '!./ListeningPractice/nested/example.html',
+        '!/ReadingPractice/', '!listeningpractice/**', '!READINGPRACTICE',
+        '!ListeningPractice\\nested\\example.html', '!public/../ReadingPractice/example.html',
+        '!**', '!*/example.html', '!**/*.html', '![LR]*Practice/**'
+    ]) {
+        assert.throws(() => assertProtectedDockerignore(`${source}\n${rule}\n`), /re-inclusion/, rule);
+    }
+}
+
+function assertProtectedDockerSourcesRegressionCoverage(dockerfile) {
+    assertNoProtectedDockerSources(dockerfile);
+    const sources = dockerCopyAddSources(dockerfile);
+    assert(sources.includes('assets'), 'public generated Listening assets remain in the image');
+    const users = parseDockerInstructions(dockerfile).instructions.filter(({ command }) => command === 'USER');
+    assert.equal(users.at(-1)?.args, 'node', 'the final runtime user must remain node');
+    for (const root of protectedPracticeRoots) {
+        for (const command of ['COPY', 'ADD']) {
+            for (const operand of [root, `./${root}`, `/${root}//nested/example.html`, `public/../${root}/file`, `nested/${root}/file`, `${root.toLowerCase()}/file`, `${root}\\nested\\file`]) {
+                const json = `${command} --chown=node:node ${JSON.stringify(['assets', operand, '/app/'])}`;
+                assert.throws(() => assertNoProtectedDockerSources(json), /protected Docker source/, json);
+            }
+            for (const instruction of [
+                `${command} ${root} /app/`,
+                `  ${command.toLowerCase()} --link --chmod=755 assets "./${root}/with space" /app/`,
+                `${command} --from=build 'nested/${root}/file' /app/`,
+                `${command} "${root}\\nested\\file" /app/`,
+                `${command} "${root.slice(0, 4)}"${root.slice(4)} /app/`,
+                `${command} assets \\\r\n# continuation comment\r\n  ./${root}/file /app/`,
+                `${command} ${root}\\\n    assets /app/`,
+                `${command} ${root.slice(0, 4)}\\\n${root.slice(4)} /app/`,
+                '# ordinary comment\n# escape=`\n' + `${command} ${root.slice(0, 6)}\\${root.slice(6)} /app/`,
+                '\n# escape=`\n' + `${command} ${root.slice(0, 6)}\\${root.slice(6)} /app/`,
+                'RUN true # ' + '\\'.repeat(3) + '\n' + `${command} ${root} /app/`,
+                '# escape=`\n' + `${command} assets ` + '`\n' + `./${root} /app/`,
+                `${command} ["\\u${root.charCodeAt(0).toString(16).padStart(4, '0')}${root.slice(1)}", "/app/"]`
+            ]) {
+                assert.throws(() => assertNoProtectedDockerSources(instruction), /protected Docker source/, instruction);
+            }
+        }
+    }
+    assert.deepEqual(dockerCopyAddSources('COPY --link --chown=node:node ["assets", "backend", "/app/"]'), ['assets', 'backend']);
+    assert.doesNotThrow(() => assertNoProtectedDockerSources([
+        '# COPY ListeningPractice /app/', 'RUN echo ReadingPractice',
+        'COPY assets/generated/listening-exams /app/ListeningPractice/',
+        'COPY backend/package*.json /app/backend/', 'ADD public/ReadingPractice-not-private /app/'
+    ].join('\n')));
+    for (const instruction of ['COPY', 'ADD ["ReadingPractice"]', 'COPY [invalid]', 'COPY "unterminated /app/', 'COPY ${PRIVATE_ROOT} /app/', 'COPY <<EOF /app/file', 'COPY assets \\']) {
+        assert.throws(() => assertNoProtectedDockerSources(instruction), undefined, instruction);
+    }
+}
+
 test('docker image hardening excludes secrets and runs app as non-root', () => {
     const repoRoot = path.resolve(__dirname, '..', '..');
     const dockerfile = fs.readFileSync(path.join(repoRoot, 'backend', 'Dockerfile'), 'utf8');
@@ -55,8 +233,10 @@ test('docker image hardening excludes secrets and runs app as non-root', () => {
             `.dockerignore must exclude ${pattern}`
         );
     }
-    assert(!dockerignore.split(/\r?\n/).includes('ListeningPractice'));
-    assert(dockerfile.includes('COPY ListeningPractice ./ListeningPractice'));
+    // Keep U03 vectors in this existing case: the frozen CI verifier binds the 141-case suite.
+    assertProtectedDockerignoreRegressionCoverage(dockerignore);
+    assertProtectedDockerSourcesRegressionCoverage(dockerfile);
+    assert.match(compose, /source: \.\.\/ListeningPractice\n\s+target: \/app\/ListeningPractice\n\s+read_only: true\n\s+bind:\n\s+create_host_path: false/);
     for (const listeningAssetPath of [
         'assets/generated/listening-exams/manifest.js',
         'assets/generated/listening-exams/listening-index.compat.js',

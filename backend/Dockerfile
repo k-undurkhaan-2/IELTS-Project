@@ -14,7 +14,6 @@ COPY assets ./assets
 COPY css ./css
 COPY js ./js
 COPY src/styles ./src/styles
-COPY ListeningPractice ./ListeningPractice
 COPY templates ./templates
 COPY index.html ./index.html
 COPY backend ./backend
