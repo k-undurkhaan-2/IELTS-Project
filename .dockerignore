@@ -38,3 +38,9 @@ backend/tor/volume-backups/
 *.tar
 *.tar.gz
 node_modules
+
+ListeningPractice
+ListeningPractice/**
+
+ReadingPractice
+ReadingPractice/**
