@@ -42,7 +42,7 @@ boundaries may require additional security review.
 
 Choose the appropriate persistent domain for the subject being contributed.
 [Branch Governance](docs/BRANCH_GOVERNANCE.md) defines the six active
-persistent branches and the canonical integration topology.
+persistent authority branches and the canonical integration topology.
 
 | Branch role | Contribution target guidance |
 | --- | --- |
@@ -117,8 +117,8 @@ with a non-sensitive explanation.
 
 Ensure CI passes where the target branch invokes it. The current PR workflow
 filters the **base** branch: PRs into bases matching `codex/**` are excluded;
-PRs into other bases are covered. Push CI covers exactly the six active
-persistent branches; historical retained branches may lack current CI authority.
+PRs into other bases are covered. Push CI covers exactly the six existing
+persistent authority branches; historical retained branches may lack current CI authority.
 See the [CI Policy](docs/CI_POLICY.md) for exact triggers,
 profiles, evidence, and known-debt handling.
 
