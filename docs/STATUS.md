@@ -23,7 +23,7 @@ The repository maintains the integrated server-backed Web Service. Long-term int
 
 The persistent-domain branch architecture is established. CI bootstrap is
 canonical on `main`. [Branch Governance](BRANCH_GOVERNANCE.md) defines exactly
-six active persistent branches: `main`, `dev/current-mainline`, `ci/master`,
+six active persistent authority branches: `main`, `dev/current-mainline`, `ci/master`,
 `docs/master`, `ui/master`, and `security/server-security`.
 
 Creation-triggered push validation completed successfully for the three new
@@ -35,7 +35,7 @@ domain heads at commit `4c6c60f04a46f99901d7ff602fc5d2d279c03dcc`:
 | `ui/master` | [37174234051](https://github.com/k-undurkhaan-2/IELTS-Project/actions/runs/37174234051) | 7-of-7 PASS | ACTIVE / VALIDATED |
 | `security/server-security` | [37174274700](https://github.com/k-undurkhaan-2/IELTS-Project/actions/runs/37174274700) | 7-of-7 PASS | ACTIVE / VALIDATED |
 
-All six canonical persistent branches have Baseline-aware CI coverage under
+Push CI currently covers the six existing persistent authority branches under
 [CI Policy](CI_POLICY.md). Historical retained branches may not have current
 CI authority; their existence does not establish an active contribution target.
 This records the accepted architecture and validation, not completion of
@@ -43,6 +43,87 @@ cleanup, archive, salvage, release, deployment, or Hosted Service readiness.
 The historical documentation-governance ref and its still-unperformed archive
 protection are described in
 [Branch Governance](BRANCH_GOVERNANCE.md#documentation-governance-audit-anchor).
+
+### Integration, preview, and refresh policy
+
+There remain exactly four peer subject domains: `docs/master`, `ui/master`,
+`ci/master`, and `security/server-security`. `dev/current-mainline` is the
+central continuous cross-domain integration authority. A validated,
+explicitly tracked `PARTIAL_INTEGRATION` state is permitted, but any open
+`BLOCKING_INTEGRATION_OBLIGATION` prevents preview eligibility, main promotion,
+and deployment eligibility. Dev is not automatically preview-, deployment-,
+main-, or release-ready. Cross-domain follow-up does not automatically require
+atomic integration; the technical invalidity or material safety threshold is
+defined in [Branch Governance](BRANCH_GOVERNANCE.md#exceptional-coordinated-atomic-integration).
+
+The policy and implementation states are distinct:
+
+```yaml
+persistent_authority_branches:
+  active: 6
+peer_subject_domains: 4
+deploy_preview:
+  governance_defined: true
+  remote_ref_created: false
+  ruleset_configured: false
+  local_workspace_created: false
+automatic_main_to_domain_refresh:
+  policy_defined: true
+  workflow_implemented: false
+local_workspace_normalization:
+  implemented: false
+```
+
+The planned `deploy/preview` is a
+`LONG_LIVED_NON_AUTHORITATIVE_EXPERIMENTAL_DEPLOYMENT_CHANNEL`, not an additional
+subject domain or a production authority. Only an eligible exact dev SHA may
+be promoted there under separate authority. Canonical source promotion stays
+`domain -> dev/current-mainline -> main`; preview is a side deployment channel.
+
+After remote activation, preview will require a persistent deployment
+workspace tracking only `origin/deploy/preview`. Tracked-source development
+mutations and commits are prohibited there. Deployment runtime writes are
+allowed when excluded from tracked source, including ignored or external
+outputs, caches, logs, packages, receipts, and Docker exports. Deployment
+secrets must not become Git-tracked content. The workspace and deployment
+workflow have not been created by this amendment.
+
+Canonical persistent-domain refresh uses `main`. Future automation requires
+an accepted main state, a domain head that is an ancestor of main, no open PR
+targeting the domain, and no concurrent refresh. Divergent or unpromoted domain
+history requires manual preflight; automation cannot resolve it. Periodic
+checks are conditional eligibility checks. Automation privileges and ruleset
+changes require separate authorization. Routine dev-to-domain refresh remains
+prohibited; an exceptional baseline dependency requires explicit authority.
+
+Before new domain work, local policy requires fetch plus fast-forward-only
+synchronization, `HEAD == origin/<persistent-domain>`, and a clean working tree.
+A failed fast-forward requires STOP and explicit reconciliation, with no
+automatic merge, rebase, hard reset, or discarded commits. The intended
+control/main/dev/docs/UI/CI/Security/preview topology is policy only; local
+normalization has not been implemented.
+
+Future preview and refresh CI implementation is `CI_DOMAIN_FOLLOWUP` under
+`ci/master`. Existing CI policy and workflows remain unchanged. Repository
+configuration and local workspace normalization are separately governed.
+
+### Issue #64 convergence transition
+
+The Documentation repair was accepted through
+[PR #65](https://github.com/k-undurkhaan-2/IELTS-Project/pull/65), but
+[Issue #64](https://github.com/k-undurkhaan-2/IELTS-Project/issues/64) remains
+OPEN with cross-domain convergence pending. The earlier general
+`COORDINATED_ATOMIC_DEV_INTEGRATION` recommendation for U03 plus Docs #64 is
+superseded as the default policy direction before execution. Its Git/topology
+preflight findings and historical evidence remain valid evidence; the proposed
+atomic branch was never created and the integration remains unexecuted.
+
+The changed interpretation permits validated partial dev integration with
+explicit blocking obligations. This amendment does not modify, close, or
+reclassify Issue #64, integrate either domain, create an integration candidate,
+or authorize deployment or main promotion. Convergence will be replanned after
+amendment acceptance. The [separately governed follow-up sequence](BRANCH_GOVERNANCE.md#separately-governed-follow-up-sequence)
+does not start automatically.
 
 ## Available capabilities
 
