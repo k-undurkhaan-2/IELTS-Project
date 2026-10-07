@@ -7912,7 +7912,7 @@ def _validate_workflow_steps(job_name: str, steps: Any, errors: list[str]) -> No
 
     setup_python = by_name.get("Set up Python", {})
     if job_name != "final-result":
-        if tuple(setup_python) != ("name", "uses", "with") or setup_python.get("with") != {"python-version": "3.12"}:
+        if tuple(setup_python) != ("name", "uses", "with") or setup_python.get("with") != {"python-version": "3.12.10"}:
             errors.append(f"{job_name} Python setup is not exact")
         if setup_python.get("uses") != f"actions/setup-python@{APPROVED_ACTIONS['actions/setup-python']['sha']}":
             errors.append(f"{job_name} Python action pin is not exact")

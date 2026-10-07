@@ -1544,10 +1544,22 @@ unbounded in-memory value.
 
 ## Runtime scope and remaining P3 limitation
 
-All jobs use Python family `3.12` and Node family `24.x`. These are initial CI
-runtime families only. They are not Alpha, signed runtime, release-toolchain,
-production-runtime, or browser-support authority, and no exact patch is
-ratified. This remains documented as CISEC-008, an accepted P3 limitation.
+All six hosted producer/verifier setup steps must acquire the same exact
+Python patch version, `3.12.10`; Node remains pinned to `24.20.0`. Floating,
+minor-only, range, and mixed Python selectors are rejected. Executable byte
+identity participates in command authority through `resolvedExecutableSha256`,
+so deterministic runtime acquisition is required to preserve the existing
+strict executable-identity checks and fresh replay.
+
+The `actions/setup-python` action SHA pin fixes the action implementation; the
+`python-version` patch pin fixes the acquired Python runtime version. Both pins
+remain required. This alignment does not remove or relax executable path,
+size, hash, file identity, context binding, command-plan or execution-binding
+digests, runtime closure, or fresh replay requirements.
+
+These pins govern CI acquisition only. They do not establish Alpha, signed
+runtime, release-toolchain, production-runtime, or browser-support authority.
+CISEC-008 remains an accepted P3 limitation for that broader runtime authority.
 
 CISEC-009 is closed in this foundation: subprocess stdout, stderr, line length,
 preview, and command-results size are all explicitly bounded, and over-limit
