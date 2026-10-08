@@ -339,9 +339,26 @@ test('docker image hardening excludes secrets and runs app as non-root', () => {
     assert(deploymentRunbook.includes('Recreate only `app` with `--no-build`.'));
     assert(deploymentRunbook.includes('omitting `--no-build` can make the target host attempt'));
     assert(deploymentRunbook.includes('Listening Runtime Assets'));
-    assert(deploymentRunbook.includes('assets/generated/listening-exams/manifest.js'));
-    assert(deploymentRunbook.includes('assets/generated/listening-exams/listening-index.compat.js'));
-    assert(deploymentRunbook.includes('test -d /app/ListeningPractice'));
+    assert(deploymentRunbook.includes('Public Listening Image Assets'));
+    const listeningImageCheck = deploymentRunbook.match(/docker run --rm --entrypoint sh backend-app:latest -ec '([\s\S]*?)'/);
+    assert(listeningImageCheck, 'runbook must validate the standalone image without a private runtime bind');
+    for (const publicAsset of ['manifest.js', 'listening-index.compat.js', 'listening-practice-unified.html']) {
+        assert(listeningImageCheck[1].includes(`test -s /app/assets/generated/listening-exams/${publicAsset}`));
+    }
+    assert(!deploymentRunbook.includes('test -d /app/ListeningPractice'));
+    assert.doesNotMatch(listeningImageCheck[1], /ListeningPractice|ReadingPractice/);
+    assert(deploymentRunbook.includes('Private Listening Runtime Resources'));
+    assert.match(deploymentRunbook, /supplied\s+externally by the host bind mount, rather than by the image/);
+    assert(deploymentRunbook.includes('source: ../ListeningPractice'));
+    assert(deploymentRunbook.includes('target: /app/ListeningPractice'));
+    assert(deploymentRunbook.includes('read_only: true'));
+    assert(deploymentRunbook.includes('create_host_path: false'));
+    assert(deploymentRunbook.includes('The host source must already exist before Compose starts or recreates `app`.'));
+    assert.match(deploymentRunbook, /`read_only: true` makes the mounted resource read-only/);
+    assert.match(deploymentRunbook, /`create_host_path: false` prevents Compose from creating a missing host source/);
+    assert(deploymentRunbook.includes('U02 remains `DEFERRED_DEPENDENCY`'));
+    assert.match(deploymentRunbook, /`PRIVATE_OVERLAY_READINESS_ACCEPTANCE`\s+remains `UNRESOLVED`/);
+    assert(deploymentRunbook.includes('branch role does not grant release or deployment authority.'));
     assert(deploymentRunbook.includes('Admin Password Maintenance Rotation'));
     assert(deploymentRunbook.includes('Do not overwrite the long-lived target `backend/.env`'));
     assert(deploymentRunbook.includes('Do not commit the temporary file'));
