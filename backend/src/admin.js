@@ -2804,7 +2804,7 @@ function createTrafficMiddleware(options = {}) {
         return (req, res, next) => next();
     }
     const secret = options.secret || process.env.TRAFFIC_SECRET || process.env.SESSION_SECRET || 'traffic-development-secret';
-    const production = (options.nodeEnv || process.env.NODE_ENV) === 'production';
+    const production = process.env.NODE_ENV === 'production' || options.nodeEnv === 'production';
     const weakSecret = !secret
         || secret === 'traffic-development-secret'
         || secret === 'development-session-secret-change-me'

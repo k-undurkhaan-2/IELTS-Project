@@ -9,18 +9,19 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { test } = require('node:test');
 const bcrypt = require('bcryptjs');
+const express = require('express');
 const otp = require('otplib');
 const session = require('express-session');
 
 const { createApp } = require('../src/app');
 const { MemoryAuthStore, PostgresAuthStore, createRateLimiter, getUserSecurityEpoch, normalizeRateLimitKey } = require('../src/auth');
-const { MemoryAuthHandoffStore, createSignedAuthState } = require('../src/authHandoff');
+const { MemoryAuthHandoffStore, createAuthHandoffRouter, createSignedAuthState } = require('../src/authHandoff');
 const { MemoryAuthSessionStore } = require('../src/authSessions');
 const { MemoryAdminStore, PostgresAdminStore, createTrafficMiddleware, normalizeAdminSearchQuery, normalizeTrafficEvent, serializeRecord } = require('../src/admin');
 const { bootstrapAdmin } = require('../src/bootstrapAdmin');
 const { runMigrations } = require('../src/migrations');
 const { MemoryPracticeRecordStore, PostgresPracticeRecordStore, createPracticeRecordService, extractColumns, mergePracticeRecords, normalizePracticeRecord } = require('../src/practiceRecords');
-const { MemoryTotpStore, PostgresTotpStore } = require('../src/totp');
+const { MemoryTotpStore, PostgresTotpStore, createTotpRouter } = require('../src/totp');
 
 const protectedPracticeRoots = ['ListeningPractice', 'ReadingPractice'];
 
@@ -200,6 +201,27 @@ function assertProtectedDockerSourcesRegressionCoverage(dockerfile) {
     }
 }
 
+test('Docker COPY and ADD parser rejects private roots across equivalent forms', () => {
+    const prohibitedInstructions = [
+        'copy --link --chmod=0644 ListeningPractice /app/ListeningPractice',
+        'COPY --chown=node:node ["assets", "ListeningPractice/private.html", "/app/"]',
+        'copy ["listeningpractice/private.html", "/app/"]',
+        `ADD --checksum=sha256:${'a'.repeat(64)} ReadingPractice /app/`,
+        'add ["readingpractice/private.html", "/app/"]',
+        'COPY --from=build public/../ListeningPractice/private.html /app/'
+    ];
+    for (const instruction of prohibitedInstructions) {
+        assert.throws(
+            () => assertNoProtectedDockerSources(instruction),
+            /protected Docker source/,
+            instruction
+        );
+    }
+    assert.doesNotThrow(() => assertNoProtectedDockerSources(
+        'COPY --link [".ieltmps-build/public-listening-frontend/active.json", "/app/public/listening-frontend/active.json"]'
+    ));
+});
+
 test('docker image hardening excludes secrets and runs app as non-root', () => {
     const repoRoot = path.resolve(__dirname, '..', '..');
     const dockerfile = fs.readFileSync(path.join(repoRoot, 'backend', 'Dockerfile'), 'utf8');
@@ -227,6 +249,18 @@ test('docker image hardening excludes secrets and runs app as non-root', () => {
     assert.match(dockerfile, /^FROM node:24-alpine/m);
     assert.doesNotMatch(dockerfile, /^FROM node:20-alpine/m);
     assert.match(dockerfile, /\nUSER node\s*\n/);
+    assert.match(dockerfile, /node:24-alpine remains mutable/);
+    assert.match(dockerfile, /independently approved\s*\n# registry digest is required before any authoritative production image build/);
+    const publicListeningArtifactVersion = 'lpf-v1-1a576be93d7d-a2-fad166773fa6259a';
+    for (const copyInstruction of [
+        'COPY .ieltmps-build/public-listening-frontend/active.json /app/public/listening-frontend/active.json',
+        `COPY .ieltmps-build/public-listening-frontend/${publicListeningArtifactVersion}/manifest.json /app/public/listening-frontend/${publicListeningArtifactVersion}/manifest.json`,
+        `COPY .ieltmps-build/public-listening-frontend/${publicListeningArtifactVersion}/payload/ /app/public/listening-frontend/${publicListeningArtifactVersion}/payload/`
+    ]) {
+        assert(dockerfile.split(/\r?\n/).includes(copyInstruction), `missing literal artifact COPY: ${copyInstruction}`);
+    }
+    assert.doesNotMatch(dockerfile, /^ARG\s+.*(?:LISTENING|ARTIFACT|VERSION)/mi);
+    assert.doesNotMatch(dockerfile, /^COPY\s+\.ieltmps-build\/public-listening-frontend\/?\s/m);
     for (const pattern of ['.git', 'backend/.env', 'backend/.env.*', 'backend/logs', 'backend/node_modules', 'backend/tor/bridges.local.txt', 'backend/tor/bridges.age', 'backend/tor/bridge-age-identity.txt', 'backend/tor/bridge.identity', 'backend/tor/bridge.pub', 'backend/tor/*.identity', 'backend/tor/*.pub', 'backend/tor/*.agekey']) {
         assert(
             dockerignore.split(/\r?\n/).includes(pattern),
@@ -909,6 +943,211 @@ test('production app validates public URL modes, handoff secrets, and trusted pr
             trustedProxyIps: '10.0.0.10'
         })
     );
+});
+
+test('real production process dominates caller nodeEnv across app and child security controls', { concurrency: false }, async () => {
+    const hadNodeEnv = Object.prototype.hasOwnProperty.call(process.env, 'NODE_ENV');
+    const originalNodeEnv = process.env.NODE_ENV;
+    const strongSessionSecret = 'runtime-session-secret-0123456789abcdef';
+    const strongHandoffSecret = 'runtime-handoff-secret-0123456789abcdef';
+    const strongTotpKey = 'runtime-totp-key-0123456789abcdef';
+    const strongTrafficSecret = 'runtime-traffic-secret-0123456789abcdef';
+    const weakTotpKey = 'short-totp-key';
+    const weakTrafficSecret = 'traffic-development-secret';
+    const trafficStore = { recordTraffic() {} };
+    const runtimeMatrix = [
+        ['production', 'test', true],
+        ['production', 'development', true],
+        ['production', undefined, true],
+        ['test', 'production', true],
+        ['development', 'production', true],
+        ['test', 'test', false],
+        ['development', 'development', false]
+    ];
+
+    function callerModeOptions(nodeEnv) {
+        return nodeEnv === undefined ? {} : { nodeEnv };
+    }
+
+    function createRuntimeAppOptions(nodeEnv, overrides = {}) {
+        const sessionStore = new session.MemoryStore();
+        const authStore = new MemoryAuthStore({ sessionStore });
+        const authSessionStore = new MemoryAuthSessionStore();
+        const totpStore = new MemoryTotpStore();
+        const practiceStore = new MemoryPracticeRecordStore();
+        const adminStore = new MemoryAdminStore({ authStore, practiceStore, totpStore, sessionStore });
+        return {
+            authStore,
+            authSessionStore,
+            totpStore,
+            practiceStore,
+            adminStore,
+            authHandoffStore: new MemoryAuthHandoffStore(),
+            sessionStore,
+            sessionSecret: strongSessionSecret,
+            authHandoffSecret: strongHandoffSecret,
+            authPublicUrl: 'https://auth.example',
+            businessPublicUrl: 'https://business.example',
+            adminPublicUrl: 'https://admin.example',
+            totpEnabled: true,
+            totpEncryptionKey: strongTotpKey,
+            trafficEnabled: true,
+            trafficSecret: strongTrafficSecret,
+            rateLimit: { maxAttempts: 100, windowMs: 60_000 },
+            ...callerModeOptions(nodeEnv),
+            ...overrides
+        };
+    }
+
+    function listenForRuntimeTest(app) {
+        return new Promise((resolve, reject) => {
+            const server = app.listen(0, '127.0.0.1', () => resolve(server));
+            server.once('error', reject);
+        });
+    }
+
+    function closeRuntimeTestServer(server) {
+        return new Promise((resolve, reject) => {
+            server.close((error) => error ? reject(error) : resolve());
+        });
+    }
+
+    async function directAuthHandoffStartStatus(nodeEnv, host) {
+        const app = express();
+        app.use('/auth', createAuthHandoffRouter({
+            stateSecret: strongHandoffSecret,
+            authStore: {},
+            ticketStore: {},
+            authPublicUrl: 'https://auth.example',
+            businessPublicUrl: 'https://business.example',
+            adminPublicUrl: 'https://admin.example',
+            ...callerModeOptions(nodeEnv)
+        }));
+        const server = await listenForRuntimeTest(app);
+        try {
+            const { port } = server.address();
+            const response = await rawHttpRequest(
+                `http://127.0.0.1:${port}`,
+                'GET',
+                '/auth/business/start?return_to=/',
+                { headers: { host } }
+            );
+            return response.response.status;
+        } finally {
+            await closeRuntimeTestServer(server);
+        }
+    }
+
+    try {
+        for (const [processNodeEnv, callerNodeEnv, production] of runtimeMatrix) {
+            process.env.NODE_ENV = processNodeEnv;
+            const modeOptions = callerModeOptions(callerNodeEnv);
+            const label = `process=${processNodeEnv}, caller=${callerNodeEnv ?? 'unspecified'}`;
+            const createWeakTraffic = () => createTrafficMiddleware({
+                store: trafficStore,
+                enabled: true,
+                secret: weakTrafficSecret,
+                ...modeOptions
+            });
+            const createWeakTotp = () => createTotpRouter({
+                store: new MemoryTotpStore(),
+                enabled: true,
+                encryptionKey: weakTotpKey,
+                ...modeOptions
+            });
+            const createWeakTrafficApp = () => createApp(createRuntimeAppOptions(callerNodeEnv, {
+                trafficSecret: weakTrafficSecret
+            }));
+            const createWeakTotpApp = () => createApp(createRuntimeAppOptions(callerNodeEnv, {
+                totpEncryptionKey: weakTotpKey
+            }));
+
+            if (production) {
+                assert.throws(createWeakTraffic, /TRAFFIC_SECRET or SESSION_SECRET/, label);
+                assert.throws(createWeakTotp, /TOTP_ENCRYPTION_KEY or SESSION_SECRET/, label);
+                assert.throws(createWeakTrafficApp, /TRAFFIC_SECRET or SESSION_SECRET/, label);
+                assert.throws(createWeakTotpApp, /TOTP_ENCRYPTION_KEY or SESSION_SECRET/, label);
+            } else {
+                assert.doesNotThrow(createWeakTraffic, label);
+                assert.doesNotThrow(createWeakTotp, label);
+                assert.doesNotThrow(createWeakTrafficApp, label);
+                assert.doesNotThrow(createWeakTotpApp, label);
+            }
+
+            assert.doesNotThrow(() => createTrafficMiddleware({
+                store: trafficStore,
+                enabled: true,
+                secret: strongTrafficSecret,
+                ...modeOptions
+            }), label);
+            assert.doesNotThrow(() => createTotpRouter({
+                store: new MemoryTotpStore(),
+                enabled: true,
+                encryptionKey: strongTotpKey,
+                ...modeOptions
+            }), label);
+            assert.equal(
+                await directAuthHandoffStartStatus(callerNodeEnv, '127.0.0.1'),
+                production ? 400 : 302,
+                label
+            );
+            assert.equal(
+                await directAuthHandoffStartStatus(callerNodeEnv, 'business.example'),
+                302,
+                label
+            );
+        }
+
+        process.env.NODE_ENV = 'production';
+        assert.doesNotThrow(() => createTrafficMiddleware({
+            store: trafficStore,
+            enabled: false,
+            secret: weakTrafficSecret,
+            nodeEnv: 'test'
+        }));
+        assert.doesNotThrow(() => createApp(createRuntimeAppOptions('test', {
+            trafficEnabled: false,
+            trafficSecret: weakTrafficSecret
+        })));
+
+        const app = createApp(createRuntimeAppOptions('test'));
+        assert.deepEqual(app.locals.publicListeningFrontendReadiness, {
+            required: true,
+            ready: false,
+            errorCode: 'PUBLIC_LISTENING_FRONTEND_INVALID'
+        });
+        const server = await listenForRuntimeTest(app);
+        try {
+            const { port } = server.address();
+            const baseUrl = `http://127.0.0.1:${port}`;
+            const health = await rawHttpRequest(baseUrl, 'GET', '/api/health');
+            assert.equal(health.response.status, 503);
+            assert.deepEqual(JSON.parse(health.text), {
+                ok: false,
+                readiness: { publicListeningFrontend: 'unavailable' }
+            });
+
+            const loopback = await rawHttpRequest(baseUrl, 'GET', '/auth/business/start?return_to=/', {
+                headers: { host: '127.0.0.1' }
+            });
+            assert.equal(loopback.response.status, 400);
+            assert.equal(loopback.text, 'Invalid auth handoff host');
+
+            const authorized = await rawHttpRequest(baseUrl, 'GET', '/auth/business/start?return_to=/', {
+                headers: { host: 'business.example' }
+            });
+            assert.equal(authorized.response.status, 302);
+
+            const csrf = await rawHttpRequest(baseUrl, 'GET', '/api/auth/csrf');
+            assert.equal(csrf.response.status, 200);
+            assert.match(JSON.parse(csrf.text).csrfToken, /^[a-f0-9]{64}$/);
+        } finally {
+            await closeRuntimeTestServer(server);
+        }
+    } finally {
+        if (hadNodeEnv) process.env.NODE_ENV = originalNodeEnv;
+        else delete process.env.NODE_ENV;
+    }
 });
 
 async function register(client, username = 'alice', password = 'StrongPass1') {
@@ -8093,30 +8332,18 @@ test('static hosting serves index and denies dotfiles with security headers', as
         assert.notEqual(encodedBackslashTraversal.response.status, 200);
         assert.doesNotMatch(encodedBackslashTraversal.text, /createApp/);
 
-        let symlinkCreated = false;
         try {
             fs.symlinkSync(outsideSecretPath, path.join(staticRoot, 'assets', 'linked-secret.txt'));
-            symlinkCreated = true;
         } catch (error) {
-            t.diagnostic(`skipping symlink boundary assertion: ${error.message}`);
+            assert.fail(`required static-boundary symlink fixture unavailable: ${error.message}`);
         }
-        if (symlinkCreated) {
-            const linkedSecret = await client.request('GET', '/assets/linked-secret.txt');
-            assert.equal(linkedSecret.response.status, 403);
-            assert.doesNotMatch(linkedSecret.text, /outside secret/);
-        }
+        const linkedSecret = await client.request('GET', '/assets/linked-secret.txt');
+        assert.equal(linkedSecret.response.status, 403);
+        assert.doesNotMatch(linkedSecret.text, /outside secret/);
 
         const bundle = await client.request('GET', '/js/bundles/core-foundation.bundle.js');
         assert.equal(bundle.response.status, 200);
         assert.match(bundle.text, /Generated by scripts\/build-bundles\.mjs/);
-
-        const publicListeningManifest = await client.request('GET', '/assets/generated/listening-exams/manifest.js');
-        assert.equal(publicListeningManifest.response.status, 200);
-        assert.match(publicListeningManifest.text, /__LISTENING_EXAM_MANIFEST__/);
-
-        const publicListeningIndex = await client.request('GET', '/assets/generated/listening-exams/listening-index.compat.js');
-        assert.equal(publicListeningIndex.response.status, 200);
-        assert.match(publicListeningIndex.text, /listeningExamIndex/);
 
         for (const protectedPath of [
             '/practice/reading/p1-high-01',
@@ -8127,6 +8354,8 @@ test('static hosting serves index and denies dotfiles with security headers', as
             '/assets/generated/reading-exams/p1-high-01.js',
             '/assets/generated/reading-explanations/p1-high-01.js',
             '/assets/generated/listening-exams/listening-practice-unified.html',
+            '/assets/generated/listening-exams/manifest.js',
+            '/assets/generated/listening-exams/listening-index.compat.js',
             '/ListeningPractice/P1/sample.html',
             '/listeningpractice/P1/sample.html',
             '/templates/legacy.html',
@@ -8218,8 +8447,8 @@ test('static hosting serves index and denies dotfiles with security headers', as
             assert.doesNotMatch(afterRevoke.text, /Listening Sample|__READING_EXAM_DATA__|Unified Listening/);
         }
         const publicManifestAfterRevoke = await revokedPublicSession.request('GET', '/assets/generated/listening-exams/manifest.js');
-        assert.equal(publicManifestAfterRevoke.response.status, 200);
-        assert.match(publicManifestAfterRevoke.text, /__LISTENING_EXAM_MANIFEST__/);
+        assert.equal(publicManifestAfterRevoke.response.status, 401);
+        assert.doesNotMatch(publicManifestAfterRevoke.text, /__LISTENING_EXAM_MANIFEST__/);
 
         client.setCookie('ielts.sid', '');
         client.setCookie('ielts.sv', '');
@@ -8353,19 +8582,15 @@ test('static boundary rechecks optional roots created after an initial miss', as
 
         const listeningRoot = path.join(staticRoot, 'ListeningPractice');
         fs.mkdirSync(listeningRoot, { recursive: true });
-        let symlinkCreated = false;
         try {
             fs.symlinkSync(outsideSecretPath, path.join(listeningRoot, 'linked-secret.txt'));
-            symlinkCreated = true;
         } catch (error) {
-            t.diagnostic(`skipping late symlink boundary assertion: ${error.message}`);
+            assert.fail(`required late static-boundary symlink fixture unavailable: ${error.message}`);
         }
 
-        if (symlinkCreated) {
-            const linkedSecret = await client.request('GET', '/ListeningPractice/linked-secret.txt');
-            assert.equal(linkedSecret.response.status, 403);
-            assert.doesNotMatch(linkedSecret.text, /late outside secret/);
-        }
+        const linkedSecret = await client.request('GET', '/ListeningPractice/linked-secret.txt');
+        assert.equal(linkedSecret.response.status, 403);
+        assert.doesNotMatch(linkedSecret.text, /late outside secret/);
     } finally {
         await client.close();
         fs.rmSync(staticRoot, { recursive: true, force: true });

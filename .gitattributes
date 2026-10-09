@@ -1,3 +1,6 @@
 developer/release.sh text eol=lf
 js/bundles/*.bundle.js text eol=lf
 "ListeningPractice/vip special/js/bundles/*.bundle.js" text eol=lf
+assets/generated/listening-exams/listening-practice-unified.html text eol=lf
+assets/generated/listening-exams/manifest.js text eol=lf
+assets/generated/listening-exams/listening-index.compat.js text eol=lf

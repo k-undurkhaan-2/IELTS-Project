@@ -25,6 +25,15 @@ const {
 const { PostgresAdminStore, createAdminRouter, createTrafficMiddleware } = require('./admin');
 const { PostgresPracticeRecordStore, createPracticeRecordsRouter } = require('./practiceRecords');
 const {
+    PUBLIC_LISTENING_CSP,
+    PUBLIC_LISTENING_GENERATED_DEPENDENCIES,
+    classifyPublicListeningRequest,
+    isLoadedPublicListeningFrontend,
+    loadProductionPublicListeningFrontend
+} = require('./publicListeningFrontend');
+
+const PUBLIC_LISTENING_REQUEST_TARGET = Symbol('publicListeningRequestTarget');
+const {
     PostgresTotpStore,
     createRequireAdminTotp,
     createTotpRouter,
@@ -91,6 +100,10 @@ function createDefaultSessionStore(pool) {
 }
 
 function createContentSecurityPolicy(req) {
+    const publicListeningTarget = req[PUBLIC_LISTENING_REQUEST_TARGET];
+    if (publicListeningTarget?.kind === 'public') {
+        return PUBLIC_LISTENING_CSP;
+    }
     const requestPath = String(req.path || '').toLowerCase();
     const listeningWrapper = requestPath === '/practice/listening'
         || requestPath.startsWith('/practice/listening/');
@@ -318,7 +331,7 @@ const BOOLEAN_TRUE_STRINGS = new Set(['1', 'true', 'yes', 'on']);
 const BOOLEAN_FALSE_STRINGS = new Set(['0', 'false', 'no', 'off']);
 
 function isProduction(options = {}) {
-    return (options.nodeEnv || process.env.NODE_ENV) === 'production';
+    return process.env.NODE_ENV === 'production' || options.nodeEnv === 'production';
 }
 
 function isWeakSecret(secret) {
@@ -516,16 +529,19 @@ function normalizeHttpErrorStatus(error, fallback = 500) {
     return Number.isInteger(status) && status >= 400 && status < 600 ? status : fallback;
 }
 
-function loadGeneratedManifest(filePath, globalKey) {
-    const source = fs.readFileSync(filePath, 'utf8');
+function loadGeneratedManifestSource(source, globalKey, filename = 'generated-manifest.js') {
     const sandbox = {};
     vm.createContext(sandbox);
     vm.runInContext(source, sandbox, {
-        filename: filePath,
+        filename,
         timeout: 1000
     });
     const manifest = sandbox[globalKey];
     return manifest && typeof manifest === 'object' ? manifest : {};
+}
+
+function loadGeneratedManifest(filePath, globalKey) {
+    return loadGeneratedManifestSource(fs.readFileSync(filePath, 'utf8'), globalKey, filePath);
 }
 
 function createListeningShortRouteId(examId, includeHash = false) {
@@ -840,8 +856,12 @@ function encodePublicPathSegments(value) {
         .join('/');
 }
 
-function createListeningExamResolver(staticRoot) {
-    const manifestPath = path.join(staticRoot, 'assets', 'generated', 'listening-exams', 'manifest.js');
+function createListeningExamResolver(staticRoot, options = {}) {
+    const manifestPath = options.manifestPath
+        || path.join(staticRoot, 'assets', 'generated', 'listening-exams', 'manifest.js');
+    const manifestSource = typeof options.manifestSource === 'string'
+        ? options.manifestSource
+        : null;
     const listeningRoots = [
         {
             root: path.resolve(staticRoot, 'ListeningPractice'),
@@ -858,7 +878,13 @@ function createListeningExamResolver(staticRoot) {
     function getManifest() {
         if (!cachedManifest) {
             try {
-                cachedManifest = loadGeneratedManifest(manifestPath, '__LISTENING_EXAM_MANIFEST__');
+                cachedManifest = manifestSource === null
+                    ? loadGeneratedManifest(manifestPath, '__LISTENING_EXAM_MANIFEST__')
+                    : loadGeneratedManifestSource(
+                        manifestSource,
+                        '__LISTENING_EXAM_MANIFEST__',
+                        'verified-public-listening-manifest.js'
+                    );
             } catch (error) {
                 if (error && error.code === 'ENOENT') {
                     cachedManifest = {};
@@ -923,6 +949,69 @@ function createListeningExamResolver(staticRoot) {
     };
 }
 
+function sendPublicListeningUnavailable(res) {
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(503).type('text/plain').send('Listening frontend unavailable');
+}
+
+async function sendContainedPrivateListeningFile(res, privateRoot, rawRelativePath, next) {
+    const rawPath = String(rawRelativePath || '');
+    if (!rawPath
+        || rawPath.startsWith('/')
+        || rawPath.includes('\\')
+        || rawPath.includes('\0')
+        || rawPath.includes('//')
+        || /%(?:2f|5c|2e)/i.test(rawPath)) {
+        return res.status(400).type('text/plain').send('Invalid private Listening path');
+    }
+    let decodedPath;
+    try {
+        decodedPath = decodeURIComponent(rawPath);
+    } catch (_) {
+        return res.status(400).type('text/plain').send('Invalid private Listening path');
+    }
+    if (decodedPath.includes('\\')
+        || decodedPath.includes('\0')
+        || /%[0-9a-f]{2}/i.test(decodedPath)) {
+        return res.status(400).type('text/plain').send('Invalid private Listening path');
+    }
+    const segments = decodedPath.split('/');
+    if (segments.some((segment) => !segment || segment === '.' || segment === '..')) {
+        return res.status(400).type('text/plain').send('Invalid private Listening path');
+    }
+
+    try {
+        const rootPath = path.resolve(privateRoot);
+        const targetPath = path.resolve(rootPath, ...segments);
+        if (!isPathInside(rootPath, targetPath)) {
+            return res.status(403).type('text/plain').send('Forbidden');
+        }
+        let rootRealpath;
+        let targetRealpath;
+        try {
+            rootRealpath = await fs.promises.realpath(rootPath);
+            targetRealpath = await fs.promises.realpath(targetPath);
+        } catch (error) {
+            if (error && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) {
+                return res.status(404).type('text/plain').send('Not found');
+            }
+            throw error;
+        }
+        if (!isPathInside(rootRealpath, targetRealpath)) {
+            return res.status(403).type('text/plain').send('Forbidden');
+        }
+        const stats = await fs.promises.stat(targetRealpath);
+        if (!stats.isFile()) {
+            return res.status(404).type('text/plain').send('Not found');
+        }
+        return res.sendFile(targetRealpath, { dotfiles: 'deny' }, (error) => {
+            if (error) next(error);
+        });
+    } catch (error) {
+        return next(error);
+    }
+}
+
 function createApp(options = {}) {
     const app = express();
     const authPublicUrls = resolveAuthPublicUrls(options);
@@ -930,6 +1019,39 @@ function createApp(options = {}) {
     const repoRoot = options.staticRoot || path.resolve(__dirname, '..', '..');
     const adminRoot = options.adminRoot || path.resolve(__dirname, '..', 'admin');
     const authRoot = options.authRoot || path.resolve(__dirname, '..', 'auth');
+    const productionMode = isProduction(options);
+    const effectiveNodeEnv = productionMode
+        ? 'production'
+        : (options.nodeEnv || process.env.NODE_ENV);
+    for (const forbiddenOption of ['publicListeningFrontendRoot', 'publicListeningFrontendAuthority']) {
+        if (Object.prototype.hasOwnProperty.call(options, forbiddenOption)) {
+            throw new Error(`${forbiddenOption} is not a supported runtime override`);
+        }
+    }
+    const hasPublicListeningFixture = Object.prototype.hasOwnProperty.call(
+        options,
+        'publicListeningFrontendFixture'
+    );
+    let publicListeningFrontend = null;
+    let publicListeningFrontendLoadError = null;
+    if (hasPublicListeningFixture) {
+        if (effectiveNodeEnv !== 'test'
+            || !isLoadedPublicListeningFrontend(options.publicListeningFrontendFixture)) {
+            throw new Error('publicListeningFrontendFixture is available only to non-production tests');
+        }
+        publicListeningFrontend = options.publicListeningFrontendFixture;
+    } else if (productionMode) {
+        try {
+            publicListeningFrontend = loadProductionPublicListeningFrontend();
+        } catch (error) {
+            publicListeningFrontendLoadError = error;
+        }
+    }
+    app.locals.publicListeningFrontendReadiness = Object.freeze({
+        required: productionMode,
+        ready: Boolean(publicListeningFrontend),
+        errorCode: publicListeningFrontendLoadError?.code || null
+    });
     const pool = options.pool || db.pool;
     const dbClient = options.db || db;
     const cookieName = options.cookieName || 'ielts.sid';
@@ -968,6 +1090,15 @@ function createApp(options = {}) {
 
     app.disable('x-powered-by');
     app.set('trust proxy', trustProxy);
+    app.use((req, res, next) => {
+        const target = classifyPublicListeningRequest(req.originalUrl || req.url || '/');
+        req[PUBLIC_LISTENING_REQUEST_TARGET] = target;
+        if (target?.kind === 'reject') {
+            res.setHeader('Cache-Control', 'no-store');
+            return res.status(target.status).type('text/plain').send('Invalid request target');
+        }
+        return next();
+    });
     app.use(helmet({
         contentSecurityPolicy: false
     }));
@@ -1061,7 +1192,15 @@ function createApp(options = {}) {
     const trafficEnabled = options.trafficEnabled !== undefined
         ? Boolean(options.trafficEnabled)
         : parseBoolean(process.env.TRAFFIC_ENABLED, true);
-    const resolveListeningExam = createListeningExamResolver(repoRoot);
+    const generatedManifestRequestPath = PUBLIC_LISTENING_GENERATED_DEPENDENCIES[0].requestPath;
+    const verifiedListeningManifestSource = publicListeningFrontend
+        ? publicListeningFrontend.getGeneratedText(generatedManifestRequestPath)
+        : null;
+    const resolveListeningExam = verifiedListeningManifestSource !== null
+        ? createListeningExamResolver(repoRoot, { manifestSource: verifiedListeningManifestSource })
+        : (productionMode
+            ? (() => null)
+            : createListeningExamResolver(repoRoot));
 
     function getProxyAudience(req) {
         return normalizeAuthSessionAudience(req.get('x-ielts-onion-audience'));
@@ -1411,10 +1550,18 @@ function createApp(options = {}) {
         store: trafficStore,
         enabled: trafficEnabled,
         secret: options.trafficSecret || process.env.TRAFFIC_SECRET || sessionSecret,
-        nodeEnv: options.nodeEnv
+        nodeEnv: effectiveNodeEnv
     }));
 
     app.get('/api/health', (req, res) => {
+        if (productionMode && !publicListeningFrontend) {
+            return res.status(503).json({
+                ok: false,
+                readiness: {
+                    publicListeningFrontend: 'unavailable'
+                }
+            });
+        }
         res.json({ ok: true });
     });
 
@@ -1470,7 +1617,7 @@ function createApp(options = {}) {
         clearSessionCookieOptions,
         sessionVerifierCookieName,
         clearSessionVerifierCookieOptions,
-        nodeEnv: options.nodeEnv,
+        nodeEnv: effectiveNodeEnv,
         totpVerificationMaxAgeMs
     }));
     app.use('/api/auth', createAuthRouter({
@@ -1484,7 +1631,7 @@ function createApp(options = {}) {
         rateLimit: options.rateLimit,
         csrfRateLimit: options.csrfRateLimit,
         totpEnabled,
-        nodeEnv: options.nodeEnv,
+        nodeEnv: effectiveNodeEnv,
         resolveAuthState: (state) => verifySignedAuthState(authHandoffSecret, state),
         signAuthActionProof: (payload) => createSignedAuthState(authHandoffSecret, payload),
         onDeleteUser: async (userId) => {
@@ -1505,7 +1652,7 @@ function createApp(options = {}) {
         issuer: options.totpIssuer,
         encryptionKey: options.totpEncryptionKey,
         verificationMaxAgeMs: totpVerificationMaxAgeMs,
-        nodeEnv: options.nodeEnv,
+        nodeEnv: effectiveNodeEnv,
         recoveryHashRounds: options.totpRecoveryHashRounds,
         resolveAuthState: (state) => verifySignedAuthState(authHandoffSecret, state)
     }));
@@ -1763,20 +1910,66 @@ function createApp(options = {}) {
         res.sendFile(path.join(repoRoot, 'index.html'));
     });
 
-    app.get([
-        '/assets/generated/listening-exams/manifest.js',
-        '/assets/generated/listening-exams/listening-index.compat.js'
-    ], (req, res, next) => {
-        const assetName = req.path.endsWith('/manifest.js')
-            ? 'manifest.js'
-            : 'listening-index.compat.js';
-        const targetPath = path.join(repoRoot, 'assets', 'generated', 'listening-exams', assetName);
-        res.sendFile(targetPath, {
-            dotfiles: 'deny'
-        }, (error) => {
-            if (error) {
-                next(error);
+    app.use((req, res, next) => {
+        const target = req[PUBLIC_LISTENING_REQUEST_TARGET];
+        if (!target) {
+            return next();
+        }
+        if (target.kind === 'reject') {
+            return res.status(target.status).type('text/plain').send('Invalid Listening frontend path');
+        }
+
+        return requireVerifiedContentAuth(req, res, (authError) => {
+            if (authError) {
+                return next(authError);
             }
+            if (req.method !== 'GET' && req.method !== 'HEAD') {
+                res.setHeader('Allow', 'GET, HEAD');
+                return res.status(405).type('text/plain').send('Method not allowed');
+            }
+
+            if (target.kind === 'generated') {
+                if (publicListeningFrontend) {
+                    return publicListeningFrontend.sendGeneratedFile(target.requestPath, res)
+                        || sendPublicListeningUnavailable(res);
+                }
+                if (productionMode) {
+                    return sendPublicListeningUnavailable(res);
+                }
+                const assetName = target.requestPath.endsWith('/manifest.js')
+                    ? 'manifest.js'
+                    : 'listening-index.compat.js';
+                const targetPath = path.join(repoRoot, 'assets', 'generated', 'listening-exams', assetName);
+                res.setHeader('Cache-Control', 'private, no-store');
+                return res.sendFile(targetPath, { dotfiles: 'deny' }, (error) => {
+                    if (error) next(error);
+                });
+            }
+
+            if (target.kind === 'private-nested') {
+                const privateNestedRoot = path.join(
+                    repoRoot,
+                    'ListeningPractice',
+                    'vip special',
+                    'ListeningPractice'
+                );
+                return sendContainedPrivateListeningFile(
+                    res,
+                    privateNestedRoot,
+                    target.relativePath,
+                    next
+                );
+            }
+
+            if (!publicListeningFrontend) {
+                return sendPublicListeningUnavailable(res);
+            }
+            if (!publicListeningFrontend.hasShellFile(target.relativePath)) {
+                return res.status(404).type('text/plain').send('Not found');
+            }
+            res.setHeader('Content-Security-Policy', PUBLIC_LISTENING_CSP);
+            return publicListeningFrontend.sendShellFile(target.relativePath, res)
+                || sendPublicListeningUnavailable(res);
         });
     });
 
@@ -1795,6 +1988,9 @@ function createApp(options = {}) {
 
     app.get(['/practice/listening/:examId', '/practice/listening/:examId/'], (req, res, next) => {
         try {
+            if (productionMode && !publicListeningFrontend) {
+                return sendPublicListeningUnavailable(res);
+            }
             const target = resolveListeningExam(req.params.examId);
             if (!target) {
                 return sendNotFoundPage(res, {
