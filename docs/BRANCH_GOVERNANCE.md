@@ -2,7 +2,7 @@
 
 This is the canonical subject document for branch roles, integration topology,
 and baseline refresh. It records the established persistent-domain architecture
-and defines policy for a future preview channel and local workspaces. Policy
+and defines policy for the active preview channel and local workspaces. Policy
 definition does not activate a remote ref, configure protection, implement
 automation, create a workspace, or authorize deployment.
 [CONTRIBUTING.md](../CONTRIBUTING.md) remains the public contribution entry
@@ -28,7 +28,7 @@ remote branch establishes active authority.
 
 ### Long-lived non-authoritative channels
 
-`LONG_LIVED_NON_AUTHORITATIVE_CHANNEL` is a separate ref class. The planned
+`LONG_LIVED_NON_AUTHORITATIVE_CHANNEL` is a separate ref class. The active
 `deploy/preview` belongs to this class; it is not a fifth peer subject domain,
 a development authority, a canonical branch, or a production branch. A
 long-lived channel does not increase the six-branch authority count.
@@ -165,12 +165,12 @@ from preview, main promotion, and deployment.
 Issue #64 remains open with cross-domain convergence pending. This amendment
 does not modify or reclassify the issue, integrate Security or Docs into dev,
 create an integration candidate, or close the obligation. Convergence will be
-replanned after governance amendment acceptance, using the validation and
+replanned under separate authority, using the validation and
 technical atomicity threshold above.
 
-## Future experimental preview channel
+## Experimental preview channel
 
-The planned channel has this policy definition:
+The active channel has this policy definition:
 
 ```yaml
 branch: deploy/preview
@@ -179,11 +179,12 @@ role: LONG_LIVED_NON_AUTHORITATIVE_EXPERIMENTAL_DEPLOYMENT_CHANNEL
 development_authority: none
 subject_authority: none
 production_authority: false
-activation: NOT_YET_PERFORMED
+activation: COMPLETE
 ```
 
-The remote ref has not been created. Its future protection and activation are
-separately governed. The only normal source is an eligible exact
+The protected remote ref is active, and the Preview Deployment Channel
+ruleset is configured and active. Remote topology activation is complete;
+it does not constitute deployment. The only normal source is an eligible exact
 `dev/current-mainline` SHA:
 
 ```text
@@ -213,8 +214,8 @@ authorize deployment.
 
 ### Persistent local preview workspace
 
-After remote activation, `deploy/preview` will have a persistent local
-workspace with role `PERSISTENT_DEPLOYMENT_WORKSPACE`. It serves deployment,
+`deploy/preview` has a persistent local workspace with role
+`PERSISTENT_DEPLOYMENT_WORKSPACE`. It serves deployment,
 not development. The workspace tracks only `origin/deploy/preview`. Its normal
 synchronization is:
 
@@ -310,7 +311,7 @@ belongs to `ci/master`; repository configuration remains separately governed.
 
 ## Local persistent workspace policy
 
-The intended logical topology is:
+The accepted logical topology is:
 
 | Workspace | Role |
 | --- | --- |
@@ -323,9 +324,9 @@ The intended logical topology is:
 | `security` | `PERSISTENT_DOMAIN_WORKSPACE` |
 | `preview` | `PERSISTENT_DEPLOYMENT_WORKSPACE` |
 
-This is a conceptual topology, not a claim that local normalization or the
-preview workspace has been created. Local workspace normalization is
-separately governed.
+The eight-role local topology has been normalized and accepted. Historical
+and noncanonical workspaces remain preserved outside the canonical operational
+layer. Local workspace normalization remains separately governed.
 
 Before new domain work, synchronize the persistent domain workspace:
 
@@ -357,7 +358,7 @@ These operations must not be conflated. In particular,
 
 Other existing refs may be temporary, historical, retained, salvage sources,
 manual-review holds, or deletion candidates. These are distinct from the
-planned long-lived non-authoritative channel class. Their existence does not
+long-lived non-authoritative channel class. Their existence does not
 establish present contribution authority.
 A prefix alone establishes no active authority; use this document and the
 relevant issue or maintainer authority instead of inferring a target from a
@@ -404,19 +405,23 @@ future preview or refresh workflow already exists.
 Branch role does not grant release or deployment authority. Neither `main`,
 `dev/current-mainline`, nor any domain head by itself authorizes production
 deployment, release publication, or Hosted Service operation. Those actions
-require separate authority and acceptance. The future experimental preview
-channel grants no production authority; its remote activation and every
-deployment require separately governed work.
+require separate authority and acceptance. The experimental preview
+channel grants no production authority. Its remote activation was separately
+governed and is complete; every deployment still requires separately governed
+work.
 
 ## Separately governed follow-up sequence
 
-After this amendment receives Documentation-domain acceptance, later work is
-ordered as follows, each under its own authority:
+The separately governed follow-up sequence retains this order, each step
+under its own authority. Steps 1–2 are complete and accepted; steps 3–5
+remain pending:
 
-1. `REMOTE_PERSISTENT_TOPOLOGY_COMPLETION`: create `deploy/preview`, establish
-   protection, and validate its non-authority role.
-2. `LOCAL_PERSISTENT_WORKSPACE_NORMALIZATION`: establish the intended control,
-   main, dev, docs, UI, CI, Security, and preview workspace topology.
+1. `REMOTE_PERSISTENT_TOPOLOGY_COMPLETION`: **COMPLETE / ACCEPTED**.
+   `deploy/preview` was created and protected, and its non-authority role was
+   validated.
+2. `LOCAL_PERSISTENT_WORKSPACE_NORMALIZATION`: **COMPLETE / ACCEPTED**.
+   The control, main, dev, docs, UI, CI, Security, and preview workspace topology
+   was normalized and accepted.
 3. `ISSUE_64_SEQUENTIAL_DEV_CONVERGENCE_REPLAN`: replan convergence under the
    partial-integration and blocking-obligation model.
 4. `AUTOMATION_IMPLEMENTATION`: implement conditional main-to-domain refresh

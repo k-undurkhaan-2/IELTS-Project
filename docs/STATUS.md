@@ -61,32 +61,45 @@ The policy and implementation states are distinct:
 ```yaml
 persistent_authority_branches:
   active: 6
+
 peer_subject_domains: 4
+
 deploy_preview:
   governance_defined: true
-  remote_ref_created: false
-  ruleset_configured: false
-  local_workspace_created: false
+  remote_ref_created: true
+  ruleset_configured: true
+  local_workspace_created: true
+
 automatic_main_to_domain_refresh:
   policy_defined: true
   workflow_implemented: false
+
 local_workspace_normalization:
-  implemented: false
+  implemented: true
+  accepted: true
 ```
 
-The planned `deploy/preview` is a
+The active, protected `deploy/preview` is a
 `LONG_LIVED_NON_AUTHORITATIVE_EXPERIMENTAL_DEPLOYMENT_CHANNEL`, not an additional
 subject domain or a production authority. Only an eligible exact dev SHA may
 be promoted there under separate authority. Canonical source promotion stays
 `domain -> dev/current-mainline -> main`; preview is a side deployment channel.
 
-After remote activation, preview will require a persistent deployment
-workspace tracking only `origin/deploy/preview`. Tracked-source development
+[Remote topology activation was accepted at the exact dev SHA selected for
+activation, with the Preview Deployment Channel ruleset configured and active.](https://github.com/k-undurkhaan-2/IELTS-Project/issues/70#issuecomment-6019692423)
+
+Preview has a persistent local workspace with role
+`PERSISTENT_DEPLOYMENT_WORKSPACE`, tracking only `origin/deploy/preview`.
+Tracked-source development
 mutations and commits are prohibited there. Deployment runtime writes are
 allowed when excluded from tracked source, including ignored or external
 outputs, caches, logs, packages, receipts, and Docker exports. Deployment
-secrets must not become Git-tracked content. The workspace and deployment
-workflow have not been created by this amendment.
+secrets must not become Git-tracked content.
+
+Preview promotion and deployment automation remain unimplemented. Remote
+channel activation and local workspace creation do not constitute deployment.
+Deployment remains unauthorized and has not started or been performed; hosting
+has not been configured or started.
 
 Canonical persistent-domain refresh uses `main`. Future automation requires
 an accepted main state, a domain head that is an ancestor of main, no open PR
@@ -99,9 +112,11 @@ prohibited; an exceptional baseline dependency requires explicit authority.
 Before new domain work, local policy requires fetch plus fast-forward-only
 synchronization, `HEAD == origin/<persistent-domain>`, and a clean working tree.
 A failed fast-forward requires STOP and explicit reconciliation, with no
-automatic merge, rebase, hard reset, or discarded commits. The intended
-control/main/dev/docs/UI/CI/Security/preview topology is policy only; local
-normalization has not been implemented.
+automatic merge, rebase, hard reset, or discarded commits. The eight-role local
+topology has been normalized and accepted under
+`IELTMPS-LOCAL-PERSISTENT-WORKSPACE-NORMALIZATION-ACCEPTANCE-R1`.
+Historical and noncanonical workspaces remain preserved outside the canonical
+operational layer.
 
 Future preview and refresh CI implementation is `CI_DOMAIN_FOLLOWUP` under
 `ci/master`. Existing CI policy and workflows remain unchanged. Repository
@@ -121,8 +136,8 @@ atomic branch was never created and the integration remains unexecuted.
 The changed interpretation permits validated partial dev integration with
 explicit blocking obligations. This amendment does not modify, close, or
 reclassify Issue #64, integrate either domain, create an integration candidate,
-or authorize deployment or main promotion. Convergence will be replanned after
-amendment acceptance. The [separately governed follow-up sequence](BRANCH_GOVERNANCE.md#separately-governed-follow-up-sequence)
+or authorize deployment or main promotion. Convergence will be replanned under
+separate authority. The [separately governed follow-up sequence](BRANCH_GOVERNANCE.md#separately-governed-follow-up-sequence)
 does not start automatically.
 
 ## Available capabilities
