@@ -4397,6 +4397,42 @@ class WorkflowPolicyTest(unittest.TestCase):
                         for error in errors),
                     errors,
                 )
+        python_jobs = (
+            "repository-policy-producer", "ubuntu-canonical-producer",
+            "windows-compatibility-producer", "repository-policy",
+            "ubuntu-canonical", "windows-compatibility",
+        )
+        parsed_jobs = ci.parse_canonical_workflow_yaml(self.workflow)["jobs"]
+        actual_python = {
+            job: [step.get("with") for step in details["steps"]
+                  if step.get("name") == "Set up Python"]
+            for job, details in parsed_jobs.items() if job != "final-result"
+        }
+        self.assertEqual(actual_python, {
+            job: [{"python-version": "3.12.10"}] for job in python_jobs
+        })
+        exact_python_selector = 'python-version: "3.12.10"'
+        python_selectors = list(re.finditer(re.escape(exact_python_selector), self.workflow))
+        self.assertEqual(len(python_selectors), 6)
+        for job, selector in zip(python_jobs, python_selectors):
+            for rejected in ("3.12", "3.12.9", "3.12.11", "3.12.14", "3.12.15", "3.12.16", "3.12.*",
+                             ">=3.12", "~3.12.10", "3.x", "*"):
+                with self.subTest(python_job=job, selector=rejected):
+                    candidate = (
+                        self.workflow[:selector.start()]
+                        + f'python-version: "{rejected}"'
+                        + self.workflow[selector.end():]
+                    )
+                    self.assertEqual(ci.check_workflow_text(candidate),
+                                     [f"{job} Python setup is not exact"])
+        for rejected in ("3.12", "3.12.9", "3.12.11", "3.12.14", "3.12.15", "3.12.*", ">=3.12"):
+            with self.subTest(all_python_selectors=rejected):
+                candidate = self.workflow.replace(
+                    exact_python_selector, f'python-version: "{rejected}"'
+                )
+                self.assertEqual(ci.check_workflow_text(candidate), sorted(
+                    f"{job} Python setup is not exact" for job in python_jobs
+                ))
         exact_node_selector = 'node-version: "24.20.0"'
         selectors = list(re.finditer(re.escape(exact_node_selector), self.workflow))
         self.assertEqual(len(selectors), 6)
