@@ -62,29 +62,63 @@ slow or failing rebuild instead of using the already loaded image.
 
 ## Listening Runtime Assets
 
-The business UI depends on generated Listening runtime assets at:
+### Public Listening Image Assets
+
+The business UI depends on public generated Listening assets at:
 
 - `assets/generated/listening-exams/manifest.js`
 - `assets/generated/listening-exams/listening-index.compat.js`
 - `assets/generated/listening-exams/listening-practice-unified.html`
-- `ListeningPractice/`
 
-Production app-image builds must include those files and directories. Do not
+Production app-image builds must include these public generated files. Do not
 stage deployment sources from Git-tracked files only unless the generated
 Listening index files are present in that staged source. If they are omitted,
 the app can remain healthy while the business Listening entry disappears.
 
-Before recreating `app`, verify the app image contains the generated Listening
-index files:
+Accepted Security U03 excludes the private `ListeningPractice/` and
+`ReadingPractice/` roots from application image construction. These roots are
+not the public generated assets above; this runbook documents that accepted
+boundary and does not enforce the exclusion itself.
+
+Before recreating `app`, validate the public generated files in the standalone
+app image without any private runtime bind:
 
 ```sh
-docker run --rm --entrypoint sh backend-app:latest -lc '
+docker run --rm --entrypoint sh backend-app:latest -ec '
   test -s /app/assets/generated/listening-exams/manifest.js
   test -s /app/assets/generated/listening-exams/listening-index.compat.js
   test -s /app/assets/generated/listening-exams/listening-practice-unified.html
-  test -d /app/ListeningPractice
 '
 ```
+
+### Private Listening Runtime Resources
+
+When `app` runs under the Compose configuration with the existing bind in
+[docker-compose.yml](docker-compose.yml), `/app/ListeningPractice` is supplied
+externally by the host bind mount, rather than by the image:
+
+```yaml
+source: ../ListeningPractice
+target: /app/ListeningPractice
+read_only: true
+bind:
+  create_host_path: false
+```
+
+The host source must already exist before Compose starts or recreates `app`.
+`create_host_path: false` prevents Compose from creating a missing host source;
+`read_only: true` makes the mounted resource read-only inside the container.
+
+U02 remains `DEFERRED_DEPENDENCY`, and `PRIVATE_OVERLAY_READINESS_ACCEPTANCE`
+remains `UNRESOLVED`. These existing bind facts do not define private resource
+manifests, authorization receipts, version compatibility, delivery, rollback,
+or a full runtime readiness contract. A Reading runtime mount or deployment
+process remains unresolved and is outside Issue #64 scope.
+
+As stated in [Branch governance](../docs/BRANCH_GOVERNANCE.md#release-and-deployment-boundary),
+branch role does not grant release or deployment authority. These checks do
+not establish production readiness or authorize deployment or Hosted Service
+launch.
 
 After recreating `app`, verify the public generated index endpoints return
 `200` and that protected Listening practice content still requires auth:
