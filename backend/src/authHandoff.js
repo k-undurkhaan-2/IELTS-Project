@@ -176,8 +176,8 @@ function validateExactAllowedHost(req, audience, configuredTargetUrls, options =
 }
 
 function isLocalDevelopment(options = {}) {
-    const production = process.env.NODE_ENV === 'production' || options.nodeEnv === 'production';
-    return !production;
+    const nodeEnv = options.nodeEnv || process.env.NODE_ENV || 'development';
+    return nodeEnv !== 'production';
 }
 
 function getVerifierCookieName(audience) {

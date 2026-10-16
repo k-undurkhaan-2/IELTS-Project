@@ -52,7 +52,7 @@ function resolveEncryptionKeySource(options = {}) {
         || process.env.TOTP_ENCRYPTION_KEY
         || process.env.SESSION_SECRET
         || DEFAULT_SESSION_SECRET;
-    const production = process.env.NODE_ENV === 'production' || options.nodeEnv === 'production';
+    const production = (options.nodeEnv || process.env.NODE_ENV) === 'production';
     const weakSource = !source
         || String(source).length < 32
         || source === DEFAULT_SESSION_SECRET

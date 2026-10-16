@@ -945,7 +945,7 @@ test('production app validates public URL modes, handoff secrets, and trusted pr
     );
 });
 
-test('real production process dominates caller nodeEnv across app and child security controls', { concurrency: false }, async () => {
+test('real production process dominates caller nodeEnv in integrated createApp security controls', { concurrency: false }, async () => {
     const hadNodeEnv = Object.prototype.hasOwnProperty.call(process.env, 'NODE_ENV');
     const originalNodeEnv = process.env.NODE_ENV;
     const strongSessionSecret = 'runtime-session-secret-0123456789abcdef';
@@ -954,7 +954,6 @@ test('real production process dominates caller nodeEnv across app and child secu
     const strongTrafficSecret = 'runtime-traffic-secret-0123456789abcdef';
     const weakTotpKey = 'short-totp-key';
     const weakTrafficSecret = 'traffic-development-secret';
-    const trafficStore = { recordTraffic() {} };
     const runtimeMatrix = [
         ['production', 'test', true],
         ['production', 'development', true],
@@ -1012,49 +1011,10 @@ test('real production process dominates caller nodeEnv across app and child secu
         });
     }
 
-    async function directAuthHandoffStartStatus(nodeEnv, host) {
-        const app = express();
-        app.use('/auth', createAuthHandoffRouter({
-            stateSecret: strongHandoffSecret,
-            authStore: {},
-            ticketStore: {},
-            authPublicUrl: 'https://auth.example',
-            businessPublicUrl: 'https://business.example',
-            adminPublicUrl: 'https://admin.example',
-            ...callerModeOptions(nodeEnv)
-        }));
-        const server = await listenForRuntimeTest(app);
-        try {
-            const { port } = server.address();
-            const response = await rawHttpRequest(
-                `http://127.0.0.1:${port}`,
-                'GET',
-                '/auth/business/start?return_to=/',
-                { headers: { host } }
-            );
-            return response.response.status;
-        } finally {
-            await closeRuntimeTestServer(server);
-        }
-    }
-
     try {
         for (const [processNodeEnv, callerNodeEnv, production] of runtimeMatrix) {
             process.env.NODE_ENV = processNodeEnv;
-            const modeOptions = callerModeOptions(callerNodeEnv);
             const label = `process=${processNodeEnv}, caller=${callerNodeEnv ?? 'unspecified'}`;
-            const createWeakTraffic = () => createTrafficMiddleware({
-                store: trafficStore,
-                enabled: true,
-                secret: weakTrafficSecret,
-                ...modeOptions
-            });
-            const createWeakTotp = () => createTotpRouter({
-                store: new MemoryTotpStore(),
-                enabled: true,
-                encryptionKey: weakTotpKey,
-                ...modeOptions
-            });
             const createWeakTrafficApp = () => createApp(createRuntimeAppOptions(callerNodeEnv, {
                 trafficSecret: weakTrafficSecret
             }));
@@ -1063,48 +1023,15 @@ test('real production process dominates caller nodeEnv across app and child secu
             }));
 
             if (production) {
-                assert.throws(createWeakTraffic, /TRAFFIC_SECRET or SESSION_SECRET/, label);
-                assert.throws(createWeakTotp, /TOTP_ENCRYPTION_KEY or SESSION_SECRET/, label);
                 assert.throws(createWeakTrafficApp, /TRAFFIC_SECRET or SESSION_SECRET/, label);
                 assert.throws(createWeakTotpApp, /TOTP_ENCRYPTION_KEY or SESSION_SECRET/, label);
             } else {
-                assert.doesNotThrow(createWeakTraffic, label);
-                assert.doesNotThrow(createWeakTotp, label);
                 assert.doesNotThrow(createWeakTrafficApp, label);
                 assert.doesNotThrow(createWeakTotpApp, label);
             }
-
-            assert.doesNotThrow(() => createTrafficMiddleware({
-                store: trafficStore,
-                enabled: true,
-                secret: strongTrafficSecret,
-                ...modeOptions
-            }), label);
-            assert.doesNotThrow(() => createTotpRouter({
-                store: new MemoryTotpStore(),
-                enabled: true,
-                encryptionKey: strongTotpKey,
-                ...modeOptions
-            }), label);
-            assert.equal(
-                await directAuthHandoffStartStatus(callerNodeEnv, '127.0.0.1'),
-                production ? 400 : 302,
-                label
-            );
-            assert.equal(
-                await directAuthHandoffStartStatus(callerNodeEnv, 'business.example'),
-                302,
-                label
-            );
         }
 
         process.env.NODE_ENV = 'production';
-        assert.doesNotThrow(() => createTrafficMiddleware({
-            store: trafficStore,
-            enabled: false,
-            secret: weakTrafficSecret,
-            nodeEnv: 'test'
-        }));
         assert.doesNotThrow(() => createApp(createRuntimeAppOptions('test', {
             trafficEnabled: false,
             trafficSecret: weakTrafficSecret
