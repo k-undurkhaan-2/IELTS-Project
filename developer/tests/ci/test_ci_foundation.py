@@ -27,6 +27,7 @@ import unittest
 import unicodedata
 import uuid
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -276,6 +277,575 @@ def _resolved_local_test_authority(
             f"TEST-TOOL-AUTHORITY-UNAVAILABLE: {type(exc).__name__}: {exc}"
         ) from exc
     return policy, authoritative
+
+
+@dataclass(frozen=True)
+class _R2SourceInventoryProfile:
+    name: str
+    authority_commit: str
+    authority_tree: str
+    tree_manifest_sha256: str
+    # A1 binds the complete three-blob R3 replacement set in the same inventory.
+    a1_integrated_tree_manifest_sha256: str
+    path_count: int
+    serialized_bytes: int
+    sorted_path_sha256: str
+    javascript_path_count: int
+    static_command_count: int
+    all_command_count: int
+    target_reference_count: int
+    static_insertions: tuple[tuple[int, str], ...]
+    all_insertions: tuple[tuple[int, str], ...]
+    late_all_ordinals: tuple[tuple[str, int], ...]
+
+
+_R2_ADDED_JAVASCRIPT_PATHS = (
+    "backend/src/publicListeningFrontend.js",
+    "backend/test/publicListeningFrontend.test.js",
+)
+_R2_AUTHORIZED_MUTABLE_PATH = "developer/tests/ci/test_ci_foundation.py"
+_R2_MUTABLE_OBJECT_SENTINEL = "AUTHORIZED-TEST-CONTENT"
+_R2_ADDED_COMMAND_IDS = tuple(
+    f"node-check:{relative}" for relative in _R2_ADDED_JAVASCRIPT_PATHS
+)
+_R2_ORDINARY_PROFILE = _R2SourceInventoryProfile(
+    name="ordinary-ci",
+    authority_commit="c685981e1108e827db5631a52c00f6a42c76f6e7",
+    authority_tree="b76786aec92ddd202f86ffa132eded709fd52a5a",
+    tree_manifest_sha256=(
+        "90f1f395d496430ff82e0707d73b885c6ef55ceeda15c3603f2afe0e2f3af92c"
+    ),
+    a1_integrated_tree_manifest_sha256=(
+        "a3b8feff145885570a0efdfcbd8570922189e6b17c51f8987bc9fafcea04e4da"
+    ),
+    path_count=914,
+    serialized_bytes=40_446,
+    sorted_path_sha256=(
+        "ea143c283e5b8b28098505a303530d0fc9c0c2731273f5bde84d00d5022c52aa"
+    ),
+    javascript_path_count=669,
+    static_command_count=677,
+    all_command_count=705,
+    target_reference_count=19_940,
+    static_insertions=(),
+    all_insertions=(),
+    late_all_ordinals=(
+        ("frontend-security:vocabSessionExportGuard.test.js", 699),
+        ("frontend-security:messageOriginGuard.test.js", 700),
+        ("backend-canonical", 701),
+        ("standalone-packaging", 702),
+        ("standalone-membership-audit", 703),
+        ("lockfile-integrity", 704),
+    ),
+)
+_R2_SECURITY_PROFILE = _R2SourceInventoryProfile(
+    name="security-candidate",
+    authority_commit="f34cb368568a4b6db5c4758f6c9235ef8a3a98b7",
+    authority_tree="604e9b1fbd7387239c83fd18d3e1114f30ae6e93",
+    tree_manifest_sha256=(
+        "d799a0d0d49633157cf074bc27df0593e4d0338136d066f76f278ff501cf0688"
+    ),
+    a1_integrated_tree_manifest_sha256=(
+        "0ceef47379c22e6630ccaabd5a7b027bac418364980da30846f6169da116ad94"
+    ),
+    path_count=916,
+    serialized_bytes=40_530,
+    sorted_path_sha256=(
+        "5b9401b4afa1b964ebd2887ec023c247a605d4faad6532de6cc168720f70c786"
+    ),
+    javascript_path_count=671,
+    static_command_count=679,
+    all_command_count=707,
+    target_reference_count=19_986,
+    static_insertions=(
+        (443, _R2_ADDED_COMMAND_IDS[0]),
+        (447, _R2_ADDED_COMMAND_IDS[1]),
+    ),
+    all_insertions=(
+        (452, _R2_ADDED_COMMAND_IDS[0]),
+        (456, _R2_ADDED_COMMAND_IDS[1]),
+    ),
+    late_all_ordinals=(
+        ("frontend-security:vocabSessionExportGuard.test.js", 701),
+        ("frontend-security:messageOriginGuard.test.js", 702),
+        ("backend-canonical", 703),
+        ("standalone-packaging", 704),
+        ("standalone-membership-audit", 705),
+        ("lockfile-integrity", 706),
+    ),
+)
+_R2_PROFILES_BY_IDENTITY = {
+    (profile.path_count, profile.sorted_path_sha256): profile
+    for profile in (_R2_ORDINARY_PROFILE, _R2_SECURITY_PROFILE)
+}
+_R2_ORDINARY_CONTENT_AUTHORITY = {
+    ".github/workflows/ci.yml": {
+        "gitBlob": "e98fdf32109f2cabb9fc9933e74ea7cfb8d9cd4c",
+        "size": 15_653,
+        "sha256": "c406e7277affaa37a9debf7782572e39078e81156295bdb19c8c7037d41e9fbf",
+    },
+    ".dockerignore": {
+        "gitBlob": "e2e156be6cf46a4dd20185d08391452f142f13a9",
+        "size": 802,
+        "sha256": "42e9a1e038e984a375941b3c136084da54214839436c24e92b2fdc0db0a483c1",
+    },
+    "backend/Dockerfile": {
+        "gitBlob": "dda70a01f25e74a29817a84058de11902171d41f",
+        "size": 650,
+        "sha256": "cafe138ab6d039b64a795f219d39b107fa02ac4f2db6c7a3e84ff9a86743d839",
+    },
+    "backend/src/app.js": {
+        "gitBlob": "ef6e3fa4e3e173103becdcbe3752c19548f24510",
+        "size": 73_536,
+        "sha256": "bcd46ce8d4fe5f85257b981c7d1d5714786e9550a3a24faf865a3ba3272fd07a",
+    },
+    "backend/test/backend.test.js": {
+        "gitBlob": "a6e8a7c32bb04faaa78ac297491098c4cadcc21d",
+        "size": 394_035,
+        "sha256": "15a720a948ca8b9be241e2e5e9b28f25f188f3bb301a712f8cc1c62b565078b2",
+    },
+    "developer/tests/ci/run_ci_foundation.py": {
+        "gitBlob": "d2426776b792187bb9eb472a913d2a667768fbd1",
+        "size": 1_129_796,
+        "sha256": "b90f01ff03a3dd624e74ed9ff04d07dfe5e469cdbf2f2340fe4859820bc82c88",
+    },
+    "docs/CI_POLICY.md": {
+        "gitBlob": "96ed26437ad47c1cb6a136ae9c68b738c51906a5",
+        "size": 97_576,
+        "sha256": "ed2552da3e9f06089e217d8388b12a8de7d0d1d846f851e1c6ef79dd0185eddb",
+    },
+}
+_R2_SECURITY_CONTENT_DELTA = {
+    ".github/workflows/ci.yml": {
+        "gitBlob": "5c33bcaddd6426522d210231659ed4e034deebfb",
+        "size": 15_635,
+        "sha256": "5f75af5ed06ff08e1804cfb04079eeefd3bdddb7e3561dc60856ca5df349efe9",
+    },
+    ".dockerignore": {
+        "gitBlob": "fa4ee4513d0e30df9316c81fcf0a71086a4a4c31",
+        "size": 878,
+        "sha256": "48ccfae71420aed53ac179a546dbd42c458697c496423a2714b760be5f08d39a",
+    },
+    "backend/Dockerfile": {
+        "gitBlob": "3cda28fa6fe82476f6b4750b282075b36f1d771c",
+        "size": 1_222,
+        "sha256": "be87830d91db221b19de4a67c67b953ba6ee111c29372e87c7e6397415d1c825",
+    },
+    "backend/src/app.js": {
+        "gitBlob": "922d050fce4a68b1af51168ff9c6b69773bb7b12",
+        "size": 81_856,
+        "sha256": "69a8947b2785ca73b2d31852da35e0e247af6197764426a408a805581b0e036f",
+    },
+    "backend/src/publicListeningFrontend.js": {
+        "gitBlob": "cea74d6be9f75884e15815d64e9061ec369a745f",
+        "size": 35_922,
+        "sha256": "7f9e8b30341108af540d0694908411e12bdeaea0135af468856a2b3ee0f459e4",
+    },
+    "backend/test/backend.test.js": {
+        "gitBlob": "1692e8f51d2d537d8776931003cd3e46b1bfcdc3",
+        "size": 410_758,
+        "sha256": "787d7c6763736960f7013b17161f2fc4445b2005a1d6c8b3ca04eb4cf13558ca",
+    },
+    "backend/test/publicListeningFrontend.test.js": {
+        "gitBlob": "5de1f890058c4016a55857eb932ad5096bbfac5f",
+        "size": 34_349,
+        "sha256": "6aab71707f520837fbfce399414fe3f08be0e130988aa2bf52bd6033e6676bab",
+    },
+    "developer/tests/ci/run_ci_foundation.py": {
+        "gitBlob": "1749f23e1e2b84f8561634ce7656c9c62c37a394",
+        "size": 1_129_794,
+        "sha256": "88f082a95496b4ce0cd86d9cf72082b7935b08cce58e3731deb7ed55fb1de707",
+    },
+    "docs/CI_POLICY.md": {
+        "gitBlob": "e59f01e8d08066a4c94f307fa28245ba77475430",
+        "size": 96_847,
+        "sha256": "9de82f8ba4b2ab6a7718eff9d7514d86f2a4c77998021d3e295343be904558dc",
+    },
+}
+_R2_STATIC_COMMAND_PREFIX = (
+    "baseline-schema",
+    "node-version",
+    "npm-version",
+    "git-bash-version",
+    "static-suite",
+    "git-candidate-paths",
+)
+_R2_STATIC_COMMAND_SUFFIX = (
+    "python-source-syntax",
+    "lockfile-integrity",
+)
+_R2_ALL_COMMAND_PREFIX = (
+    "baseline-schema",
+    "node-version",
+    "npm-version",
+    "git-bash-version",
+    "git-candidate-paths",
+    "git-tracked-paths",
+    "git-diff-check",
+    "git-cached-diff-check",
+    "git-stage-modes",
+    "git-dir",
+    "tracked-private-resource-scan",
+    "tracked-secret-scan",
+    "license-governance-consistency",
+    "workflow-self-policy",
+    "static-suite",
+)
+_R2_ALL_COMMAND_SUFFIX = (
+    "python-source-syntax",
+    "bundle-normalization",
+    "learner-focused",
+    "frontend-security:adminFrontendGuard.test.js",
+    "frontend-security:appActionsExportGuard.test.js",
+    "frontend-security:dataManagementPanel.test.js",
+    "frontend-security:examActionsExportGuard.test.js",
+    "frontend-security:examSessionReplayCloneGuard.test.js",
+    "frontend-security:localDataRenderingGuard.test.js",
+    "frontend-security:practiceRecordExportServerGuard.test.js",
+    "frontend-security:privacyLoggingGuard.test.js",
+    "frontend-security:remotePracticeDataSource.test.js",
+    "frontend-security:resourceCoreProbeBypassGuard.test.js",
+    "frontend-security:secureIdentifierGuard.test.js",
+    "frontend-security:suiteBackGuardSecurity.test.js",
+    "frontend-security:vocabSessionExportGuard.test.js",
+    "frontend-security:messageOriginGuard.test.js",
+    "backend-canonical",
+    "standalone-packaging",
+    "standalone-membership-audit",
+    "lockfile-integrity",
+)
+_R2_CANDIDATE_WIDE_COMMAND_IDS = frozenset({
+    "tracked-private-resource-scan",
+    "tracked-secret-scan",
+    "static-suite",
+    "bundle-normalization",
+    "learner-focused",
+    "frontend-security:adminFrontendGuard.test.js",
+    "frontend-security:appActionsExportGuard.test.js",
+    "frontend-security:dataManagementPanel.test.js",
+    "frontend-security:examActionsExportGuard.test.js",
+    "frontend-security:examSessionReplayCloneGuard.test.js",
+    "frontend-security:localDataRenderingGuard.test.js",
+    "frontend-security:practiceRecordExportServerGuard.test.js",
+    "frontend-security:privacyLoggingGuard.test.js",
+    "frontend-security:remotePracticeDataSource.test.js",
+    "frontend-security:resourceCoreProbeBypassGuard.test.js",
+    "frontend-security:secureIdentifierGuard.test.js",
+    "frontend-security:suiteBackGuardSecurity.test.js",
+    "frontend-security:vocabSessionExportGuard.test.js",
+    "frontend-security:messageOriginGuard.test.js",
+    "backend-canonical",
+    "standalone-packaging",
+})
+
+
+def _r2_inventory_identity(
+    candidate_paths: object,
+) -> tuple[tuple[str, ...], int, str, int]:
+    if not isinstance(candidate_paths, (list, tuple)):
+        raise AssertionError("R2 source inventory must be an ordered path sequence")
+    paths = tuple(candidate_paths)
+    if any(type(relative) is not str for relative in paths):
+        raise AssertionError("R2 source inventory paths must be strings")
+    if len(paths) != len(set(paths)):
+        raise AssertionError("R2 source inventory contains duplicate paths")
+    if paths != tuple(sorted(paths)):
+        raise AssertionError("R2 source inventory is not Python-code-point sorted")
+    for relative in paths:
+        if (
+            not relative
+            or relative.startswith(("/", "\\"))
+            or "\\" in relative
+            or any(ord(character) < 32 or ord(character) == 127 for character in relative)
+            or any(part in {"", ".", ".."} for part in relative.split("/"))
+            or Path(relative).is_absolute()
+        ):
+            raise AssertionError("R2 source inventory contains an unsafe path")
+    serialized = ("\n".join(paths) + "\n").encode("utf-8")
+    javascript_count = sum(
+        Path(relative).suffix.casefold() in {".js", ".mjs"}
+        for relative in paths
+    )
+    return paths, len(serialized), hashlib.sha256(serialized).hexdigest(), javascript_count
+
+
+def _r2_profile_for_paths(candidate_paths: object) -> _R2SourceInventoryProfile:
+    paths, serialized_bytes, digest, javascript_count = _r2_inventory_identity(
+        candidate_paths
+    )
+    profile = _R2_PROFILES_BY_IDENTITY.get((len(paths), digest))
+    if profile is None:
+        raise AssertionError("R2 source inventory identity is not authorized")
+    if (
+        serialized_bytes != profile.serialized_bytes
+        or javascript_count != profile.javascript_path_count
+    ):
+        raise AssertionError("R2 source inventory metadata does not match its authority")
+    additions = tuple(relative in paths for relative in _R2_ADDED_JAVASCRIPT_PATHS)
+    expected_additions = (
+        (False, False) if profile is _R2_ORDINARY_PROFILE else (True, True)
+    )
+    if additions != expected_additions:
+        raise AssertionError("R2 source inventory has a partial or mixed protected delta")
+    return profile
+
+
+def _r2_bounded_git(
+    repo_root: Path,
+    *arguments: str,
+) -> ci.CommandCapture:
+    policy, tools = _resolved_local_test_authority("git")
+    source_environment = _explicit_local_test_environment()
+    environment = ci.child_process_environment(
+        tools,
+        source_environment=source_environment,
+        repo_root=repo_root,
+        policy=policy,
+    )
+    resolved_root = repo_root.resolve(strict=True)
+    capture = ci.execute_command(
+        "r2-source-inventory",
+        "test-source-authority",
+        (
+            tools["git"],
+            "-c",
+            f"safe.directory={resolved_root}",
+            "-c",
+            "core.quotePath=false",
+            "-C",
+            str(resolved_root),
+            *arguments,
+        ),
+        timeout=60,
+        cwd=resolved_root,
+        env=environment,
+        include_preview=False,
+        max_stdout_bytes=ci.MAX_STATIC_MACHINE_STDOUT_BYTES,
+        max_stderr_bytes=ci.MAX_STDERR_BYTES,
+    )
+    if not capture.execution_passed() or capture.stderr_raw not in {b"", None}:
+        raise AssertionError("trusted Git could not enumerate the immutable HEAD tree")
+    return capture
+
+
+def _r2_git_head_inventory(
+    repo_root: Path = ci.REPO_ROOT,
+) -> tuple[str, str, tuple[str, ...], dict[str, tuple[str, str, str]]]:
+    identity_capture = _r2_bounded_git(
+        repo_root,
+        "rev-parse",
+        "HEAD^{commit}",
+        "HEAD^{tree}",
+    )
+    identity_output = identity_capture.stdout_raw or b""
+    if not identity_output.endswith(b"\n") or b"\r" in identity_output:
+        raise AssertionError("trusted Git returned malformed R2 identity framing")
+    identity_lines = identity_output.decode("ascii", errors="strict").splitlines()
+    if (
+        len(identity_lines) != 2
+        or any(not re.fullmatch(r"[0-9a-f]{40}", value) for value in identity_lines)
+    ):
+        raise AssertionError("trusted Git returned malformed R2 object identities")
+    completed = _r2_bounded_git(
+        repo_root,
+        "ls-tree",
+        "-r",
+        "-z",
+        "--format=%(objectmode)%x09%(objecttype)%x09%(objectname)%x09%(path)",
+        identity_lines[0],
+    )
+    tree_output = completed.stdout_raw or b""
+    if (
+        not tree_output
+        or len(tree_output) > ci.MAX_STATIC_MACHINE_STDOUT_BYTES
+        or not tree_output.endswith(b"\0")
+    ):
+        raise AssertionError("trusted Git returned malformed R2 tree framing")
+    raw_paths = tree_output.split(b"\0")
+    if raw_paths[-1] != b"" or any(not record for record in raw_paths[:-1]):
+        raise AssertionError("trusted Git returned malformed R2 path records")
+    object_entries: dict[str, tuple[str, str, str]] = {}
+    try:
+        for record in raw_paths[:-1]:
+            fields = record.split(b"\t", 3)
+            if len(fields) != 4:
+                raise AssertionError("trusted Git returned malformed R2 tree objects")
+            mode_bytes, type_bytes, object_id_bytes, path_bytes = fields
+            mode = mode_bytes.decode("ascii", errors="strict")
+            object_type = type_bytes.decode("ascii", errors="strict")
+            object_id = object_id_bytes.decode("ascii", errors="strict")
+            relative = path_bytes.decode("utf-8", errors="strict")
+            if (
+                mode not in {"100644", "100755", "120000", "160000"}
+                or object_type not in {"blob", "commit"}
+                or (object_type == "commit") != (mode == "160000")
+                or not re.fullmatch(r"[0-9a-f]{40}", object_id)
+            ):
+                raise AssertionError("trusted Git returned malformed R2 tree objects")
+            if relative in object_entries:
+                raise AssertionError("trusted Git returned duplicate R2 tree paths")
+            object_entries[relative] = (mode, object_type, object_id)
+    except UnicodeError as exc:
+        raise AssertionError("trusted Git returned a non-UTF-8 R2 path") from exc
+    paths = tuple(sorted(object_entries))
+    _r2_inventory_identity(paths)
+    return identity_lines[0], identity_lines[1], paths, object_entries
+
+
+def _r2_validate_commit_authority(
+    profile: _R2SourceInventoryProfile,
+    *,
+    head_commit: str,
+    head_tree: str,
+) -> None:
+    if (
+        not re.fullmatch(r"[0-9a-f]{40}", head_commit)
+        or not re.fullmatch(r"[0-9a-f]{40}", head_tree)
+    ):
+        raise AssertionError("R2 Git source identity is malformed")
+    if head_commit == profile.authority_commit:
+        if head_tree != profile.authority_tree:
+            raise AssertionError("R2 frozen authority commit has the wrong tree")
+
+
+def _r2_validate_git_object_authority(
+    profile: _R2SourceInventoryProfile,
+    object_entries: Mapping[str, tuple[str, str, str]],
+) -> None:
+    paths = tuple(sorted(object_entries))
+    if _r2_profile_for_paths(paths) is not profile:
+        raise AssertionError("R2 Git object inventory does not match its profile")
+    if _R2_AUTHORIZED_MUTABLE_PATH not in object_entries:
+        raise AssertionError("R2 Git object inventory omits the authorized test path")
+    manifest_records: list[str] = []
+    for relative in paths:
+        entry = object_entries[relative]
+        if not isinstance(entry, tuple) or len(entry) != 3:
+            raise AssertionError("R2 Git object inventory contains a malformed identity")
+        mode, object_type, object_id = entry
+        if (
+            mode not in {"100644", "100755", "120000", "160000"}
+            or object_type not in {"blob", "commit"}
+            or (object_type == "commit") != (mode == "160000")
+            or not re.fullmatch(r"[0-9a-f]{40}", object_id)
+        ):
+            raise AssertionError("R2 Git object inventory contains a malformed identity")
+        manifest_object = (
+            _R2_MUTABLE_OBJECT_SENTINEL
+            if relative == _R2_AUTHORIZED_MUTABLE_PATH
+            else object_id
+        )
+        manifest_records.append(
+            f"{relative}\t{mode}\t{object_type}\t{manifest_object}\n"
+        )
+    manifest_digest = hashlib.sha256(
+        "".join(manifest_records).encode("utf-8")
+    ).hexdigest()
+    if manifest_digest not in (
+        profile.tree_manifest_sha256,
+        profile.a1_integrated_tree_manifest_sha256,
+    ):
+        raise AssertionError("R2 immutable full-tree Git object authority does not match")
+    content_authority = (
+        _R2_ORDINARY_CONTENT_AUTHORITY
+        if profile is _R2_ORDINARY_PROFILE
+        else _R2_SECURITY_CONTENT_DELTA
+    )
+    for relative, expected in content_authority.items():
+        entry = object_entries.get(relative)
+        if entry is None or entry[2] != expected["gitBlob"]:
+            raise AssertionError("R2 immutable Git blob authority does not match")
+
+
+def _r2_bind_source_paths(
+    *,
+    immutable_tree_paths: object,
+    runner_candidate_paths: object,
+) -> _R2SourceInventoryProfile:
+    profile = _r2_profile_for_paths(immutable_tree_paths)
+    tree_paths = tuple(immutable_tree_paths)  # type: ignore[arg-type]
+    if not isinstance(runner_candidate_paths, (list, tuple)):
+        raise AssertionError("runner R2 source inventory must be a path sequence")
+    if tuple(runner_candidate_paths) != tree_paths:
+        raise AssertionError("runner R2 source inventory differs from immutable Git authority")
+    return profile
+
+
+def _r2_current_source_inventory(
+    repo_root: Path = ci.REPO_ROOT,
+) -> tuple[_R2SourceInventoryProfile, tuple[str, ...]]:
+    head_commit, head_tree, tree_paths, object_entries = _r2_git_head_inventory(repo_root)
+    candidate_paths, path_errors = ci.deterministic_candidate_paths(repo_root)
+    if path_errors:
+        raise AssertionError(f"runner R2 source inventory failed: {path_errors}")
+    profile = _r2_bind_source_paths(
+        immutable_tree_paths=tree_paths,
+        runner_candidate_paths=candidate_paths,
+    )
+    _r2_validate_commit_authority(
+        profile,
+        head_commit=head_commit,
+        head_tree=head_tree,
+    )
+    _r2_validate_git_object_authority(profile, object_entries)
+    return profile, tree_paths
+
+
+def _r2_counterpart_inventories(
+    live_paths: tuple[str, ...],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    live_profile = _r2_profile_for_paths(live_paths)
+    if live_profile is _R2_ORDINARY_PROFILE:
+        ordinary_paths = live_paths
+        security_paths = tuple(sorted((*ordinary_paths, *_R2_ADDED_JAVASCRIPT_PATHS)))
+    else:
+        security_paths = live_paths
+        ordinary_paths = tuple(
+            relative
+            for relative in security_paths
+            if relative not in _R2_ADDED_JAVASCRIPT_PATHS
+        )
+    if _r2_profile_for_paths(ordinary_paths) is not _R2_ORDINARY_PROFILE:
+        raise AssertionError("R2 ordinary counterpart inventory is not exact")
+    if _r2_profile_for_paths(security_paths) is not _R2_SECURITY_PROFILE:
+        raise AssertionError("R2 security counterpart inventory is not exact")
+    return ordinary_paths, security_paths
+
+
+def _r2_expected_command_ids(
+    candidate_paths: object,
+) -> dict[str, tuple[str, ...]]:
+    profile = _r2_profile_for_paths(candidate_paths)
+    paths = tuple(candidate_paths)  # type: ignore[arg-type]
+    javascript_ids = tuple(
+        f"node-check:{relative}"
+        for relative in paths
+        if Path(relative).suffix.casefold() in {".js", ".mjs"}
+    )
+    result = {
+        "static": (
+            *_R2_STATIC_COMMAND_PREFIX,
+            *javascript_ids,
+            *_R2_STATIC_COMMAND_SUFFIX,
+        ),
+        "all": (
+            *_R2_ALL_COMMAND_PREFIX,
+            *javascript_ids,
+            *_R2_ALL_COMMAND_SUFFIX,
+        ),
+    }
+    if len(result["static"]) != profile.static_command_count:
+        raise AssertionError("R2 static command identity sequence has the wrong size")
+    if len(result["all"]) != profile.all_command_count:
+        raise AssertionError("R2 all command identity sequence has the wrong size")
+    for plan_name, insertions in (
+        ("static", profile.static_insertions),
+        ("all", profile.all_insertions),
+    ):
+        ids = result[plan_name]
+        if tuple((ordinal, ids[ordinal]) for ordinal, _ in insertions) != insertions:
+            raise AssertionError("R2 protected syntax command ordinal is not exact")
+    return result
 
 
 def _explicit_live_local_external_authority() -> ci.ExecutionExternalAuthority:
@@ -5787,8 +6357,19 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
 
     def test_full_scale_command_results_retain_705_records_under_fixed_limit(self) -> None:
         baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
-        candidate_paths, path_errors = ci.deterministic_candidate_paths(ci.REPO_ROOT)
-        self.assertEqual(path_errors, [])
+        source_profile, immutable_source_paths = _r2_current_source_inventory()
+        candidate_paths = list(immutable_source_paths)
+        ordinary_paths, security_paths = _r2_counterpart_inventories(
+            immutable_source_paths
+        )
+        self.assertEqual(
+            _r2_counterpart_inventories(ordinary_paths),
+            (ordinary_paths, security_paths),
+        )
+        self.assertEqual(
+            _r2_counterpart_inventories(security_paths),
+            (ordinary_paths, security_paths),
+        )
         tools = {
             role: str(Path(sys.executable).resolve(strict=True))
             for role in ci.required_tool_names("all")
@@ -5798,27 +6379,907 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
             Path(tools["node"]).resolve(strict=True),
             Path(sys.executable).resolve(strict=True),
         )
+        static_invocation_id = ci.deterministic_static_invocation_id(ci.REPO_ROOT)
         plan = ci.build_profile_command_plan(
             "all",
             tools=tools,
             candidate_paths=candidate_paths,
             baseline=baseline,
             current_platform="ubuntu",
-            static_invocation_id=ci.deterministic_static_invocation_id(ci.REPO_ROOT),
+            static_invocation_id=static_invocation_id,
             repo_root=ci.REPO_ROOT,
         )
+        expected_live_ids = _r2_expected_command_ids(immutable_source_paths)["all"]
+        self.assertEqual(
+            [(spec["ordinal"], spec["commandId"]) for spec in plan],
+            list(enumerate(expected_live_ids)),
+        )
+
+        def build_structural_plan(
+            command_profile: str,
+            source_paths: tuple[str, ...],
+        ) -> list[dict]:
+            return ci.build_profile_command_plan(
+                command_profile,
+                tools=tools,
+                candidate_paths=source_paths,
+                baseline=baseline,
+                current_platform="ubuntu",
+                static_invocation_id=static_invocation_id,
+                repo_root=ci.REPO_ROOT,
+            )
+
+        live_plans = {
+            "all": plan,
+            "static": build_structural_plan("static", immutable_source_paths),
+        }
+        live_target_authority: dict[str, dict] = {}
+        for spec in plan:
+            for target in spec["targets"]:
+                relative = target["path"]
+                if relative in live_target_authority:
+                    self.assertEqual(live_target_authority[relative], target)
+                else:
+                    live_target_authority[relative] = copy.deepcopy(target)
+        self.assertEqual(set(live_target_authority), set(immutable_source_paths))
+        active_content_authority: Mapping[str, Mapping[str, object]] = {}
+
+        def structural_target_authority(_repo_root: Path, relative: str) -> dict:
+            if relative in live_target_authority:
+                target = copy.deepcopy(live_target_authority[relative])
+            else:
+                content = active_content_authority[relative]
+                identity_seed = int(content["gitBlob"][:16], 16)
+                target = {
+                    "path": relative,
+                    "canonicalSourcePath": str((ci.REPO_ROOT / relative).resolve()),
+                    "fileIdentity": {
+                        "deviceOrVolume": "1",
+                        "inodeOrFileIndex": str(identity_seed),
+                        "creationOrChangeTimeNs": "1",
+                        "writeTimeNs": "1",
+                        "reparsePoint": False,
+                    },
+                    "modeType": "regular-file",
+                    "reparsePoint": False,
+                }
+            content = active_content_authority.get(relative)
+            if content is not None:
+                target["size"] = content["size"]
+                target["sha256"] = content["sha256"]
+            return target
+
+        parser_modes: dict[str, str] = {}
+        real_parser_mode = ci._node_stdin_parser_mode
+
+        def structural_parser_mode(repo_root: Path, relative: str) -> str:
+            if relative not in parser_modes:
+                parser_modes[relative] = real_parser_mode(repo_root, relative)
+            return parser_modes[relative]
+
+        for relative in _R2_ADDED_JAVASCRIPT_PATHS:
+            self.assertEqual(structural_parser_mode(ci.REPO_ROOT, relative), "commonjs")
+
+        with (
+            mock.patch.object(
+                ci,
+                "_target_authority",
+                side_effect=structural_target_authority,
+            ),
+            mock.patch.object(
+                ci,
+                "_node_stdin_parser_mode",
+                side_effect=structural_parser_mode,
+            ),
+        ):
+            active_content_authority = _R2_ORDINARY_CONTENT_AUTHORITY
+            ordinary_structural_plans = {
+                command_profile: build_structural_plan(
+                    command_profile,
+                    ordinary_paths,
+                )
+                for command_profile in ("static", "all")
+            }
+            active_content_authority = _R2_SECURITY_CONTENT_DELTA
+            security_structural_plans = {
+                command_profile: build_structural_plan(
+                    command_profile,
+                    security_paths,
+                )
+                for command_profile in ("static", "all")
+            }
+
+        def assert_exact_structural_plan(
+            selected_plan: list[dict],
+            source_paths: tuple[str, ...],
+            command_profile: str,
+        ) -> None:
+            selected_profile = _r2_profile_for_paths(source_paths)
+            expected_ids = _r2_expected_command_ids(source_paths)[command_profile]
+            self.assertEqual(
+                [(spec["ordinal"], spec["commandId"]) for spec in selected_plan],
+                list(enumerate(expected_ids)),
+            )
+            expected_count = (
+                selected_profile.static_command_count
+                if command_profile == "static"
+                else selected_profile.all_command_count
+            )
+            self.assertEqual(len(selected_plan), expected_count)
+            target_universe = {
+                target["path"]
+                for spec in selected_plan
+                for target in spec["targets"]
+            }
+            self.assertEqual(target_universe, set(source_paths))
+            if command_profile == "all":
+                self.assertEqual(
+                    sum(len(spec["targets"]) for spec in selected_plan),
+                    selected_profile.target_reference_count,
+                )
+                for command_id, ordinal in selected_profile.late_all_ordinals:
+                    self.assertEqual(selected_plan[ordinal]["commandId"], command_id)
+
+        for command_profile in ("static", "all"):
+            assert_exact_structural_plan(
+                live_plans[command_profile],
+                immutable_source_paths,
+                command_profile,
+            )
+
+        for command_profile in ("static", "all"):
+            ordinary_plan = ordinary_structural_plans[command_profile]
+            security_plan = security_structural_plans[command_profile]
+            assert_exact_structural_plan(
+                ordinary_plan,
+                ordinary_paths,
+                command_profile,
+            )
+            assert_exact_structural_plan(
+                security_plan,
+                security_paths,
+                command_profile,
+            )
+            ordinary_ids = [spec["commandId"] for spec in ordinary_plan]
+            security_ids = [spec["commandId"] for spec in security_plan]
+            insertion_authority = (
+                _R2_SECURITY_PROFILE.static_insertions
+                if command_profile == "static"
+                else _R2_SECURITY_PROFILE.all_insertions
+            )
+            expected_security_ids = list(ordinary_ids)
+            for ordinal, command_id in insertion_authority:
+                expected_security_ids.insert(ordinal, command_id)
+            self.assertEqual(security_ids, expected_security_ids)
+            self.assertEqual(
+                [
+                    command_id
+                    for command_id in security_ids
+                    if command_id not in _R2_ADDED_COMMAND_IDS
+                ],
+                ordinary_ids,
+            )
+            ordinary_by_id = {
+                spec["commandId"]: spec for spec in ordinary_plan
+            }
+            security_by_id = {
+                spec["commandId"]: spec for spec in security_plan
+            }
+            expected_target_expansions = (
+                _R2_CANDIDATE_WIDE_COMMAND_IDS & set(ordinary_ids)
+            )
+            if command_profile == "all":
+                expected_target_expansions = {
+                    *expected_target_expansions,
+                    "license-governance-consistency",
+                }
+            actual_target_expansions: set[str] = set()
+            for command_id in ordinary_ids:
+                ordinary_spec = ordinary_by_id[command_id]
+                security_spec = security_by_id[command_id]
+                self.assertEqual(
+                    {
+                        key: value
+                        for key, value in ordinary_spec.items()
+                        if key not in {
+                            "ordinal",
+                            "targets",
+                            "executionInputSize",
+                            "executionInputSha256",
+                        }
+                    },
+                    {
+                        key: value
+                        for key, value in security_spec.items()
+                        if key not in {
+                            "ordinal",
+                            "targets",
+                            "executionInputSize",
+                            "executionInputSha256",
+                        }
+                    },
+                    command_id,
+                )
+                ordinary_targets = ordinary_spec["targets"]
+                security_targets = security_spec["targets"]
+                ordinary_target_paths = [
+                    target["path"] for target in ordinary_targets
+                ]
+                added_targets = [
+                    target
+                    for target in security_targets
+                    if target["path"] in _R2_ADDED_JAVASCRIPT_PATHS
+                ]
+                if added_targets:
+                    actual_target_expansions.add(command_id)
+                expected_security_target_paths = ordinary_target_paths
+                if command_id in expected_target_expansions:
+                    if command_id == "license-governance-consistency":
+                        expected_security_target_paths = [
+                            "LICENSE",
+                            "LICENSE.md",
+                            "NOTICE.md",
+                            "LICENSES/AGPL-3.0-only.txt",
+                            "README.md",
+                            "docs/CONTENT_POLICY.md",
+                            "docs/STATUS.md",
+                            "api-contract/README.md",
+                            "backend/package.json",
+                        ]
+                        expected_security_target_paths.extend(
+                            relative
+                            for relative in security_paths
+                            if (
+                                relative.startswith("backend/src/")
+                                or relative.startswith("backend/scripts/")
+                                or relative.startswith("backend/test/")
+                            )
+                            and Path(relative).suffix.casefold() in {".js", ".mjs"}
+                        )
+                        expected_security_target_paths = list(
+                            dict.fromkeys(expected_security_target_paths)
+                        )
+                    else:
+                        expected_security_target_paths = list(security_paths)
+                self.assertEqual(
+                    [target["path"] for target in security_targets],
+                    expected_security_target_paths,
+                    command_id,
+                )
+                self.assertEqual(
+                    [target["path"] for target in added_targets],
+                    (
+                        list(_R2_ADDED_JAVASCRIPT_PATHS)
+                        if command_id in expected_target_expansions
+                        else []
+                    ),
+                    command_id,
+                )
+                ordinary_targets_by_path = {
+                    target["path"]: target for target in ordinary_targets
+                }
+                for target in security_targets:
+                    relative = target["path"]
+                    content = _R2_SECURITY_CONTENT_DELTA.get(relative)
+                    if relative in ordinary_targets_by_path:
+                        expected_target = copy.deepcopy(
+                            ordinary_targets_by_path[relative]
+                        )
+                        if content is not None:
+                            expected_target["size"] = content["size"]
+                            expected_target["sha256"] = content["sha256"]
+                        self.assertEqual(target, expected_target, command_id)
+                    else:
+                        self.assertIn(relative, _R2_ADDED_JAVASCRIPT_PATHS)
+                        self.assertIsNotNone(content)
+                        self.assertEqual(
+                            (target["size"], target["sha256"]),
+                            (content["size"], content["sha256"]),
+                            command_id,
+                        )
+                        self.assertEqual(target["modeType"], "regular-file")
+                        self.assertIs(target["reparsePoint"], False)
+                if security_spec["executionInputMode"] == "TARGET-BYTES-STDIN":
+                    self.assertEqual(len(security_targets), 1)
+                    self.assertEqual(
+                        (
+                            security_spec["executionInputSize"],
+                            security_spec["executionInputSha256"],
+                        ),
+                        (
+                            security_targets[0]["size"],
+                            security_targets[0]["sha256"],
+                        ),
+                        command_id,
+                    )
+                else:
+                    self.assertIsNone(security_spec["executionInputSize"])
+                    self.assertIsNone(security_spec["executionInputSha256"])
+            self.assertEqual(actual_target_expansions, expected_target_expansions)
+            for ordinal, command_id in insertion_authority:
+                spec = security_plan[ordinal]
+                relative = command_id.removeprefix("node-check:")
+                self.assertEqual(spec["commandId"], command_id)
+                self.assertEqual(spec["commandClass"], "direct-syntax")
+                self.assertEqual(spec["commandRole"], "observation-producing")
+                self.assertTrue(spec["required"])
+                self.assertEqual(spec["profile"], command_profile)
+                self.assertEqual(spec["platform"], "ubuntu")
+                self.assertEqual(spec["argv"], [tools["node"], "--check", relative])
+                self.assertEqual(spec["logicalArgv"], spec["argv"])
+                self.assertEqual(
+                    spec["executionArgv"],
+                    [tools["node"], "--check", "--input-type=commonjs", "-"],
+                )
+                self.assertEqual(spec["executionInputMode"], "TARGET-BYTES-STDIN")
+                self.assertEqual(spec["cwd"], ".")
+                self.assertEqual(spec["toolRole"], "node-syntax-check")
+                self.assertEqual(spec["allowedExecutionExits"], [0, 1])
+                self.assertEqual(
+                    spec["resultSemantics"],
+                    "exit-zero-pass-exit-one-classified-observation",
+                )
+                self.assertEqual(
+                    [target["path"] for target in spec["targets"]],
+                    [relative],
+                )
+                immutable_content = _R2_SECURITY_CONTENT_DELTA[relative]
+                self.assertEqual(
+                    (
+                        spec["targets"][0]["size"],
+                        spec["targets"][0]["sha256"],
+                    ),
+                    (
+                        immutable_content["size"],
+                        immutable_content["sha256"],
+                    ),
+                )
+                self.assertEqual(spec["executionInputSize"], spec["targets"][0]["size"])
+                self.assertEqual(
+                    spec["executionInputSha256"],
+                    spec["targets"][0]["sha256"],
+                )
+
+        ordinary_all = ordinary_structural_plans["all"]
+        security_all = security_structural_plans["all"]
+        ordinary_by_id = {spec["commandId"]: spec for spec in ordinary_all}
+        security_by_id = {spec["commandId"]: spec for spec in security_all}
+        candidate_wide_delta = sum(
+            len(security_by_id[command_id]["targets"])
+            - len(ordinary_by_id[command_id]["targets"])
+            for command_id in _R2_CANDIDATE_WIDE_COMMAND_IDS
+        )
+        license_delta = (
+            len(security_by_id["license-governance-consistency"]["targets"])
+            - len(ordinary_by_id["license-governance-consistency"]["targets"])
+        )
+        direct_syntax_delta = sum(
+            len(security_by_id[command_id]["targets"])
+            for command_id in _R2_ADDED_COMMAND_IDS
+        )
+        total_reference_delta = (
+            sum(len(spec["targets"]) for spec in security_all)
+            - sum(len(spec["targets"]) for spec in ordinary_all)
+        )
+        self.assertEqual(
+            (
+                candidate_wide_delta,
+                license_delta,
+                direct_syntax_delta,
+                total_reference_delta,
+            ),
+            (42, 2, 2, 46),
+        )
+
+        security_records = [
+            synthetic_record_from_spec(spec) for spec in security_all
+        ]
+        self.assertEqual(len(security_records), _R2_SECURITY_PROFILE.all_command_count)
+        self.assertEqual(
+            [record["commandId"] for record in security_records],
+            [spec["commandId"] for spec in security_all],
+        )
+        self.assertEqual(
+            sum(len(record["targets"]) for record in security_records),
+            _R2_SECURITY_PROFILE.target_reference_count,
+        )
+        self.assertEqual(
+            (
+                ci.MAX_PROFILE_COMMANDS,
+                ci.MAX_EVIDENCE_COLLECTION_ITEMS,
+                ci.MAX_COMMAND_RESULTS_JSON_BYTES,
+            ),
+            (50_000, 20_000, 33_554_432),
+        )
+
+        same_count_different_membership = tuple(sorted((
+            "bad/path1.txt" if relative == ".dockerignore" else relative
+            for relative in ordinary_paths
+        )))
+        ordinary_identity = _r2_inventory_identity(ordinary_paths)
+        mismatched_identity = _r2_inventory_identity(
+            same_count_different_membership
+        )
+        self.assertEqual(
+            (
+                len(mismatched_identity[0]),
+                mismatched_identity[1],
+                mismatched_identity[3],
+            ),
+            (
+                len(ordinary_identity[0]),
+                ordinary_identity[1],
+                ordinary_identity[3],
+            ),
+        )
+        self.assertNotEqual(mismatched_identity[2], ordinary_identity[2])
+        for label, rejected_paths in (
+            (
+                "one-approved-addition-only",
+                tuple(sorted((*ordinary_paths, _R2_ADDED_JAVASCRIPT_PATHS[0]))),
+            ),
+            (
+                "other-approved-addition-only",
+                tuple(sorted((*ordinary_paths, _R2_ADDED_JAVASCRIPT_PATHS[1]))),
+            ),
+            (
+                "unexpected-third-path",
+                tuple(sorted((*security_paths, "backend/test/unexpectedR2Third.test.js"))),
+            ),
+            (
+                "renamed-approved-path",
+                tuple(sorted(
+                    "backend/src/publicListeningFrontendRenamed.js"
+                    if relative == _R2_ADDED_JAVASCRIPT_PATHS[0]
+                    else relative
+                    for relative in security_paths
+                )),
+            ),
+            (
+                "duplicated-approved-path",
+                tuple(sorted((*security_paths, _R2_ADDED_JAVASCRIPT_PATHS[0]))),
+            ),
+            (
+                "removed-protected-path",
+                tuple(
+                    relative
+                    for relative in security_paths
+                    if relative != ".github/SECURITY.md"
+                ),
+            ),
+            (
+                "substituted-protected-path",
+                tuple(sorted(
+                    ".github/SECURITY-substitute.md"
+                    if relative == ".github/SECURITY.md"
+                    else relative
+                    for relative in security_paths
+                )),
+            ),
+            (
+                "same-count-different-membership",
+                same_count_different_membership,
+            ),
+        ):
+            with self.subTest(r2_inventory_rejection=label), self.assertRaises(
+                AssertionError
+            ):
+                _r2_profile_for_paths(rejected_paths)
+        for removed_path in _R2_ADDED_JAVASCRIPT_PATHS:
+            with self.subTest(
+                r2_inventory_rejection="security-missing-approved-path",
+                path=removed_path,
+            ), self.assertRaises(AssertionError):
+                _r2_profile_for_paths(tuple(
+                    relative
+                    for relative in security_paths
+                    if relative != removed_path
+                ))
+        with self.assertRaises(AssertionError):
+            _r2_profile_for_paths({
+                "profile": "security-candidate",
+                "pathCount": 916,
+                "sortedPathSha256": _R2_SECURITY_PROFILE.sorted_path_sha256,
+            })
+        with self.assertRaises(TypeError):
+            _r2_profile_for_paths(  # type: ignore[call-arg]
+                ordinary_paths,
+                expected_profile="security-candidate",
+            )
+        self.assertEqual(
+            tuple(inspect.signature(_r2_profile_for_paths).parameters),
+            ("candidate_paths",),
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GITHUB_HEAD_REF": "codex/issue-79-security-runtime-r1",
+                "GITHUB_SHA": _R2_SECURITY_PROFILE.authority_commit,
+                "R2_EXPECTED_PROFILE": "security-candidate",
+            },
+        ):
+            self.assertIs(
+                _r2_profile_for_paths(ordinary_paths),
+                _R2_ORDINARY_PROFILE,
+            )
+        with self.assertRaises(AssertionError):
+            _r2_bind_source_paths(
+                immutable_tree_paths=ordinary_paths,
+                runner_candidate_paths=security_paths,
+            )
+        _, _, _, live_object_authority = _r2_git_head_inventory()
+
+        def overlay_git_blobs(
+            source: Mapping[str, tuple[str, str, str]],
+            content_authority: Mapping[str, Mapping[str, object]],
+        ) -> dict[str, tuple[str, str, str]]:
+            overlaid = dict(source)
+            for relative, content in content_authority.items():
+                if relative in overlaid:
+                    mode, object_type, _object_id = overlaid[relative]
+                else:
+                    mode, object_type = "100644", "blob"
+                overlaid[relative] = (
+                    mode,
+                    object_type,
+                    str(content["gitBlob"]),
+                )
+            return overlaid
+
+        if source_profile is _R2_ORDINARY_PROFILE:
+            ordinary_object_authority = dict(live_object_authority)
+            security_object_authority = overlay_git_blobs(
+                live_object_authority,
+                _R2_SECURITY_CONTENT_DELTA,
+            )
+        else:
+            security_object_authority = dict(live_object_authority)
+            ordinary_object_authority = dict(live_object_authority)
+            for relative in _R2_ADDED_JAVASCRIPT_PATHS:
+                ordinary_object_authority.pop(relative)
+            ordinary_object_authority = overlay_git_blobs(
+                ordinary_object_authority,
+                _R2_ORDINARY_CONTENT_AUTHORITY,
+            )
+        security_from_ordinary = overlay_git_blobs(
+            ordinary_object_authority,
+            _R2_SECURITY_CONTENT_DELTA,
+        )
+        ordinary_from_security = dict(security_object_authority)
+        for relative in _R2_ADDED_JAVASCRIPT_PATHS:
+            ordinary_from_security.pop(relative)
+        ordinary_from_security = overlay_git_blobs(
+            ordinary_from_security,
+            _R2_ORDINARY_CONTENT_AUTHORITY,
+        )
+        self.assertEqual(security_from_ordinary, security_object_authority)
+        self.assertEqual(ordinary_from_security, ordinary_object_authority)
+        _r2_validate_commit_authority(
+            _R2_ORDINARY_PROFILE,
+            head_commit="e" * 40,
+            head_tree="d" * 40,
+        )
+        _r2_validate_git_object_authority(
+            _R2_ORDINARY_PROFILE,
+            ordinary_object_authority,
+        )
+        _r2_validate_git_object_authority(
+            _R2_SECURITY_PROFILE,
+            security_object_authority,
+        )
+
+        def profile_fixture(
+            trusted_profile: _R2SourceInventoryProfile,
+        ) -> tuple[
+            tuple[str, ...],
+            Mapping[str, tuple[str, str, str]],
+            list[dict],
+        ]:
+            if trusted_profile is _R2_ORDINARY_PROFILE:
+                return ordinary_paths, ordinary_object_authority, ordinary_all
+            if trusted_profile is _R2_SECURITY_PROFILE:
+                return security_paths, security_object_authority, security_all
+            raise AssertionError("R2 trusted source profile is not exact")
+
+        def counterpart_profile_for(
+            trusted_profile: _R2SourceInventoryProfile,
+        ) -> _R2SourceInventoryProfile:
+            if trusted_profile is _R2_ORDINARY_PROFILE:
+                return _R2_SECURITY_PROFILE
+            if trusted_profile is _R2_SECURITY_PROFILE:
+                return _R2_ORDINARY_PROFILE
+            raise AssertionError("R2 counterpart source profile is not exact")
+
+        wrong_object_authority = dict(ordinary_object_authority)
+        readme_mode, readme_type, _readme_object = wrong_object_authority["README.md"]
+        wrong_object_authority["README.md"] = (
+            readme_mode,
+            readme_type,
+            "f" * 40,
+        )
+        with self.assertRaises(AssertionError):
+            _r2_validate_git_object_authority(
+                _R2_ORDINARY_PROFILE,
+                wrong_object_authority,
+            )
+        test_only_object_authority = dict(ordinary_object_authority)
+        test_mode, test_type, _test_object = test_only_object_authority[
+            _R2_AUTHORIZED_MUTABLE_PATH
+        ]
+        test_only_object_authority[_R2_AUTHORIZED_MUTABLE_PATH] = (
+            test_mode,
+            test_type,
+            "f" * 40,
+        )
+        _r2_validate_git_object_authority(
+            _R2_ORDINARY_PROFILE,
+            test_only_object_authority,
+        )
+        immutable_mode_drift = dict(ordinary_object_authority)
+        immutable_mode_drift["README.md"] = (
+            "100755" if readme_mode == "100644" else "100644",
+            readme_type,
+            _readme_object,
+        )
+        with self.assertRaises(AssertionError):
+            _r2_validate_git_object_authority(
+                _R2_ORDINARY_PROFILE,
+                immutable_mode_drift,
+            )
+        mutable_mode_drift = dict(test_only_object_authority)
+        mutable_mode_drift[_R2_AUTHORIZED_MUTABLE_PATH] = (
+            "100755" if test_mode == "100644" else "100644",
+            test_type,
+            "f" * 40,
+        )
+        with self.assertRaises(AssertionError):
+            _r2_validate_git_object_authority(
+                _R2_ORDINARY_PROFILE,
+                mutable_mode_drift,
+            )
+        with self.assertRaises(AssertionError):
+            _r2_validate_commit_authority(
+                _R2_ORDINARY_PROFILE,
+                head_commit=_R2_ORDINARY_PROFILE.authority_commit,
+                head_tree="f" * 40,
+            )
+
+        def assert_security_plan(candidate_plan: list[dict]) -> None:
+            assert_exact_structural_plan(candidate_plan, security_paths, "all")
+            self.assertEqual(candidate_plan, security_all)
+
+        for mutation in (
+            "incorrect-command-id",
+            "incorrect-insertion-order",
+            "incorrect-protected-target",
+            "incorrect-protected-target-order",
+            "duplicate-command-id",
+            "missing-command",
+            "extra-command",
+            "incorrect-target-reference-count",
+            "unexpected-existing-command-movement",
+            "existing-command-metadata-drift",
+        ):
+            changed_plan = list(security_all)
+            changed_records = list(security_records)
+
+            def mutable_spec(ordinal: int) -> dict:
+                changed_plan[ordinal] = copy.deepcopy(changed_plan[ordinal])
+                return changed_plan[ordinal]
+
+            def refresh_record(ordinal: int) -> None:
+                changed_records[ordinal] = synthetic_record_from_spec(
+                    changed_plan[ordinal]
+                )
+
+            if mutation == "incorrect-command-id":
+                mutable_spec(452)["commandId"] = (
+                    "node-check:backend/src/publicListeningFrontend-substitute.js"
+                )
+                refresh_record(452)
+            elif mutation == "incorrect-insertion-order":
+                changed_plan[452], changed_plan[456] = (
+                    changed_plan[456],
+                    changed_plan[452],
+                )
+                changed_records[452], changed_records[456] = (
+                    changed_records[456],
+                    changed_records[452],
+                )
+            elif mutation == "incorrect-protected-target":
+                mutable_spec(452)["targets"][0]["path"] = (
+                    "backend/src/publicListeningFrontend-substitute.js"
+                )
+                refresh_record(452)
+            elif mutation == "incorrect-protected-target-order":
+                protected_ordinal = security_by_id["tracked-secret-scan"]["ordinal"]
+                protected_spec = mutable_spec(protected_ordinal)
+                added_index = next(
+                    index
+                    for index, target in enumerate(protected_spec["targets"])
+                    if target["path"] == _R2_ADDED_JAVASCRIPT_PATHS[0]
+                )
+                protected_spec["targets"].insert(
+                    0,
+                    protected_spec["targets"].pop(added_index),
+                )
+                refresh_record(protected_ordinal)
+            elif mutation == "duplicate-command-id":
+                mutable_spec(456)["commandId"] = _R2_ADDED_COMMAND_IDS[0]
+                refresh_record(456)
+            elif mutation == "missing-command":
+                changed_plan.pop()
+                changed_records.pop()
+            elif mutation == "extra-command":
+                extra_spec = copy.deepcopy(changed_plan[452])
+                extra_spec["commandId"] = "node-check:unauthorized/extra.js"
+                extra_spec["ordinal"] = len(changed_plan)
+                changed_plan.append(extra_spec)
+                changed_records.append(synthetic_record_from_spec(extra_spec))
+            elif mutation == "incorrect-target-reference-count":
+                mutable_spec(12)["targets"].append(
+                    copy.deepcopy(changed_plan[452]["targets"][0])
+                )
+                refresh_record(12)
+            elif mutation == "unexpected-existing-command-movement":
+                changed_plan[100], changed_plan[101] = (
+                    changed_plan[101],
+                    changed_plan[100],
+                )
+                changed_records[100], changed_records[101] = (
+                    changed_records[101],
+                    changed_records[100],
+                )
+            else:
+                mutable_spec(100)["commandRole"] = "substituted-role"
+                refresh_record(100)
+            with self.subTest(r2_plan_rejection=mutation), self.assertRaises(
+                AssertionError
+            ):
+                assert_security_plan(changed_plan)
+            with self.subTest(r2_production_plan_rejection=mutation):
+                self.assertIn(
+                    "COMMAND-AUTHORITY-MISMATCH",
+                    [
+                        violation["id"]
+                        for violation in ci._command_authority_violations(
+                            "all",
+                            changed_records,
+                            [],
+                            expected_plan=security_all,
+                        )
+                    ],
+                )
+
+        security_static = security_structural_plans["static"]
+        security_static_records = [
+            synthetic_record_from_spec(spec) for spec in security_static
+        ]
+
+        def assert_security_static_plan(candidate_plan: list[dict]) -> None:
+            assert_exact_structural_plan(candidate_plan, security_paths, "static")
+            self.assertEqual(candidate_plan, security_static)
+
+        for mutation in (
+            "incorrect-static-command-id",
+            "incorrect-static-insertion-order",
+            "incorrect-static-protected-target",
+        ):
+            changed_static = list(security_static)
+            changed_static_records = list(security_static_records)
+            if mutation == "incorrect-static-command-id":
+                changed_static[443] = copy.deepcopy(changed_static[443])
+                changed_static[443]["commandId"] = (
+                    "node-check:backend/src/publicListeningFrontend-substitute.js"
+                )
+                changed_static_records[443] = synthetic_record_from_spec(
+                    changed_static[443]
+                )
+            elif mutation == "incorrect-static-insertion-order":
+                changed_static[443], changed_static[447] = (
+                    changed_static[447],
+                    changed_static[443],
+                )
+                changed_static_records[443], changed_static_records[447] = (
+                    changed_static_records[447],
+                    changed_static_records[443],
+                )
+            else:
+                changed_static[443] = copy.deepcopy(changed_static[443])
+                changed_static[443]["targets"][0]["path"] = (
+                    "backend/src/publicListeningFrontend-substitute.js"
+                )
+                changed_static_records[443] = synthetic_record_from_spec(
+                    changed_static[443]
+                )
+            with self.subTest(r2_static_plan_rejection=mutation), self.assertRaises(
+                AssertionError
+            ):
+                assert_security_static_plan(changed_static)
+            with self.subTest(r2_production_static_plan_rejection=mutation):
+                self.assertIn(
+                    "COMMAND-AUTHORITY-MISMATCH",
+                    [
+                        violation["id"]
+                        for violation in ci._command_authority_violations(
+                            "static",
+                            changed_static_records,
+                            [],
+                            expected_plan=security_static,
+                        )
+                    ],
+                )
+
+        def assert_security_records_rejected(records: list[dict]) -> None:
+            _admitted, position_errors = ci._preflight_command_record_positions(
+                records,
+                security_all,
+            )
+            missing_ids, extra_ids, duplicate_ids = ci.command_id_set_differences(
+                security_all,
+                records,
+            )
+            self.assertTrue(
+                position_errors or missing_ids or extra_ids or duplicate_ids
+            )
+
+        for mutation in (
+            "missing-record",
+            "extra-record",
+            "incorrect-record-id",
+            "incorrect-record-order",
+            "incorrect-record-ordinal",
+            "incorrect-record-target",
+            "incorrect-record-target-reference-count",
+        ):
+            changed_records = list(security_records)
+
+            def mutable_record(ordinal: int) -> dict:
+                changed_records[ordinal] = copy.deepcopy(changed_records[ordinal])
+                return changed_records[ordinal]
+
+            if mutation == "missing-record":
+                changed_records.pop()
+            elif mutation == "extra-record":
+                extra_record = copy.deepcopy(changed_records[452])
+                extra_record["commandId"] = "node-check:unauthorized/extra.js"
+                extra_record["ordinal"] = len(changed_records)
+                changed_records.append(extra_record)
+            elif mutation == "incorrect-record-id":
+                mutable_record(452)["commandId"] = (
+                    "node-check:backend/src/publicListeningFrontend-substitute.js"
+                )
+            elif mutation == "incorrect-record-order":
+                changed_records[452], changed_records[456] = (
+                    changed_records[456],
+                    changed_records[452],
+                )
+            elif mutation == "incorrect-record-ordinal":
+                mutable_record(452)["ordinal"] = 999
+            elif mutation == "incorrect-record-target":
+                mutable_record(452)["targets"][0]["path"] = (
+                    "backend/src/publicListeningFrontend-substitute.js"
+                )
+            else:
+                mutable_record(12)["targets"].append(
+                    copy.deepcopy(changed_records[452]["targets"][0])
+                )
+            with self.subTest(r2_record_rejection=mutation):
+                assert_security_records_rejected(changed_records)
+
         command_classes = sorted({spec["commandClass"] for spec in plan})
         target_universe = {
             target["path"] for spec in plan for target in spec["targets"]
         }
         target_reference_count = sum(len(spec["targets"]) for spec in plan)
-        self.assertEqual(len(plan), 705)
+        self.assertEqual(len(plan), source_profile.all_command_count)
         self.assertEqual(len(command_classes), 16)
         # The dedicated W702 authority module adds one protected target and
-        # 22 references; the 705 commands and 476-test inventory are unchanged.
+        # 22 references; the 476-test inventory is unchanged in both R2 profiles.
         # The G2 security policy adds one protected target and 21 references.
-        self.assertEqual(len(target_universe), 914)
-        self.assertEqual(target_reference_count, 19940)
+        self.assertEqual(target_universe, set(immutable_source_paths))
+        self.assertEqual(len(target_universe), source_profile.path_count)
+        self.assertEqual(target_reference_count, source_profile.target_reference_count)
         self.assertTrue({
             ".github/SECURITY.md",
             "CONTRIBUTING.md",
@@ -5839,13 +7300,17 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
         ]
         self.assertEqual(len(message_origin_commands), 1)
         message_origin_command = message_origin_commands[0]
+        late_ordinals = dict(source_profile.late_all_ordinals)
         trusted_node = tools["node"]
         expected_message_origin_argv = [
             trusted_node,
             "--test",
             ci.MESSAGE_ORIGIN_SECURITY_GUARD,
         ]
-        self.assertEqual(message_origin_command["ordinal"], 700)
+        self.assertEqual(
+            message_origin_command["ordinal"],
+            late_ordinals["frontend-security:messageOriginGuard.test.js"],
+        )
         self.assertEqual(message_origin_command["commandClass"], "frontend-security")
         self.assertEqual(message_origin_command["commandRole"], "observation-producing")
         self.assertTrue(message_origin_command["required"])
@@ -5893,10 +7358,18 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
         message_origin_route = " ".join(expected_message_origin_argv[1:]).casefold()
         for token in forbidden_route_tokens:
             self.assertNotIn(token, message_origin_route)
-        self.assertEqual(plan[699]["commandId"], "frontend-security:vocabSessionExportGuard.test.js")
-        self.assertEqual(plan[701]["commandId"], "backend-canonical")
+        self.assertEqual(
+            plan[late_ordinals["frontend-security:vocabSessionExportGuard.test.js"]][
+                "commandId"
+            ],
+            "frontend-security:vocabSessionExportGuard.test.js",
+        )
+        self.assertEqual(
+            plan[late_ordinals["backend-canonical"]]["commandId"],
+            "backend-canonical",
+        )
         records = [synthetic_record_from_spec(spec) for spec in plan]
-        backend_command = plan[701]
+        backend_command = plan[late_ordinals["backend-canonical"]]
         self.assertEqual(backend_command["commandClass"], "backend-canonical")
         self.assertEqual(backend_command["profile"], "all")
         self.assertEqual(backend_command["platform"], "ubuntu")
@@ -6168,122 +7641,164 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
             "queueOverflow": False,
             "mutationEventCount": 0,
         }
-        for spec, record in zip(plan, records):
-            if spec["commandId"] == "tracked-secret-scan":
-                record["fileScans"] = [
-                    {
-                        "path": target["path"],
-                        "fileSize": int(target["size"] or 0),
-                        "classification": "text-scanned",
-                        "scannedBytes": int(target["size"] or 0),
-                        "rawBytesScanned": int(target["size"] or 0),
-                        "encodingViewsApplied": [
-                            "raw-bytes",
-                            *ci.UTF16_ASCII_CREDENTIAL_VIEWS,
-                        ],
-                        "utf16LeDecodedUnits": 0,
-                        "utf16BeDecodedUnits": 0,
-                        "patternFamiliesApplied": list(
-                            ci.SECRET_SCAN_PATTERN_FAMILIES
-                        ),
-                        "hitCount": 0,
+        def enrich_live_shaped_records(
+            selected_plan: list[dict],
+            selected_records: list[dict],
+            *,
+            special_message_record: dict | None = None,
+            special_message_observation: dict | None = None,
+        ) -> list[dict]:
+            selected_observations: list[dict] = []
+            for spec, record in zip(selected_plan, selected_records):
+                if spec["commandId"] == "tracked-secret-scan":
+                    record["fileScans"] = [
+                        {
+                            "path": target["path"],
+                            "fileSize": int(target["size"] or 0),
+                            "classification": "text-scanned",
+                            "scannedBytes": int(target["size"] or 0),
+                            "rawBytesScanned": int(target["size"] or 0),
+                            "encodingViewsApplied": [
+                                "raw-bytes",
+                                *ci.UTF16_ASCII_CREDENTIAL_VIEWS,
+                            ],
+                            "utf16LeDecodedUnits": 0,
+                            "utf16BeDecodedUnits": 0,
+                            "patternFamiliesApplied": list(
+                                ci.SECRET_SCAN_PATTERN_FAMILIES
+                            ),
+                            "hitCount": 0,
+                        }
+                        for target in spec["targets"]
+                    ]
+                if spec["toolRole"] in ci.DEPENDENCY_BACKED_TOOL_ROLES:
+                    record.update(
+                        {
+                            "dependencyBacked": True,
+                            "runtimeClosureDigest": "4" * 64,
+                            "dependencyClosureDigest": "5" * 64,
+                            "nodePath": [],
+                            "resolvedTestRunnerEntrypoint": record[
+                                "resolvedExecutablePath"
+                            ],
+                            "resolvedTestRunnerSha256": record[
+                                "resolvedExecutableSha256"
+                            ],
+                            "closureWatcherActive": True,
+                            "closureMutationState": "clean",
+                            "runtimeClosureGuard": copy.deepcopy(closure_guard),
+                        }
+                    )
+                elif (
+                    spec["commandId"]
+                    == "frontend-security:messageOriginGuard.test.js"
+                ):
+                    record["dependencyBacked"] = False
+                observation_kinds = ci._source_observation_kinds(spec)
+                self.assertLessEqual(len(observation_kinds), 1)
+                if observation_kinds and record is not special_message_record:
+                    record["diagnosticPreview"] = (
+                        "live-shaped bounded diagnostic" * 8
+                    )
+                if not observation_kinds:
+                    continue
+                if record is special_message_record:
+                    self.assertIsNotNone(special_message_observation)
+                    selected_observations.append(
+                        copy.deepcopy(special_message_observation)
+                    )
+                    continue
+                observation_kind = next(iter(observation_kinds))
+                if observation_kind == "static-producer-v1":
+                    result_name = "live-shaped-static-suite"
+                    source_result_id = result_name
+                    source_path = ci.STATIC_SUITE_RELATIVE_PATH
+                    raw_fields = {
+                        "name": result_name,
+                        "status": "pass",
+                        "detail": {"fixture": "live-shaped"},
                     }
-                    for target in spec["targets"]
-                ]
-            if spec["toolRole"] in ci.DEPENDENCY_BACKED_TOOL_ROLES:
-                record.update(
-                    {
-                        "dependencyBacked": True,
-                        "runtimeClosureDigest": "4" * 64,
-                        "dependencyClosureDigest": "5" * 64,
-                        "nodePath": [],
-                        "resolvedTestRunnerEntrypoint": record[
-                            "resolvedExecutablePath"
-                        ],
-                        "resolvedTestRunnerSha256": record[
-                            "resolvedExecutableSha256"
-                        ],
-                        "closureWatcherActive": True,
-                        "closureMutationState": "clean",
-                        "runtimeClosureGuard": copy.deepcopy(closure_guard),
-                    }
-                )
-            elif (
-                spec["commandId"]
-                == "frontend-security:messageOriginGuard.test.js"
-            ):
-                record["dependencyBacked"] = False
-            observation_kinds = ci._source_observation_kinds(spec)
-            self.assertLessEqual(len(observation_kinds), 1)
-            if observation_kinds and record is not message_origin_record:
-                record["diagnosticPreview"] = "live-shaped bounded diagnostic" * 8
-            if not observation_kinds:
-                continue
-            if record is message_origin_record:
-                observations.append(copy.deepcopy(message_origin_observation))
-                continue
-            observation_kind = next(iter(observation_kinds))
-            if observation_kind == "static-producer-v1":
-                result_name = "live-shaped-static-suite"
-                source_result_id = result_name
-                source_path = ci.STATIC_SUITE_RELATIVE_PATH
-                raw_fields = {
-                    "name": result_name,
-                    "status": "pass",
-                    "detail": {"fixture": "live-shaped"},
-                }
-            elif observation_kind == "process-output-v1":
-                if spec["commandClass"] == "direct-syntax":
-                    source_result_id = spec["commandId"].removeprefix("node-check:")
-                    source_path = source_result_id
-                elif spec["commandClass"] == "learner-focused":
-                    source_result_id = "command:learner-focused-runtime"
-                    source_path = "developer/tests/js/learnerPalette.test.js"
-                elif spec["commandClass"] == "frontend-security":
-                    source_path = next(
-                        relative
-                        for relative in (
-                            *ci.SECURITY_GUARD_FILES,
-                            ci.MESSAGE_ORIGIN_SECURITY_GUARD,
+                elif observation_kind == "process-output-v1":
+                    if spec["commandClass"] == "direct-syntax":
+                        source_result_id = spec["commandId"].removeprefix(
+                            "node-check:"
                         )
-                        if Path(relative).name
-                        == spec["commandId"].removeprefix("frontend-security:")
-                    )
-                    source_result_id = f"file:{source_path}"
-                elif spec["commandClass"] == "backend-canonical":
-                    source_result_id = backend_scope
-                    source_path = "backend/package.json"
+                        source_path = source_result_id
+                    elif spec["commandClass"] == "learner-focused":
+                        source_result_id = "command:learner-focused-runtime"
+                        source_path = "developer/tests/js/learnerPalette.test.js"
+                    elif spec["commandClass"] == "frontend-security":
+                        source_path = next(
+                            relative
+                            for relative in (
+                                *ci.SECURITY_GUARD_FILES,
+                                ci.MESSAGE_ORIGIN_SECURITY_GUARD,
+                            )
+                            if Path(relative).name
+                            == spec["commandId"].removeprefix(
+                                "frontend-security:"
+                            )
+                        )
+                        source_result_id = f"file:{source_path}"
+                    elif spec["commandClass"] == "backend-canonical":
+                        source_result_id = backend_scope
+                        source_path = "backend/package.json"
+                    else:
+                        self.fail(
+                            "unexpected process observation class: "
+                            f"{spec['commandClass']}"
+                        )
+                    raw_fields = {
+                        "executed": True,
+                        "exitCode": 0,
+                        "stdout": "live-shaped process observation",
+                        "stderr": "",
+                        "error": None,
+                    }
+                elif observation_kind == "standalone-membership-v1":
+                    source_path = "js/siteContent.js"
+                    source_result_id = f"membership:index.html::{source_path}"
+                    raw_fields = {"relative": source_path, "missing": False}
                 else:
-                    self.fail(
-                        f"unexpected process observation class: {spec['commandClass']}"
-                    )
-                raw_fields = {
-                    "executed": True,
-                    "exitCode": 0,
-                    "stdout": "live-shaped process observation",
-                    "stderr": "",
-                    "error": None,
-                }
-            elif observation_kind == "standalone-membership-v1":
-                source_path = "js/siteContent.js"
-                source_result_id = f"membership:index.html::{source_path}"
-                raw_fields = {"relative": source_path, "missing": False}
-            else:
-                self.fail(f"unexpected observation kind: {observation_kind}")
-            raw = ci.make_raw_observation(
-                spec["commandId"],
-                spec["ordinal"],
-                0,
-                observation_kind,
-                source_result_id,
-                source_path,
-                raw_fields,
-                ci.command_output_digest(record),
-            )
-            record["producerObservations"].append(raw)
-            observations.append(
-                {"commandId": spec["commandId"], "rawObservation": raw}
-            )
+                    self.fail(f"unexpected observation kind: {observation_kind}")
+                raw = ci.make_raw_observation(
+                    spec["commandId"],
+                    spec["ordinal"],
+                    0,
+                    observation_kind,
+                    source_result_id,
+                    source_path,
+                    raw_fields,
+                    ci.command_output_digest(record),
+                )
+                record["producerObservations"].append(raw)
+                selected_observations.append(
+                    {"commandId": spec["commandId"], "rawObservation": raw}
+                )
+            return selected_observations
+
+        observations = enrich_live_shaped_records(
+            plan,
+            records,
+            special_message_record=message_origin_record,
+            special_message_observation=message_origin_observation,
+        )
+        counterpart_profile = counterpart_profile_for(source_profile)
+        (
+            counterpart_paths,
+            counterpart_object_authority,
+            counterpart_plan,
+        ) = profile_fixture(counterpart_profile)
+        if counterpart_profile is _R2_SECURITY_PROFILE:
+            counterpart_records = security_records
+        else:
+            counterpart_records = [
+                synthetic_record_from_spec(spec) for spec in counterpart_plan
+            ]
+        counterpart_observations = enrich_live_shaped_records(
+            counterpart_plan,
+            counterpart_records,
+        )
         runner = fake_runner(baseline)
         runner.profile = "all"
         runner.platform = "ubuntu"
@@ -6353,7 +7868,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 "dependencyMemberCount": "0",
             }
         )
-        for record in records:
+        for record in (*records, *counterpart_records):
             if record.get("dependencyBacked") is True:
                 record["runtimeClosureDigest"] = runtime_digest
                 record["dependencyClosureDigest"] = dependency_digest
@@ -6362,16 +7877,43 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
             runner.command_plan_digest,
             platform_name="ubuntu",
         )
+        counterpart_plan_digest = ci.command_plan_digest(counterpart_plan)
+        counterpart_execution_binding = synthetic_execution_binding(
+            "all",
+            counterpart_plan_digest,
+            platform_name="ubuntu",
+        )
+        counterpart_runner = fake_runner(baseline)
+        counterpart_runner.profile = "all"
+        counterpart_runner.platform = "ubuntu"
+        counterpart_runner.command_plan = counterpart_plan
+        counterpart_runner.command_results = counterpart_records
+        counterpart_runner.observations = counterpart_observations
+        counterpart_runner.completed_classes = set()
+        counterpart_runner.command_plan_digest = counterpart_plan_digest
+        counterpart_runner.runtime = copy.deepcopy(runner.runtime)
+        counterpart_runner.runtime_closure_document = copy.deepcopy(
+            runner.runtime_closure_document
+        )
+        counterpart_runner.runtime_closure_guard_evidence = copy.deepcopy(
+            runner.runtime_closure_guard_evidence
+        )
+        counterpart_runner.execution_binding = counterpart_execution_binding
+        ci.finalize_evidence_transcript(counterpart_runner)
         with tempfile.TemporaryDirectory(prefix="ci-scale-evidence-") as temp_dir:
             repo = Path(temp_dir)
             output = repo / ".ci-results"
             ci.create_fresh_evidence_root(output, repo_root=repo)
             independent_results: list[list[str]] = []
+            independently_verified_plan_digests: list[str] = []
             independent_verify = ci.verify_evidence_file_set
 
             def tracked_independent_verify(*args, **kwargs):
                 result = independent_verify(*args, **kwargs)
                 independent_results.append(result)
+                independently_verified_plan_digests.append(
+                    ci.command_plan_digest(kwargs["expected_command_plan"])
+                )
                 return result
 
             with mock.patch.object(
@@ -6386,6 +7928,10 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                     evidence_authority_root=repo,
                 )
             self.assertEqual(independent_results, [[]])
+            self.assertEqual(
+                independently_verified_plan_digests,
+                [runner.command_plan_digest],
+            )
             data = (output / "command-results.json").read_bytes()
             self.assertLess(len(data), ci.MAX_COMMAND_RESULTS_JSON_BYTES)
             document = ci.strict_json_loads(data)
@@ -6399,12 +7945,719 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                         if item.get("id") == "COMMAND-RESULT-JSON-LIMIT"
                     )
                 )
+            counterpart_evidence_records = [
+                ci._compact_command_record_for_evidence(record)
+                for record in counterpart_runner.command_results
+            ]
+            self.assertEqual(
+                ci._command_authority_violations(
+                    "all",
+                    counterpart_evidence_records,
+                    [],
+                    expected_plan=counterpart_plan,
+                ),
+                [],
+            )
+            counterpart_binding_errors: list[str] = []
+            ci._validate_execution_binding(
+                counterpart_runner.execution_binding,
+                ci.execution_binding_digest(
+                    counterpart_runner.execution_binding
+                ),
+                label=f"{counterpart_profile.name}-command-results",
+                errors=counterpart_binding_errors,
+            )
+            counterpart_binding_errors.extend(
+                ci.authorization_context_binding_errors(
+                    counterpart_runner.authorization_context_binding,
+                    counterpart_runner.authorization_context_binding_digest,
+                    execution_binding=counterpart_runner.execution_binding,
+                )
+            )
+            self.assertEqual(counterpart_binding_errors, [])
+            counterpart_record_errors: list[str] = []
+            counterpart_observation_errors: list[str] = []
+            for ordinal, record in enumerate(counterpart_evidence_records):
+                ci._validate_command_record(
+                    record,
+                    ordinal,
+                    counterpart_record_errors,
+                    expected_record=counterpart_plan[ordinal],
+                )
+                for observation_ordinal, raw in enumerate(
+                    record["producerObservations"]
+                ):
+                    counterpart_observation_errors.extend(
+                        ci._validate_raw_observation(
+                            raw,
+                            label=(
+                                f"{counterpart_profile.name}-command-results.records"
+                                f"[{ordinal}].producerObservations"
+                                f"[{observation_ordinal}]"
+                            ),
+                            source=record,
+                        )
+                    )
+            self.assertEqual(counterpart_record_errors, [])
+            self.assertEqual(counterpart_observation_errors, [])
+            counterpart_document = dict(document)
+            counterpart_document.update({
+                "runtime": {
+                    key: str(value)
+                    for key, value in counterpart_runner.runtime.items()
+                },
+                "executionBinding": counterpart_runner.execution_binding,
+                "executionBindingDigest": ci.execution_binding_digest(
+                    counterpart_runner.execution_binding
+                ),
+                "authorizationContextBinding": (
+                    counterpart_runner.authorization_context_binding
+                ),
+                "authorizationContextBindingDigest": (
+                    counterpart_runner.authorization_context_binding_digest
+                ),
+                "records": counterpart_evidence_records,
+                "observations": [],
+                "completedCommandClasses": sorted(
+                    counterpart_runner.completed_classes
+                ),
+                "expectedCompletedCommandClasses": list(
+                    counterpart_runner.expected_completed_command_classes
+                ),
+                "actualCompletedCommandClasses": list(
+                    counterpart_runner.actual_completed_command_classes
+                ),
+                "expectedCompletedCommandClassSetDigest": (
+                    counterpart_runner.expected_completed_command_class_set_digest
+                ),
+                "completedCommandClassSetDigest": (
+                    counterpart_runner.completed_command_class_set_digest
+                ),
+                "producerObservationCount": (
+                    counterpart_runner.producer_observation_count
+                ),
+                "producerObservationUniverseDigest": (
+                    counterpart_runner.producer_observation_universe_digest
+                ),
+                "producerTranscriptDigest": (
+                    counterpart_runner.producer_transcript_digest
+                ),
+                "missingCommandIds": list(
+                    counterpart_runner.missing_command_ids
+                ),
+                "extraCommandIds": list(counterpart_runner.extra_command_ids),
+                "duplicateCommandIds": list(
+                    counterpart_runner.duplicate_command_ids
+                ),
+                "commandPlanDigest": counterpart_runner.command_plan_digest,
+                "commandAuthority": ci._portable_command_plan_value(
+                    counterpart_plan
+                ),
+                "runtimeDependencyClosure": copy.deepcopy(
+                    counterpart_runner.runtime_closure_document
+                ),
+                "runtimeDependencyGuard": copy.deepcopy(
+                    counterpart_runner.runtime_closure_guard_evidence
+                ),
+            })
+            counterpart_data = ci._json_bytes(counterpart_document)
+            self.assertLess(
+                len(counterpart_data),
+                ci.MAX_COMMAND_RESULTS_JSON_BYTES,
+            )
+            counterpart_document = ci.strict_json_loads(
+                counterpart_data,
+                label=f"{counterpart_profile.name} counterpart command evidence",
+            )
+            profile_documents = {
+                source_profile.name: document,
+                counterpart_profile.name: counterpart_document,
+            }
+            profile_serialized_documents = {
+                source_profile.name: data,
+                counterpart_profile.name: counterpart_data,
+            }
+            profile_producer_plans = {
+                source_profile.name: plan,
+                counterpart_profile.name: counterpart_plan,
+            }
+
+            def independently_reloaded_claims(
+                serialized: bytes,
+                expected_plan: list[dict],
+                *,
+                label: str,
+            ) -> tuple[dict, dict[str, object], set[str]]:
+                reloaded = ci.strict_json_loads(serialized, label=label)
+                valid_records, positional_errors = (
+                    ci._preflight_command_record_positions(
+                        reloaded["records"],
+                        expected_plan,
+                    )
+                )
+                self.assertEqual(positional_errors, [])
+                if valid_records is None:
+                    self.fail(f"{label} did not retain a valid record sequence")
+                expected_plan_digest = ci.command_plan_digest(expected_plan)
+                expected_classes = ci.expected_completed_command_classes(
+                    expected_plan
+                )
+                actual_classes = ci.actual_completed_command_classes(
+                    expected_plan,
+                    valid_records,
+                )
+                missing_ids, extra_ids, duplicate_ids = (
+                    ci.command_id_set_differences(
+                        expected_plan,
+                        valid_records,
+                    )
+                )
+                independently_derived: dict[str, object] = {
+                    "commandAuthority": ci._portable_command_plan_value(
+                        expected_plan
+                    ),
+                    "commandPlanDigest": expected_plan_digest,
+                    "expectedCompletedCommandClasses": expected_classes,
+                    "actualCompletedCommandClasses": actual_classes,
+                    "completedCommandClasses": actual_classes,
+                    "expectedCompletedCommandClassSetDigest": (
+                        ci.completed_command_class_set_digest(expected_classes)
+                    ),
+                    "completedCommandClassSetDigest": (
+                        ci.completed_command_class_set_digest(actual_classes)
+                    ),
+                    "producerObservationCount": sum(
+                        len(record.get("producerObservations", []))
+                        for record in valid_records
+                        if isinstance(
+                            record.get("producerObservations", []),
+                            list,
+                        )
+                    ),
+                    "producerObservationUniverseDigest": (
+                        ci.producer_observation_universe_digest(valid_records)
+                    ),
+                    "producerTranscriptDigest": ci.producer_transcript_digest(
+                        expected_plan_digest,
+                        valid_records,
+                        actual_classes,
+                    ),
+                    "missingCommandIds": missing_ids,
+                    "extraCommandIds": extra_ids,
+                    "duplicateCommandIds": duplicate_ids,
+                }
+                mismatches = {
+                    field_name
+                    for field_name, expected_value in independently_derived.items()
+                    if reloaded.get(field_name) != expected_value
+                }
+                return reloaded, independently_derived, mismatches
+
+            def serialize_mutated_claim(
+                mutable_document: dict,
+                field_name: str,
+                replacement: object,
+            ) -> bytes:
+                original = mutable_document[field_name]
+                mutable_document[field_name] = replacement
+                try:
+                    serialized = ci._json_bytes(mutable_document)
+                finally:
+                    mutable_document[field_name] = original
+                self.assertLess(
+                    len(serialized),
+                    ci.MAX_COMMAND_RESULTS_JSON_BYTES,
+                )
+                return serialized
+
+            def unrelated_digest(original: str) -> str:
+                zero_digest = "sha256:" + "0" * 64
+                return (
+                    zero_digest
+                    if original != zero_digest
+                    else "sha256:" + "1" * 64
+                )
+
+            for direction_source_profile in (
+                _R2_ORDINARY_PROFILE,
+                _R2_SECURITY_PROFILE,
+            ):
+                direction_counterpart_profile = counterpart_profile_for(
+                    direction_source_profile
+                )
+                (
+                    direction_source_paths,
+                    direction_source_objects,
+                    direction_source_plan,
+                ) = profile_fixture(direction_source_profile)
+                (
+                    direction_counterpart_paths,
+                    direction_counterpart_objects,
+                    direction_counterpart_plan,
+                ) = profile_fixture(direction_counterpart_profile)
+                direction_counterpart_producer_plan = profile_producer_plans[
+                    direction_counterpart_profile.name
+                ]
+                if direction_counterpart_profile is source_profile:
+                    independently_rebuilt_counterpart_plan = (
+                        build_structural_plan(
+                            "all", direction_counterpart_paths
+                        )
+                    )
+                else:
+                    with (
+                        mock.patch.object(
+                            ci,
+                            "_target_authority",
+                            side_effect=structural_target_authority,
+                        ),
+                        mock.patch.object(
+                            ci,
+                            "_node_stdin_parser_mode",
+                            side_effect=structural_parser_mode,
+                        ),
+                    ):
+                        active_content_authority = (
+                            _R2_ORDINARY_CONTENT_AUTHORITY
+                            if direction_counterpart_profile
+                            is _R2_ORDINARY_PROFILE
+                            else _R2_SECURITY_CONTENT_DELTA
+                        )
+                        independently_rebuilt_counterpart_plan = (
+                            build_structural_plan(
+                                "all",
+                                direction_counterpart_paths,
+                            )
+                        )
+                self.assertIsNot(
+                    independently_rebuilt_counterpart_plan,
+                    direction_counterpart_producer_plan,
+                )
+                self.assertEqual(
+                    independently_rebuilt_counterpart_plan,
+                    direction_counterpart_producer_plan,
+                )
+                direction_label = (
+                    f"{direction_source_profile.name}->"
+                    f"{direction_counterpart_profile.name}"
+                )
+                positive_complete = False
+                with self.subTest(
+                    r2_profile_direction=direction_label,
+                    case="independent-positive",
+                ):
+                    self.assertIs(
+                        _r2_profile_for_paths(direction_source_paths),
+                        direction_source_profile,
+                    )
+                    self.assertIs(
+                        _r2_bind_source_paths(
+                            immutable_tree_paths=direction_source_paths,
+                            runner_candidate_paths=direction_source_paths,
+                        ),
+                        direction_source_profile,
+                    )
+                    _r2_validate_git_object_authority(
+                        direction_source_profile,
+                        direction_source_objects,
+                    )
+                    self.assertIs(
+                        _r2_profile_for_paths(direction_counterpart_paths),
+                        direction_counterpart_profile,
+                    )
+                    self.assertIs(
+                        _r2_bind_source_paths(
+                            immutable_tree_paths=direction_counterpart_paths,
+                            runner_candidate_paths=direction_counterpart_paths,
+                        ),
+                        direction_counterpart_profile,
+                    )
+                    _r2_validate_git_object_authority(
+                        direction_counterpart_profile,
+                        direction_counterpart_objects,
+                    )
+                    selected_ordinary, selected_security = (
+                        _r2_counterpart_inventories(direction_source_paths)
+                    )
+                    self.assertEqual(selected_ordinary, ordinary_paths)
+                    self.assertEqual(selected_security, security_paths)
+                    selected_source_paths = (
+                        selected_ordinary
+                        if direction_source_profile is _R2_ORDINARY_PROFILE
+                        else selected_security
+                    )
+                    selected_counterpart_paths = (
+                        selected_security
+                        if direction_source_profile is _R2_ORDINARY_PROFILE
+                        else selected_ordinary
+                    )
+                    self.assertEqual(
+                        direction_source_paths,
+                        selected_source_paths,
+                    )
+                    self.assertEqual(
+                        direction_counterpart_paths,
+                        selected_counterpart_paths,
+                    )
+                    self.assertIsNot(
+                        direction_source_profile,
+                        direction_counterpart_profile,
+                    )
+                    assert_exact_structural_plan(
+                        direction_source_plan,
+                        direction_source_paths,
+                        "all",
+                    )
+                    assert_exact_structural_plan(
+                        direction_counterpart_plan,
+                        direction_counterpart_paths,
+                        "all",
+                    )
+                    assert_exact_structural_plan(
+                        independently_rebuilt_counterpart_plan,
+                        direction_counterpart_paths,
+                        "all",
+                    )
+                    counterpart_reloaded, independently_derived, mismatches = (
+                        independently_reloaded_claims(
+                            profile_serialized_documents[
+                                direction_counterpart_profile.name
+                            ],
+                            independently_rebuilt_counterpart_plan,
+                            label=(
+                                f"{direction_label} independently reloaded "
+                                "counterpart command evidence"
+                            ),
+                        )
+                    )
+                    self.assertEqual(mismatches, set())
+                    self.assertEqual(
+                        counterpart_reloaded,
+                        profile_documents[direction_counterpart_profile.name],
+                    )
+                    self.assertEqual(
+                        len(counterpart_reloaded["records"]),
+                        direction_counterpart_profile.all_command_count,
+                    )
+                    self.assertEqual(
+                        [
+                            record["commandId"]
+                            for record in counterpart_reloaded["records"]
+                        ],
+                        [
+                            spec["commandId"]
+                            for spec in independently_rebuilt_counterpart_plan
+                        ],
+                    )
+                    self.assertEqual(
+                        counterpart_reloaded["commandAuthority"],
+                        independently_derived["commandAuthority"],
+                    )
+                    self.assertEqual(
+                        ci._command_authority_violations(
+                            "all",
+                            counterpart_reloaded["records"],
+                            [],
+                            expected_plan=independently_rebuilt_counterpart_plan,
+                        ),
+                        [],
+                    )
+                    self.assertEqual(
+                        {
+                            target["path"]
+                            for record in counterpart_reloaded["records"]
+                            for target in record["targets"]
+                        },
+                        set(direction_counterpart_paths),
+                    )
+                    self.assertEqual(
+                        sum(
+                            len(record["targets"])
+                            for record in counterpart_reloaded["records"]
+                        ),
+                        direction_counterpart_profile.target_reference_count,
+                    )
+                    compact_protected_records = [
+                        record
+                        for record in counterpart_reloaded["records"]
+                        if record["executionInputMode"]
+                        == "PROTECTED-TARGET-BUNDLE"
+                    ]
+                    self.assertTrue(compact_protected_records)
+                    for record in compact_protected_records:
+                        self.assertEqual(record["executionInputs"], [])
+                        for field_name in (
+                            ci._PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS
+                        ):
+                            self.assertEqual(
+                                record["protectedTargetBundle"][field_name],
+                                [],
+                            )
+                    positive_complete = True
+
+                if not positive_complete:
+                    del independently_rebuilt_counterpart_plan
+                    continue
+                persisted_counterpart = counterpart_reloaded
+                del counterpart_reloaded
+                del compact_protected_records
+                changed_record = next(
+                    record
+                    for record in persisted_counterpart["records"]
+                    if record["commandId"] == "baseline-schema"
+                )
+                original_stdout_digest = changed_record["stdoutSha256"]
+                changed_stdout_digest = (
+                    "0" * 64
+                    if original_stdout_digest != "0" * 64
+                    else "1" * 64
+                )
+                changed_record["stdoutSha256"] = changed_stdout_digest
+                try:
+                    changed_record_data = ci._json_bytes(persisted_counterpart)
+                finally:
+                    changed_record["stdoutSha256"] = original_stdout_digest
+                self.assertLess(
+                    len(changed_record_data),
+                    ci.MAX_COMMAND_RESULTS_JSON_BYTES,
+                )
+                changed_control_complete = False
+                with self.subTest(
+                    r2_profile_direction=direction_label,
+                    case="changed-record-copied-transcript",
+                ):
+                    changed_record_document = ci.strict_json_loads(
+                        changed_record_data,
+                        label=f"{direction_label} changed persisted record",
+                    )
+                    changed_valid_records, changed_position_errors = (
+                        ci._preflight_command_record_positions(
+                            changed_record_document["records"],
+                            independently_rebuilt_counterpart_plan,
+                        )
+                    )
+                    self.assertEqual(changed_position_errors, [])
+                    if changed_valid_records is None:
+                        self.fail(
+                            f"{direction_label} changed record sequence is invalid"
+                        )
+                    changed_actual_classes = (
+                        ci.actual_completed_command_classes(
+                            independently_rebuilt_counterpart_plan,
+                            changed_valid_records,
+                        )
+                    )
+                    self.assertEqual(
+                        changed_actual_classes,
+                        independently_derived[
+                            "actualCompletedCommandClasses"
+                        ],
+                    )
+                    self.assertEqual(
+                        ci.producer_observation_universe_digest(
+                            changed_valid_records
+                        ),
+                        independently_derived[
+                            "producerObservationUniverseDigest"
+                        ],
+                    )
+                    changed_plan_digest = ci.command_plan_digest(
+                        independently_rebuilt_counterpart_plan
+                    )
+                    self.assertEqual(
+                        changed_plan_digest,
+                        independently_derived["commandPlanDigest"],
+                    )
+                    changed_record_derived = dict(independently_derived)
+                    changed_record_derived["producerTranscriptDigest"] = (
+                        ci.producer_transcript_digest(
+                            changed_plan_digest,
+                            changed_valid_records,
+                            changed_actual_classes,
+                        )
+                    )
+                    changed_record_mismatches = {
+                        field_name
+                        for field_name, expected_value in (
+                            changed_record_derived.items()
+                        )
+                        if changed_record_document.get(field_name)
+                        != expected_value
+                    }
+                    reloaded_changed_record = next(
+                        record
+                        for record in changed_record_document["records"]
+                        if record["commandId"] == "baseline-schema"
+                    )
+                    changed_record_errors: list[str] = []
+                    changed_record_hard_failure = ci._validate_command_record(
+                        reloaded_changed_record,
+                        reloaded_changed_record["ordinal"],
+                        changed_record_errors,
+                        expected_record=independently_rebuilt_counterpart_plan[
+                            reloaded_changed_record["ordinal"]
+                        ],
+                    )
+                    self.assertFalse(changed_record_hard_failure)
+                    self.assertEqual(changed_record_errors, [])
+                    self.assertEqual(
+                        changed_record_document["producerTranscriptDigest"],
+                        persisted_counterpart["producerTranscriptDigest"],
+                    )
+                    self.assertNotEqual(
+                        changed_record_derived["producerTranscriptDigest"],
+                        persisted_counterpart["producerTranscriptDigest"],
+                    )
+                    self.assertEqual(
+                        changed_record_mismatches,
+                        {"producerTranscriptDigest"},
+                    )
+                    changed_control_complete = True
+                if not changed_control_complete:
+                    del changed_record_data, changed_record
+                    del persisted_counterpart, independently_derived
+                    del independently_rebuilt_counterpart_plan
+                    continue
+                del changed_record_document, changed_record_derived
+                del changed_record_data, changed_valid_records
+                del reloaded_changed_record
+
+                for mismatch_case, field_name, replacement in (
+                    (
+                        "unrelated-transcript-digest",
+                        "producerTranscriptDigest",
+                        unrelated_digest(
+                            persisted_counterpart["producerTranscriptDigest"]
+                        ),
+                    ),
+                    (
+                        "observation-universe-digest",
+                        "producerObservationUniverseDigest",
+                        unrelated_digest(
+                            persisted_counterpart[
+                                "producerObservationUniverseDigest"
+                            ]
+                        ),
+                    ),
+                    (
+                        "completed-command-classes",
+                        "completedCommandClasses",
+                        [],
+                    ),
+                    (
+                        "expected-plan-authority",
+                        "commandAuthority",
+                        ci._portable_command_plan_value(
+                            profile_producer_plans[
+                                direction_source_profile.name
+                            ]
+                        ),
+                    ),
+                ):
+                    with self.subTest(
+                        r2_profile_direction=direction_label,
+                        case=mismatch_case,
+                    ):
+                        mutated_data = serialize_mutated_claim(
+                            persisted_counterpart,
+                            field_name,
+                            replacement,
+                        )
+                        mutated_document = ci.strict_json_loads(
+                            mutated_data,
+                            label=f"{direction_label} {mismatch_case}",
+                        )
+                        self.assertEqual(
+                            mutated_document["records"],
+                            persisted_counterpart["records"],
+                        )
+                        self.assertEqual(
+                            mutated_document[field_name],
+                            replacement,
+                        )
+                        mismatches = {
+                            claim_name
+                            for claim_name, expected_value in (
+                                independently_derived.items()
+                            )
+                            if mutated_document.get(claim_name)
+                            != expected_value
+                        }
+                        self.assertEqual(mismatches, {field_name})
+                        del mutated_document, mutated_data
+                del changed_record, persisted_counterpart, replacement
+                del independently_derived
+                del independently_rebuilt_counterpart_plan
+
+            security_document = profile_documents[_R2_SECURITY_PROFILE.name]
+            self.assertEqual(
+                len(security_document["records"]),
+                _R2_SECURITY_PROFILE.all_command_count,
+            )
+            self.assertEqual(
+                [record["commandId"] for record in security_document["records"]],
+                [spec["commandId"] for spec in security_all],
+            )
+            self.assertEqual(
+                security_document["commandAuthority"],
+                ci._portable_command_plan_value(security_all),
+            )
+            self.assertEqual(
+                sum(
+                    len(record["targets"])
+                    for record in security_document["records"]
+                ),
+                _R2_SECURITY_PROFILE.target_reference_count,
+            )
+            security_secret_scan = next(
+                record
+                for record in security_document["records"]
+                if record["commandId"] == "tracked-secret-scan"
+            )
+            self.assertEqual(
+                [scan["path"] for scan in security_secret_scan["fileScans"]],
+                list(security_paths),
+            )
+            for command_id in _R2_ADDED_COMMAND_IDS:
+                inserted_record = next(
+                    record
+                    for record in security_document["records"]
+                    if record["commandId"] == command_id
+                )
+                self.assertEqual(len(inserted_record["producerObservations"]), 1)
+                self.assertEqual(
+                    inserted_record["producerObservations"][0]["sourcePath"],
+                    command_id.removeprefix("node-check:"),
+                )
+            self.assertNotIn(
+                "command-results-size-limit",
+                {
+                    record["commandId"]
+                    for record in security_document["records"]
+                },
+            )
+            security_protected_records = [
+                record
+                for record in security_document["records"]
+                if record["executionInputMode"] == "PROTECTED-TARGET-BUNDLE"
+            ]
+            self.assertTrue(security_protected_records)
+            for record in security_protected_records:
+                self.assertEqual(record["executionInputs"], [])
+                for field_name in ci._PROTECTED_BUNDLE_DUPLICATE_ARRAY_FIELDS:
+                    self.assertEqual(
+                        record["protectedTargetBundle"][field_name],
+                        [],
+                    )
             self.assertEqual(
                 [record["commandId"] for record in document["records"]],
                 [spec["commandId"] for spec in plan],
             )
             self.assertIsNone(document["runtimeDependencyClosure"]["vitest"])
-            self.assertEqual(len(document["records"]), 705)
+            self.assertEqual(
+                len(document["records"]),
+                source_profile.all_command_count,
+            )
             persisted_message_origin = next(
                 record
                 for record in document["records"]
@@ -10921,6 +13174,10 @@ print(json.dumps({
 
     def test_synthetic_hosted_profiles_initialize_bind_and_preserve_static_count(self) -> None:
         baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
+        source_profile, immutable_source_paths = _r2_current_source_inventory()
+        expected_static_ids = _r2_expected_command_ids(immutable_source_paths)[
+            "static"
+        ]
         for platform_name, canonical_os in (("Ubuntu", "Linux"), ("Windows", "Windows")):
             with self.subTest(platform=platform_name):
                 fixture = _HostedToolFixture(platform_name)
@@ -10939,7 +13196,18 @@ print(json.dumps({
                         )
                         self.assertEqual(runner.tool_resolution_errors, [])
                         self.assertEqual(set(runner.require_all_tools(phase="CAPTURE")), set(self.REQUIRED))
-                        self.assertEqual(len(runner.command_plan), 677)
+                        self.assertEqual(
+                            tuple(runner.planned_candidate_paths),
+                            immutable_source_paths,
+                        )
+                        self.assertEqual(
+                            [(spec["ordinal"], spec["commandId"]) for spec in runner.command_plan],
+                            list(enumerate(expected_static_ids)),
+                        )
+                        self.assertEqual(
+                            len(runner.command_plan),
+                            source_profile.static_command_count,
+                        )
                         with (
                             mock.patch.object(
                                 ci,
@@ -12089,6 +14357,10 @@ class WindowsGitInstallationAuthorityRegressionTest(unittest.TestCase):
 
     def test_hosted_all_profile_binds_and_static_plan_remains_677_without_execution(self) -> None:
         baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
+        source_profile, immutable_source_paths = _r2_current_source_inventory()
+        expected_static_ids = _r2_expected_command_ids(immutable_source_paths)[
+            "static"
+        ]
         fixture, _git_root = self.hosted_layout(
             git_directory="bin",
             bash_position="bin/bash.exe",
@@ -12144,7 +14416,21 @@ class WindowsGitInstallationAuthorityRegressionTest(unittest.TestCase):
             )
             self.assertTrue(all_runner.command_plan)
             self.assertEqual(all_runner.command_plan_errors, [])
-            self.assertEqual(len(static_runner.command_plan), 677)
+            self.assertEqual(
+                tuple(static_runner.planned_candidate_paths),
+                immutable_source_paths,
+            )
+            self.assertEqual(
+                [
+                    (spec["ordinal"], spec["commandId"])
+                    for spec in static_runner.command_plan
+                ],
+                list(enumerate(expected_static_ids)),
+            )
+            self.assertEqual(
+                len(static_runner.command_plan),
+                source_profile.static_command_count,
+            )
             self.assertEqual(static_runner.command_plan_errors, [])
             bash_spec = copy.deepcopy(next(
                 item
@@ -13509,6 +15795,10 @@ class CI9FrozenReleaseSkipDualSignatureTest(unittest.TestCase):
         )
 
     def test_static_profile_command_count_remains_exact(self) -> None:
+        source_profile, immutable_source_paths = _r2_current_source_inventory()
+        expected_static_ids = _r2_expected_command_ids(immutable_source_paths)[
+            "static"
+        ]
         runner = ci.FoundationRunner(
             "static",
             self.baseline,
@@ -13519,7 +15809,18 @@ class CI9FrozenReleaseSkipDualSignatureTest(unittest.TestCase):
         try:
             self.assertEqual(runner.command_plan_errors, [])
             self.assertEqual(runner.tool_resolution_errors, [])
-            self.assertEqual(len(runner.command_plan), 677)
+            self.assertEqual(
+                tuple(runner.planned_candidate_paths),
+                immutable_source_paths,
+            )
+            self.assertEqual(
+                [(spec["ordinal"], spec["commandId"]) for spec in runner.command_plan],
+                list(enumerate(expected_static_ids)),
+            )
+            self.assertEqual(
+                len(runner.command_plan),
+                source_profile.static_command_count,
+            )
         finally:
             runner.cleanup_task_resources()
 

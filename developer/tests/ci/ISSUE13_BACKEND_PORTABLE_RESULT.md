@@ -487,3 +487,150 @@ historical baseline debt or release-only skips. The accepted 12-file reconciliat
 candidate remains unchanged; this addendum versions only the current portable
 contracts. Local v2 validation is separate from any future exact-head hosted
 acceptance.
+
+## Issue #107 R3 additive backend portable-result v3 addendum
+
+This R3 section is additive. It does not rewrite the historical v1 material or
+the P1A v2 addendum above, and it does not redefine a v2 report as v3. Under the
+approved v2 source profile, `BackendCanonicalPortableResult` version **2** still
+means exactly 141 ordered flat members, no nested members, 142 duration spans,
+143 retained non-duration segments, inventory digest
+`c19b500fff55e20740791a59de895da19ccb51e8998f212413cec3c83cd8238a`,
+and digest domain `ieltmps-backend-canonical-portable-result-v2`. Historical
+public constants such as `VERSION = 2` and `TEST_COUNT = 141` retain that
+meaning. A v2-selected side neither accepts the v3 hierarchy nor silently
+changes to the v3 digest domain.
+
+R3 adds a separately selected `BackendCanonicalPortableResult` version **3**.
+Its hierarchy inventory digest is
+`3217938708947463015beba935fad163b387a6ba2969625679f326c7770e843a`
+and its identity domain is
+`ieltmps-backend-canonical-portable-result-v3`. Thus equal-looking retained
+bytes cannot make a v2 result and a v3 result share an identity.
+
+### Protected path-profile selection
+
+Protocol selection happens before stdout parsing and is derived from the
+independently rebuilt, complete trusted path authority. Paths are sorted by
+Python Unicode code point, encoded as UTF-8, joined with LF, and serialized with
+exactly one terminal LF. The only recognized profiles are:
+
+| Protocol | Tracked paths | Serialized UTF-8 bytes | Sorted-path SHA-256 |
+| --- | ---: | ---: | --- |
+| historical v2 | 914 | 40,446 | `ea143c283e5b8b28098505a303530d0fc9c0c2731273f5bde84d00d5022c52aa` |
+| additive v3 | 916 | 40,530 | `5b9401b4afa1b964ebd2887ec023c247a605d4faad6532de6cc168720f70c786` |
+
+Cardinality alone never selects a protocol. Partial, mixed, unknown, or
+extended path profiles reject. Stdout, reporter footer counts, branch names,
+environment variables, candidate-provided version fields, permissive parser
+probes, and parsing fallback are not selector inputs. Once protected authority
+selects v3, any v3 parsing or binding failure is final for that side; the parser
+must not retry the bytes as v2.
+
+Producer and replay perform this selection independently. Each immutable side
+binding includes its selected protocol, exact path-profile identity, protected
+source identity, hierarchy inventory identity, and independently rebuilt
+trusted command authority. Both sides must select and bind the same values
+before semantic comparison. The existing package, runtime, dependency, tool,
+protected-input, containment, stderr, exit-status, producer, and fresh-replay
+checks remain effective and are not replaced by reporter parsing.
+
+### Coherent v3 protected-source tuples
+
+The v3 profile accepts exactly one of two complete six-file source tuples. The
+per-file raw SHA-256 values are:
+
+| Protected source | LF SHA-256 | CRLF SHA-256 |
+| --- | --- | --- |
+| `backend/Dockerfile` | `be87830d91db221b19de4a67c67b953ba6ee111c29372e87c7e6397415d1c825` | `6a65d29fe167a6d9ef2364e1e3297257953ae31cbc82512ea4c103c6b145aebd` |
+| `backend/package.json` | `64b7da71131e3012c15ca83dc9e434286763e5caa4deed5a1df27d59ff34ad4c` | `2a4f5fc9c2587ff92598f83e9516212ced6304d5c4bceecf0797084423c7bdf7` |
+| `backend/src/app.js` | `69a8947b2785ca73b2d31852da35e0e247af6197764426a408a805581b0e036f` | `da97a8be86a308a13710b7224d88ff39d120d239b33b049e09cd4f05ff5f69aa` |
+| `backend/src/publicListeningFrontend.js` | `7f9e8b30341108af540d0694908411e12bdeaea0135af468856a2b3ee0f459e4` | `15772d7017cfc72fe63a409190fea626526d91522136f66d763285cb25b191bf` |
+| `backend/test/backend.test.js` | `787d7c6763736960f7013b17161f2fc4445b2005a1d6c8b3ca04eb4cf13558ca` | `b638658447d0760d7ff6ce29bc3dd73dd02415cbe9e5e72f65d32d70b73988a3` |
+| `backend/test/publicListeningFrontend.test.js` | `6aab71707f520837fbfce399414fe3f08be0e130988aa2bf52bd6033e6676bab` | `11bb1b9cb081fe93bf7e1b9d9af87d46778c23095e35fa89dfd7f5e38f5d201e` |
+
+The complete all-LF tuple contains exactly 564,843 bytes. The complete all-CRLF
+tuple contains exactly 577,131 bytes. Those are the two accepted tuple-wide
+states; all other 62 assignments across the six LF/CRLF alternatives reject.
+A substituted, omitted, duplicated, unexpectedly extended, or otherwise
+invalid protected source also rejects. Recognizing both coherent line-ending
+representations does not normalize source bytes or permit per-file mixing.
+
+### Exact v3 hierarchy and reporter cardinalities
+
+The v3 reporter has 148 top-level members and six nested members, for 154 total
+executed members. The first 143 top-level members are from
+`backend.test.js`; the remaining five are from
+`publicListeningFrontend.test.js`. The hierarchy parent is the second
+top-level member of the latter file, so its global zero-based top-level ordinal
+is exactly `143 + 1 = 144`.
+
+The required suite heading is exactly:
+
+```text
+public Listening loader rejects Locator, Manifest, Payload and inventory corruption
+```
+
+It owns exactly these six children, in this order:
+
+1. `strict active locator schema`
+2. `Manifest bytes and digest`
+3. `same-length Manifest corruption is rejected by SHA-256`
+4. `per-file Payload checksum`
+5. `unexpected Payload file`
+6. `image-root-only dependency checksum`
+
+All six children must have the exact required indentation and parent
+association, and the parent's completion must follow all six nested
+completions. The children are included in the 154 executed-member total; they
+are not six additional top-level entries. Missing, duplicate, reordered,
+renamed, additional, or reparented members, a changed suite heading, changed
+indentation, or misplaced parent completion reject.
+
+The footer requires the exact reporter framing, punctuation, and field order,
+with `tests 154`, `suites 0`, `pass 154`, `fail 0`, `cancelled 0`,
+`skipped 0`, and `todo 0`, followed by the terminal duration field. Wrong
+counts, fields, ordering, punctuation, additional output, nonempty stderr, or a
+nonzero/incomplete execution cannot acquire v3 portability.
+
+### Duration-only normalization and identity
+
+For v3, normalization excludes only the approved decimal numeric text in the
+154 member-completion durations and the one terminal reporter duration: exactly
+155 spans, leaving exactly 156 retained byte segments. Each decimal has 1-16
+ASCII integral digits and, when a fractional part is present, 1-16 ASCII
+fractional digits. Exponents, signs, alternate units, `NaN`, over-width
+numbers, and duration-like text outside those spans reject or remain identity
+bytes as required by their grammar position.
+
+Every other byte remains exact: the npm banner, names, suite heading, reporter
+glyphs, statuses, indentation, hierarchy, ordering, whitespace, punctuation,
+units, footer labels and values, line endings, and stream boundaries. The
+existing maximum stdout size of 2,097,152 bytes and maximum line count of 2,048
+remain unchanged. The historical v2 normalization remains separately fixed at
+142 duration spans and 143 retained segments.
+
+Positive compatibility therefore means that exact historical v2 evidence still
+accepts when protected authority selects v2, while either coherent v3 source
+tuple accepts only the exact v3 hierarchy and footer. Producer and replay may
+differ only in the approved duration numerics and still derive equal results.
+Negative compatibility requires rejection of non-duration reporter changes,
+any of the 62 mixed source tuples, source/path/hierarchy substitution,
+candidate-directed version selection, v2/v3 or producer/replay disagreement,
+and any attempted v3-to-v2 fallback.
+
+### R3 validation and stop boundary
+
+This addendum describes an Issue #107 R3 **local candidate**. Focused local
+tests may establish historical v2 preservation, exact v3 positives, all 62
+mixed-tuple negatives, hierarchy/footer negatives, duration-only behavior,
+independent selection, producer/replay agreement, and no fallback. They do not
+constitute Hosted CI evidence, integration acceptance, merge approval, or
+acceptance of the Security PR whose frozen source identities were used as
+authority inputs.
+
+R4, R5, R6, and R7 remain outstanding and have not started. Cross-node
+integration and the separately governed Issue #109 integration decision have
+not started. Hosted CI has not been dispatched or rerun for this candidate.
+The candidate remains unstaged, uncommitted, and unpublished until a later
+maintainer disposition explicitly authorizes the next transaction.
