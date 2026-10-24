@@ -126,7 +126,8 @@ function createContentSecurityPolicy(req) {
         ["manifest-src", ["'self'"]]
     ];
     if (rawListeningContent) {
-        directives.push(["sandbox", ['allow-scripts', 'allow-downloads', 'allow-same-origin']]);
+        // Legacy exercise submit handlers require confirm() before grading.
+        directives.push(["sandbox", ['allow-scripts', 'allow-downloads', 'allow-same-origin', 'allow-modals']]);
     }
     return directives
         .map(([name, values]) => `${name} ${values.join(' ')}`)

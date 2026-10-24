@@ -7994,7 +7994,7 @@ test('static hosting serves index and denies dotfiles with security headers', as
         assert.match(listeningCsp, /base-uri 'self'/);
         assert.match(listeningCsp, /frame-src 'none'/);
         assert.match(listeningCsp, /child-src 'none'/);
-        assert.match(listeningCsp, /sandbox allow-scripts allow-downloads allow-same-origin/);
+        assert.match(listeningCsp, /sandbox allow-scripts allow-downloads allow-same-origin allow-modals(?:;|$)/);
 
         const lowerCaseListening = await client.request('GET', '/listeningpractice/P1/sample.html');
         assert.equal(lowerCaseListening.response.status, 200);
@@ -8002,7 +8002,7 @@ test('static hosting serves index and denies dotfiles with security headers', as
         assert.match(lowerCaseListeningCsp, /connect-src 'none'/);
         assert.match(lowerCaseListeningCsp, /form-action 'none'/);
         assert.match(lowerCaseListeningCsp, /base-uri 'self'/);
-        assert.match(lowerCaseListeningCsp, /sandbox allow-scripts allow-downloads allow-same-origin/);
+        assert.match(lowerCaseListeningCsp, /sandbox allow-scripts allow-downloads allow-same-origin allow-modals(?:;|$)/);
 
         const revokedContentSessions = [];
         for (const protectedPath of [
