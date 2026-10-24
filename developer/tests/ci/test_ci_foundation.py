@@ -16661,9 +16661,11 @@ class CI6ReplayVerificationTest(unittest.TestCase):
                 self.assertEqual(len(comparisons[side][key]), 1, key)
         documents["summary.json"].update({key: comparisons["producer"][value]
                                           for key, value in fields.items()})
-        pair = backend.portable._BoundPair(backend.portable._bind_side(ci, producer),
-            backend.portable._bind_side(ci, replay), producer_records, runner.command_results,
-            runner.command_plan_digest, runner.actual_completed_command_classes)
+        # Bind the synthetic two-target fixtures with explicit v2 protocol authority.
+        with backend.force_protocol_selection(version=2):
+            pair = backend.portable._BoundPair(backend.portable._bind_side(ci, producer),
+                backend.portable._bind_side(ci, replay), producer_records, runner.command_results,
+                runner.command_plan_digest, runner.actual_completed_command_classes)
         result = backend.portable._derive_equal_result(ci, pair)
         self.assertIsNotNone(result)
         views = backend.portable._comparison_views(ci, pair, result)
