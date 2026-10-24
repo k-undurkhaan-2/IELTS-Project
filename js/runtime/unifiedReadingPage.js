@@ -476,10 +476,35 @@
         if (!toolbar) return;
         toolbar.style.display = 'flex';
         global.requestAnimationFrame(() => {
-            const top = global.scrollY + rect.top - toolbar.offsetHeight - 8;
-            const left = global.scrollX + rect.left + (rect.width / 2) - (toolbar.offsetWidth / 2);
-            toolbar.style.top = `${top > 0 ? top : global.scrollY + rect.bottom + 8}px`;
-            toolbar.style.left = `${Math.max(8, left)}px`;
+            const viewport = global.visualViewport;
+            const viewportTop = viewport?.offsetTop || 0;
+            const viewportLeft = viewport?.offsetLeft || 0;
+            const viewportHeight = viewport?.height || global.innerHeight;
+            const viewportWidth = viewport?.width || document.documentElement.clientWidth;
+            const mobile = global.matchMedia('(pointer: coarse), (max-width: 980px)').matches;
+            // Leave room for the native selection menu and handles on touch browsers.
+            const gap = mobile ? 64 : 8;
+            toolbar.style.maxWidth = `${Math.max(0, viewportWidth - 16)}px`;
+            const minTop = viewportTop + 8;
+            const minLeft = viewportLeft + 8;
+            const maxTop = Math.max(minTop, viewportTop + viewportHeight - toolbar.offsetHeight - 8);
+            const maxLeft = Math.max(minLeft, viewportLeft + viewportWidth - toolbar.offsetWidth - 8);
+            const above = rect.top - toolbar.offsetHeight - gap;
+            const below = rect.bottom + gap;
+            let top = above >= minTop ? above : below;
+            if (mobile) {
+                const moreRoomBelow = viewportTop + viewportHeight - rect.bottom > rect.top - viewportTop;
+                if (below <= maxTop) {
+                    top = below;
+                } else if (above >= minTop) {
+                    top = above;
+                } else {
+                    top = moreRoomBelow ? below : above;
+                }
+            }
+            const left = rect.left + (rect.width / 2) - (toolbar.offsetWidth / 2);
+            toolbar.style.top = `${global.scrollY + Math.max(minTop, Math.min(top, maxTop))}px`;
+            toolbar.style.left = `${global.scrollX + Math.max(minLeft, Math.min(left, maxLeft))}px`;
         });
     }
 
@@ -596,7 +621,21 @@
         document.addEventListener('selectionchange', () => {
             global.setTimeout(updateSelectionToolbar, 10);
         });
-        toolbar.addEventListener('mousedown', () => {
+        const repositionToolbar = () => {
+            if (toolbar.style.display !== 'flex') return;
+            const anchor = interaction.lastRange || interaction.currentHighlightNode;
+            if (anchor) positionSelectionToolbar(anchor.getBoundingClientRect());
+        };
+        document.addEventListener('scroll', repositionToolbar, true);
+        global.addEventListener('resize', repositionToolbar);
+        global.visualViewport?.addEventListener('resize', repositionToolbar);
+        global.visualViewport?.addEventListener('scroll', repositionToolbar);
+        toolbar.addEventListener('pointerdown', (event) => {
+            // Keep the selected text intact until the button's click action runs.
+            if (event.button === 0) event.preventDefault();
+        });
+        toolbar.addEventListener('mousedown', (event) => {
+            event.preventDefault();
             interaction.keepToolbar = true;
         });
         toolbar.addEventListener('mouseup', () => {

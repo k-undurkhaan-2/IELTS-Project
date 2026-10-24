@@ -669,6 +669,12 @@
         #selbar {
             position: absolute;
             z-index: 1000;
+            box-sizing: border-box;
+            max-width: calc(100% - 16px);
+            flex-wrap: wrap;
+            user-select: none;
+            -webkit-user-select: none;
+            touch-action: manipulation;
             background: #1e293b;
             color: white;
             padding: 4px;
@@ -691,6 +697,13 @@
 
         #selbar button:hover {
             background: #334155;
+        }
+
+        @media (pointer: coarse), (max-width: 980px) {
+            #selbar button {
+                min-height: 44px;
+                min-width: 44px;
+            }
         }
 
         /* Settings Panel floating */
