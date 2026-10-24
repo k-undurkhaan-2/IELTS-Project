@@ -1265,6 +1265,9 @@
   }
 
   function bootstrap() {
+    if (window.ListeningAudioPlayer) {
+      window.ListeningAudioPlayer.install(window.document);
+    }
     state.parentWindow = findParentWindow();
     if (!state.examId) {
       state.examId = extractExamIdFromUrl();

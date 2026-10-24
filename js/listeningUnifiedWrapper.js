@@ -764,6 +764,9 @@
     function adaptFrameUi() {
         var doc = getFrameDocument();
         if (!doc || !doc.body) return;
+        if (global.ListeningAudioPlayer) {
+            global.ListeningAudioPlayer.install(doc);
+        }
         doc.body.classList.add('listening-unified-ui');
         ensureAdapterStyle(doc);
         ensureListeningLayout(doc);
