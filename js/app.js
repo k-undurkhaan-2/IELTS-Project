@@ -1078,7 +1078,7 @@ class ExamSystemApp {
                 }
             });
         },
-        async loadInitialData() {
+        async loadInitialData({ restoreBrowseFilter = true } = {}) {
             try {
                 const examIndex = await storage.get('exam_index', []);
                 if (Array.isArray(examIndex)) {
@@ -1088,8 +1088,10 @@ class ExamSystemApp {
                 if (Array.isArray(practiceRecords)) {
                     this.setState('practice.records', practiceRecords);
                 }
-                const browseFilter = await storage.get('browse_filter', { category: 'all', type: 'all' });
-                this.setState('ui.browseFilter', browseFilter);
+                if (restoreBrowseFilter) {
+                    const browseFilter = await storage.get('browse_filter', { category: 'all', type: 'all' });
+                    this.setState('ui.browseFilter', browseFilter);
+                }
                 await this.loadUserStats();
                 this.updateOverviewStats();
             } catch (error) {
@@ -1291,7 +1293,8 @@ class ExamSystemApp {
         },
         async refreshData() {
             try {
-                await this.loadInitialData();
+                // Returning from a practice window must not restore an older browse selection.
+                await this.loadInitialData({ restoreBrowseFilter: false });
                 this.onViewActivated(this.currentView);
             } catch (error) {
                 console.error('Failed to refresh data:', summarizeAppErrorForLog(error));
