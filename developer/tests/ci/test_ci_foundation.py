@@ -287,6 +287,8 @@ class _R2SourceInventoryProfile:
     tree_manifest_sha256: str
     # A1 binds the complete three-blob R3 replacement set in the same inventory.
     a1_integrated_tree_manifest_sha256: str
+    # A3 binds only the authenticated dual-profile fixture replacement.
+    a3_integrated_tree_manifest_sha256: str
     path_count: int
     serialized_bytes: int
     sorted_path_sha256: str
@@ -318,6 +320,9 @@ _R2_ORDINARY_PROFILE = _R2SourceInventoryProfile(
     a1_integrated_tree_manifest_sha256=(
         "a3b8feff145885570a0efdfcbd8570922189e6b17c51f8987bc9fafcea04e4da"
     ),
+    a3_integrated_tree_manifest_sha256=(
+        "5c470cad937ad449092fa066a202c46d27f4ac49527ab00ff85df80f9d9d72a1"
+    ),
     path_count=914,
     serialized_bytes=40_446,
     sorted_path_sha256=(
@@ -347,6 +352,9 @@ _R2_SECURITY_PROFILE = _R2SourceInventoryProfile(
     ),
     a1_integrated_tree_manifest_sha256=(
         "0ceef47379c22e6630ccaabd5a7b027bac418364980da30846f6169da116ad94"
+    ),
+    a3_integrated_tree_manifest_sha256=(
+        "56d4692cd91ec95ed7753b9831042f67b2aad50b55d5fda1f574fd7a4f71618c"
     ),
     path_count=916,
     serialized_bytes=40_530,
@@ -744,6 +752,7 @@ def _r2_validate_git_object_authority(
     if manifest_digest not in (
         profile.tree_manifest_sha256,
         profile.a1_integrated_tree_manifest_sha256,
+        profile.a3_integrated_tree_manifest_sha256,
     ):
         raise AssertionError("R2 immutable full-tree Git object authority does not match")
     content_authority = (

@@ -274,30 +274,30 @@ V3_NESTED_NAMES = (
 V3_PARENT_ORDINAL = 144
 REAL_REPO_ROOT = ci.REPO_ROOT
 
-_CACHED_PROTOCOL_PATHS = {}
-_CACHED_FORCED_TARGETS = {}
-
-
 def independent_path_profile(paths):
     serialized = ("\n".join(sorted(paths)) + "\n").encode("utf-8")
     return len(paths), len(serialized), digest(serialized)
 
 
 def protocol_paths(version):
-    if version not in _CACHED_PROTOCOL_PATHS:
-        paths, errors = ci.deterministic_candidate_paths(REAL_REPO_ROOT)
-        if errors:
-            raise AssertionError(errors)
-        if independent_path_profile(paths) != V2_PATH_PROFILE:
-            raise AssertionError(("unexpected-v2-path-profile", independent_path_profile(paths)))
-        if version == 3:
-            paths = sorted([*paths, *V3_ADDED_PATHS])
-            if independent_path_profile(paths) != V3_PATH_PROFILE:
-                raise AssertionError(("unexpected-v3-path-profile", independent_path_profile(paths)))
-        elif version != 2:
-            raise AssertionError(("unknown-protocol-version", version))
-        _CACHED_PROTOCOL_PATHS[version] = tuple(paths)
-    return _CACHED_PROTOCOL_PATHS[version]
+    if version not in (2, 3):
+        raise AssertionError(("unknown-protocol-version", version))
+    # Authenticate every live inventory, including after earlier fixture calls.
+    paths, errors = ci.deterministic_candidate_paths(REAL_REPO_ROOT)
+    if errors:
+        raise AssertionError(errors)
+    source_profile = independent_path_profile(paths)
+    if len(paths) != len(set(paths)) or source_profile not in (V2_PATH_PROFILE, V3_PATH_PROFILE):
+        raise AssertionError(("unexpected-live-path-profile", source_profile))
+    if version == 2 and source_profile == V3_PATH_PROFILE:
+        paths = [path for path in paths if path not in V3_ADDED_PATHS]
+    elif version == 3 and source_profile == V2_PATH_PROFILE:
+        paths = [*paths, *V3_ADDED_PATHS]
+    expected = V2_PATH_PROFILE if version == 2 else V3_PATH_PROFILE
+    target_profile = independent_path_profile(paths)
+    if len(paths) != len(set(paths)) or target_profile != expected:
+        raise AssertionError(("unexpected-target-path-profile", version, target_profile))
+    return tuple(sorted(paths))
 
 
 def protocol_targets(version, *, source_variant="LF", source_mask=None,
@@ -334,11 +334,8 @@ def protocol_targets(version, *, source_variant="LF", source_mask=None,
 
 
 def forced_selector_targets(version=2, source_variant="LF"):
-    key = version, source_variant
-    if key not in _CACHED_FORCED_TARGETS:
-        _CACHED_FORCED_TARGETS[key] = protocol_targets(
-            version, source_variant=source_variant)
-    return _CACHED_FORCED_TARGETS[key]
+    # Fresh targets also prevent shared mutable fixture authority from leaking.
+    return protocol_targets(version, source_variant=source_variant)
 
 
 def v3_package_bytes(source_variant="LF"):
@@ -1904,6 +1901,100 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
             errors = []
             ci._validate_command_record(forged, 0, errors)
             self.assertTrue(any("keys are not valid" in e for e in errors))
+
+    def test_issue110_a3_both_live_profiles_construct_exact_protocols(self):
+        live_paths, errors = ci.deterministic_candidate_paths(REAL_REPO_ROOT)
+        self.assertEqual(errors, [])
+        ordinary, security = fixtures._r2_counterpart_inventories(live_paths)
+        ordinary, security = tuple(ordinary), tuple(security)
+        inventories = {2: ordinary, 3: security}
+        for live_version in (2, 3, 2):
+            with mock.patch.object(ci, "deterministic_candidate_paths",
+                                   return_value=(list(inventories[live_version]), [])):
+                for requested in (2, 3):
+                    for variant in ("LF", "CRLF"):
+                        with self.subTest(live=live_version, requested=requested, variant=variant):
+                            self.assertEqual(protocol_paths(requested), inventories[requested])
+                            targets = forced_selector_targets(requested, variant)
+                            self.assertEqual(tuple(target["path"] for target in targets),
+                                             inventories[requested])
+                            binding = portable._protocol_binding(portable._select_protocol(targets))
+                            self.assertEqual(binding["version"], requested)
+                            if requested == 3:
+                                self.assertEqual(binding["sourceTuple"]["variant"], variant)
+        self.assertEqual(set(security) - set(ordinary), set(V3_ADDED_PATHS))
+        self.assertFalse(set(ordinary) - set(security))
+
+    def test_issue110_a3_rejects_live_drift_after_fixture_reuse(self):
+        live_paths, errors = ci.deterministic_candidate_paths(REAL_REPO_ROOT)
+        self.assertEqual(errors, [])
+        ordinary, security = fixtures._r2_counterpart_inventories(live_paths)
+        ordinary, security = tuple(ordinary), tuple(security)
+        # Warm every former cache key before presenting an unauthorized live source.
+        for version in (2, 3):
+            for variant in ("LF", "CRLF"):
+                forced_selector_targets(version, variant)
+        corrupted = {
+            "unknown": [],
+            "duplicate": [*ordinary, ordinary[0]],
+            "omitted": list(ordinary[:-1]),
+            "extra": [*security, "backend/unapproved-extension.js"],
+            "same-count-and-length": [ordinary[0][:-1] + "!", *ordinary[1:]],
+            "partial-addition": [*ordinary, V3_ADDED_PATHS[0]],
+            "partial-removal": [path for path in security if path != V3_ADDED_PATHS[0]],
+            "duplicate-substitution": [ordinary[1], *ordinary[1:]],
+        }
+        original_selector = portable._select_protocol
+        original_loader = ci._frozen_backend_portable_verifier
+        for label, paths in corrupted.items():
+            with mock.patch.object(ci, "deterministic_candidate_paths", return_value=(paths, [])):
+                for version in (2, 3):
+                    for build in (protocol_paths, protocol_targets, forced_selector_targets):
+                        with self.subTest(source=label, version=version, builder=build.__name__), \
+                             self.assertRaisesRegex(AssertionError, "unexpected-live-path-profile"):
+                            build(version)
+                    with self.assertRaisesRegex(AssertionError, "unexpected-live-path-profile"):
+                        with force_protocol_selection(version):
+                            self.fail("unauthenticated override entered")
+            self.assertIs(portable._select_protocol, original_selector)
+            self.assertIs(ci._frozen_backend_portable_verifier, original_loader)
+        with mock.patch.object(ci, "deterministic_candidate_paths",
+                               return_value=(list(ordinary), ["inventory read failed"])), \
+             self.assertRaisesRegex(AssertionError, "inventory read failed"):
+            forced_selector_targets()
+        targets = forced_selector_targets(3)
+        targets[0]["path"] = "backend/unauthorized.js"
+        fresh = forced_selector_targets(3)
+        self.assertEqual(tuple(target["path"] for target in fresh), security)
+        self.assertEqual(portable._protocol_binding(portable._select_protocol(fresh))["version"], 3)
+
+    def test_issue110_a3_target_authentication_and_override_restoration(self):
+        live_paths, errors = ci.deterministic_candidate_paths(REAL_REPO_ROOT)
+        self.assertEqual(errors, [])
+        ordinary, security = fixtures._r2_counterpart_inventories(live_paths)
+        ordinary, security = tuple(ordinary), tuple(security)
+        for source, requested in ((ordinary, 3), (security, 2)):
+            with mock.patch.object(ci, "deterministic_candidate_paths", return_value=(list(source), [])), \
+                 mock.patch(__name__ + ".V3_ADDED_PATHS", (V3_ADDED_PATHS[0], "backend/wrong.js")), \
+                 self.assertRaisesRegex(AssertionError, "unexpected-target-path-profile"):
+                forced_selector_targets(requested)
+        for version in (0, 1, 4, "3"):
+            with self.assertRaisesRegex(AssertionError, "unknown-protocol-version"):
+                forced_selector_targets(version)
+        original_selector = portable._select_protocol
+        original_loader = ci._frozen_backend_portable_verifier
+        for version in (2, 3):
+            with force_protocol_selection(version) as audit:
+                self.assertEqual(portable._protocol_binding(portable._select_protocol([]))["version"], version)
+            self.assertEqual([binding["version"] for binding in audit], [version])
+            self.assertIs(portable._select_protocol, original_selector)
+            self.assertIs(ci._frozen_backend_portable_verifier, original_loader)
+            with self.assertRaisesRegex(RuntimeError, "fixture exit"):
+                with force_protocol_selection(version):
+                    raise RuntimeError("fixture exit")
+            self.assertIs(portable._select_protocol, original_selector)
+            self.assertIs(ci._frozen_backend_portable_verifier, original_loader)
+            self.assert_private_rejection("unknown-path-profile", portable._select_protocol, [])
 
     def test_issue107_real_protocol_selection_and_exact_source_profiles(self):
         self.assertEqual((len(V3_PACKAGE_LF), digest(V3_PACKAGE_LF)),
