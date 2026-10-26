@@ -289,6 +289,8 @@ class _R2SourceInventoryProfile:
     a1_integrated_tree_manifest_sha256: str
     # A3 binds only the authenticated dual-profile fixture replacement.
     a3_integrated_tree_manifest_sha256: str
+    # A4.1 binds the exact workflow/runner pair and the accepted A3 sources.
+    a4_1_integrated_tree_manifest_sha256: str
     path_count: int
     serialized_bytes: int
     sorted_path_sha256: str
@@ -323,6 +325,9 @@ _R2_ORDINARY_PROFILE = _R2SourceInventoryProfile(
     a3_integrated_tree_manifest_sha256=(
         "5c470cad937ad449092fa066a202c46d27f4ac49527ab00ff85df80f9d9d72a1"
     ),
+    a4_1_integrated_tree_manifest_sha256=(
+        "334cd06b7802c9ca0ca8ef1d06c30fa689ffe086812bf32e6127f6a355f2c98f"
+    ),
     path_count=914,
     serialized_bytes=40_446,
     sorted_path_sha256=(
@@ -355,6 +360,9 @@ _R2_SECURITY_PROFILE = _R2SourceInventoryProfile(
     ),
     a3_integrated_tree_manifest_sha256=(
         "56d4692cd91ec95ed7753b9831042f67b2aad50b55d5fda1f574fd7a4f71618c"
+    ),
+    a4_1_integrated_tree_manifest_sha256=(
+        "21d19f7596f5d295d81493b4b1a60dc9d8ae09b9020c9b07331cdeb73ead6085"
     ),
     path_count=916,
     serialized_bytes=40_530,
@@ -468,6 +476,31 @@ _R2_SECURITY_CONTENT_DELTA = {
         "gitBlob": "e59f01e8d08066a4c94f307fa28245ba77475430",
         "size": 96_847,
         "sha256": "9de82f8ba4b2ab6a7718eff9d7514d86f2a4c77998021d3e295343be904558dc",
+    },
+}
+# A4.1 alternatives retain the independent Ordinary/Security source identities.
+_R2_A4_1_ORDINARY_CONTENT_DELTA = {
+    ".github/workflows/ci.yml": {
+        "gitBlob": "31ab34309f6b06595faa7bac5b1d3bfff90f4d37",
+        "size": 15653,
+        "sha256": "b1836c822e1d9742bf82bffca67f1a421ca74a82e00b68860448c251bc6b3f0f",
+    },
+    "developer/tests/ci/run_ci_foundation.py": {
+        "gitBlob": "21ea8baef787d13a7074faf6dd3a21710f3bcc5b",
+        "size": 1130232,
+        "sha256": "dd561a9743d729b91a4e96d7516ee3fd8910a6737459d974516c89e0aa1c2253",
+    },
+}
+_R2_A4_1_SECURITY_CONTENT_DELTA = {
+    ".github/workflows/ci.yml": {
+        "gitBlob": "4fb4f29b27506a99b64090a9798c9ebf517a40c8",
+        "size": 15635,
+        "sha256": "67824377f673ff821a8a769a1884c9908b46b7ae365a7d78077a63939547b6c7",
+    },
+    "developer/tests/ci/run_ci_foundation.py": {
+        "gitBlob": "bc70144cb5d2dad1cad68acefbb9aa78325982a2",
+        "size": 1130230,
+        "sha256": "3369edc76f440a5cf93960ecf4dbb8df447b51d483eaf82b20d8256ddc99f1d0",
     },
 }
 _R2_STATIC_COMMAND_PREFIX = (
@@ -753,6 +786,7 @@ def _r2_validate_git_object_authority(
         profile.tree_manifest_sha256,
         profile.a1_integrated_tree_manifest_sha256,
         profile.a3_integrated_tree_manifest_sha256,
+        profile.a4_1_integrated_tree_manifest_sha256,
     ):
         raise AssertionError("R2 immutable full-tree Git object authority does not match")
     content_authority = (
@@ -760,6 +794,13 @@ def _r2_validate_git_object_authority(
         if profile is _R2_ORDINARY_PROFILE
         else _R2_SECURITY_CONTENT_DELTA
     )
+    if manifest_digest == profile.a4_1_integrated_tree_manifest_sha256:
+        content_authority = {
+            **content_authority,
+            **(_R2_A4_1_ORDINARY_CONTENT_DELTA
+               if profile is _R2_ORDINARY_PROFILE
+               else _R2_A4_1_SECURITY_CONTENT_DELTA),
+        }
     for relative, expected in content_authority.items():
         entry = object_entries.get(relative)
         if entry is None or entry[2] != expected["gitBlob"]:
@@ -4905,6 +4946,23 @@ class WorkflowPolicyTest(unittest.TestCase):
 
     def test_current_workflow_passes_narrow_policy(self) -> None:
         self.assertEqual(ci.check_workflow_text(self.workflow), [])
+        historical = self.workflow.replace(
+            "    timeout-minutes: 35\n", "    timeout-minutes: 20\n", 1,
+        )
+        self.assertEqual(ci.check_workflow_text(historical), [])
+        a4_1 = historical.replace(
+            "    timeout-minutes: 20\n", "    timeout-minutes: 35\n", 1,
+        )
+        self.assertEqual(ci.check_workflow_text(a4_1), [])
+        for timeout in ("0", "19", "21", "34", "36", "999", "35.0", '"35"'):
+            with self.subTest(a4_1_unauthorized_timeout=timeout):
+                self.assertTrue(ci.check_workflow_text(a4_1.replace(
+                    "    timeout-minutes: 35\n",
+                    f"    timeout-minutes: {timeout}\n", 1,
+                )))
+        for suffix in ("\n", "# unregistered A4.1 source\n"):
+            with self.subTest(a4_1_unauthorized_source=suffix):
+                self.assertTrue(ci.check_workflow_text(a4_1 + suffix))
         self.assertEqual(
             ci.parse_canonical_workflow_yaml(self.workflow)["on"],
             {
@@ -4991,6 +5049,18 @@ class WorkflowPolicyTest(unittest.TestCase):
             job: [{"python-version": "3.12.10"}] for job in python_jobs
         })
         exact_python_selector = 'python-version: "3.12.10"'
+        def assert_python_rejection(candidate: str, expected: list[str]) -> None:
+            historical_candidate = candidate.replace(
+                "    timeout-minutes: 35\n", "    timeout-minutes: 20\n", 1,
+            )
+            self.assertEqual(ci.check_workflow_text(historical_candidate), sorted(expected))
+            a4_1_candidate = historical_candidate.replace(
+                "    timeout-minutes: 20\n", "    timeout-minutes: 35\n", 1,
+            )
+            self.assertEqual(ci.check_workflow_text(a4_1_candidate), sorted([
+                *expected, "job repository-policy-producer metadata is not exact",
+            ]))
+
         python_selectors = list(re.finditer(re.escape(exact_python_selector), self.workflow))
         self.assertEqual(len(python_selectors), 6)
         for job, selector in zip(python_jobs, python_selectors):
@@ -5002,16 +5072,15 @@ class WorkflowPolicyTest(unittest.TestCase):
                         + f'python-version: "{rejected}"'
                         + self.workflow[selector.end():]
                     )
-                    self.assertEqual(ci.check_workflow_text(candidate),
-                                     [f"{job} Python setup is not exact"])
+                    assert_python_rejection(candidate, [f"{job} Python setup is not exact"])
         for rejected in ("3.12", "3.12.9", "3.12.11", "3.12.14", "3.12.15", "3.12.*", ">=3.12"):
             with self.subTest(all_python_selectors=rejected):
                 candidate = self.workflow.replace(
                     exact_python_selector, f'python-version: "{rejected}"'
                 )
-                self.assertEqual(ci.check_workflow_text(candidate), sorted(
+                assert_python_rejection(candidate, [
                     f"{job} Python setup is not exact" for job in python_jobs
-                ))
+                ])
         exact_node_selector = 'node-version: "24.20.0"'
         selectors = list(re.finditer(re.escape(exact_node_selector), self.workflow))
         self.assertEqual(len(selectors), 6)
@@ -6367,6 +6436,25 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
     def test_full_scale_command_results_retain_705_records_under_fixed_limit(self) -> None:
         baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
         source_profile, immutable_source_paths = _r2_current_source_inventory()
+        _, _, _, live_object_authority = _r2_git_head_inventory()
+        _r2_validate_git_object_authority(source_profile, live_object_authority)
+        ordinary_content_authority = _R2_ORDINARY_CONTENT_AUTHORITY
+        security_content_authority = _R2_SECURITY_CONTENT_DELTA
+        a4_1_live_delta = (
+            _R2_A4_1_ORDINARY_CONTENT_DELTA
+            if source_profile is _R2_ORDINARY_PROFILE
+            else _R2_A4_1_SECURITY_CONTENT_DELTA
+        )
+        if all(
+            live_object_authority[relative][2] == content["gitBlob"]
+            for relative, content in a4_1_live_delta.items()
+        ):
+            ordinary_content_authority = {
+                **ordinary_content_authority, **_R2_A4_1_ORDINARY_CONTENT_DELTA,
+            }
+            security_content_authority = {
+                **security_content_authority, **_R2_A4_1_SECURITY_CONTENT_DELTA,
+            }
         candidate_paths = list(immutable_source_paths)
         ordinary_paths, security_paths = _r2_counterpart_inventories(
             immutable_source_paths
@@ -6481,7 +6569,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 side_effect=structural_parser_mode,
             ),
         ):
-            active_content_authority = _R2_ORDINARY_CONTENT_AUTHORITY
+            active_content_authority = ordinary_content_authority
             ordinary_structural_plans = {
                 command_profile: build_structural_plan(
                     command_profile,
@@ -6489,7 +6577,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 )
                 for command_profile in ("static", "all")
             }
-            active_content_authority = _R2_SECURITY_CONTENT_DELTA
+            active_content_authority = security_content_authority
             security_structural_plans = {
                 command_profile: build_structural_plan(
                     command_profile,
@@ -6669,7 +6757,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 }
                 for target in security_targets:
                     relative = target["path"]
-                    content = _R2_SECURITY_CONTENT_DELTA.get(relative)
+                    content = security_content_authority.get(relative)
                     if relative in ordinary_targets_by_path:
                         expected_target = copy.deepcopy(
                             ordinary_targets_by_path[relative]
@@ -6732,7 +6820,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                     [target["path"] for target in spec["targets"]],
                     [relative],
                 )
-                immutable_content = _R2_SECURITY_CONTENT_DELTA[relative]
+                immutable_content = security_content_authority[relative]
                 self.assertEqual(
                     (
                         spec["targets"][0]["size"],
@@ -6916,7 +7004,6 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 immutable_tree_paths=ordinary_paths,
                 runner_candidate_paths=security_paths,
             )
-        _, _, _, live_object_authority = _r2_git_head_inventory()
 
         def overlay_git_blobs(
             source: Mapping[str, tuple[str, str, str]],
@@ -6939,7 +7026,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
             ordinary_object_authority = dict(live_object_authority)
             security_object_authority = overlay_git_blobs(
                 live_object_authority,
-                _R2_SECURITY_CONTENT_DELTA,
+                security_content_authority,
             )
         else:
             security_object_authority = dict(live_object_authority)
@@ -6948,18 +7035,18 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 ordinary_object_authority.pop(relative)
             ordinary_object_authority = overlay_git_blobs(
                 ordinary_object_authority,
-                _R2_ORDINARY_CONTENT_AUTHORITY,
+                ordinary_content_authority,
             )
         security_from_ordinary = overlay_git_blobs(
             ordinary_object_authority,
-            _R2_SECURITY_CONTENT_DELTA,
+            security_content_authority,
         )
         ordinary_from_security = dict(security_object_authority)
         for relative in _R2_ADDED_JAVASCRIPT_PATHS:
             ordinary_from_security.pop(relative)
         ordinary_from_security = overlay_git_blobs(
             ordinary_from_security,
-            _R2_ORDINARY_CONTENT_AUTHORITY,
+            ordinary_content_authority,
         )
         self.assertEqual(security_from_ordinary, security_object_authority)
         self.assertEqual(ordinary_from_security, ordinary_object_authority)
@@ -8227,10 +8314,10 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                         ),
                     ):
                         active_content_authority = (
-                            _R2_ORDINARY_CONTENT_AUTHORITY
+                            ordinary_content_authority
                             if direction_counterpart_profile
                             is _R2_ORDINARY_PROFILE
-                            else _R2_SECURITY_CONTENT_DELTA
+                            else security_content_authority
                         )
                         independently_rebuilt_counterpart_plan = (
                             build_structural_plan(
