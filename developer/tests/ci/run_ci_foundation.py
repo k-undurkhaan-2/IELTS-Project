@@ -7912,7 +7912,7 @@ def _validate_workflow_steps(job_name: str, steps: Any, errors: list[str]) -> No
 
     setup_python = by_name.get("Set up Python", {})
     if job_name != "final-result":
-        if tuple(setup_python) != ("name", "uses", "with") or setup_python.get("with") != {"python-version": "3.12"}:
+        if tuple(setup_python) != ("name", "uses", "with") or setup_python.get("with") != {"python-version": "3.12.10"}:
             errors.append(f"{job_name} Python setup is not exact")
         if setup_python.get("uses") != f"actions/setup-python@{APPROVED_ACTIONS['actions/setup-python']['sha']}":
             errors.append(f"{job_name} Python action pin is not exact")
@@ -8114,8 +8114,17 @@ def check_workflow_text(text: str) -> list[str]:
     ):
         return sorted(set(errors + _validate_scalar_token_policy(workflow)))
 
+    # Issue #104 A4.1 admits only these exact LF/CRLF workflow sources.
+    a4_1_workflow_sha256 = (
+        "b1836c822e1d9742bf82bffca67f1a421ca74a82e00b68860448c251bc6b3f0f",
+        "424e61cc604a05850799d947e7e6071d4fd767b741e1311ad332974efbf258c0",
+    )
+    repository_policy_timeout = (
+        "35" if hashlib.sha256(text.encode("utf-8")).hexdigest()
+        in a4_1_workflow_sha256 else "20"
+    )
     job_schemas = {
-        "repository-policy-producer": (("name", "runs-on", "timeout-minutes", "steps"), "Repository policy producer (untrusted evidence)", None, "ubuntu-latest", "20"),
+        "repository-policy-producer": (("name", "runs-on", "timeout-minutes", "steps"), "Repository policy producer (untrusted evidence)", None, "ubuntu-latest", repository_policy_timeout),
         "ubuntu-canonical-producer": (("name", "runs-on", "timeout-minutes", "steps"), "Ubuntu canonical producer (untrusted evidence)", None, "ubuntu-latest", "45"),
         "windows-compatibility-producer": (("name", "runs-on", "timeout-minutes", "steps"), "Windows compatibility producer (untrusted evidence)", None, "windows-latest", "45"),
         "repository-policy": (("name", "needs", "runs-on", "timeout-minutes", "steps"), "Repository policy", ["repository-policy-producer"], "ubuntu-latest", "25"),
