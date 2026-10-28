@@ -767,6 +767,9 @@
         if (global.ListeningAudioPlayer) {
             global.ListeningAudioPlayer.install(doc);
         }
+        if (global.ListeningHighlighter) {
+            global.ListeningHighlighter.install(doc);
+        }
         doc.body.classList.add('listening-unified-ui');
         ensureAdapterStyle(doc);
         ensureListeningLayout(doc);

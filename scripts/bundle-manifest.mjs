@@ -120,11 +120,13 @@ const inputs = Object.freeze({
         'js/utils/answerMatchCore.js',
         'js/app/spellingErrorCollector.js',
         'js/runtime/listeningAudioPlayer.js',
+        'js/runtime/listeningHighlighter.js',
         'js/listeningRecordBridge.js'
     ]),
     listeningWrapper: Object.freeze([
         'js/utils/practiceTimerPreferences.js',
         'js/runtime/listeningAudioPlayer.js',
+        'js/runtime/listeningHighlighter.js',
         'js/listeningUnifiedWrapper.js'
     ]),
     more: Object.freeze([

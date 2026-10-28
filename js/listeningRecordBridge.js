@@ -1268,6 +1268,9 @@
     if (window.ListeningAudioPlayer) {
       window.ListeningAudioPlayer.install(window.document);
     }
+    if (window.ListeningHighlighter) {
+      window.ListeningHighlighter.install(window.document);
+    }
     state.parentWindow = findParentWindow();
     if (!state.examId) {
       state.examId = extractExamIdFromUrl();
