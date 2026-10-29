@@ -1455,6 +1455,10 @@
         }
         var frameWindow = getFrameWindow();
         if (event.source && frameWindow && event.source === frameWindow) {
+            if (event.data.type === 'PRACTICE_COMPLETE') {
+                updateClockPause(false);
+                updateTimerDisplay();
+            }
             forwardToParent(event.data);
             return;
         }
