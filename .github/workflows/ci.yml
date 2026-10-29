@@ -24,7 +24,7 @@ concurrency:
 jobs:
   repository-policy-producer:
     name: Repository policy producer (untrusted evidence)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
       - name: Check out repository
@@ -43,6 +43,10 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24.20.0"
+
+      - name: Provision authenticated Ubuntu Git
+        shell: bash
+        run: 'sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_ARCH -- "$pythonLocation/bin/python" -I -B developer/tests/ci/run_ci_foundation.py --provision-authenticated-git'
 
       - name: Run CI foundation self-tests
         run: python -B developer/tests/ci/test_ci_foundation.py
@@ -66,7 +70,7 @@ jobs:
 
   ubuntu-canonical-producer:
     name: Ubuntu canonical producer (untrusted evidence)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Check out repository
@@ -85,6 +89,10 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24.20.0"
+
+      - name: Provision authenticated Ubuntu Git
+        shell: bash
+        run: 'sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_ARCH -- "$pythonLocation/bin/python" -I -B developer/tests/ci/run_ci_foundation.py --provision-authenticated-git'
 
       - name: Install locked developer dependencies for untrusted production
         run: npm --prefix developer ci --ignore-scripts --no-audit --no-fund
@@ -158,7 +166,7 @@ jobs:
     name: Repository policy
     needs:
       - repository-policy-producer
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - name: Check out repository
@@ -177,6 +185,10 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24.20.0"
+
+      - name: Provision authenticated Ubuntu Git
+        shell: bash
+        run: 'sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_ARCH -- "$pythonLocation/bin/python" -I -B developer/tests/ci/run_ci_foundation.py --provision-authenticated-git'
 
       - name: Capture trusted runtime paths
         shell: bash
@@ -205,7 +217,7 @@ jobs:
     name: Ubuntu canonical validation
     needs:
       - ubuntu-canonical-producer
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 55
     steps:
       - name: Check out repository
@@ -224,6 +236,10 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24.20.0"
+
+      - name: Provision authenticated Ubuntu Git
+        shell: bash
+        run: 'sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_ARCH -- "$pythonLocation/bin/python" -I -B developer/tests/ci/run_ci_foundation.py --provision-authenticated-git'
 
       - name: Capture trusted runtime paths
         shell: bash

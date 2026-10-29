@@ -535,6 +535,24 @@ _R2_A5_SECURITY_COMBINED_CONTENT_DELTA = {
         "sha256": "8a3804068d52749a843b8d8ae070e80d17f824577c394cdc0c01145b3ad06d5d",
     },
 }
+# Accepted Issue #104 A6 CI identities; Issue #79 A2 binds the exact Security composition.
+_R2_A6_ORDINARY_MANIFEST_SHA256 = '6cd6c2df69cd2900f57050203128b62a46044f58ce151bd523feb35dc22a07a4'
+_R2_A6_CONTENT_DELTA = {
+    ".github/workflows/ci.yml": {
+        "gitBlob": "de665cbbd178bb7e25a312e6e5bac987e8132c32",
+        "size": 16725,
+        "sha256": "233461e15af069c501074aa091fafb4fdb22dd8d8a80e431e1fd2a29ab798666"
+    },
+    "developer/tests/ci/run_ci_foundation.py": {
+        "gitBlob": "8c8a3247ebdf3f4ee40843c924abe2c052635d68",
+        "size": 1147901,
+        "sha256": "d9450c326176fb76e18b8c39dd055b15235e0705d2abdb43cc8666a54c96034e"
+    }
+}
+# Keep the existing test-object sentinel; CI trust separately binds the test bytes.
+_R2_A6_SECURITY_COMBINED_MANIFEST_SHA256 = (
+    "e6e997ca0d2e457bc4c89e48d217bfaf0ac375650af5fb1be09f9c5116c2f338"
+)
 _R2_STATIC_COMMAND_PREFIX = (
     "baseline-schema",
     "node-version",
@@ -818,7 +836,15 @@ def _r2_validate_git_object_authority(
         profile is _R2_SECURITY_PROFILE
         and manifest_digest == _R2_A5_SECURITY_COMBINED_MANIFEST_SHA256
     )
-    if not a5_security_combined and manifest_digest not in (
+    a6_ordinary = (
+        profile is _R2_ORDINARY_PROFILE
+        and manifest_digest == _R2_A6_ORDINARY_MANIFEST_SHA256
+    )
+    a6_security_combined = (
+        profile is _R2_SECURITY_PROFILE
+        and manifest_digest == _R2_A6_SECURITY_COMBINED_MANIFEST_SHA256
+    )
+    if not (a5_security_combined or a6_ordinary or a6_security_combined) and manifest_digest not in (
         profile.tree_manifest_sha256,
         profile.a1_integrated_tree_manifest_sha256,
         profile.a3_integrated_tree_manifest_sha256,
@@ -837,11 +863,13 @@ def _r2_validate_git_object_authority(
                if profile is _R2_ORDINARY_PROFILE
                else _R2_A4_1_SECURITY_CONTENT_DELTA),
         }
-    if a5_security_combined:
+    if a5_security_combined or a6_security_combined:
         content_authority = {
             **content_authority,
             **_R2_A5_SECURITY_COMBINED_CONTENT_DELTA,
         }
+    if a6_ordinary or a6_security_combined:
+        content_authority = {**content_authority, **_R2_A6_CONTENT_DELTA}
     for relative, expected in content_authority.items():
         entry = object_entries.get(relative)
         if entry is None or entry[2] != expected["gitBlob"]:
@@ -858,6 +886,18 @@ def _r2_fixture_content_authorities(
     )
     ordinary = _R2_ORDINARY_CONTENT_AUTHORITY
     security = _R2_SECURITY_CONTENT_DELTA
+    if source_profile is _R2_SECURITY_PROFILE and all(
+        object_entries[relative][2] == content["gitBlob"]
+        for relative, content in _R2_A6_CONTENT_DELTA.items()
+    ):
+        # Validation above binds all A5 CI/runtime entries before A6 selection.
+        return {**ordinary, **_R2_A6_CONTENT_DELTA}, live_content_authority
+    if source_profile is _R2_ORDINARY_PROFILE and all(
+        object_entries[relative][2] == content['gitBlob']
+        for relative, content in _R2_A6_CONTENT_DELTA.items()
+    ):
+        # Retain the accepted CI-only fixture's historical Security A4.1 counterpart.
+        return live_content_authority, {**security, **_R2_A4_1_SECURITY_CONTENT_DELTA}
     if source_profile is _R2_SECURITY_PROFILE and all(
         object_entries[relative][2] == content["gitBlob"]
         for relative, content in _R2_A5_SECURITY_COMBINED_CONTENT_DELTA.items()
@@ -5015,6 +5055,551 @@ def _assert_windows_runtime_capture(test: unittest.TestCase, fixture_factory) ->
 
 
 
+def _a6_historical_workflow(text: str) -> str:
+    """Recover the exact A4.1 fixture; do not broaden historical source authority."""
+    step = (
+        "      - name: Provision authenticated Ubuntu Git\n"
+        "        shell: bash\n"
+        "        run: '" + ci.A6_GIT_PROVISION_COMMAND + "'\n\n"
+    )
+    if text.count(step) != 4 or text.count("    runs-on: ubuntu-24.04\n") != 4:
+        raise AssertionError("A6 workflow cannot project to the historical fixture")
+    historical = text.replace(step, "").replace(
+        "    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-latest\n",
+    )
+    if hashlib.sha256(historical.encode()).hexdigest() != (
+        "b1836c822e1d9742bf82bffca67f1a421ca74a82e00b68860448c251bc6b3f0f"
+    ):
+        raise AssertionError("A6 historical workflow projection is not exact")
+    return historical
+
+
+class AuthenticatedGitA6Test(unittest.TestCase):
+    def test_exact_four_job_workflow_and_historical_timeout_profiles(self) -> None:
+        text = ci.WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertEqual(ci.check_workflow_text(text), [])
+        self.assertEqual(ci.check_workflow_text(text.replace("\n", "\r\n")), [])
+        jobs = ci.parse_canonical_workflow_yaml(text)["jobs"]
+        historical = _a6_historical_workflow(text)
+        old_jobs = ci.parse_canonical_workflow_yaml(historical)["jobs"]
+        for job, content in jobs.items():
+            expected = copy.deepcopy(old_jobs[job])
+            if job in ci.A6_GIT_JOBS:
+                expected["runs-on"] = "ubuntu-24.04"
+                expected["steps"].insert(3, dict(ci.A6_GIT_PROVISION_STEP))
+            self.assertEqual(content, expected, job)
+        self.assertEqual(ci.check_workflow_text(historical), [])
+        ordinary = historical.replace("    timeout-minutes: 35\n", "    timeout-minutes: 20\n", 1)
+        self.assertEqual(ci.check_workflow_text(ordinary), [])
+
+    def test_missing_one_sided_reordered_or_modified_provisioning_fails(self) -> None:
+        text = ci.WORKFLOW_PATH.read_text(encoding="utf-8")
+        block = ("      - name: Provision authenticated Ubuntu Git\n"
+                 "        shell: bash\n"
+                 "        run: '" + ci.A6_GIT_PROVISION_COMMAND + "'\n\n")
+        for count in (1, 2, 3, 4):
+            with self.subTest(missing_jobs=count):
+                self.assertTrue(ci.check_workflow_text(text.replace(block, "", count)))
+        for job in sorted(ci.A6_GIT_JOBS):
+            start = text.index("  " + job + ":\n")
+            # Isolate by the next top-level job, not an indented step.
+            match = re.search(r"(?m)^  [a-z][a-z-]+:\n", text[start + 4:])
+            end = start + 4 + match.start() if match else len(text)
+            section = text[start:end]
+            mutations = [
+                section.replace(block, "", 1).replace("    steps:\n", "    steps:\n" + block, 1),
+                section.replace("--provision-authenticated-git", "--list-profiles", 1),
+                section.replace("        shell: bash\n", "        shell: sh\n", 1),
+                section.replace(block, block.replace("        run:", "        if: false\n        run:"), 1),
+                section.replace("runs-on: ubuntu-24.04", "runs-on: ubuntu-latest", 1),
+            ]
+            for index, changed in enumerate(mutations):
+                with self.subTest(job=job, mutation=index):
+                    self.assertNotEqual(changed, section)
+                    self.assertTrue(ci.check_workflow_text(text[:start] + changed + text[end:]))
+        for timeout in ("20", "34", "36", "999"):
+            self.assertTrue(ci.check_workflow_text(text.replace("timeout-minutes: 35", "timeout-minutes: " + timeout, 1)))
+        self.assertTrue(ci.check_workflow_text(text + "# unregistered A6 source\n"))
+
+    def test_profile_selection_is_source_bound_and_windows_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflow = root / ".github" / "workflows" / "ci.yml"
+            workflow.parent.mkdir(parents=True)
+            with self.assertRaises(OSError):
+                ci._a6_git_required(root, "Linux")
+            self.assertFalse(ci._a6_git_required(root, "Windows"))
+            current = ci.WORKFLOW_PATH.read_text(encoding="utf-8")
+            workflow.write_bytes(current.encode())
+            self.assertTrue(ci._a6_git_required(root, "Linux"))
+            workflow.write_bytes(_a6_historical_workflow(current).encode())
+            self.assertFalse(ci._a6_git_required(root, "Linux"))
+            workflow.write_bytes(current.replace("--provision-authenticated-git", "--list-profiles", 1).encode())
+            with self.assertRaises(OSError):
+                ci._a6_git_required(root, "Linux")
+
+    def test_provisioning_cli_is_exclusive_and_denies_persistent_hosts(self) -> None:
+        self.assertTrue(ci.parse_args(["--provision-authenticated-git"]).provision_authenticated_git)
+        for arguments in (["--provision-authenticated-git"] * 2,
+                          ["--provision-authenticated-git", "--require-replay-pass"],
+                          ["--provision-authenticated-git", "--profile", "policy"]):
+            with self.subTest(arguments=arguments), self.assertRaises((ValueError, SystemExit)):
+                ci.parse_args(arguments)
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(ci, "_a6_install_git") as install:
+            with self.assertRaises(ValueError):
+                ci.provision_authenticated_git()
+            install.assert_not_called()
+
+    def test_all_qualified_metadata_and_archive_hashes_and_sizes_are_checked(self) -> None:
+        for label in ci.A6_GIT_SUPPLY:
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                ci._a6_verify_bytes(b"altered", ci.A6_GIT_SUPPLY[label], label)
+        content = b"bounded authenticated fixture"
+        identity = (hashlib.sha256(content).hexdigest(), len(content))
+        ci._a6_verify_bytes(content, identity, "fixture")
+        for changed in ((identity[0], len(content) + 1), ("0" * 64, len(content))):
+            with self.assertRaises(ValueError):
+                ci._a6_verify_bytes(content, changed, "fixture")
+        with self.assertRaises(ValueError):
+            ci._a6_verify_executable_bytes(b"git version 2.43.0\n")
+
+    @staticmethod
+    def _release_fixture() -> bytes:
+        lines = ["Origin: Ubuntu", "Label: Ubuntu", "Suite: noble-security",
+                 "Codename: noble", "Architectures: amd64", "SHA256:"]
+        for name in ("Packages.xz", "Packages"):
+            digest, size = ci.A6_GIT_SUPPLY[name]
+            lines.append(f" {digest} {size} main/binary-amd64/{name}")
+        return ("\n".join(lines) + "\n").encode()
+
+    def test_release_and_package_chain_rejects_substitution_and_duplicates(self) -> None:
+        release = self._release_fixture()
+        ci._a6_verify_release_metadata(release)
+        for changed in (release.replace(b"noble-security", b"noble-updates"),
+                        release.replace(b"amd64", b"arm64"),
+                        release.replace(ci.A6_GIT_SUPPLY["Packages.xz"][0].encode(), b"0" * 64),
+                        release + b"Origin: Ubuntu\n"):
+            with self.subTest(release=changed), self.assertRaises(ValueError):
+                ci._a6_verify_release_metadata(changed)
+        digest, size = ci.A6_GIT_SUPPLY["git.deb"]
+        package = (f"Package: git\nVersion: {ci.A6_GIT_PACKAGE_VERSION}\nArchitecture: amd64\n"
+                   f"Filename: {ci.A6_GIT_ARCHIVE_PATH}\nSHA256: {digest}\nSize: {size}\n").encode()
+        ci._a6_verify_package_metadata(package)
+        for old, new in ((b"Package: git", b"Package: git-other"),
+                         (b"1:2.43.0-1ubuntu7.4", b"1:2.43.0-1ubuntu7.3"),
+                         (b"amd64", b"arm64"), (digest.encode(), b"0" * 64),
+                         (str(size).encode(), str(size + 1).encode()),
+                         (b"pool/main", b"pool/other")):
+            with self.subTest(field=old), self.assertRaises(ValueError):
+                ci._a6_verify_package_metadata(package.replace(old, new))
+        with self.assertRaises(ValueError):
+            ci._a6_verify_package_metadata(package + b"\n" + package)
+
+    def test_signature_success_requires_the_approved_signer_and_successful_gpgv(self) -> None:
+        key = ci.A6_GIT_SIGNING_KEY
+        valid = f"[GNUPG:] VALIDSIG {key} 2026-10-28 1793145600 0 4 0 1 10 01 {key}\n".encode()
+        with tempfile.TemporaryDirectory() as temporary:
+            stage = Path(temporary)
+            (stage / "Release").write_bytes(self._release_fixture())
+            result = subprocess.CompletedProcess([], 0, valid, b"")
+            with mock.patch.object(ci.subprocess, "run", return_value=result) as run:
+                self.assertEqual(ci._a6_verify_release_signature(stage), self._release_fixture())
+                arguments = run.call_args.args[0]
+                self.assertEqual(arguments[0], "/usr/bin/gpgv")
+                self.assertIn("/usr/share/keyrings/ubuntu-archive-keyring.gpg", arguments)
+            for status, code in ((valid, 1), (b"", 0), (valid.replace(key.encode(), b"F" * 40), 0),
+                                 (valid + b"[GNUPG:] BADSIG rejected\n", 0), (valid + valid, 0)):
+                with self.subTest(status=status, code=code), mock.patch.object(
+                    ci.subprocess, "run", return_value=subprocess.CompletedProcess([], code, status, b""),
+                ), self.assertRaises(ValueError):
+                    ci._a6_verify_release_signature(stage)
+
+    def test_archive_path_links_types_permissions_and_same_version_bytes_fail(self) -> None:
+        import lzma
+        import tarfile
+
+        payload = b"git version 2.43.0\n".ljust(ci.A6_GIT_SIZE, b"\0")
+        compressed = lzma.compress(b"fixture package index")
+        cases = (
+            ("missing", "usr/bin/other", tarfile.REGTYPE, 0o755, 0, ci.A6_GIT_SIZE),
+            ("symlink", "usr/bin/git", tarfile.SYMTYPE, 0o755, 0, 0),
+            ("hardlink", "usr/bin/git", tarfile.LNKTYPE, 0o755, 0, 0),
+            ("fifo", "usr/bin/git", tarfile.FIFOTYPE, 0o755, 0, 0),
+            ("permissions", "usr/bin/git", tarfile.REGTYPE, 0o777, 0, ci.A6_GIT_SIZE),
+            ("owner", "usr/bin/git", tarfile.REGTYPE, 0o755, 1000, ci.A6_GIT_SIZE),
+            ("size", "usr/bin/git", tarfile.REGTYPE, 0o755, 0, 1),
+            ("same-version-wrong-bytes", "usr/bin/git", tarfile.REGTYPE, 0o755, 0, ci.A6_GIT_SIZE),
+        )
+        verify_bytes = ci._a6_verify_bytes
+        def metadata_already_verified(content, identity, label):
+            if label != "Packages":
+                verify_bytes(content, identity, label)
+        for label, name, kind, mode, uid, size in cases:
+            with self.subTest(member=label), tempfile.TemporaryDirectory() as temporary:
+                buffer = io.BytesIO()
+                with tarfile.open(fileobj=buffer, mode="w") as archive:
+                    member = tarfile.TarInfo(name)
+                    member.type, member.mode, member.uid, member.gid = kind, mode, uid, 0
+                    member.size = size
+                    if kind in {tarfile.SYMTYPE, tarfile.LNKTYPE}:
+                        member.linkname = "/unapproved/git"
+                    archive.addfile(member, io.BytesIO(payload[:size]) if kind == tarfile.REGTYPE else None)
+                with contextlib.ExitStack() as patches:
+                    patches.enter_context(mock.patch.object(ci, "_a6_download", return_value=compressed))
+                    patches.enter_context(mock.patch.object(ci, "_a6_verify_release_signature", return_value=b"verified"))
+                    patches.enter_context(mock.patch.object(ci, "_a6_verify_release_metadata"))
+                    patches.enter_context(mock.patch.object(ci, "_a6_verify_package_metadata"))
+                    patches.enter_context(mock.patch.object(ci, "_a6_verify_bytes", side_effect=metadata_already_verified))
+                    patches.enter_context(mock.patch.object(ci.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, buffer.getvalue(), b"")))
+                    with self.assertRaises(ValueError):
+                        ci._a6_stage_git(Path(temporary))
+                self.assertFalse((Path(temporary) / "git").exists())
+
+    def test_download_refuses_oversize_or_altered_input_before_writing(self) -> None:
+        from urllib import request
+        for content, url in ((b"wrong", ci.A6_GIT_SNAPSHOT), (b"wrong", "http://example.invalid/")):
+            response = mock.MagicMock()
+            response.__enter__.return_value = response
+            response.url = url
+            response.read.return_value = content
+            with tempfile.TemporaryDirectory() as temporary, mock.patch.object(request, "urlopen", return_value=response):
+                target = Path(temporary) / "InRelease"
+                with self.assertRaises(ValueError):
+                    ci._a6_download("dists/noble-security/InRelease", target, "InRelease")
+                self.assertFalse(target.exists())
+                if url.startswith("https:"):
+                    response.read.assert_called_once_with(ci.A6_GIT_SUPPLY["InRelease"][1] + 1)
+
+    def test_invalid_signature_stops_before_package_download_or_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            ci, "_a6_download", return_value=b"verified InRelease",
+        ) as download, mock.patch.object(
+            ci, "_a6_verify_release_signature", side_effect=ValueError("invalid signature"),
+        ), mock.patch.object(ci.subprocess, "run") as process:
+            with self.assertRaises(ValueError):
+                ci._a6_stage_git(Path(temporary))
+            self.assertEqual(download.call_count, 1)
+            process.assert_not_called()
+
+    @staticmethod
+    def _identity_path(**changes):
+        path = mock.MagicMock(spec=Path)
+        path.__str__.return_value = "/usr/bin/git"
+        path.resolve.return_value = path
+        metadata = dict(st_mode=stat.S_IFREG | 0o755, st_uid=0, st_gid=0,
+                        st_size=ci.A6_GIT_SIZE, st_nlink=1, st_file_attributes=0)
+        metadata.update(changes)
+        path.lstat.return_value = SimpleNamespace(**metadata)
+        parent = mock.MagicMock(spec=Path)
+        parent.resolve.return_value = parent
+        parent.parents = ()
+        parent.lstat.return_value = SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+        path.parent = parent
+        return path
+
+    def test_exact_immutable_identity_and_filesystem_rejections(self) -> None:
+        path = self._identity_path()
+        self.assertIsNone(ci._a6_git_identity_error(path, digest=ci.A6_GIT_SHA256, size=ci.A6_GIT_SIZE))
+        for change in ({"st_mode": stat.S_IFLNK | 0o755}, {"st_mode": stat.S_IFDIR | 0o755},
+                       {"st_mode": stat.S_IFREG | 0o775}, {"st_mode": stat.S_IFREG | 0o4755},
+                       {"st_mode": stat.S_IFREG | 0o644}, {"st_uid": 1000}, {"st_gid": 1000},
+                       {"st_nlink": 2}, {"st_size": ci.A6_GIT_SIZE + 1}, {"st_file_attributes": 0x400}):
+            with self.subTest(change=change):
+                self.assertIsNotNone(ci._a6_git_identity_error(
+                    self._identity_path(**change), digest=ci.A6_GIT_SHA256, size=ci.A6_GIT_SIZE,
+                ))
+        for digest, size in (("0" * 64, ci.A6_GIT_SIZE), (ci.A6_GIT_SHA256, ci.A6_GIT_SIZE + 1)):
+            self.assertIsNotNone(ci._a6_git_identity_error(path, digest=digest, size=size))
+        path.resolve.return_value = Path("/unexpected/git")
+        self.assertIsNotNone(ci._a6_git_identity_error(path, digest=ci.A6_GIT_SHA256, size=ci.A6_GIT_SIZE))
+        path = self._identity_path()
+        path.parent.lstat.return_value.st_mode = stat.S_IFDIR | 0o777
+        self.assertIsNotNone(ci._a6_git_identity_error(path, digest=ci.A6_GIT_SHA256, size=ci.A6_GIT_SIZE))
+
+    def test_production_resolver_checks_measured_identity_without_version_or_fallback(self) -> None:
+        fixture = _HostedToolFixture("Ubuntu")
+        try:
+            policy = ci.ToolAuthorityPolicy(**{**vars(fixture.policy), "synthetic": False})
+            with mock.patch.object(ci, "_a6_git_required", return_value=True), mock.patch.object(
+                ci, "_unsafe_tool_path_reason", return_value=None,
+            ), mock.patch.object(ci, "_a6_git_identity_error", return_value=None) as identity:
+                tools, errors = ci.resolve_trusted_tools({"git"}, source_environment=fixture.source, policy=policy)
+                self.assertEqual(errors, [])
+                self.assertEqual(tools["git"], str(fixture.paths["git"]))
+                self.assertEqual(identity.call_args.kwargs["digest"], hashlib.sha256(b"synthetic-git").hexdigest())
+                identity.return_value = "same version, different bytes"
+                tools, errors = ci.resolve_trusted_tools({"git"}, source_environment=fixture.source, policy=policy)
+                self.assertNotIn("git", tools)
+                self.assertTrue(errors)
+            with mock.patch.object(ci, "_a6_git_required", side_effect=OSError("unknown workflow")):
+                tools, errors = ci.resolve_trusted_tools({"git"}, source_environment=fixture.source, policy=policy)
+                self.assertEqual(tools, {})
+                self.assertTrue(errors)
+        finally:
+            fixture.cleanup()
+
+    def test_pinned_lease_rejects_replacement_before_and_during_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "git"
+            original = b"git version 2.43.0\nfirst"
+            replacement = b"git version 2.43.0\nother"
+            self.assertEqual(len(original), len(replacement))
+            expected = hashlib.sha256(original).hexdigest()
+            def identity(_path, *, digest, size):
+                return None if digest == expected and size == len(original) else "A6 identity mismatch"
+            path.write_bytes(original)
+            with mock.patch.object(ci, "_a6_git_identity_error", side_effect=identity):
+                lease = ci.ExecutableIdentityLease(path, "trusted-git", require_authenticated_git=True)
+                try:
+                    self.assertEqual(lease.verify(), (True, None))
+                    try:
+                        path.write_bytes(replacement)
+                    except OSError:
+                        # Windows denies replacement while the executable handle is leased.
+                        self.assertEqual(path.read_bytes(), original)
+                    else:
+                        self.assertFalse(lease.verify()[0])
+                finally:
+                    lease.close()
+                path.write_bytes(replacement)
+                with self.assertRaises(OSError):
+                    ci.ExecutableIdentityLease(path, "trusted-git", require_authenticated_git=True)
+
+    def test_cross_job_authority_normalizes_only_host_identity(self) -> None:
+        producer = {
+            "commandId": "git-candidate-paths", "toolRole": "git", "required": False,
+            "executionArgv": ["/usr/bin/git", "ls-files"], "resolvedExecutablePath": "/usr/bin/git",
+            "resolvedExecutableFileIdentity": {"inode": 1},
+            "resolvedExecutableSha256": ci.A6_GIT_SHA256, "resolvedExecutableSize": ci.A6_GIT_SIZE,
+            "executionLease": {"sha256": ci.A6_GIT_SHA256, "size": ci.A6_GIT_SIZE, "stableIdentity": {"inode": 1}},
+            "targets": [],
+        }
+        verifier = copy.deepcopy(producer)
+        verifier["executionArgv"][0] = "/bin/git"
+        verifier["resolvedExecutablePath"] = "/bin/git"
+        verifier["resolvedExecutableFileIdentity"] = {"inode": 99}
+        verifier["executionLease"]["stableIdentity"] = {"inode": 99}
+        self.assertEqual(ci.command_plan_digest([producer]), ci.command_plan_digest([verifier]))
+        actual = {**producer, "actualExecutionArgv": producer["executionArgv"]}
+        self.assertEqual(ci._command_authority_violations("policy", [actual], [], expected_plan=[verifier], cross_job=True), [])
+        for field, value in (("resolvedExecutableSha256", "0" * 64),
+                             ("resolvedExecutableSize", ci.A6_GIT_SIZE + 1)):
+            changed = {**producer, field: value}
+            self.assertNotEqual(ci.command_plan_digest([changed]), ci.command_plan_digest([verifier]))
+            failures = ci._command_authority_violations(
+                "policy", [{**changed, "actualExecutionArgv": producer["executionArgv"]}], [],
+                expected_plan=[verifier], cross_job=True,
+            )
+            self.assertIn("COMMAND-AUTHORITY-MISMATCH", {item["id"] for item in failures})
+
+
+class AuthenticatedGitA6SourceAdmissionTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _, _, _, cls.entries = _r2_git_head_inventory()
+
+    @staticmethod
+    def _overlay(entries, authority):
+        result = dict(entries)
+        for path, content in authority.items():
+            result[path] = ("100644", "blob", content["gitBlob"])
+        return result
+
+    def _ordinary_a4(self):
+        entries = dict(self.entries)
+        for path in _R2_ADDED_JAVASCRIPT_PATHS:
+            entries.pop(path, None)
+        return self._overlay(entries, {**_R2_ORDINARY_CONTENT_AUTHORITY, **_R2_A4_1_ORDINARY_CONTENT_DELTA})
+
+    def test_exact_a6_candidate_and_separate_a5_authorities(self) -> None:
+        base = self._ordinary_a4()
+        a6 = self._overlay(base, _R2_A6_CONTENT_DELTA)
+        selected = _r2_validate_git_object_authority(_R2_ORDINARY_PROFILE, a6)
+        for path, identity in _R2_A6_CONTENT_DELTA.items():
+            content = (ci.REPO_ROOT / path).read_bytes()
+            self.assertEqual(hashlib.sha256(content).hexdigest(), identity["sha256"])
+            self.assertEqual(len(content), identity["size"])
+            self.assertEqual(hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest(), identity["gitBlob"])
+            self.assertEqual(selected[path], identity)
+        a5 = self._overlay(base, {**_R2_SECURITY_CONTENT_DELTA, **_R2_A5_SECURITY_COMBINED_CONTENT_DELTA})
+        _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, a5)
+        # Issue #79 A2 now authorizes only the exact Security-combined A6 manifest.
+        _r2_validate_git_object_authority(
+            _R2_SECURITY_PROFILE, self._overlay(a5, _R2_A6_CONTENT_DELTA),
+        )
+        ordinary, security = _r2_fixture_content_authorities(_R2_ORDINARY_PROFILE, a6)
+        self.assertEqual(ordinary, selected)
+        _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, self._overlay(a6, security))
+
+    def test_one_sided_unrelated_mode_and_profile_changes_fail_closed(self) -> None:
+        base = self._ordinary_a4()
+        a6 = self._overlay(base, _R2_A6_CONTENT_DELTA)
+        for path, identity in _R2_A6_CONTENT_DELTA.items():
+            with self.subTest(one_sided=path), self.assertRaises(AssertionError):
+                _r2_validate_git_object_authority(_R2_ORDINARY_PROFILE, self._overlay(base, {path: identity}))
+        for path in ("README.md", _R2_AUTHORIZED_MUTABLE_PATH, ".github/workflows/ci.yml"):
+            for mode in ("100755", "120000"):
+                changed = dict(a6)
+                changed[path] = (mode, "blob", changed[path][2])
+                with self.subTest(path=path, mode=mode), self.assertRaises(AssertionError):
+                    _r2_validate_git_object_authority(_R2_ORDINARY_PROFILE, changed)
+        changed = dict(a6)
+        changed["README.md"] = ("100644", "blob", "0" * 40)
+        with self.assertRaises(AssertionError):
+            _r2_validate_git_object_authority(_R2_ORDINARY_PROFILE, changed)
+        changed = dict(a6)
+        changed[_R2_AUTHORIZED_MUTABLE_PATH] = ("100644", "blob", "f" * 40)
+        _r2_validate_git_object_authority(_R2_ORDINARY_PROFILE, changed)
+        with self.assertRaises(AssertionError):
+            _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, a6)
+
+    def test_historical_ordinary_a1_a3_a4_and_security_a5_profiles_remain_exact(self) -> None:
+        base = self._ordinary_a4()
+        r3_paths = (
+            "developer/tests/ci/ISSUE13_BACKEND_PORTABLE_RESULT.md",
+            "developer/tests/ci/backend_canonical_portable_result.py",
+            "developer/tests/ci/test_backend_canonical_portable_result.py",
+        )
+        historical_r3 = (
+            ("e162952c50bec5e7af7e4006be5429538ad80362", "bf2b622cb7e4159cfb1d84f5d2d245c9bf2e4cfb", "ad5e752cb82a3c28fe65d698e881865f0460eaf4"),
+            ("b6394258b2af39102522a041301ee9b27d46741f", "00694ffbe4780e13a8c57dee1ae39e40dfc7a9cd", "b99c3afef8e39c3f0f291830b6a1683d5f605e2f"),
+            ("b6394258b2af39102522a041301ee9b27d46741f", "00694ffbe4780e13a8c57dee1ae39e40dfc7a9cd", "b41be609abec19c96577ce2446dcabc8eb649ea1"),
+        )
+        for profile, content in ((_R2_ORDINARY_PROFILE, _R2_ORDINARY_CONTENT_AUTHORITY),
+                                 (_R2_SECURITY_PROFILE, _R2_SECURITY_CONTENT_DELTA)):
+            for index, objects in enumerate(historical_r3):
+                with self.subTest(profile=profile.name, historical=index):
+                    entries = self._overlay(base, content)
+                    for path, oid in zip(r3_paths, objects):
+                        entries[path] = ("100644", "blob", oid)
+                    _r2_validate_git_object_authority(profile, entries)
+            a4 = self._overlay(base, {**content, **(
+                _R2_A4_1_ORDINARY_CONTENT_DELTA if profile is _R2_ORDINARY_PROFILE else _R2_A4_1_SECURITY_CONTENT_DELTA
+            )})
+            _r2_validate_git_object_authority(profile, a4)
+        a5 = self._overlay(base, {**_R2_SECURITY_CONTENT_DELTA, **_R2_A5_SECURITY_COMBINED_CONTENT_DELTA})
+        _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, a5)
+        with self.assertRaises(AssertionError):
+            _r2_validate_git_object_authority(_R2_ORDINARY_PROFILE, a5)
+
+    def test_security_a6_exact_combination_and_counterpart_authorities(self) -> None:
+        base = self._ordinary_a4()
+        a5 = self._overlay(base, {
+            **_R2_SECURITY_CONTENT_DELTA, **_R2_A5_SECURITY_COMBINED_CONTENT_DELTA,
+        })
+        a6 = self._overlay(a5, _R2_A6_CONTENT_DELTA)
+        expected_a5 = {**_R2_SECURITY_CONTENT_DELTA, **_R2_A5_SECURITY_COMBINED_CONTENT_DELTA}
+        expected_a6 = {**expected_a5, **_R2_A6_CONTENT_DELTA}
+        self.assertEqual(_r2_validate_git_object_authority(_R2_SECURITY_PROFILE, a5), expected_a5)
+        self.assertEqual(_r2_validate_git_object_authority(_R2_SECURITY_PROFILE, a6), expected_a6)
+        self.assertEqual(_r2_fixture_content_authorities(_R2_SECURITY_PROFILE, a6), (
+            {**_R2_ORDINARY_CONTENT_AUTHORITY, **_R2_A6_CONTENT_DELTA}, expected_a6,
+        ))
+        # A5 remains a separate exact authority, including its older CI content.
+        self.assertEqual(_r2_fixture_content_authorities(_R2_SECURITY_PROFILE, a5), (
+            {**_R2_ORDINARY_CONTENT_AUTHORITY, **_R2_A4_1_ORDINARY_CONTENT_DELTA}, expected_a5,
+        ))
+        # Unchanged files retain their frozen Git identities; Windows checkout
+        # newline conversion does not define a new immutable source authority.
+        ordinary_authority, security_authority = _r2_fixture_content_authorities(
+            _R2_SECURITY_PROFILE, a6,
+        )
+        ordinary = self._overlay(base, ordinary_authority)
+        self.assertEqual(
+            _r2_validate_git_object_authority(_R2_ORDINARY_PROFILE, ordinary),
+            ordinary_authority,
+        )
+        self.assertEqual(self._overlay(ordinary, security_authority), a6)
+        with self.assertRaises(AssertionError):
+            _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, ordinary)
+        with self.assertRaises(AssertionError):
+            _r2_validate_git_object_authority(_R2_ORDINARY_PROFILE, a6)
+
+    def test_security_a6_mixed_malformed_and_additional_source_rejected(self) -> None:
+        a5 = self._overlay(self._ordinary_a4(), {
+            **_R2_SECURITY_CONTENT_DELTA, **_R2_A5_SECURITY_COMBINED_CONTENT_DELTA,
+        })
+        a6 = self._overlay(a5, _R2_A6_CONTENT_DELTA)
+        for path, identity in _R2_A6_CONTENT_DELTA.items():
+            with self.subTest(one_sided=path), self.assertRaises(AssertionError):
+                _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, self._overlay(a5, {path: identity}))
+        for path in (*_R2_SECURITY_CONTENT_DELTA, *_R2_A5_SECURITY_COMBINED_CONTENT_DELTA, 'README.md'):
+            changed = dict(a6)
+            mode, kind, _ = changed[path]
+            changed[path] = (mode, kind, 'f' * 40)
+            with self.subTest(immutable_blob=path), self.assertRaises(AssertionError):
+                _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, changed)
+        for path in ('README.md', _R2_AUTHORIZED_MUTABLE_PATH, '.github/workflows/ci.yml'):
+            mode, kind, oid = a6[path]
+            for identity in (('100755', kind, oid), ('120000', kind, oid),
+                             (mode, 'tree', oid), (mode, kind, 'F' * 40),
+                             (mode, kind, 'f' * 41), [mode, kind, oid]):
+                changed = dict(a6)
+                changed[path] = identity
+                with self.subTest(path=path, identity=identity), self.assertRaises(AssertionError):
+                    _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, changed)
+        for extra in (False, True):
+            changed = dict(a6)
+            if extra:
+                changed['unauthorized.py'] = ('100644', 'blob', 'f' * 40)
+            else:
+                changed.pop('README.md')
+            with self.subTest(extra_path=extra), self.assertRaises(AssertionError):
+                _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, changed)
+        # The sentinel remains confined to the existing test-file object ID.
+        # It is not test-byte authority: execution binding below authenticates that.
+        changed = dict(a6)
+        changed[_R2_AUTHORIZED_MUTABLE_PATH] = ('100644', 'blob', 'f' * 40)
+        _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, changed)
+
+    def test_security_a6_test_sentinel_retains_exact_execution_content_binding(self) -> None:
+        tools = _explicit_local_test_tool_map('git')
+        records, digest = ci.ci_trust_file_set_authority(
+            git=tools['git'], environment=dict(os.environ), repo_root=ci.REPO_ROOT,
+        )
+        self.assertEqual([r['relativePath'] for r in records].count(_R2_AUTHORIZED_MUTABLE_PATH), 1)
+        test_record = next(r for r in records if r['relativePath'] == _R2_AUTHORIZED_MUTABLE_PATH)
+        content = Path(__file__).read_bytes()
+        self.assertEqual(test_record['sha256'], hashlib.sha256(content).hexdigest())
+        self.assertEqual(test_record['byteLength'], len(content))
+        self.assertEqual(test_record['gitMode'], '100644')
+        binding_case = CI7ExternalAuthorityBindingTest()
+        expected = binding_case.github_binding('repository-policy', trust_digest=digest)
+        context = synthetic_external_context(expected)
+        self.assertEqual(ci.execution_binding_external_context_errors(
+            expected, ci.execution_binding_digest(expected), context,
+        ), [])
+        substitutions = {
+            'ordinary-a6-test': {_R2_AUTHORIZED_MUTABLE_PATH: {
+                'sha256': '648e60fda88c968f5280d6a832fd8152c47114b3a2fdc75cf844ad7bf4679f06',
+                'size': 1_275_479,
+            }},
+            'security-a5-test': {_R2_AUTHORIZED_MUTABLE_PATH: {
+                'sha256': '0df3c5c85d9ae53da410f62aa7aac4dc492c5379d6c65d4a6062357414900bdd',
+                'size': 1249300,
+            }},
+            'a5-content-with-a6-composition': _R2_A5_SECURITY_COMBINED_CONTENT_DELTA,
+            'altered-test': {_R2_AUTHORIZED_MUTABLE_PATH: {'sha256': '0' * 64, 'size': len(content)}},
+        }
+        for label, substitution in substitutions.items():
+            changed = copy.deepcopy(records)
+            for record in changed:
+                identity = substitution.get(record['relativePath'])
+                if identity is not None:
+                    record.update(sha256=identity['sha256'], byteLength=identity['size'])
+            changed_digest = hashlib.sha256(ci._canonical_frame({
+                'schemaVersion': ci.CI_TRUST_FILE_SET_SCHEMA_VERSION, 'files': changed,
+            })).hexdigest()
+            with self.subTest(substitution=label):
+                self.assertNotEqual(changed_digest, digest)
+                forged = binding_case.github_binding('repository-policy', trust_digest=changed_digest)
+                errors = ci.execution_binding_external_context_errors(
+                    forged, ci.execution_binding_digest(forged), context,
+                )
+                self.assertIn('execution binding differs from externally expected verification context', errors)
+
+
+
 class WorkflowPolicyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -5023,6 +5608,7 @@ class WorkflowPolicyTest(unittest.TestCase):
 
     def test_current_workflow_passes_narrow_policy(self) -> None:
         self.assertEqual(ci.check_workflow_text(self.workflow), [])
+        self.workflow = _a6_historical_workflow(self.workflow)
         historical = self.workflow.replace(
             "    timeout-minutes: 35\n", "    timeout-minutes: 20\n", 1,
         )
