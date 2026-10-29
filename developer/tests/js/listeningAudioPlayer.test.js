@@ -80,6 +80,44 @@ const fixture = `<!doctype html><html><head><style>
 </script><script src="/js/bundles/listening-record-bridge.bundle.js" defer></script>
 </body></html>`;
 
+const buttonVariants = [
+    ['standard', 'class="play-pause-btn"', '&#9658;'],
+    ['waste', 'class="play-btn" id="audio-toggle"', '▶'],
+    ['trademark', 'class="play-pause" id="playPause"', '▶'],
+    ['maple', 'class="btnIcon" id="playBtn"', '<div class="icon-tri"></div>'],
+    ['without-progress', 'class="play-btn"', 'Play']
+];
+
+function buttonFixture() {
+    return `<!doctype html><html><head><style>
+        body { color: #fff; background: #fff; }
+        section { margin: 16px; display: flex; gap: 12px; align-items: center; }
+        button { position: relative; width: 38px; height: 38px; border: 0; border-radius: 50%; background: #2563eb; color: inherit; }
+        .prog-wrap { width: 240px; height: 8px; background: #ddd; }
+        .play-pause-btn.is-playing { font-size: 0 !important; }
+        .play-pause-btn.is-playing::before, .play-pause-btn.is-playing::after { content: ''; position: absolute; top: 50%; width: 4px; height: 14px; background: currentColor; }
+        .play-pause-btn.is-playing::before { left: calc(50% - 6px); }
+        .play-pause-btn.is-playing::after { left: calc(50% + 2px); }
+        .icon-tri { width: 0; height: 0; border-left: 14px solid white; border-top: 8px solid transparent; border-bottom: 8px solid transparent; }
+    </style></head><body>${buttonVariants.map(([id, attrs, icon]) => `<section id="${id}">
+        <div class="audio-flex"><button ${attrs}>${icon}</button>${id === 'without-progress' ? '' : '<div class="prog-wrap"><div class="prog-fill"></div></div><span class="time-txt"></span>'}</div>
+        <audio src="/audio.wav" preload="metadata"></audio>
+    </section>`).join('')}
+    <script>
+        window.nativeClicks = 0;
+        document.querySelectorAll('section').forEach(player => {
+            const audio = player.querySelector('audio'), button = player.querySelector('button');
+            button.onclick = () => { window.nativeClicks++; audio.paused ? audio.play() : audio.pause(); };
+            function legacyRender() {
+                if (player.id === 'waste') return; // This template never updates its icon.
+                button.innerHTML = audio.paused ? '<div class="icon-tri"></div>' : '<span>❚❚</span>';
+                button.classList.toggle('is-playing', !audio.paused);
+            }
+            ['play', 'pause', 'timeupdate', 'ended'].forEach(type => audio.addEventListener(type, legacyRender));
+        });
+    </script><script src="/js/bundles/listening-record-bridge.bundle.js" defer></script></body></html>`;
+}
+
 const server = http.createServer((request, response) => {
     const pathname = new URL(request.url, 'http://localhost').pathname;
     if (pathname === '/audio.wav') {
@@ -95,10 +133,10 @@ const server = http.createServer((request, response) => {
         response.end(wav.subarray(start, end + 1));
         return;
     }
-    if (pathname === '/wrapper') {
+    if (pathname === '/wrapper' || pathname === '/button-wrapper') {
         response.setHeader('Content-Type', 'text/html');
         response.end(fs.readFileSync(path.join(repoRoot, 'assets/generated/listening-exams/listening-practice-unified.html'), 'utf8')
-            .replace('data-source-url=""', 'data-source-url="/fixture"'));
+            .replace('data-source-url=""', 'data-source-url="' + (pathname === '/wrapper' ? '/fixture' : '/buttons') + '"'));
         return;
     }
     if (['/js/bundles/listening-wrapper.bundle.js', '/js/bundles/listening-record-bridge.bundle.js'].includes(pathname)) {
@@ -109,6 +147,11 @@ const server = http.createServer((request, response) => {
     if (pathname === '/fixture') {
         response.setHeader('Content-Type', 'text/html');
         response.end(fixture);
+        return;
+    }
+    if (pathname === '/buttons') {
+        response.setHeader('Content-Type', 'text/html');
+        response.end(buttonFixture());
         return;
     }
     response.writeHead(404).end();
@@ -255,10 +298,136 @@ async function exerciseTouch() {
     }
 }
 
+async function exerciseButtons(entry) {
+    const page = await browser.newPage({ viewport: { width: 1000, height: 650 } });
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    try {
+        await page.goto(baseUrl + entry);
+        const frame = entry === '/button-wrapper' ? page.frames().find(candidate => candidate.parentFrame()) : page.mainFrame();
+        await frame.waitForFunction(() => [...document.querySelectorAll('audio')].every(audio => audio.duration === 120));
+        async function state(id, playing) {
+            await frame.waitForFunction(({ id, playing }) => {
+                const button = document.querySelector('#' + id + ' button');
+                return button.dataset.listeningPlayback === (playing ? 'playing' : 'paused')
+                    && button.getAttribute('aria-label') === (playing ? 'Pause audio' : 'Play audio');
+            }, { id, playing });
+        }
+        const masks = new Set();
+        for (const [id] of buttonVariants) {
+            const button = frame.locator('#' + id + ' button');
+            const audio = frame.locator('#' + id + ' audio');
+            await state(id, false);
+            const playMask = await button.evaluate(node => getComputedStyle(node, '::before').maskImage);
+            assert.notEqual(playMask, 'none', 'every template must show an icon');
+            masks.add(playMask);
+            await button.click();
+            await state(id, true);
+            assert.equal(await audio.evaluate(node => node.paused), false, 'one click must start playback');
+            assert.notEqual(await button.evaluate(node => getComputedStyle(node, '::before').maskImage), playMask);
+            assert.equal(await button.evaluate(node => getComputedStyle(node, '::after').display), 'none', 'legacy pause bars must not overlap');
+            assert.equal(await button.evaluate(node => [...node.children].every(child => getComputedStyle(child).display === 'none')), true, 'legacy SVG/CSS/text children must stay hidden after rewrites');
+            await button.focus();
+            await page.keyboard.press('Space');
+            await state(id, false);
+            await page.keyboard.press('Enter');
+            await state(id, true);
+            await audio.evaluate(node => node.pause());
+            await state(id, false);
+            await audio.evaluate(node => node.play());
+            await state(id, true);
+            await audio.evaluate(node => { node.currentTime = node.duration - 0.05; });
+            await state(id, false);
+            assert.equal(await audio.evaluate(node => node.ended), true, 'natural completion must restore the play icon');
+            await button.click();
+            await state(id, true);
+            await audio.evaluate(node => node.load());
+            await state(id, false);
+        }
+        assert.equal(masks.size, 1, 'all template families must share the rounded play icon');
+        assert.equal(await frame.evaluate(() => window.nativeClicks), 0, 'legacy click handlers must not double-toggle playback');
+        assert.equal(await frame.locator('#waste .time-txt').textContent(), '00:00 / 02:00');
+
+        // Pending playback can be cancelled and an obsolete rejection must not
+        // pause a later successful request.
+        await frame.evaluate(() => {
+            const audio = document.querySelector('#waste audio');
+            window.pendingAudio = audio;
+            window.originalPlay = audio.play;
+            audio.play = () => new Promise((resolve, reject) => { window.rejectOldPlay = reject; });
+            const button = document.querySelector('#waste button');
+            button.click();
+            button.click();
+            audio.play = window.originalPlay;
+            button.click();
+            window.rejectOldPlay(new DOMException('Cancelled', 'AbortError'));
+        });
+        await state('waste', true);
+        assert.equal(await frame.locator('#waste audio').evaluate(node => node.paused), false);
+        await frame.locator('#waste button').click();
+        await state('waste', false);
+
+        await frame.evaluate(() => {
+            const audio = document.querySelector('#waste audio');
+            audio.play = () => Promise.reject(new DOMException('Playback blocked', 'NotAllowedError'));
+            document.querySelector('#waste button').click();
+        });
+        await state('waste', false);
+        await frame.evaluate(() => { window.pendingAudio.play = window.originalPlay; });
+
+        // A missing source, followed by a recovered source, must remain usable.
+        await frame.locator('#waste audio').evaluate(audio => { audio.src = '/missing-audio.wav'; audio.load(); });
+        await frame.waitForFunction(() => document.querySelector('#waste audio').error);
+        await frame.locator('#waste button').click();
+        await state('waste', false);
+        await frame.locator('#waste audio').evaluate(audio => { audio.src = '/audio.wav'; audio.load(); });
+        await frame.waitForFunction(() => document.querySelector('#waste audio').duration === 120);
+        await frame.locator('#waste button').click();
+        await state('waste', true);
+        await state('standard', false);
+
+        // A media error can leave paused=false. The displayed play action must
+        // still attempt playback on the first click, rather than only pausing.
+        const retryCalls = await frame.locator('#waste audio').evaluate(audio => {
+            Object.defineProperty(audio, 'error', { configurable: true, value: { code: 3 } });
+            audio.dispatchEvent(new Event('error'));
+            let calls = 0;
+            const originalPlay = audio.play;
+            audio.play = () => { calls++; throw new DOMException('Decode failed', 'NotSupportedError'); };
+            document.querySelector('#waste button').click();
+            audio.play = originalPlay;
+            delete audio.error;
+            return calls;
+        });
+        assert.equal(retryCalls, 1, 'an error-state play button must attempt playback immediately');
+        await state('waste', false);
+        await frame.locator('#waste button').click();
+        await state('waste', true);
+
+        // Replace only the button, then only the audio, as partial resets do.
+        await frame.locator('#waste button').evaluate(button => { button.outerHTML = '<button class="play-btn" id="audio-toggle">▶</button>'; });
+        await state('waste', true);
+        await frame.locator('#waste button').click();
+        await state('waste', false);
+        await frame.locator('#waste audio').evaluate(audio => { audio.outerHTML = '<audio src="/audio.wav" preload="metadata"></audio>'; });
+        await frame.waitForFunction(() => document.querySelector('#waste audio').duration === 120);
+        await frame.evaluate(() => { window.ListeningAudioPlayer.install(document); });
+        await frame.locator('#waste button').click();
+        await state('waste', true);
+        assert.equal(await frame.locator('#waste audio').evaluate(node => node.paused), false, 'replacement controls must bind exactly once');
+        assert.deepEqual(errors, [], 'rejected playback must not cause uncaught errors');
+        console.log(`PASS ${entry}: 5 button families, media state, keyboard, completion, reset, rejection, cancellation, isolation, replacement`);
+    } finally {
+        await page.close();
+    }
+}
+
 try {
     await exerciseMouse('/fixture');
     await exerciseMouse('/wrapper');
     await exerciseTouch();
+    await exerciseButtons('/buttons');
+    await exerciseButtons('/button-wrapper');
 } finally {
     await browser.close();
     await new Promise(resolve => server.close(resolve));
