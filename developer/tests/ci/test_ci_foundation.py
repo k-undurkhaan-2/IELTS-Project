@@ -10197,6 +10197,9 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
                 }
                 return result, bundle
 
+            trusted_tools = _explicit_local_test_tool_map(
+                *sorted(ci.required_tool_names("static"))
+            )
             with (
                 mock.patch.multiple(ci, REPO_ROOT=repo),
                 mock.patch.object(ci.uuid, "uuid4", return_value=self.INVOCATION_UUID),
@@ -10204,9 +10207,6 @@ class StaticExecutionAuthorityTest(unittest.TestCase):
                 mock.patch.object(ci, "execute_planned_static_suite", side_effect=fake_snapshot),
                 mock.patch.object(ci.FoundationRunner, "run_direct_syntax", autospec=True),
             ):
-                trusted_tools = _explicit_local_test_tool_map(
-                    *sorted(ci.required_tool_names("static"))
-                )
                 runner = ci.FoundationRunner(
                     "static",
                     copy.deepcopy(self.baseline),
