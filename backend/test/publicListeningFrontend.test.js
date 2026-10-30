@@ -19,6 +19,7 @@ const { MemoryPracticeRecordStore } = require('../src/practiceRecords');
 const {
     PublicListeningFrontendError,
     buildPublicListeningFrontendTestAuthority,
+    classifyPublicListeningRequest,
     loadPublicListeningFrontend
 } = require('../src/publicListeningFrontend');
 const { MemoryTotpStore } = require('../src/totp');
@@ -381,9 +382,157 @@ async function createAuthenticatedFixtureClient(t, frontend, staticRoot) {
         app,
         authSessionStore,
         authStore,
+        baseUrl: running.baseUrl,
         client: createCookieClient(running.baseUrl)
     };
 }
+
+function generatedDependencyAliases(requestPath) {
+    const directory = path.posix.dirname(requestPath);
+    const filename = path.posix.basename(requestPath);
+    return [
+        `${directory}/./${filename}`,
+        `/./${requestPath.slice(1)}`,
+        requestPath.replace('/generated/', '/./generated/'),
+        `${directory}/%2e/${filename}`,
+        `${directory}/%252e/${filename}`,
+        `${directory}/%25252e/${filename}`,
+        `${directory}/temporary/../${filename}`,
+        `${directory}/temporary/%2e%2e/${filename}`,
+        `${directory}//./${filename}`,
+        `${directory}\\.\\${filename}`,
+        `${directory}/.%2F${filename}`,
+        `${directory.toUpperCase()}/./${filename}`,
+        `${directory}/./%${filename.charCodeAt(0).toString(16)}${filename.slice(1)}`,
+        `${directory}/./${filename}.`,
+        `${directory}/./${filename}/extra`,
+        `${directory}/./${filename}/.`,
+        `${directory}/./${filename}/%`,
+        `${requestPath}/../unrelated.js`
+    ];
+}
+
+async function assertGeneratedAliasesRejected(t, client, requestPath) {
+    const failures = [];
+    for (const alias of generatedDependencyAliases(requestPath)) {
+        for (const method of ['GET', 'HEAD']) {
+            const result = await client.rawRequest(method, alias);
+            const unverifiedBytesReturned = result.text.includes('UNVERIFIED-DEPENDENCY-BYTES');
+            if (result.response.status !== 404
+                || result.response.headers.get('cache-control') !== 'no-store'
+                || unverifiedBytesReturned) {
+                failures.push({ method, alias, status: result.response.status, unverifiedBytesReturned });
+            }
+        }
+    }
+    if (failures.length) t.diagnostic(JSON.stringify(failures));
+    assert.deepEqual(failures, [], 'generated dependency aliases must reject before static fallback');
+}
+
+test('nested private Listening routes reject roots and ancestors outside the top-level mount', async (t) => {
+    for (const scenario of ['nested-root', 'intermediate-ancestor']) {
+        await t.test(scenario, async (t) => {
+            const fixture = createSyntheticArtifact(t);
+            const staticRoot = createSyntheticStaticRoot(t);
+            const { client, baseUrl } = await createAuthenticatedFixtureClient(t, loadSyntheticArtifact(fixture), staticRoot);
+            const requestPath = '/ListeningPractice/vip%20special/ListeningPractice/P2/private/private.html';
+            const anonymous = await client.rawRequest('GET', requestPath);
+            assert.equal(anonymous.response.status, 401);
+            assert.doesNotMatch(anonymous.text, /PRIVATE-EXAM-BYTES/);
+            await client.csrf();
+            const registered = await client.request('POST', '/api/auth/register', {
+                username: 'nested_containment_user',
+                password: 'StrongPass1'
+            });
+            assert.equal(registered.response.status, 201);
+            const legitimate = await client.rawRequest('GET', requestPath);
+            assert.equal(legitimate.response.status, 200);
+            assert.match(legitimate.text, /PRIVATE-EXAM-BYTES/);
+            assert.equal(legitimate.response.headers.get('content-security-policy'), EXPECTED_RAW_PRIVATE_LISTENING_CSP);
+            const missing = await client.rawRequest('GET', requestPath.replace('private.html', 'missing.html'));
+            assert.equal(missing.response.status, 404);
+
+            const ancestorPath = path.join(staticRoot, 'ListeningPractice', 'vip special');
+            const linkPath = scenario === 'nested-root' ? path.join(ancestorPath, 'ListeningPractice') : ancestorPath;
+            const outsideRoot = path.join(staticRoot, 'ListeningPractice-outside');
+            const outsideRelativePath = scenario === 'nested-root'
+                ? 'P2/private/private.html' : 'ListeningPractice/P2/private/private.html';
+            writeFile(outsideRoot, outsideRelativePath, 'OUTSIDE-LISTENING-MOUNT-BYTES');
+            fs.renameSync(linkPath, `${linkPath}-original`);
+            fs.symlinkSync(outsideRoot, linkPath, 'dir');
+            assert.equal(fs.realpathSync(linkPath), fs.realpathSync(outsideRoot));
+
+            const anonymousEscaped = await createCookieClient(baseUrl).rawRequest('GET', requestPath);
+            assert.equal(anonymousEscaped.response.status, 401);
+            assert.doesNotMatch(anonymousEscaped.text, /OUTSIDE-LISTENING-MOUNT-BYTES/);
+            const escaped = await client.rawRequest('GET', requestPath);
+            t.diagnostic(JSON.stringify({
+                scenario,
+                authenticatedStatus: escaped.response.status,
+                outsideMarkerReturned: escaped.text.includes('OUTSIDE-LISTENING-MOUNT-BYTES')
+            }));
+            assert.equal(escaped.response.status, 403);
+            assert.doesNotMatch(escaped.text, /OUTSIDE-LISTENING-MOUNT-BYTES/);
+            assert.equal(escaped.response.headers.get('content-security-policy'), EXPECTED_RAW_PRIVATE_LISTENING_CSP);
+            const head = await client.rawRequest('HEAD', requestPath);
+            assert.equal(head.response.status, 403);
+            assert.equal(head.body.length, 0);
+
+            // Links whose real paths stay in the mount remain valid.
+            fs.unlinkSync(linkPath);
+            fs.symlinkSync(`${linkPath}-original`, linkPath, 'dir');
+            const contained = await client.rawRequest('GET', requestPath);
+            assert.equal(contained.response.status, 200);
+            assert.match(contained.text, /PRIVATE-EXAM-BYTES/);
+            assert.equal(contained.response.headers.get('content-security-policy'), EXPECTED_RAW_PRIVATE_LISTENING_CSP);
+
+            const targetPath = path.join(linkPath, outsideRelativePath);
+            fs.renameSync(targetPath, `${targetPath}-original`);
+            fs.symlinkSync(path.join(outsideRoot, outsideRelativePath), targetPath, 'file');
+            const escapedTarget = await client.rawRequest('GET', requestPath);
+            assert.equal(escapedTarget.response.status, 403);
+            assert.doesNotMatch(escapedTarget.text, /OUTSIDE-LISTENING-MOUNT-BYTES/);
+        });
+    }
+});
+
+test('generated dependency dot aliases cannot serve unverified static bytes', async (t) => {
+    const fixture = createSyntheticArtifact(t);
+    const staticRoot = createSyntheticStaticRoot(t);
+    for (const dependency of [TEST_MANIFEST_PATH, TEST_INDEX_PATH]) {
+        writeFile(staticRoot, dependency, 'UNVERIFIED-DEPENDENCY-BYTES');
+    }
+    writeFile(staticRoot, 'assets/unrelated.js', 'UNRELATED-PUBLIC-BYTES');
+    const { client } = await createAuthenticatedFixtureClient(t, loadSyntheticArtifact(fixture), staticRoot);
+    await client.csrf();
+    const registered = await client.request('POST', '/api/auth/register', {
+        username: 'dependency_alias_user',
+        password: 'StrongPass1'
+    });
+    assert.equal(registered.response.status, 201);
+    for (const dependency of [TEST_MANIFEST_PATH, TEST_INDEX_PATH]) {
+        const canonical = await client.rawRequest('GET', `/${dependency}?version=verified`);
+        assert.equal(canonical.response.status, 200);
+        assert.deepEqual(canonical.body, fixture.payload.get(dependency));
+        const head = await client.rawRequest('HEAD', `/${dependency}`);
+        assert.equal(head.response.status, 200);
+        assert.equal(head.body.length, 0);
+        assert.equal(Number(head.response.headers.get('content-length')), fixture.payload.get(dependency).length);
+        await t.test(dependency, (t) => assertGeneratedAliasesRejected(t, client, `/${dependency}`));
+    }
+    const unrelated = await client.rawRequest('GET', '/assets/./unrelated.js');
+    assert.equal(unrelated.response.status, 200);
+    assert.equal(unrelated.text, 'UNRELATED-PUBLIC-BYTES');
+    for (const unrelatedPath of [
+        '/assets/generated/reading-exams/./manifest.js',
+        '/assets/generated/listening-exams/./listening-practice-unified.html',
+        '/assets/generated/listening-exams/./other.js',
+        '/other/assets/generated/listening-exams/manifest.js',
+        '/ListeningPractice/P1/legacy.html'
+    ]) {
+        assert.equal(classifyPublicListeningRequest(unrelatedPath), null, unrelatedPath);
+    }
+});
 
 test('public Listening loader verifies its exact synthetic inventory and serves only retained bytes', async (t) => {
     const fixture = createSyntheticArtifact(t);
@@ -619,7 +768,12 @@ test('authenticated A2 public routes enforce allowlists, CSP separation and priv
         ['GET', '//assets/generated/listening-exams/manifest.js', 400],
         ['GET', '/assets/generated/listening-exams/manifest.js.', 404],
         ['GET', '/assets/generated/listening-exams/manifest.js%2Fextra', 404],
-        ['GET', '/ListeningPractice/vip%20special/ListeningPractice/%2e%2e/private.html', 400]
+        ['GET', '/ListeningPractice/vip%20special/ListeningPractice/%2e%2e/private.html', 400],
+        ['GET', '/ListeningPractice/vip%20special/ListeningPractice/P2/./private/private.html', 400],
+        ['GET', '/ListeningPractice/vip%20special/ListeningPractice/P2/private/../private/private.html', 400],
+        ['GET', '/ListeningPractice/vip%20special/ListeningPractice/P2%2Fprivate/private.html', 400],
+        ['GET', '/ListeningPractice/vip%20special/ListeningPractice/P2%5Cprivate/private.html', 400],
+        ['GET', '/ListeningPractice/vip%20special/ListeningPractice/%252e%252e/private.html', 400]
     ]) {
         const rejected = await client.rawRequest(method, rejectedPath);
         assert.equal(rejected.response.status, expectedStatus, `${method} ${rejectedPath}`);
@@ -702,8 +856,14 @@ test('production readiness fails closed and production rejects fixture or root o
     }
 
     async function assertUnavailableDataPlane(createAppImplementation, label, optionOverrides = {}) {
+        const staticRoot = createSyntheticStaticRoot(t);
+        for (const dependency of [TEST_MANIFEST_PATH, TEST_INDEX_PATH]) {
+            writeFile(staticRoot, dependency, 'UNVERIFIED-DEPENDENCY-BYTES');
+        }
+        writeFile(staticRoot, 'assets/unrelated.js', 'UNRELATED-PUBLIC-BYTES');
         const app = createAppImplementation({
             ...createProductionOptions(label),
+            staticRoot,
             ...optionOverrides
         });
         assert.equal(app.locals.publicListeningFrontendReadiness.required, true);
@@ -743,7 +903,14 @@ test('production readiness fails closed and production rejects fixture or root o
             assert.equal(unavailable.response.status, 503, `${label}: ${governedPath}`);
             assert.equal(unavailable.response.headers.get('cache-control'), 'no-store');
             assert.doesNotMatch(unavailable.text, LISTENING_FIXTURE_BYTES);
+            assert.doesNotMatch(unavailable.text, /UNVERIFIED-DEPENDENCY-BYTES/);
         }
+        for (const dependency of [TEST_MANIFEST_PATH, TEST_INDEX_PATH]) {
+            await t.test(`${label}: ${dependency}`, (t) => assertGeneratedAliasesRejected(t, client, `/${dependency}`));
+        }
+        const unrelated = await client.rawRequest('GET', '/assets/./unrelated.js');
+        assert.equal(unrelated.response.status, 200);
+        assert.equal(unrelated.text, 'UNRELATED-PUBLIC-BYTES');
     }
 
     await assertUnavailableDataPlane(createApp, 'missing');

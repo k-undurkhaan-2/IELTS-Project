@@ -798,8 +798,10 @@ function classifyPublicListeningRequest(requestUrl) {
         return { kind: 'reject', status: 400, reason: 'unsupported request-target form' };
     }
     const decoded = decodePathVariants(rawPath);
-    const normalizedVariants = decoded.variants.map((variant) => {
-        return variant.replace(/\\/g, '/').replace(/\/+/g, '/').toLowerCase();
+    const normalizedVariants = decoded.variants.flatMap((variant) => {
+        const normalized = variant.replace(/\\/g, '/').replace(/\/+/g, '/').toLowerCase();
+        // Normalize only to detect dependency intent; acceptance still requires the exact raw path.
+        return [normalized, path.posix.normalize(normalized)];
     });
     const generatedMatch = PUBLIC_LISTENING_GENERATED_DEPENDENCIES.find((entry) => {
         return normalizedVariants.includes(entry.requestPath.toLowerCase());

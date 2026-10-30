@@ -954,7 +954,7 @@ function sendPublicListeningUnavailable(res) {
     return res.status(503).type('text/plain').send('Listening frontend unavailable');
 }
 
-async function sendContainedPrivateListeningFile(res, privateRoot, rawRelativePath, next) {
+async function sendContainedPrivateListeningFile(res, listeningRoot, privateRoot, rawRelativePath, next) {
     const rawPath = String(rawRelativePath || '');
     if (!rawPath
         || rawPath.startsWith('/')
@@ -989,7 +989,11 @@ async function sendContainedPrivateListeningFile(res, privateRoot, rawRelativePa
         let rootRealpath;
         let targetRealpath;
         try {
+            const listeningRootRealpath = await fs.promises.realpath(listeningRoot);
             rootRealpath = await fs.promises.realpath(rootPath);
+            if (!isPathInside(listeningRootRealpath, rootRealpath)) {
+                return res.status(403).type('text/plain').send('Forbidden');
+            }
             targetRealpath = await fs.promises.realpath(targetPath);
         } catch (error) {
             if (error && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) {
@@ -1947,14 +1951,15 @@ function createApp(options = {}) {
             }
 
             if (target.kind === 'private-nested') {
+                const listeningRoot = path.join(repoRoot, 'ListeningPractice');
                 const privateNestedRoot = path.join(
-                    repoRoot,
-                    'ListeningPractice',
+                    listeningRoot,
                     'vip special',
                     'ListeningPractice'
                 );
                 return sendContainedPrivateListeningFile(
                     res,
+                    listeningRoot,
                     privateNestedRoot,
                     target.relativePath,
                     next
