@@ -37,6 +37,428 @@ NAMES = [f"backend case {i:03d} preserves value {1000 + i}" for i in range(141)]
 PACKAGE = json_bytes({"name": "fixture-backend", "version": "1.0.0",
                       "scripts": {"test": "node --test"}})
 
+# Independent Issue 107 authorities.  These are deliberately not borrowed from
+# the implementation module: a wrong production constant must fail the tests.
+V2_PATH_PROFILE = (914, 40446, "ea143c283e5b8b28098505a303530d0fc9c0c2731273f5bde84d00d5022c52aa")
+V3_PATH_PROFILE = (916, 40530, "5b9401b4afa1b964ebd2887ec023c247a605d4faad6532de6cc168720f70c786")
+V3_ADDED_PATHS = (
+    "backend/src/publicListeningFrontend.js",
+    "backend/test/publicListeningFrontend.test.js",
+)
+V3_HIERARCHY_DIGEST = "3217938708947463015beba935fad163b387a6ba2969625679f326c7770e843a"
+V3_SOURCE_PROFILES = {
+    "LF": (
+        564843,
+        (
+            ("backend/Dockerfile", 1222,
+             "be87830d91db221b19de4a67c67b953ba6ee111c29372e87c7e6397415d1c825"),
+            ("backend/package.json", 736,
+             "64b7da71131e3012c15ca83dc9e434286763e5caa4deed5a1df27d59ff34ad4c"),
+            ("backend/src/app.js", 81856,
+             "69a8947b2785ca73b2d31852da35e0e247af6197764426a408a805581b0e036f"),
+            ("backend/src/publicListeningFrontend.js", 35922,
+             "7f9e8b30341108af540d0694908411e12bdeaea0135af468856a2b3ee0f459e4"),
+            ("backend/test/backend.test.js", 410758,
+             "787d7c6763736960f7013b17161f2fc4445b2005a1d6c8b3ca04eb4cf13558ca"),
+            ("backend/test/publicListeningFrontend.test.js", 34349,
+             "6aab71707f520837fbfce399414fe3f08be0e130988aa2bf52bd6033e6676bab"),
+        ),
+    ),
+    "CRLF": (
+        577131,
+        (
+            ("backend/Dockerfile", 1258,
+             "6a65d29fe167a6d9ef2364e1e3297257953ae31cbc82512ea4c103c6b145aebd"),
+            ("backend/package.json", 763,
+             "2a4f5fc9c2587ff92598f83e9516212ced6304d5c4bceecf0797084423c7bdf7"),
+            ("backend/src/app.js", 83914,
+             "da97a8be86a308a13710b7224d88ff39d120d239b33b049e09cd4f05ff5f69aa"),
+            ("backend/src/publicListeningFrontend.js", 36794,
+             "15772d7017cfc72fe63a409190fea626526d91522136f66d763285cb25b191bf"),
+            ("backend/test/backend.test.js", 419284,
+             "b638658447d0760d7ff6ce29bc3dd73dd02415cbe9e5e72f65d32d70b73988a3"),
+            ("backend/test/publicListeningFrontend.test.js", 35118,
+             "11bb1b9cb081fe93bf7e1b9d9af87d46778c23095e35fa89dfd7f5e38f5d201e"),
+        ),
+    ),
+}
+V3_PACKAGE_LF = ("\n".join((
+    "{",
+    '  "name": "ielts-practice-backend",',
+    '  "version": "0.1.0",',
+    '  "private": true,',
+    '  "license": "AGPL-3.0-only",',
+    '  "main": "src/server.js",',
+    '  "scripts": {',
+    '    "start": "node src/server.js",',
+    '    "test": "node --test",',
+    '    "test:compose-profiles": "node scripts/check-compose-profiles.mjs",',
+    '    "migrate": "node scripts/migrate.mjs",',
+    '    "bootstrap:admin": "node scripts/bootstrap-admin.mjs",',
+    '    "smoke:postgres": "node scripts/smoke-postgres.mjs"',
+    "  },",
+    '  "dependencies": {',
+    '    "bcryptjs": "^2.4.3",',
+    '    "connect-pg-simple": "^10.0.0",',
+    '    "dotenv": "^16.4.7",',
+    '    "express": "^4.19.2",',
+    '    "express-session": "^1.18.1",',
+    '    "helmet": "^7.1.0",',
+    '    "otplib": "^13.4.1",',
+    '    "pg": "^8.13.1",',
+    '    "qrcode": "^1.5.4",',
+    '    "zod": "^3.24.1"',
+    "  }",
+    "}",
+)) + "\n").encode("ascii")
+V3_PACKAGE_CRLF = V3_PACKAGE_LF.replace(b"\n", b"\r\n")
+
+V3_TOP_LEVEL_NAMES = (
+    "Docker COPY and ADD parser rejects private roots across equivalent forms",
+    "docker image hardening excludes secrets and runs app as non-root",
+    "production app rejects missing or placeholder session secrets",
+    "production app rejects weak TOTP encryption keys",
+    "production app rejects missing auth handoff public URLs at construction",
+    "production app validates public URL modes, handoff secrets, and trusted proxy config at construction",
+    "real production process dominates caller nodeEnv in integrated createApp security controls",
+    "auth registration rejects weak and duplicate credentials",
+    "auth write endpoints require a valid CSRF token",
+    "auth CSRF endpoint is rate limited to prevent session store flooding",
+    "rate limiter bounds tracked keys",
+    "rate limiter hashes oversized keys before tracking attempts",
+    "login, logout, and authenticated practice API access",
+    "authenticated APIs require the session verifier companion cookie",
+    "authenticated APIs require an active server-side auth session registry entry",
+    "business account session API lists safe metadata and revokes other sessions",
+    "admin session API lists target sessions and revokes copied user sessions",
+    "security epoch invalidates copied full cookie jars after account security changes",
+    "auth session registry rejects copied sessions on the wrong onion audience",
+    "TOTP verification rotates the session verifier for copied cookie jars",
+    "sensitive API responses are not cacheable",
+    "malformed JSON bodies return a stable validation error",
+    "oversized JSON bodies return a stable payload error",
+    "logout clears secure session cookies with matching attributes",
+    "production public URL policy controls session and handoff cookie Secure attributes",
+    "direct app always hides retired legacy account APIs",
+    "login performs a dummy password check for unknown users",
+    "password comparisons reject input beyond bcrypt byte limit",
+    "legacy direct account mutations stay retired",
+    "retired legacy account mutation routes do not revoke active sessions",
+    "retired legacy account routes are hidden before sensitive checks run",
+    "authenticated APIs refresh stale session users before trusting them",
+    "pending TOTP sessions refresh stale users before trusting them",
+    "legacy self-delete route is retired and preserves account data",
+    "legacy admin self-delete route is retired before last-admin checks",
+    "Auth stores refuse direct last-admin deletion",
+    "auth login rate limit returns 429 after repeated attempts",
+    "auth login rate limit applies across usernames from one IP",
+    "auth registration rate limit applies across usernames from one IP",
+    "auth and CSRF rate limits ignore X-Forwarded-For from untrusted clients",
+    "TOTP rate limits ignore X-Forwarded-For from untrusted clients",
+    "TOTP setup requires auth, CSRF, and returns recovery codes once",
+    "TOTP setup rejects legacy plaintext pending secrets in sessions",
+    "enabling TOTP revokes other active sessions for the same user",
+    "TOTP login requires a second factor before full session access",
+    "TOTP login treats corrupted stored secrets as invalid codes",
+    "invalid TOTP codes do not trigger recovery code bcrypt checks",
+    "TOTP setup code cannot be reused as a login code",
+    "TOTP login rejects replayed current time-step tokens",
+    "TOTP pending setup and login expire before verification",
+    "TOTP recovery codes are one-time and can be regenerated",
+    "Postgres TOTP recovery code consumption requires an unused row update",
+    "Postgres TOTP time-step consumption rejects stale updates",
+    "ordinary users can disable TOTP through scoped auth action state",
+    "admin users cannot disable TOTP through business scoped auth action state",
+    "managed TOTP disable revokes other active sessions for the same user",
+    "removed passkey API returns 404",
+    "practice API requires authentication",
+    "ordinary practice sync preserves unseen history without exporting it",
+    "copied authenticated session cannot export through sync or destructive routes",
+    "practice sync merges concurrent mutations and rejects identity collisions atomically",
+    "Postgres practice sync locks before reading and only writes merged changes",
+    "Postgres practice import supports valid session moves without intermediate uniqueness conflicts",
+    "Postgres partial merge preserves persisted ordering after deleting the first slot (P2 reproducer)",
+    "Postgres partial merge preserves an updated slot after a middle deletion",
+    "Postgres partial merge keeps session replacements in their persisted logical slot",
+    "Postgres partial import appends several new records after the persisted maximum",
+    "Postgres partial merge rejects identity conflicts without changing records or order",
+    "Postgres partial merge guards integer exhaustion before any record mutation",
+    "Postgres partial import preserves logical slots when an old ID is reused after session moves",
+    "Postgres partial merge serializes same-user appends without duplicate order keys",
+    "practice destructive data management requires data step-up bound to the business browser",
+    "practice import deduplicates by id and non-empty sessionId",
+    "PUT practice records replaces the list returned by GET",
+    "PUT practice records deduplicates duplicate session ids before storing",
+    "admin API rejects anonymous and non-admin users",
+    "site content API requires admin TOTP for writes and publishes sanitized public content",
+    "site content UI renders with text nodes and admin edit controls",
+    "admin dashboard redirects anonymous users through auth handoff",
+    "retired legacy admin login html is hidden from authenticated admin static access",
+    "admin shell and business account menu do not link back through the business home",
+    "business settings password and TOTP actions require scoped auth state",
+    "auth handoff creates a one-time business session ticket",
+    "auth logout handoff clears the shared auth session before returning to the target entry",
+    "auth handoff ignores poisoned forwarded hosts and validates canonical start hosts",
+    "auth handoff allows local-development relative redirects without public URLs",
+    "auth login binds signed handoff state to an audience-specific entry",
+    "auth audience login pages require a handoff state before showing credential forms",
+    "auth generic login page requires a handoff state before showing credential forms",
+    "auth audience login pages hide credentials for mismatched handoff state",
+    "auth login page lets admin flow switch away from an existing learner auth session",
+    "auth login page does not redeem admin handoff after learner credentials",
+    "auth login page lets business flow switch away from an existing admin auth session",
+    "auth login session conflict restart logs out and returns to the same flow",
+    "auth API enforces account type for signed business and admin flows",
+    "auth proxy rejects no-state login and registration mutations",
+    "auth complete JSON mode returns redirect payloads and structured errors",
+    "auth handoff rejects unsafe return paths and audience mismatches",
+    "auth callback uses proxy audience headers to rescue misdirected tickets",
+    "auth handoff rejects expired tickets",
+    "admin auth handoff requires admin role and TOTP verification",
+    "admin auth handoff preserves existing TOTP freshness without extending it",
+    "practice API rejects unsafe record identifiers and oversized batches",
+    "practice record import cannot grow beyond the batch record cap",
+    "practice record normalization rejects circular payloads without overflowing the stack",
+    "practice record normalization and memory store do not expose mutable payload aliases",
+    "practice record normalization rejects non-JSON payload values before serialization",
+    "practice record normalization clamps numeric statistics",
+    "practice record metadata truncation preserves valid Unicode",
+    "admin record serialization redacts sensitive payload fields",
+    "admin record serialization preserves shared references while still detecting cycles",
+    "admin record serialization caps display payload text and normalizes scalar fields",
+    "admin can list users, inspect records, and delete one record",
+    "admin sensitive mutations are rate limited",
+    "admin mutation rate limits ignore X-Forwarded-For from untrusted clients",
+    "admin API does not expose internal error messages",
+    "admin routes require TOTP verification in the current session",
+    "admin TOTP verification expires and can be renewed in-session",
+    "admin sensitive mutations require recent password step-up",
+    "admin account center and user-list sensitive reads require recent password step-up",
+    "admin exports require one-time password step-up tokens",
+    "admin mutations rotate the session verifier for copied cookie jars",
+    "admin can manage users and inspect learning and traffic stats",
+    "PostgresAdminStore refuses last-admin demotion inside a locked transaction",
+    "MemoryAdminStore refuses direct last-admin demotion and deletion",
+    "PostgresAdminStore deletes sessions and users inside a locked transaction",
+    "admin user deletion clears target TOTP state in memory store",
+    "memory admin session deletion skips oversized serialized sessions",
+    "memory auth session deletion skips oversized serialized sessions",
+    "admin search query normalization preserves valid Unicode",
+    "traffic middleware minimizes untrusted request metadata",
+    "traffic visitor hashing ignores raw user-agent entropy",
+    "traffic middleware rejects weak hashing secrets in production",
+    "Postgres traffic recent events respect the selected day window",
+    "memory traffic store caps retained events",
+    "admin user changes invalidate target sessions and stale admin roles",
+    "admin web routes reject self password changes",
+    "retired legacy admin account mutations preserve current TOTP verification",
+    "migration runner serializes migrations with a PostgreSQL advisory lock",
+    "migration runner releases the advisory lock after migration failure",
+    "bootstrap admin creates and updates an admin user",
+    "static hosting serves index and denies dotfiles with security headers",
+    "static boundary rechecks optional roots created after an initial miss",
+    "public Listening loader verifies its exact synthetic inventory and serves only retained bytes",
+    "public Listening loader rejects Locator, Manifest, Payload and inventory corruption",
+    "public Listening loader rejects symlinked Payload entries and path escape",
+    "authenticated A2 public routes enforce allowlists, CSP separation and private containment",
+    "production readiness fails closed and production rejects fixture or root overrides",
+)
+V3_NESTED_NAMES = (
+    "strict active locator schema",
+    "Manifest bytes and digest",
+    "same-length Manifest corruption is rejected by SHA-256",
+    "per-file Payload checksum",
+    "unexpected Payload file",
+    "image-root-only dependency checksum",
+)
+V3_PARENT_ORDINAL = 144
+REAL_REPO_ROOT = ci.REPO_ROOT
+
+def independent_path_profile(paths):
+    serialized = ("\n".join(sorted(paths)) + "\n").encode("utf-8")
+    return len(paths), len(serialized), digest(serialized)
+
+
+def protocol_paths(version):
+    if version not in (2, 3):
+        raise AssertionError(("unknown-protocol-version", version))
+    # Authenticate every live inventory, including after earlier fixture calls.
+    paths, errors = ci.deterministic_candidate_paths(REAL_REPO_ROOT)
+    if errors:
+        raise AssertionError(errors)
+    source_profile = independent_path_profile(paths)
+    if len(paths) != len(set(paths)) or source_profile not in (V2_PATH_PROFILE, V3_PATH_PROFILE):
+        raise AssertionError(("unexpected-live-path-profile", source_profile))
+    if version == 2 and source_profile == V3_PATH_PROFILE:
+        paths = [path for path in paths if path not in V3_ADDED_PATHS]
+    elif version == 3 and source_profile == V2_PATH_PROFILE:
+        paths = [*paths, *V3_ADDED_PATHS]
+    expected = V2_PATH_PROFILE if version == 2 else V3_PATH_PROFILE
+    target_profile = independent_path_profile(paths)
+    if len(paths) != len(set(paths)) or target_profile != expected:
+        raise AssertionError(("unexpected-target-path-profile", version, target_profile))
+    return tuple(sorted(paths))
+
+
+def protocol_targets(version, *, source_variant="LF", source_mask=None,
+                     complete=False, physical="1"):
+    """Build lightweight selector inputs or complete synthetic target authority."""
+    paths = protocol_paths(version)
+    stable = {"deviceOrVolume": physical, "inodeOrFileIndex": physical,
+              "creationOrChangeTimeNs": physical, "writeTimeNs": physical,
+              "reparsePoint": False}
+    targets = []
+    for path in paths:
+        if complete:
+            targets.append({
+                "path": path, "canonicalSourcePath": str(REAL_REPO_ROOT / path),
+                "size": max(1, len(path.encode("utf-8"))),
+                "sha256": digest(b"issue107-selector\0" + path.encode("utf-8")),
+                "fileIdentity": stable.copy(), "modeType": "regular-file",
+                "reparsePoint": False,
+            })
+        else:
+            targets.append({"path": path})
+    if version == 3:
+        by_path = {target["path"]: target for target in targets}
+        lf_sources = V3_SOURCE_PROFILES["LF"][1]
+        crlf_sources = V3_SOURCE_PROFILES["CRLF"][1]
+        if source_mask is None:
+            selected = V3_SOURCE_PROFILES[source_variant][1]
+        else:
+            selected = tuple(crlf_sources[index] if source_mask & (1 << index)
+                             else lf_sources[index] for index in range(6))
+        for path, size, sha256 in selected:
+            by_path[path].update(size=size, sha256=sha256)
+    return targets
+
+
+def forced_selector_targets(version=2, source_variant="LF"):
+    # Fresh targets also prevent shared mutable fixture authority from leaking.
+    return protocol_targets(version, source_variant=source_variant)
+
+
+def v3_package_bytes(source_variant="LF"):
+    return V3_PACKAGE_LF if source_variant == "LF" else V3_PACKAGE_CRLF
+
+
+def v3_reporter_lines(duration="1.25", total="99.5", *, initial=True):
+    package = json.loads(V3_PACKAGE_LF)
+    lines = ([""] if initial else []) + [
+        f"> {package['name']}@{package['version']} test", "> node --test", "",
+    ]
+    for ordinal, name in enumerate(V3_TOP_LEVEL_NAMES):
+        if ordinal == V3_PARENT_ORDINAL:
+            lines.append(f"▶ {name}")
+            lines.extend(f"  ✔ {child} ({duration}ms)" for child in V3_NESTED_NAMES)
+        lines.append(f"✔ {name} ({duration}ms)")
+    counts = (154, 0, 154, 0, 0, 0, 0)
+    lines.extend(f"ℹ {key} {value}" for key, value in zip(portable.COUNTS, counts))
+    lines.append(f"ℹ duration_ms {total}")
+    return lines
+
+
+def encode_reporter_lines(lines, *, newline="\n", terminal=True):
+    text = newline.join(lines) + (newline if terminal else "")
+    return text.encode("utf-8")
+
+
+def npm_stdout_v3(duration="1.25", total="99.5", *, newline="\n", initial=True):
+    return encode_reporter_lines(v3_reporter_lines(duration, total, initial=initial),
+                                 newline=newline)
+
+
+def v3_layout(*, initial=True):
+    member_start = 4 if initial else 3
+    heading = member_start + V3_PARENT_ORDINAL
+    return SimpleNamespace(member_start=member_start, heading=heading,
+        child_start=heading + 1, parent_completion=heading + 7,
+        footer_start=member_start + 155)
+
+
+def v3_duration_spans(stdout):
+    """Locate duration spans independently from the production parser."""
+    spans, offset = [], 0
+    duration_prefix = "ℹ duration_ms ".encode()
+    for raw_line in stdout.splitlines(keepends=True):
+        body = raw_line[:-2] if raw_line.endswith(b"\r\n") else raw_line[:-1]
+        if body.startswith(("✔ ".encode(), "  ✔ ".encode())):
+            begin = body.rfind(b" (") + 2
+            spans.append((offset + begin, offset + len(body) - 3))
+        elif body.startswith(duration_prefix):
+            spans.append((offset + len(duration_prefix), offset + len(body)))
+        offset += len(raw_line)
+    return spans
+
+
+def retained_segments(stdout, spans):
+    segments, offset = [], 0
+    for begin, end in spans:
+        segments.append(stdout[offset:begin].hex())
+        offset = end
+    segments.append(stdout[offset:].hex())
+    return segments
+
+
+def replace_spans(stdout, spans, replacements):
+    changed = stdout
+    for (begin, end), replacement in reversed(list(zip(spans, replacements))):
+        changed = changed[:begin] + replacement + changed[end:]
+    return changed
+
+
+def selected_bound_side(stdout, protocol_binding):
+    if protocol_binding["version"] == 2:
+        package_bytes = PACKAGE
+    else:
+        package_bytes = v3_package_bytes(protocol_binding["sourceTuple"]["variant"])
+    binding = {
+        "command": {"commandId": "backend-canonical", "commandClass": "backend-canonical",
+                    "ordinal": 0},
+        "package": json.loads(package_bytes),
+        "packageJsonSha256": digest(package_bytes),
+        "tools": {}, "authority": [], "inputBundleDigest": "fixture-input",
+        "dependencyClosureDigest": "fixture-dependency",
+        "protocol": copy.deepcopy(protocol_binding),
+    }
+    return portable._BoundSide(stdout, json_bytes(binding))
+
+
+def selected_bound_pair(producer_stdout, replay_stdout, producer_binding, replay_binding=None):
+    replay_binding = producer_binding if replay_binding is None else replay_binding
+    return portable._BoundPair(
+        selected_bound_side(producer_stdout, producer_binding),
+        selected_bound_side(replay_stdout, replay_binding), [], [], "fixture-plan", [])
+
+
+@contextlib.contextmanager
+def force_protocol_selection(version=2, source_variant="LF"):
+    """Force only synthetic outer fixtures while preserving fresh-module types."""
+    targets = forced_selector_targets(version, source_variant)
+    loader = ci._frozen_backend_portable_verifier
+    audit = []
+
+    @contextlib.contextmanager
+    def instrument(module):
+        original = module._select_protocol
+
+        def selected(_synthetic_targets):
+            selection = original(targets)
+            audit.append(copy.deepcopy(module._protocol_binding(selection)))
+            return selection
+
+        with mock.patch.object(module, "_select_protocol", side_effect=selected):
+            yield
+
+    @contextlib.contextmanager
+    def observed(*args, **kwargs):
+        with loader(*args, **kwargs) as module, instrument(module):
+            yield module
+
+    with instrument(portable), \
+         mock.patch.object(ci, "_frozen_backend_portable_verifier", side_effect=observed):
+        yield audit
+
 
 def npm_stdout(duration="1.25", total="99.5", *, names=None, newline="\n", initial=True):
     names = NAMES if names is None else names
@@ -141,6 +563,29 @@ def fixture(platform="ubuntu", *, stdout=None, stderr=b"", physical="1", ordinal
     return portable._ReplayEvidence(record, spec, stdout, stderr, PACKAGE, runtime, closure, guard)
 
 
+def v3_fixture(platform="ubuntu", *, duration="1.25", total="99.5", physical="1",
+               ordinal=0, source_variant="LF"):
+    package = v3_package_bytes(source_variant)
+    expected_size, expected_sha256 = {
+        "LF": (736, V3_SOURCE_PROFILES["LF"][1][1][2]),
+        "CRLF": (763, V3_SOURCE_PROFILES["CRLF"][1][1][2]),
+    }[source_variant]
+    if (len(package), digest(package)) != (expected_size, expected_sha256):
+        raise AssertionError(("v3-package-preimage", source_variant, len(package), digest(package)))
+    evidence = fixture(platform, stdout=npm_stdout_v3(duration, total),
+                       physical=physical, ordinal=ordinal)
+    spec = copy.deepcopy(evidence.expected_authority)
+    spec["targets"] = protocol_targets(3, source_variant=source_variant,
+                                       complete=True, physical=physical)
+    rebuilt = fixtures.synthetic_record_from_spec(spec)
+    record = copy.deepcopy(evidence.command_record)
+    for key in (*portable.AUTHORITY_KEYS, "executionInputs", "executionInputBundleDigest",
+                "protectedTargetBundle"):
+        record[key] = copy.deepcopy(rebuilt[key])
+    return replace(evidence, command_record=record, expected_authority=spec,
+                   package_json=package)
+
+
 def unrelated_specs(family, ordinal):
     ids = (["frontend-security:adminFrontendGuard.test.js", "frontend-security:remotePracticeDataSource.test.js"]
            if family == "frontend-security" else [family])
@@ -212,14 +657,21 @@ def replay_fixture(producer, replay, *, compact=False, extra=False, prefix_count
 
 @contextlib.contextmanager
 def outer_fixture(producer=None, replay=None, *, compact=True, extra=False, prefix_count=0,
-                  hosted=False, frontend_ordinals=()):
+                  hosted=False, frontend_ordinals=(), forced_protocol=(2, "LF")):
     with fixtures.backend_verifier_source_fixture() as source:
         producer = fixture() if producer is None else copy.deepcopy(producer)
         replay = fixture(stdout=npm_stdout("90", "912"), physical="9") if replay is None else copy.deepcopy(replay)
         # Both sides include the unchanged verifier source, with actual local authority.
         # Source authority is independently remeasured by the production loader.
         for evidence in (producer, replay):
-            evidence.expected_authority["targets"].append(copy.deepcopy(source.target))
+            matches = [index for index, target in enumerate(evidence.expected_authority["targets"])
+                       if target["path"] == source.target["path"]]
+            if len(matches) > 1:
+                raise AssertionError("duplicate backend verifier target in fixture")
+            if matches:
+                evidence.expected_authority["targets"][matches[0]] = copy.deepcopy(source.target)
+            else:
+                evidence.expected_authority["targets"].append(copy.deepcopy(source.target))
             rebuilt = fixtures.synthetic_record_from_spec(evidence.expected_authority)
             for key in (*portable.AUTHORITY_KEYS, "executionInputs", "executionInputBundleDigest", "protectedTargetBundle"):
                 evidence.command_record[key] = copy.deepcopy(rebuilt[key])
@@ -281,11 +733,15 @@ def outer_fixture(producer=None, replay=None, *, compact=True, extra=False, pref
         runner.run = mock.Mock(return_value=comparison)
         runner.close_execution_leases = mock.Mock()
         runner.cleanup_task_resources = mock.Mock()
-        with mock.patch.object(ci, "rebuild_external_verification_context", return_value=context), \
+        selection_context = (contextlib.nullcontext([]) if forced_protocol is None
+                             else force_protocol_selection(*forced_protocol))
+        with selection_context as selected_protocols, \
+             mock.patch.object(ci, "rebuild_external_verification_context", return_value=context), \
              mock.patch.object(ci, "REPO_ROOT", root):
             yield SimpleNamespace(producer=producer, replay=replay, runner=runner, context=context,
                 root=root, output=output, documents=documents, comparison=comparison,
-                pair={"producer": producer, "replay": replay}, source=source)
+                pair={"producer": producer, "replay": replay}, source=source,
+                selected_protocols=selected_protocols)
 
 
 def write_documents(output, documents, *, ascii_json=False):
@@ -586,6 +1042,11 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
         self.assertEqual(identity.call_count, identity_calls, label)
         print("BACKEND_NEGATIVE " + json.dumps({"case": label, "parser": parser.call_count,
             "identity": identity.call_count, "attached": False, "pass": False}, sort_keys=True))
+
+    def assert_private_rejection(self, reason, function, *args):
+        with self.assertRaisesRegex(
+                ValueError, rf"^backend portable result unavailable: {reason}$"):
+            function(*args)
 
     def test_valid_outer_path(self):
         for platform in ("ubuntu", "windows"):
@@ -1440,6 +1901,467 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
             errors = []
             ci._validate_command_record(forged, 0, errors)
             self.assertTrue(any("keys are not valid" in e for e in errors))
+
+    def test_issue110_a3_both_live_profiles_construct_exact_protocols(self):
+        live_paths, errors = ci.deterministic_candidate_paths(REAL_REPO_ROOT)
+        self.assertEqual(errors, [])
+        ordinary, security = fixtures._r2_counterpart_inventories(live_paths)
+        ordinary, security = tuple(ordinary), tuple(security)
+        inventories = {2: ordinary, 3: security}
+        for live_version in (2, 3, 2):
+            with mock.patch.object(ci, "deterministic_candidate_paths",
+                                   return_value=(list(inventories[live_version]), [])):
+                for requested in (2, 3):
+                    for variant in ("LF", "CRLF"):
+                        with self.subTest(live=live_version, requested=requested, variant=variant):
+                            self.assertEqual(protocol_paths(requested), inventories[requested])
+                            targets = forced_selector_targets(requested, variant)
+                            self.assertEqual(tuple(target["path"] for target in targets),
+                                             inventories[requested])
+                            binding = portable._protocol_binding(portable._select_protocol(targets))
+                            self.assertEqual(binding["version"], requested)
+                            if requested == 3:
+                                self.assertEqual(binding["sourceTuple"]["variant"], variant)
+        self.assertEqual(set(security) - set(ordinary), set(V3_ADDED_PATHS))
+        self.assertFalse(set(ordinary) - set(security))
+
+    def test_issue110_a3_rejects_live_drift_after_fixture_reuse(self):
+        live_paths, errors = ci.deterministic_candidate_paths(REAL_REPO_ROOT)
+        self.assertEqual(errors, [])
+        ordinary, security = fixtures._r2_counterpart_inventories(live_paths)
+        ordinary, security = tuple(ordinary), tuple(security)
+        # Warm every former cache key before presenting an unauthorized live source.
+        for version in (2, 3):
+            for variant in ("LF", "CRLF"):
+                forced_selector_targets(version, variant)
+        corrupted = {
+            "unknown": [],
+            "duplicate": [*ordinary, ordinary[0]],
+            "omitted": list(ordinary[:-1]),
+            "extra": [*security, "backend/unapproved-extension.js"],
+            "same-count-and-length": [ordinary[0][:-1] + "!", *ordinary[1:]],
+            "partial-addition": [*ordinary, V3_ADDED_PATHS[0]],
+            "partial-removal": [path for path in security if path != V3_ADDED_PATHS[0]],
+            "duplicate-substitution": [ordinary[1], *ordinary[1:]],
+        }
+        original_selector = portable._select_protocol
+        original_loader = ci._frozen_backend_portable_verifier
+        for label, paths in corrupted.items():
+            with mock.patch.object(ci, "deterministic_candidate_paths", return_value=(paths, [])):
+                for version in (2, 3):
+                    for build in (protocol_paths, protocol_targets, forced_selector_targets):
+                        with self.subTest(source=label, version=version, builder=build.__name__), \
+                             self.assertRaisesRegex(AssertionError, "unexpected-live-path-profile"):
+                            build(version)
+                    with self.assertRaisesRegex(AssertionError, "unexpected-live-path-profile"):
+                        with force_protocol_selection(version):
+                            self.fail("unauthenticated override entered")
+            self.assertIs(portable._select_protocol, original_selector)
+            self.assertIs(ci._frozen_backend_portable_verifier, original_loader)
+        with mock.patch.object(ci, "deterministic_candidate_paths",
+                               return_value=(list(ordinary), ["inventory read failed"])), \
+             self.assertRaisesRegex(AssertionError, "inventory read failed"):
+            forced_selector_targets()
+        targets = forced_selector_targets(3)
+        targets[0]["path"] = "backend/unauthorized.js"
+        fresh = forced_selector_targets(3)
+        self.assertEqual(tuple(target["path"] for target in fresh), security)
+        self.assertEqual(portable._protocol_binding(portable._select_protocol(fresh))["version"], 3)
+
+    def test_issue110_a3_target_authentication_and_override_restoration(self):
+        live_paths, errors = ci.deterministic_candidate_paths(REAL_REPO_ROOT)
+        self.assertEqual(errors, [])
+        ordinary, security = fixtures._r2_counterpart_inventories(live_paths)
+        ordinary, security = tuple(ordinary), tuple(security)
+        for source, requested in ((ordinary, 3), (security, 2)):
+            with mock.patch.object(ci, "deterministic_candidate_paths", return_value=(list(source), [])), \
+                 mock.patch(__name__ + ".V3_ADDED_PATHS", (V3_ADDED_PATHS[0], "backend/wrong.js")), \
+                 self.assertRaisesRegex(AssertionError, "unexpected-target-path-profile"):
+                forced_selector_targets(requested)
+        for version in (0, 1, 4, "3"):
+            with self.assertRaisesRegex(AssertionError, "unknown-protocol-version"):
+                forced_selector_targets(version)
+        original_selector = portable._select_protocol
+        original_loader = ci._frozen_backend_portable_verifier
+        for version in (2, 3):
+            with force_protocol_selection(version) as audit:
+                self.assertEqual(portable._protocol_binding(portable._select_protocol([]))["version"], version)
+            self.assertEqual([binding["version"] for binding in audit], [version])
+            self.assertIs(portable._select_protocol, original_selector)
+            self.assertIs(ci._frozen_backend_portable_verifier, original_loader)
+            with self.assertRaisesRegex(RuntimeError, "fixture exit"):
+                with force_protocol_selection(version):
+                    raise RuntimeError("fixture exit")
+            self.assertIs(portable._select_protocol, original_selector)
+            self.assertIs(ci._frozen_backend_portable_verifier, original_loader)
+            self.assert_private_rejection("unknown-path-profile", portable._select_protocol, [])
+
+    def test_issue107_real_protocol_selection_and_exact_source_profiles(self):
+        self.assertEqual((len(V3_PACKAGE_LF), digest(V3_PACKAGE_LF)),
+            (736, "64b7da71131e3012c15ca83dc9e434286763e5caa4deed5a1df27d59ff34ad4c"))
+        self.assertEqual((len(V3_PACKAGE_CRLF), digest(V3_PACKAGE_CRLF)),
+            (763, "2a4f5fc9c2587ff92598f83e9516212ced6304d5c4bceecf0797084423c7bdf7"))
+        self.assertEqual(len(V3_TOP_LEVEL_NAMES), 148)
+        self.assertEqual(V3_TOP_LEVEL_NAMES[V3_PARENT_ORDINAL],
+            "public Listening loader rejects Locator, Manifest, Payload and inventory corruption")
+        self.assertEqual(tuple(portable._V3_TOP_LEVEL_NAMES), V3_TOP_LEVEL_NAMES)
+        self.assertEqual(tuple(portable._V3_NESTED_NAMES), V3_NESTED_NAMES)
+        self.assertEqual(list(inspect.signature(portable._select_protocol).parameters), ["targets"])
+
+        v2_targets = protocol_targets(2)
+        self.assertEqual(independent_path_profile([target["path"] for target in v2_targets]),
+                         V2_PATH_PROFILE)
+        self.assertEqual(portable._trusted_path_profile(v2_targets), {
+            "trackedPaths": V2_PATH_PROFILE[0], "serializedUtf8Bytes": V2_PATH_PROFILE[1],
+            "sortedPathSha256": V2_PATH_PROFILE[2],
+        })
+        v2_selection = portable._select_protocol(v2_targets)
+        v2_binding = portable._protocol_binding(v2_selection)
+        self.assertEqual((v2_binding["version"], v2_binding["sourceTuple"]), (2, None))
+        self.assertEqual(v2_binding["hierarchyInventoryDigest"],
+                         "c19b500fff55e20740791a59de895da19ccb51e8998f212413cec3c83cd8238a")
+        self.assertEqual(portable._parse_selected_stdout(npm_stdout(), json.loads(PACKAGE), v2_binding),
+                         portable._parse_stdout(npm_stdout(), json.loads(PACKAGE)))
+
+        for variant in ("LF", "CRLF"):
+            targets = protocol_targets(3, source_variant=variant)
+            self.assertEqual(independent_path_profile([target["path"] for target in targets]),
+                             V3_PATH_PROFILE)
+            selection = portable._select_protocol(targets)
+            binding = portable._protocol_binding(selection)
+            total_bytes, sources = V3_SOURCE_PROFILES[variant]
+            self.assertEqual(binding["version"], 3)
+            self.assertEqual(binding["digestDomain"],
+                             "ieltmps-backend-canonical-portable-result-v3")
+            self.assertEqual(binding["pathProfile"], {
+                "trackedPaths": V3_PATH_PROFILE[0], "serializedUtf8Bytes": V3_PATH_PROFILE[1],
+                "sortedPathSha256": V3_PATH_PROFILE[2],
+            })
+            self.assertEqual(binding["hierarchyInventoryDigest"], V3_HIERARCHY_DIGEST)
+            self.assertEqual(binding["sourceTuple"], {
+                "variant": variant, "totalBytes": total_bytes,
+                "sources": [{"path": path, "size": size, "sha256": sha256}
+                            for path, size, sha256 in sources],
+            })
+
+        path_cases = []
+        missing = copy.deepcopy(v2_targets)
+        missing.pop()
+        path_cases.append(("missing", missing, "unknown-path-profile"))
+        partial = copy.deepcopy(v2_targets) + [{"path": V3_ADDED_PATHS[0]}]
+        path_cases.append(("partial", partial, "unknown-path-profile"))
+        extended = protocol_targets(3)
+        extended.append({"path": "backend/unapproved-extension.js"})
+        path_cases.append(("extended", extended, "unknown-path-profile"))
+        renamed = protocol_targets(3)
+        renamed[0]["path"] += ".renamed"
+        path_cases.append(("renamed", renamed, "unknown-path-profile"))
+        duplicated = copy.deepcopy(v2_targets)
+        duplicated.append(copy.deepcopy(duplicated[0]))
+        path_cases.append(("duplicated", duplicated, "invalid-target-authority"))
+        surrogate = copy.deepcopy(v2_targets)
+        surrogate[0]["path"] = "backend/\ud800.js"
+        path_cases.append(("surrogate", surrogate, "invalid-target-authority"))
+        for label, targets, reason in path_cases:
+            with self.subTest(path_profile=label):
+                self.assert_private_rejection(reason, portable._select_protocol, targets)
+
+        for field, value in (("sha256", "0" * 64), ("size", 1)):
+            targets = protocol_targets(3)
+            source = next(target for target in targets if target["path"] == "backend/src/app.js")
+            source[field] = value
+            with self.subTest(source_field=field):
+                self.assertEqual(independent_path_profile([target["path"] for target in targets]),
+                                 V3_PATH_PROFILE)
+                self.assert_private_rejection("invalid-source-tuple", portable._select_protocol,
+                                              targets)
+
+    def test_issue107_rejects_all_62_mixed_source_tuples(self):
+        accepted = {}
+        for mask in range(64):
+            targets = protocol_targets(3, source_mask=mask)
+            self.assertEqual(independent_path_profile([target["path"] for target in targets]),
+                             V3_PATH_PROFILE, mask)
+            if mask in (0, 63):
+                binding = portable._protocol_binding(portable._select_protocol(targets))
+                accepted[mask] = binding["sourceTuple"]["variant"]
+            else:
+                with self.subTest(mask=f"{mask:06b}"):
+                    self.assert_private_rejection("mixed-source-tuple", portable._select_protocol,
+                                                  targets)
+        self.assertEqual(accepted, {0: "LF", 63: "CRLF"})
+
+    def test_issue107_v3_exact_hierarchy_footer_and_duration_only_normalization(self):
+        stdout = npm_stdout_v3(initial=True)
+        lines = stdout.splitlines(keepends=True)
+        self.assertEqual(len(lines), 167)
+        layout = v3_layout()
+        self.assertEqual(lines[layout.heading].rstrip(b"\r\n").decode(),
+                         "▶ " + V3_TOP_LEVEL_NAMES[V3_PARENT_ORDINAL])
+        self.assertEqual([line.rstrip(b"\r\n").decode() for line in
+                          lines[layout.child_start:layout.child_start + 6]],
+                         [f"  ✔ {name} (1.25ms)" for name in V3_NESTED_NAMES])
+        self.assertEqual([line.rstrip(b"\r\n").decode() for line in lines[-8:]], [
+            "ℹ tests 154", "ℹ suites 0", "ℹ pass 154", "ℹ fail 0",
+            "ℹ cancelled 0", "ℹ skipped 0", "ℹ todo 0", "ℹ duration_ms 99.5",
+        ])
+
+        package = json.loads(V3_PACKAGE_LF)
+        members, gaps = portable._parse_stdout_v3(stdout, package)
+        expected = [{"name": name, "status": "pass"} for name in V3_TOP_LEVEL_NAMES]
+        expected[V3_PARENT_ORDINAL]["children"] = [
+            {"name": name, "status": "pass"} for name in V3_NESTED_NAMES]
+        self.assertEqual(members, expected)
+        spans = v3_duration_spans(stdout)
+        self.assertEqual((len(spans), len(gaps)), (155, 156))
+        self.assertEqual(gaps, retained_segments(stdout, spans))
+        self.assertEqual(b"".join(bytes.fromhex(gap) for gap in gaps),
+                         b"".join(stdout[offset:begin] for offset, (begin, _end) in
+                                  zip([0, *[end for _begin, end in spans]],
+                                      [*spans, (len(stdout), len(stdout))])))
+
+        decimals = (b"0", b"1.0", b"1234567890123456", b"0." + b"9" * 16)
+        normalized = replace_spans(stdout, spans,
+            [decimals[index % len(decimals)] for index in range(len(spans))])
+        self.assertEqual(portable._parse_stdout_v3(normalized, package), (members, gaps))
+
+        crlf_members, crlf_gaps = portable._parse_stdout_v3(
+            npm_stdout_v3(newline="\r\n"), package)
+        no_initial_members, no_initial_gaps = portable._parse_stdout_v3(
+            npm_stdout_v3(initial=False), package)
+        self.assertEqual(crlf_members, members)
+        self.assertEqual(no_initial_members, members)
+        self.assertNotEqual(crlf_gaps, gaps)
+        self.assertNotEqual(no_initial_gaps, gaps)
+        baseline_value = {"orderedTests": members, "stdoutNonDurationSegmentsHex": gaps}
+        self.assertNotEqual(portable._identity_v3(ci, baseline_value), portable._identity_v3(ci, {
+            "orderedTests": crlf_members, "stdoutNonDurationSegmentsHex": crlf_gaps,
+        }))
+        self.assertNotEqual(portable._identity_v3(ci, baseline_value), portable._identity_v3(ci, {
+            "orderedTests": no_initial_members, "stdoutNonDurationSegmentsHex": no_initial_gaps,
+        }))
+
+    def test_issue107_v3_hierarchy_member_and_parent_negative_matrix(self):
+        baseline = v3_reporter_lines()
+        layout = v3_layout()
+        variants = []
+
+        def changed(label, reason, mutate):
+            lines = baseline.copy()
+            mutate(lines)
+            variants.append((label, reason, lines))
+
+        changed("missing top-level", "hierarchy-member-mismatch",
+                lambda lines: lines.pop(layout.member_start))
+        changed("duplicated top-level", "hierarchy-member-mismatch",
+                lambda lines: lines.__setitem__(layout.member_start + 1,
+                                                lines[layout.member_start]))
+        changed("renamed top-level", "hierarchy-member-mismatch",
+                lambda lines: lines.__setitem__(layout.member_start,
+                    lines[layout.member_start].replace(V3_TOP_LEVEL_NAMES[0], "renamed member")))
+        def reorder_top(lines):
+            lines[layout.member_start], lines[layout.member_start + 1] = (
+                lines[layout.member_start + 1], lines[layout.member_start])
+        changed("reordered top-level", "hierarchy-member-mismatch", reorder_top)
+        changed("additional top-level", "hierarchy-member-mismatch",
+                lambda lines: lines.insert(layout.footer_start, "✔ additional member (1.25ms)"))
+        changed("missing nested", "hierarchy-member-mismatch",
+                lambda lines: lines.pop(layout.child_start))
+        changed("duplicated nested", "hierarchy-member-mismatch",
+                lambda lines: lines.__setitem__(layout.child_start + 1,
+                                                lines[layout.child_start]))
+        changed("renamed nested", "hierarchy-member-mismatch",
+                lambda lines: lines.__setitem__(layout.child_start,
+                    lines[layout.child_start].replace(V3_NESTED_NAMES[0], "renamed child")))
+        def reorder_nested(lines):
+            lines[layout.child_start], lines[layout.child_start + 1] = (
+                lines[layout.child_start + 1], lines[layout.child_start])
+        changed("reordered nested", "hierarchy-member-mismatch", reorder_nested)
+        changed("additional nested", "parent-completion-placement",
+                lambda lines: lines.insert(layout.parent_completion,
+                                           "  ✔ additional child (1.25ms)"))
+        changed("wrong suite heading", "hierarchy-heading-mismatch",
+                lambda lines: lines.__setitem__(layout.heading, "▶ wrong suite"))
+        changed("indented suite heading", "hierarchy-heading-mismatch",
+                lambda lines: lines.__setitem__(layout.heading, "  " + lines[layout.heading]))
+        changed("reparented child", "hierarchy-indentation-mismatch",
+                lambda lines: lines.__setitem__(layout.child_start,
+                                                lines[layout.child_start][2:]))
+        changed("wrong child indentation", "hierarchy-indentation-mismatch",
+                lambda lines: lines.__setitem__(layout.child_start,
+                                                " " + lines[layout.child_start]))
+        changed("indented parent completion", "parent-completion-placement",
+                lambda lines: lines.__setitem__(layout.parent_completion,
+                                                "  " + lines[layout.parent_completion]))
+        def early_parent(lines):
+            parent = lines.pop(layout.parent_completion)
+            lines.insert(layout.child_start + 5, parent)
+        changed("parent completion before children", "parent-completion-placement", early_parent)
+        def late_parent(lines):
+            parent = lines.pop(layout.parent_completion)
+            lines.insert(layout.parent_completion + 1, parent)
+        changed("parent completion after next top-level", "parent-completion-placement", late_parent)
+
+        footer = baseline[-8:]
+        for label, reason, lines in variants:
+            with self.subTest(case=label):
+                self.assertNotEqual(lines, baseline)
+                self.assertEqual(lines[-8:], footer)
+                self.assert_private_rejection(reason, portable._parse_stdout_v3,
+                    encode_reporter_lines(lines), json.loads(V3_PACKAGE_LF))
+
+    def test_issue107_v3_footer_stream_and_decimal_negative_matrix(self):
+        baseline = v3_reporter_lines()
+        layout = v3_layout()
+        variants = []
+
+        def changed(label, reason, mutate):
+            lines = baseline.copy()
+            mutate(lines)
+            variants.append((label, reason, encode_reporter_lines(lines)))
+
+        changed("footer count", "footer-mismatch",
+                lambda lines: lines.__setitem__(layout.footer_start, "ℹ tests 153"))
+        changed("footer field", "footer-mismatch",
+                lambda lines: lines.__setitem__(layout.footer_start + 1, "ℹ suite 0"))
+        def reorder_footer(lines):
+            lines[layout.footer_start], lines[layout.footer_start + 1] = (
+                lines[layout.footer_start + 1], lines[layout.footer_start])
+        changed("footer order", "footer-mismatch", reorder_footer)
+        changed("footer punctuation", "footer-mismatch",
+                lambda lines: lines.__setitem__(layout.footer_start, "ℹ tests: 154"))
+        changed("missing footer", "footer-mismatch",
+                lambda lines: lines.pop(layout.footer_start))
+        changed("additional footer", "footer-mismatch",
+                lambda lines: lines.append("ℹ memory_bytes 1"))
+        changed("wrong banner", "banner-mismatch",
+                lambda lines: lines.__setitem__(1, "> ielts-practice-backend@0.2.0 test"))
+
+        stdout = npm_stdout_v3()
+        variants.extend((
+            ("integral width", "duration-grammar",
+             stdout.replace(b"(1.25ms)", b"(12345678901234567ms)", 1)),
+            ("fractional width", "duration-grammar",
+             stdout.replace(b"(1.25ms)", b"(1.12345678901234567ms)", 1)),
+            ("exponent", "duration-grammar",
+             stdout.replace(b"(1.25ms)", b"(1e3ms)", 1)),
+            ("NaN", "duration-grammar", stdout.replace(b"(1.25ms)", b"(NaNms)", 1)),
+            ("empty decimal", "duration-grammar",
+             stdout.replace(b"(1.25ms)", b"(ms)", 1)),
+            ("footer decimal width", "duration-grammar",
+             stdout.replace(b"duration_ms 99.5", b"duration_ms " + b"9" * 17, 1)),
+            ("invalid UTF-8", "stream-encoding", stdout.replace(b"Docker", b"Dock\xffr", 1)),
+            ("control byte", "stream-encoding", stdout.replace(b"Docker", b"Dock\x00r", 1)),
+            ("missing terminal newline", "line-boundary", stdout[:-1]),
+            ("overlong line", "line-boundary", b"x" * 2048 + b"\n"),
+            ("excessive lines", "line-boundary", b"\n" * (portable.MAX_STREAM_LINES + 1)),
+            ("oversized stream", "stream-boundary", b"x" * (portable.MAX_STREAM_BYTES + 1)),
+        ))
+        for label, reason, data in variants:
+            with self.subTest(case=label):
+                self.assert_private_rejection(reason, portable._parse_stdout_v3,
+                                              data, json.loads(V3_PACKAGE_LF))
+
+    def test_issue107_protocol_binding_domains_disagreement_and_no_fallback(self):
+        v2_binding = portable._protocol_binding(portable._select_protocol(protocol_targets(2)))
+        v3_bindings = {variant: portable._protocol_binding(portable._select_protocol(
+            protocol_targets(3, source_variant=variant))) for variant in ("LF", "CRLF")}
+
+        probe = {"version": "domain-probe"}
+        self.assertEqual(portable._identity_for_protocol(ci, probe, v2_binding),
+                         portable._identity(ci, probe))
+        self.assertEqual(portable._identity_for_protocol(ci, probe, v3_bindings["LF"]),
+                         portable._identity_v3(ci, probe))
+        self.assertNotEqual(portable._identity(ci, probe), portable._identity_v3(ci, probe))
+        self.assertEqual(portable._identity_v3(ci, probe), ci.canonical_failure_digest({
+            "digestDomain": "ieltmps-backend-canonical-portable-result-v3",
+            "resultUtf8": json_bytes(probe),
+        }))
+
+        for variant, binding in v3_bindings.items():
+            result = portable._derive_equal_result(ci, selected_bound_pair(
+                npm_stdout_v3(), npm_stdout_v3("90", "912"), binding))
+            self.assertIsNotNone(result, variant)
+            self.assertEqual(result["result"]["version"], 3)
+            self.assertEqual(result["result"]["protocol"], binding)
+            self.assertEqual(len(result["result"]["orderedTests"]), 148)
+            self.assertEqual(len(result["result"]["stdoutNonDurationSegmentsHex"]), 156)
+
+        tamper_cases = {
+            "version": lambda value: value.update(version=2),
+            "digest domain": lambda value: value.update(
+                digestDomain="ieltmps-backend-canonical-portable-result-v2"),
+            "hierarchy": lambda value: value.update(hierarchyInventoryDigest="0" * 64),
+            "path profile": lambda value: value["pathProfile"].update(sortedPathSha256="0" * 64),
+            "source tuple": lambda value: value["sourceTuple"]["sources"][0].update(sha256="0" * 64),
+        }
+        for label, tamper in tamper_cases.items():
+            binding = copy.deepcopy(v3_bindings["LF"])
+            tamper(binding)
+            with self.subTest(binding=label), mock.patch.object(
+                    portable, "_parse_stdout_v3", wraps=portable._parse_stdout_v3) as parser:
+                self.assert_private_rejection("protocol-binding", portable._parse_selected_stdout,
+                    npm_stdout_v3(), json.loads(V3_PACKAGE_LF), binding)
+                parser.assert_not_called()
+                self.assert_private_rejection("protocol-binding", portable._identity_for_protocol,
+                                              ci, probe, binding)
+
+        with mock.patch.object(portable, "_parse_stdout",
+                               side_effect=AssertionError("v2 fallback")) as v2_parser:
+            self.assertIsNone(portable._derive_equal_result(ci, selected_bound_pair(
+                npm_stdout(), npm_stdout(), v3_bindings["LF"])))
+            v2_parser.assert_not_called()
+        with mock.patch.object(portable, "_parse_stdout_v3",
+                               side_effect=AssertionError("v3 probe")) as v3_parser:
+            self.assertIsNone(portable._derive_equal_result(ci, selected_bound_pair(
+                npm_stdout_v3(), npm_stdout_v3(), v2_binding)))
+            v3_parser.assert_not_called()
+
+        for label, producer_binding, replay_binding, producer_stdout, replay_stdout in (
+            ("version", v2_binding, v3_bindings["LF"], npm_stdout(), npm_stdout_v3()),
+            ("source profile", v3_bindings["LF"], v3_bindings["CRLF"],
+             npm_stdout_v3(), npm_stdout_v3()),
+        ):
+            with self.subTest(disagreement=label), \
+                 mock.patch.object(portable, "_parse_stdout", wraps=portable._parse_stdout) as v2_parser, \
+                 mock.patch.object(portable, "_parse_stdout_v3", wraps=portable._parse_stdout_v3) as v3_parser:
+                self.assertIsNone(portable._derive_equal_result(ci, selected_bound_pair(
+                    producer_stdout, replay_stdout, producer_binding, replay_binding)))
+                v2_parser.assert_not_called()
+                v3_parser.assert_not_called()
+
+    def test_issue107_v3_real_selector_outer_binding_and_candidate_selector_rejection(self):
+        producer = v3_fixture(duration="1.25", total="99.5", physical="1")
+        replay = v3_fixture(duration="90", total="912", physical="9")
+        with outer_fixture(producer, replay, forced_protocol=None) as case:
+            with portable_spy("_select_protocol") as selector, \
+                 portable_spy("_parse_stdout_v3") as parser, \
+                 portable_spy("_identity_v3") as identity:
+                errors, transcript = verify(case)
+            self.assertEqual(errors, [])
+            self.assertEqual(transcript["finalAcceptance"], "PASS")
+            result = transcript["backendCanonicalPortableResult"]["result"]
+            self.assertEqual(result["version"], 3)
+            self.assertEqual(result["reporterCounts"], {
+                "tests": 154, "suites": 0, "pass": 154, "fail": 0,
+                "cancelled": 0, "skipped": 0, "todo": 0,
+            })
+            self.assertEqual(result["protocol"]["sourceTuple"]["variant"], "LF")
+            self.assertGreaterEqual(selector.call_count, 6)
+            self.assertEqual((parser.call_count, identity.call_count), (2, 2))
+            for call in selector.call_args_list:
+                binding = portable._protocol_binding(portable._select_protocol(call.args[0]))
+                self.assertEqual((binding["version"], binding["sourceTuple"]["variant"]),
+                                 (3, "LF"))
+
+            record = case.documents["command-results.json"]["records"][0]
+            record["protocolVersion"] = 3
+            reseal_producer(case)
+            with portable_spy("_parse_stdout_v3") as rejected_parser, \
+                 portable_spy("_identity_v3") as rejected_identity:
+                self.assert_rejected(case, "candidate-supplied protocol selector")
+            rejected_parser.assert_not_called()
+            rejected_identity.assert_not_called()
 
     def test_v2_retained_bytes_and_142_duration_span_controls(self):
         stdout = npm_stdout(initial=False)
