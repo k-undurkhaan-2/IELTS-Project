@@ -5,6 +5,8 @@
     var FILL_SELECTOR = '.progress-bar, .progress-fill, .prog-fill, .pos';
     var TIME_SELECTOR = '.time-display, .time-text, .time-txt, .time, #timeDisp, #timeText';
     var PLAY_SELECTOR = 'button.play-pause-btn, button.play-btn, button.play-pause, button#playBtn';
+    var SCRUB_SEEK_INTERVAL = 80;
+    var SCRUB_PENDING_SEEK_LIMIT = 200;
 
     function installButtonStyle(doc) {
         if (doc.getElementById('listening-audio-button-style')) return;
@@ -111,13 +113,17 @@
         return String(Math.floor(value / 60)).padStart(2, '0') + ':' + String(value % 60).padStart(2, '0');
     }
 
-    function bindPlayer(doc, audio, root, progress) {
+    function bindPlayer(doc, audio, root, progress, cache) {
         var win = doc.defaultView || global;
         var fill = progress.querySelector(FILL_SELECTOR);
         var knob = progress.querySelector('.knob');
         var time = root.querySelector(TIME_SELECTOR);
         var pointerId = null;
         var previewTime = null;
+        var dragStartTime = null;
+        var pendingSeek = null;
+        var seekTimer = null;
+        var lastSeekAt = -Infinity;
         var listeners = [];
 
         function listen(target, type, handler, options) {
@@ -159,7 +165,11 @@
         function seek(seconds) {
             if (duration() && Number.isFinite(seconds)) {
                 try {
-                    audio.currentTime = Math.min(duration(), Math.max(0, seconds));
+                    var target = Math.min(duration(), Math.max(0, seconds));
+                    if (Math.abs(audio.currentTime - target) > 0.001) {
+                        audio.currentTime = target;
+                        lastSeekAt = win.performance.now();
+                    }
                 } catch (_) {
                     // A source can be replaced between the gesture and the seek.
                 }
@@ -167,14 +177,52 @@
             render();
         }
 
+        function flushSeek() {
+            // Keep only the latest position and give an in-flight seek time to
+            // finish, but never let a stalled download block newer input.
+            if (pendingSeek === null || seekTimer !== null) return;
+            var interval = audio.seeking ? SCRUB_PENDING_SEEK_LIMIT : SCRUB_SEEK_INTERVAL;
+            var delay = interval - (win.performance.now() - lastSeekAt);
+            if (delay > 0) {
+                seekTimer = win.setTimeout(function flushLater() {
+                    seekTimer = null;
+                    flushSeek();
+                }, delay);
+                return;
+            }
+            var target = pendingSeek;
+            pendingSeek = null;
+            seek(target);
+        }
+
+        function clearSeekTimer() {
+            if (seekTimer !== null) win.clearTimeout(seekTimer);
+            seekTimer = null;
+        }
+
+        function seekCompleted() {
+            clearSeekTimer();
+            flushSeek();
+        }
+
         function cancel() {
             var previousPointer = pointerId;
             pointerId = null;
             previewTime = null;
+            dragStartTime = null;
+            pendingSeek = null;
+            clearSeekTimer();
+            if (cache) cache.setScrubbing(audio, false);
             if (previousPointer !== null && progress.hasPointerCapture && progress.hasPointerCapture(previousPointer)) {
                 progress.releasePointerCapture(previousPointer);
             }
             render();
+        }
+
+        function revertDrag() {
+            var target = dragStartTime;
+            cancel();
+            if (target !== null) seek(target);
         }
 
         function start(event) {
@@ -182,17 +230,22 @@
             consume(event);
             if (!duration()) return;
             pointerId = event.pointerId;
+            dragStartTime = audio.currentTime;
+            if (cache) cache.setScrubbing(audio, true);
             progress.focus({ preventScroll: true });
             if (progress.setPointerCapture) {
                 try { progress.setPointerCapture(pointerId); } catch (_) { }
             }
             preview(event);
+            seek(previewTime);
         }
 
         function move(event) {
             if (pointerId === null || event.pointerId !== pointerId) return;
             consume(event);
             preview(event);
+            pendingSeek = previewTime;
+            flushSeek();
         }
 
         function finish(event) {
@@ -201,17 +254,17 @@
             preview(event);
             var target = previewTime;
             cancel();
-            // Commit once on release instead of issuing a new media request on
-            // every move, without changing playback state or speed.
+            // The final exact position takes priority over throttled/in-flight
+            // seeks, without changing playback state or speed.
             seek(target);
         }
 
         function cancelPointer(event) {
-            if (pointerId !== null && event.pointerId === pointerId) cancel();
+            if (pointerId !== null && event.pointerId === pointerId) revertDrag();
         }
 
         function keyboardSeek(event) {
-            var target = audio.currentTime;
+            var target = previewTime !== null ? previewTime : audio.currentTime;
             switch (event.key) {
                 case 'ArrowLeft':
                 case 'ArrowDown': target -= 5; break;
@@ -239,7 +292,7 @@
         listen(win, 'pointerup', finish, true);
         listen(win, 'pointercancel', cancelPointer, true);
         listen(progress, 'lostpointercapture', cancelPointer);
-        listen(win, 'blur', cancel);
+        listen(win, 'blur', revertDrag);
         listen(progress, 'keydown', keyboardSeek, true);
         // Stop the original mouse handlers from starting a second scrubbing
         // session or seeking again when the captured pointer is released.
@@ -248,6 +301,7 @@
         ['timeupdate', 'loadedmetadata', 'durationchange', 'seeked', 'ended'].forEach(function bindMediaEvent(type) {
             listen(audio, type, render);
         });
+        listen(audio, 'seeked', seekCompleted);
         listen(audio, 'emptied', cancel);
         listen(audio, 'error', cancel);
         render();
@@ -264,6 +318,7 @@
     function install(doc) {
         if (!doc || doc.__listeningAudioPlayerInstalled) return;
         doc.__listeningAudioPlayerInstalled = true;
+        var cache = global.ListeningAudioCache ? global.ListeningAudioCache.install(doc) : null;
         var controllers = new Map();
         var buttons = new Map();
         installButtonStyle(doc);
@@ -282,6 +337,7 @@
                 }
             });
             Array.prototype.forEach.call(doc.querySelectorAll('audio'), function attach(audio) {
+                if (!cache && audio.preload !== 'auto') audio.preload = 'auto';
                 // Some templates place audio beside, rather than inside, the
                 // visible controls. Stop at the nearest unambiguous container.
                 var root = audio.parentElement;
@@ -303,7 +359,7 @@
                     var progress = !foundProgress && root.querySelector(PROGRESS_SELECTOR);
                     if (progress) {
                         if (!controllers.has(progress)) {
-                            controllers.set(progress, bindPlayer(doc, audio, root, progress));
+                            controllers.set(progress, bindPlayer(doc, audio, root, progress, cache));
                         }
                         foundProgress = true;
                     }

@@ -119,15 +119,20 @@ const inputs = Object.freeze({
     listeningRecordBridge: Object.freeze([
         'js/utils/answerMatchCore.js',
         'js/app/spellingErrorCollector.js',
+        'js/runtime/listeningAudioCache.js',
         'js/runtime/listeningAudioPlayer.js',
         'js/runtime/listeningHighlighter.js',
         'js/listeningRecordBridge.js'
     ]),
     listeningWrapper: Object.freeze([
         'js/utils/practiceTimerPreferences.js',
+        'js/runtime/listeningAudioCache.js',
         'js/runtime/listeningAudioPlayer.js',
         'js/runtime/listeningHighlighter.js',
         'js/listeningUnifiedWrapper.js'
+    ]),
+    listeningAudioCacheWorker: Object.freeze([
+        'js/runtime/listeningAudioCacheWorker.js'
     ]),
     more: Object.freeze([
         'assets/wordlists/ielts_core.bundle.js',
@@ -170,6 +175,7 @@ const defaultBundleInputs = Object.freeze({
     'js/bundles/practice-page-enhancer.bundle.js': inputs.practicePageEnhancer,
     'js/bundles/listening-record-bridge.bundle.js': inputs.listeningRecordBridge,
     'js/bundles/listening-wrapper.bundle.js': inputs.listeningWrapper,
+    'js/bundles/listening-audio-cache-worker.bundle.js': inputs.listeningAudioCacheWorker,
     'js/bundles/more.bundle.js': inputs.more,
     'js/bundles/theme.bundle.js': inputs.theme
 });

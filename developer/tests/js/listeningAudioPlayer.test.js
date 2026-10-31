@@ -10,8 +10,8 @@ const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 
-// Generated silence exercises the browser's real media clock and HTTP seeking
-// without depending on private listening questions or recordings.
+// Distinct tones in each half let us check actual decoded audio as well as the
+// media clock, without depending on private listening questions or recordings.
 const duration = 120;
 const sampleRate = 8000;
 const wav = Buffer.alloc(44 + duration * sampleRate * 2);
@@ -27,6 +27,10 @@ wav.writeUInt16LE(2, 32);
 wav.writeUInt16LE(16, 34);
 wav.write('data', 36);
 wav.writeUInt32LE(wav.length - 44, 40);
+for (let sample = 0; sample < duration * sampleRate; sample++) {
+    const frequency = sample < duration * sampleRate / 2 ? 220 : 880;
+    wav.writeInt16LE(Math.round(4000 * Math.sin(2 * Math.PI * frequency * sample / sampleRate)), 44 + sample * 2);
+}
 
 function playerMarkup(id = 'first', alternate = false) {
     return `<div class="audio-player" id="${id}">
@@ -126,6 +130,7 @@ function buttonFixture() {
     </script><script src="/js/bundles/listening-record-bridge.bundle.js" defer></script></body></html>`;
 }
 
+const slowAudioRequests = [];
 const server = http.createServer((request, response) => {
     const pathname = new URL(request.url, 'http://localhost').pathname;
     if (pathname === '/submit-host') {
@@ -145,7 +150,7 @@ const server = http.createServer((request, response) => {
         </body></html>`);
         return;
     }
-    if (pathname === '/audio.wav') {
+    if (pathname === '/audio.wav' || pathname === '/slow-audio.wav') {
         const range = /^bytes=(\d+)-(\d*)$/.exec(request.headers.range || '');
         const start = range ? Number(range[1]) : 0;
         const end = range && range[2] ? Math.min(Number(range[2]), wav.length - 1) : wav.length - 1;
@@ -153,8 +158,19 @@ const server = http.createServer((request, response) => {
             'Content-Type': 'audio/wav',
             'Accept-Ranges': 'bytes',
             'Content-Length': end - start + 1,
+            'Cache-Control': 'no-store',
             ...(range ? { 'Content-Range': `bytes ${start}-${end}/${wav.length}` } : {})
         });
+        if (pathname === '/slow-audio.wav') {
+            slowAudioRequests.push(start);
+            // Make metadata available, but keep the destination unbuffered.
+            // A range request must seek there without waiting for the full file.
+            const prefix = start === 0 ? Math.min(end + 1, 44 + 256 * 1024) : start;
+            response.write(wav.subarray(start, prefix));
+            const timer = setTimeout(() => response.end(wav.subarray(prefix, end + 1)), start === 0 ? 2500 : 120);
+            response.on('close', () => clearTimeout(timer));
+            return;
+        }
         response.end(wav.subarray(start, end + 1));
         return;
     }
@@ -164,14 +180,15 @@ const server = http.createServer((request, response) => {
             .replace('data-source-url=""', 'data-source-url="' + (pathname === '/wrapper' ? '/fixture' : '/buttons') + '"'));
         return;
     }
-    if (['/js/bundles/listening-wrapper.bundle.js', '/js/bundles/listening-record-bridge.bundle.js'].includes(pathname)) {
+    if (['/js/bundles/listening-wrapper.bundle.js', '/js/bundles/listening-record-bridge.bundle.js', '/js/bundles/listening-audio-cache-worker.bundle.js'].includes(pathname)) {
         response.setHeader('Content-Type', 'text/javascript');
         response.end(fs.readFileSync(path.join(repoRoot, pathname)));
         return;
     }
     if (pathname === '/fixture') {
         response.setHeader('Content-Type', 'text/html');
-        response.end(fixture);
+        response.end(new URL(request.url, 'http://localhost').searchParams.has('slow')
+            ? fixture.replaceAll('/audio.wav', '/slow-audio.wav') : fixture);
         return;
     }
     if (pathname === '/buttons') {
@@ -208,7 +225,176 @@ async function waitForTime(frame, seconds, id = 'first') {
     await frame.waitForFunction(({ id, seconds }) => {
         const audio = document.querySelector('#' + id + ' audio');
         return !audio.seeking && Math.abs(audio.currentTime - seconds) < 1;
-    }, { id, seconds });
+    }, { id, seconds }, { timeout: 1500 });
+}
+
+async function exerciseAudibleScrub(entry) {
+    const page = await browser.newPage({ viewport: { width: 1000, height: 650 } });
+    try {
+        await page.goto(baseUrl + entry);
+        const frame = entry === '/wrapper' ? page.frames().find(candidate => candidate.parentFrame()) : page.mainFrame();
+        await frame.waitForFunction(() => document.querySelector('#first audio')?.duration === 120 && document.querySelector('#first audio').src.startsWith('blob:'));
+        assert.equal(await frame.locator('#first audio').evaluate(audio => audio.preload), 'auto', 'open recordings should buffer ahead of scrubbing');
+        await frame.evaluate(async () => {
+            const context = new AudioContext();
+            const source = context.createMediaElementSource(document.querySelector('#first audio'));
+            const analyser = context.createAnalyser();
+            analyser.fftSize = 2048;
+            analyser.smoothingTimeConstant = 0;
+            source.connect(analyser).connect(context.destination);
+            const bins = new Float32Array(analyser.frequencyBinCount);
+            window.readAudioFrequency = () => {
+                analyser.getFloatFrequencyData(bins);
+                let peak = 0;
+                for (let index = 1; index < bins.length; index++) {
+                    if (bins[index] > bins[peak]) peak = index;
+                }
+                return bins[peak] > -60 ? peak * context.sampleRate / analyser.fftSize : 0;
+            };
+            await context.resume();
+        });
+        await frame.locator('#first button').click();
+        const waitForTone = frequency => frame.waitForFunction(expected => Math.abs(window.readAudioFrequency() - expected) < 30,
+            frequency, { timeout: 1500 });
+        await waitForTone(220);
+        const rect = await frame.locator('#first .progress-container').boundingBox();
+        const x = fraction => rect.x + rect.width * fraction;
+        const y = rect.y + rect.height / 2;
+        await page.mouse.move(x(0.75), y);
+        await page.mouse.down();
+        await waitForTime(frame, 90);
+        await waitForTone(880);
+        await page.mouse.move(x(0.25), y, { steps: 10 });
+        await waitForTime(frame, 30);
+        await waitForTone(220);
+        assert.equal((await snapshot(frame)).paused, false, 'live scrubbing must keep playing before pointer release');
+        await page.mouse.up();
+        console.log(`PASS ${entry}: decoded audio switches between 220 Hz and 880 Hz while the pointer is held`);
+    } finally {
+        await page.close();
+    }
+}
+
+async function exerciseSlowSeek() {
+    const page = await browser.newPage();
+    try {
+        await page.goto(baseUrl + '/fixture?slow=1', { waitUntil: 'domcontentloaded' });
+        await page.waitForFunction(() => document.querySelector('#first audio')?.duration === 120);
+        assert.equal(await page.locator('#first audio').evaluate(audio => {
+            for (let index = 0; index < audio.buffered.length; index++) {
+                if (audio.buffered.start(index) <= 96 && audio.buffered.end(index) >= 96) return true;
+            }
+            return false;
+        }), false, 'the seek destination must start unbuffered');
+        const before = slowAudioRequests.length;
+        const rect = await page.locator('#first .progress-container').boundingBox();
+        await page.mouse.move(rect.x + rect.width * 0.2, rect.y + rect.height / 2);
+        await page.mouse.down();
+        await page.mouse.move(rect.x + rect.width * 0.8, rect.y + rect.height / 2, { steps: 12 });
+        try {
+            await waitForTime(page.mainFrame(), 96);
+        } catch (error) {
+            console.error('Delayed seek state:', { requests: slowAudioRequests, media: await page.locator('#first audio').evaluate(audio => ({
+                currentTime: audio.currentTime, seeking: audio.seeking,
+                buffered: Array.from({ length: audio.buffered.length }, (_, index) => [audio.buffered.start(index), audio.buffered.end(index)])
+            })) });
+            throw error;
+        }
+        assert(slowAudioRequests.slice(before).some(start => start > 0), 'unbuffered seeking must use an HTTP range request');
+        await page.mouse.up();
+        await waitForTime(page.mainFrame(), 96);
+        console.log('PASS delayed HTTP audio: seek completes while dragging before the full recording downloads');
+    } finally {
+        await page.close();
+    }
+}
+
+async function exerciseQueuedScrub() {
+    const page = await browser.newPage();
+    try {
+        await page.goto(baseUrl + '/fixture');
+        await page.waitForFunction(() => document.querySelector('#first audio')?.duration === 120 && document.querySelector('#first audio').src.startsWith('blob:'));
+        await page.evaluate(() => {
+            const audio = document.querySelector('#first audio');
+            const progress = document.querySelector('#first .progress-container');
+            let current = 0;
+            let seeking = false;
+            window.seekRequests = [];
+            // Hold completion explicitly to reproduce a slow decoder/network.
+            Object.defineProperty(audio, 'currentTime', {
+                get: () => current,
+                set: value => { current = value; seeking = true; window.seekRequests.push(value); }
+            });
+            Object.defineProperty(audio, 'seeking', { get: () => seeking });
+            window.completeSeek = () => { seeking = false; audio.dispatchEvent(new Event('seeked')); };
+            window.scrub = (type, fraction) => {
+                const rect = progress.getBoundingClientRect();
+                progress.dispatchEvent(new PointerEvent(type, {
+                    bubbles: true, cancelable: true, pointerId: 42, isPrimary: true, button: 0,
+                    clientX: rect.left + rect.width * fraction
+                }));
+            };
+            window.resetSource = () => { current = 0; seeking = false; audio.dispatchEvent(new Event('emptied')); };
+            scrub('pointerdown', 0.1);
+            for (let step = 2; step <= 8; step++) scrub('pointermove', step / 10);
+        });
+        await page.waitForTimeout(120);
+        assert.deepEqual(await page.evaluate(() => seekRequests), [12], 'rapid moves must give an in-flight media request time to finish');
+        await page.evaluate(() => completeSeek());
+        await page.waitForFunction(() => seekRequests.length === 2);
+        assert.deepEqual(await page.evaluate(() => seekRequests), [12, 96], 'completion must seek directly to the latest pointer position');
+        await page.evaluate(() => {
+            scrub('pointermove', 0.3);
+            scrub('pointerup', 0.7);
+            completeSeek();
+        });
+        await page.waitForTimeout(120);
+        assert.deepEqual(await page.evaluate(() => seekRequests), [12, 96, 84], 'release must immediately override pending work and never jump back');
+
+        // When a seek settles quickly, a rapid burst still has to be throttled.
+        const afterBurst = await page.evaluate(() => {
+            scrub('pointerdown', 0.1);
+            completeSeek();
+            for (let step = 2; step <= 9; step++) scrub('pointermove', step / 10);
+            return seekRequests.at(-1);
+        });
+        assert.equal(afterBurst, 12);
+        await page.waitForFunction(() => seekRequests.at(-1) === 108);
+        await page.evaluate(() => { scrub('pointerup', 0.9); completeSeek(); });
+
+        for (const reason of ['pointercancel', 'lostpointercapture', 'blur', 'keyboard', 'emptied', 'error', 'replacement']) {
+            await page.evaluate(reason => {
+                const audio = document.querySelector('#first audio');
+                const progress = document.querySelector('#first .progress-container');
+                // Save the committed time, then queue a delayed live seek.
+                window.expectedTime = audio.currentTime;
+                const startFraction = audio.currentTime === 24 ? 0.3 : 0.2;
+                scrub('pointerdown', startFraction);
+                completeSeek();
+                scrub('pointermove', 0.5);
+                if (reason === 'blur') window.dispatchEvent(new Event('blur'));
+                else if (reason === 'keyboard') {
+                    progress.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }));
+                    window.expectedTime = 65;
+                } else if (reason === 'emptied') {
+                    resetSource();
+                    window.expectedTime = 0;
+                } else if (reason === 'error' || reason === 'replacement') {
+                    if (reason === 'error') audio.dispatchEvent(new Event('error'));
+                    else progress.remove();
+                    window.expectedTime = startFraction * 120;
+                } else scrub(reason, 0.5);
+            }, reason);
+            // Let removal observers run before completing an obsolete seek.
+            await page.evaluate(() => completeSeek());
+            await page.waitForTimeout(120);
+            const result = await page.evaluate(() => ({ actual: document.querySelector('#first audio').currentTime, expected: expectedTime }));
+            assert.equal(result.actual, result.expected, reason + ' must discard all queued seeks');
+        }
+        console.log('PASS queued scrubbing: coalescing, throttling, exact release, cancellation, keyboard, source reset, error and replacement');
+    } finally {
+        await page.close();
+    }
 }
 
 async function exerciseMouse(entry) {
@@ -230,6 +416,7 @@ async function exerciseMouse(entry) {
         const preview = await snapshot(frame);
         assert(Math.abs(preview.width - 75) < 1, 'dragging must immediately preview the requested progress');
         assert.equal(preview.text, '01:30 / 02:00', 'dragging must update the displayed time');
+        await waitForTime(frame, 90);
         await page.mouse.up();
         await waitForTime(frame, 90);
         assert.equal((await snapshot(frame)).paused, true, 'seeking while paused must stay paused');
@@ -243,6 +430,7 @@ async function exerciseMouse(entry) {
         await frame.locator('#first audio').evaluate(audio => audio.dispatchEvent(new Event('timeupdate')));
         assert(Math.abs((await snapshot(frame)).width - 30) < 1);
         await page.mouse.move(x(0.5), y, { steps: 5 });
+        await waitForTime(frame, 60);
         await page.mouse.up();
         await waitForTime(frame, 60);
         const playing = await snapshot(frame);
@@ -311,6 +499,7 @@ async function exerciseTouch() {
         await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: touch(0.2) });
         await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: touch(0.8) });
         assert(Math.abs((await snapshot(frame)).width - 80) < 1, 'touch dragging must preview progress');
+        await waitForTime(frame, 96);
         await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
         await waitForTime(frame, 96);
         await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: touch(0.3) });
@@ -513,6 +702,10 @@ async function exerciseSubmission(wrapped, action) {
 }
 
 try {
+    await exerciseAudibleScrub('/fixture');
+    await exerciseAudibleScrub('/wrapper');
+    await exerciseSlowSeek();
+    await exerciseQueuedScrub();
     for (const wrapped of [false, true]) {
         for (const action of ['click', 'keyboard', 'api', 'observer', 'already-paused']) {
             await exerciseSubmission(wrapped, action);
