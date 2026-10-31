@@ -4656,9 +4656,10 @@
     }
 
     async function renderExplanations() {
+        const results = state.lastResults;
         clearExplanations();
         const explanation = await ensureExplanationDataset();
-        if (!explanation) {
+        if (!explanation || state.lastResults !== results) {
             return;
         }
         renderPassageExplanations();
@@ -5869,6 +5870,17 @@
         dom.submitBtn.classList.toggle('exit-mode', variant === 'exit');
     }
 
+    function canReturnToTest() {
+        return Boolean(
+            state.submitted
+            && state.readOnly
+            && state.readOnlyReason === 'final-submit'
+            && !state.reviewMode
+            && !state.suiteSessionId
+            && !state.simulationMode
+        );
+    }
+
     function syncPrimaryActionButtons() {
         if (dom.submitBtn && !dom.submitBtn.dataset.defaultLabel) {
             dom.submitBtn.dataset.defaultLabel = dom.submitBtn.textContent || dom.submitBtn.getAttribute('aria-label') || dom.submitBtn.title || 'Submit';
@@ -5903,32 +5915,28 @@
             return;
         }
         if (!simulationEnabled || state.reviewMode) {
-            const canResetSubmittedSingle = Boolean(
-                state.submitted
-                && state.readOnly
-                && state.readOnlyReason === 'final-submit'
-                && !state.reviewMode
-                && !state.suiteSessionId
-            );
+            const canResume = canReturnToTest();
             if (dom.submitBtn) {
                 dom.submitBtn.style.display = '';
                 if (dom.submitBtn.dataset.defaultType) {
                     dom.submitBtn.setAttribute('type', dom.submitBtn.dataset.defaultType);
                 }
-                if (!state.readOnly || canResetSubmittedSingle) {
+                if (canResume) {
+                    setPrimaryButtonLabel(dom.submitBtn, 'Return to test');
+                } else if (!state.readOnly) {
                     setPrimaryButtonLabel(dom.submitBtn, dom.submitBtn.dataset.defaultLabel || 'Submit');
                 }
-                dom.submitBtn.disabled = state.readOnly;
+                dom.submitBtn.disabled = state.readOnly && !canResume;
             }
             if (dom.resetBtn) {
                 dom.resetBtn.style.display = '';
                 if (dom.resetBtn.dataset.defaultType) {
                     dom.resetBtn.setAttribute('type', dom.resetBtn.dataset.defaultType);
                 }
-                if (!state.readOnly || canResetSubmittedSingle) {
+                if (!state.readOnly || canResume) {
                     dom.resetBtn.textContent = dom.resetBtn.dataset.defaultLabel || 'Reset';
                 }
-                dom.resetBtn.disabled = state.readOnly && !canResetSubmittedSingle;
+                dom.resetBtn.disabled = state.readOnly && !canResume;
             }
             return;
         }
@@ -6017,6 +6025,7 @@
         state.lastResults = null;
         state.submitted = false;
         state.readOnly = false;
+        state.readOnlyReason = '';
         state.timerLocked = false;
         state.timerExpired = false;
         state.timerExpiryHandled = false;
@@ -6848,6 +6857,10 @@
             handleExitClick();
             return;
         }
+        if (canReturnToTest()) {
+            resetToAnsweringPresentation();
+            return;
+        }
         if (state.readOnly) {
             return;
         }
@@ -6867,9 +6880,11 @@
         renderResults(results);
         enterSubmittedReadOnlyState(state.simulationMode ? 'simulation-final-submit' : 'final-submit');
         await renderExplanations();
-        applyHighlights(highlightSnapshot);
-        enhanceReviewHighlights();
-        updateNavStatuses(results);
+        if (state.lastResults === results) {
+            applyHighlights(highlightSnapshot);
+            enhanceReviewHighlights();
+            updateNavStatuses(results);
+        }
         const messageType = state.simulationMode ? 'SIMULATION_SUBMIT' : 'PRACTICE_COMPLETE';
         const timing = resolvePracticeTiming(1, submissionSnapshot.timerSnapshot);
         postMessage(messageType, Object.assign({

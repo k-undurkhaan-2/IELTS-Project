@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified reading submit/readOnly/highlight regression (file:// compatible)."""
+"""Unified reading submit/return/reset/highlight regression (file:// compatible)."""
 
 from __future__ import annotations
 
@@ -40,9 +40,13 @@ async def run() -> Dict[str, Any]:
 
         await page.evaluate(
             """() => {
-                const input = document.querySelector('input[type="text"], textarea');
+                const input = document.querySelector('#question-groups input, #question-groups textarea');
                 if (input) {
-                    input.value = 'readonly_probe';
+                    if (input.type === 'radio' || input.type === 'checkbox') {
+                        input.checked = true;
+                    } else {
+                        input.value = 'readonly_probe';
+                    }
                     input.dispatchEvent(new Event('input', { bubbles: true }));
                     input.dispatchEvent(new Event('change', { bubbles: true }));
                 }
@@ -91,9 +95,12 @@ async def run() -> Dict[str, Any]:
                     }
                 }
                 const items = Array.from(document.querySelectorAll('#left .hl'));
+                const input = document.querySelector('#question-groups input, #question-groups textarea');
                 return {
                     count: items.length,
-                    texts: items.map((n) => String(n.textContent || '').trim()).filter(Boolean)
+                    texts: items.map((n) => String(n.textContent || '').trim()).filter(Boolean),
+                    answerValue: input && input.value,
+                    answerChecked: !!(input && input.checked)
                 };
             }"""
         )
@@ -110,7 +117,7 @@ async def run() -> Dict[str, Any]:
             """() => {
                 const leftItems = Array.from(document.querySelectorAll('#left .hl'));
                 const leftTexts = leftItems.map((n) => String(n.textContent || '').trim()).filter(Boolean);
-                const input = document.querySelector('input[type="text"], textarea, input[type="radio"], input[type="checkbox"], select');
+                const input = document.querySelector('#question-groups input, #question-groups textarea, #question-groups select');
                 const submit = document.getElementById('submit-btn');
                 const reset = document.getElementById('reset-btn');
                 const exit = document.getElementById('exit-btn');
@@ -120,10 +127,43 @@ async def run() -> Dict[str, Any]:
                     readOnlyClass: document.body.classList.contains('review-readonly-mode'),
                     inputDisabled: !input || input.disabled === true,
                     submitDisabled: !!(submit && submit.disabled),
+                    submitLabel: submit && submit.textContent.trim(),
                     resetDisabled: !!(reset && reset.disabled),
                     exitVisible: !!(exit && getComputedStyle(exit).display !== 'none')
                 };
             }"""
+        )
+
+        await page.click("#submit-btn")
+        await page.wait_for_function(
+            "() => !document.body.classList.contains('review-readonly-mode')",
+            timeout=30000,
+        )
+        after_return = await page.evaluate(
+            """() => {
+                const input = document.querySelector('#question-groups input, #question-groups textarea');
+                const submit = document.getElementById('submit-btn');
+                const results = document.getElementById('results');
+                return {
+                    readOnlyClass: document.body.classList.contains('review-readonly-mode'),
+                    inputDisabled: !input || input.disabled === true,
+                    inputValue: input && input.value,
+                    inputChecked: !!(input && input.checked),
+                    submitDisabled: !!(submit && submit.disabled),
+                    submitLabel: submit && submit.textContent.trim(),
+                    resultsVisible: !!(results && getComputedStyle(results).display !== 'none'),
+                    explanationsVisible: !!document.querySelector('.reading-explanation-card, .reading-group-explanation, .reading-question-explanation, .reading-question-explanation-list'),
+                    leftTexts: Array.from(document.querySelectorAll('#left .hl')).map(n => n.textContent.trim()),
+                    timerRunning: window.__IELTS_PRACTICE_TIMER__.getSnapshot().running
+                };
+            }"""
+        )
+
+        await page.click("#submit-btn")
+        await page.wait_for_function(
+            "() => document.body.classList.contains('review-readonly-mode')"
+            " && document.getElementById('submit-btn').textContent.trim() === 'Return to test'",
+            timeout=30000,
         )
 
         await page.click("#reset-btn")
@@ -159,6 +199,7 @@ async def run() -> Dict[str, Any]:
             "data": {
                 "before": before,
                 "afterSubmit": after_submit,
+                "afterReturn": after_return,
                 "afterReset": after_reset
             }
         }
@@ -177,6 +218,7 @@ async def main() -> int:
 
     before = payload.get("data", {}).get("before", {})
     after_submit = payload.get("data", {}).get("afterSubmit", {})
+    after_return = payload.get("data", {}).get("afterReturn", {})
     after_reset = payload.get("data", {}).get("afterReset", {})
     before_count = int(before.get("count") or 0)
     before_texts = [str(v) for v in (before.get("texts") or []) if str(v).strip()]
@@ -188,9 +230,20 @@ async def main() -> int:
         (all(text in after_texts for text in before_texts), "highlight_text_not_preserved"),
         (bool(after_submit.get("readOnlyClass")), "readonly_class_missing"),
         (bool(after_submit.get("inputDisabled")), "input_not_disabled"),
-        (bool(after_submit.get("submitDisabled")), "submit_not_disabled"),
+        (not bool(after_submit.get("submitDisabled")), "return_button_disabled"),
+        (after_submit.get("submitLabel") == "Return to test", "return_button_label_incorrect"),
         (not bool(after_submit.get("resetDisabled")), "reset_disabled_after_submit"),
         (bool(after_submit.get("exitVisible")), "exit_not_visible"),
+        (not bool(after_return.get("readOnlyClass")), "return_readonly_class_still_present"),
+        (not bool(after_return.get("inputDisabled")), "return_input_still_disabled"),
+        (after_return.get("inputValue") == before.get("answerValue"), "return_answer_not_preserved"),
+        (after_return.get("inputChecked") == before.get("answerChecked"), "return_selection_not_preserved"),
+        (not bool(after_return.get("submitDisabled")), "return_submit_still_disabled"),
+        (after_return.get("submitLabel") == "Submit", "return_submit_label_incorrect"),
+        (not bool(after_return.get("resultsVisible")), "return_results_still_visible"),
+        (not bool(after_return.get("explanationsVisible")), "return_explanations_still_visible"),
+        (bool(after_return.get("timerRunning")), "return_timer_not_resumed"),
+        (all(text in after_return.get("leftTexts", []) for text in before_texts), "return_highlights_not_preserved"),
         (not bool(after_reset.get("readOnlyClass")), "reset_readonly_class_still_present"),
         (not bool(after_reset.get("inputDisabled")), "reset_input_still_disabled"),
         (not bool(after_reset.get("submitDisabled")), "reset_submit_still_disabled"),
