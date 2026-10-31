@@ -47,7 +47,15 @@ const fixture = `<!doctype html><html><head><style>
     .progress-bar-wrapper { width: 100%; height: 8px; background: #ddd; }
     .progress-bar, .progress-fill { height: 8px; width: 0; background: #2684ff; }
 </style></head><body>${playerMarkup()}${playerMarkup('second', true)}
+<main><input name="q1" value="answer"><div id="results"></div></main>
+<div class="bottom-bar"><button id="finish-btn" type="button">Finish</button></div>
 <script>
+    window.ANSWER_KEY = { q1: 'answer' };
+    function showReview() {
+        document.getElementById('results').innerHTML = '<table class="results-table"><thead><tr><th>Question</th><th>Your Answer</th><th>Correct Answer</th><th>Result</th></tr></thead><tbody><tr><td>1</td><td>answer</td><td>answer</td><td>Correct</td></tr></tbody></table>';
+    }
+    document.getElementById('finish-btn').addEventListener('click', showReview);
+    document.addEventListener('source-review-ready', showReview);
     // Legacy players suppress UI updates while scrubbing and only reset their
     // flag on mouseup; the alternate template only implements click-to-seek.
     document.querySelectorAll('.audio-player').forEach(player => {
@@ -120,6 +128,23 @@ function buttonFixture() {
 
 const server = http.createServer((request, response) => {
     const pathname = new URL(request.url, 'http://localhost').pathname;
+    if (pathname === '/submit-host') {
+        const wrapped = new URL(request.url, 'http://localhost').searchParams.has('wrapped');
+        response.setHeader('Content-Type', 'text/html');
+        response.end(`<!doctype html><html><body>
+            <iframe id="practice" src="${wrapped ? '/wrapper' : '/fixture'}" style="width:100%;height:700px"></iframe>
+            <script>
+                window.completions = [];
+                window.addEventListener('message', event => {
+                    const frame = document.getElementById('practice');
+                    if (event.source !== frame.contentWindow || event.data?.type !== 'PRACTICE_COMPLETE') return;
+                    const source = frame.contentDocument.querySelector('iframe')?.contentDocument || frame.contentDocument;
+                    completions.push({ data: event.data.data, paused: [...source.querySelectorAll('audio')].map(audio => audio.paused) });
+                });
+            </script>
+        </body></html>`);
+        return;
+    }
     if (pathname === '/audio.wav') {
         const range = /^bytes=(\d+)-(\d*)$/.exec(request.headers.range || '');
         const start = range ? Number(range[1]) : 0;
@@ -422,7 +447,78 @@ async function exerciseButtons(entry) {
     }
 }
 
+async function exerciseSubmission(wrapped, action) {
+    const page = await browser.newPage();
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    try {
+        const startedAt = Date.UTC(2026, 0, 1);
+        if (action === 'expiry') {
+            await page.clock.setFixedTime(startedAt);
+            await page.addInitScript(() => localStorage.setItem('ielts_listening_timer_preferences_v1', JSON.stringify({
+                mode: 'countdown', countdownMinutes: 1, expiryAction: 'auto-submit'
+            })));
+        }
+        await page.goto(baseUrl + '/submit-host' + (wrapped ? '?wrapped=1' : ''));
+        const frame = page.frames().find(candidate => new URL(candidate.url()).pathname === '/fixture');
+        const apiFrame = wrapped ? page.frames().find(candidate => candidate.url().endsWith('/wrapper')) : frame;
+        await frame.waitForFunction(() => typeof window.__listeningBridgeComplete === 'function'
+            && [...document.querySelectorAll('audio')].every(audio => audio.duration === 120));
+        await page.evaluate(() => document.getElementById('practice').contentWindow.postMessage({
+            type: 'INIT_SESSION', data: { examId: 'listening-p1-audio', sessionId: 'audio-session', startTime: Date.now() }
+        }, location.origin));
+        await frame.waitForFunction(() => window.__listeningBridgeGetState().initialized);
+        await frame.locator('#first .play-pause-btn').click();
+        await frame.locator('#second .play-pause-btn').click();
+        await frame.waitForFunction(() => [...document.querySelectorAll('audio')].every(audio => !audio.paused && audio.currentTime > 0));
+
+        assert.equal(await apiFrame.evaluate(() => window.__listeningBridgeComplete()), false, 'an attempt without results must not complete');
+        assert.deepEqual(await frame.locator('audio').evaluateAll(nodes => nodes.map(audio => audio.paused)), [false, false], 'unsuccessful completion must leave playback running');
+        if (action === 'already-paused') await frame.locator('#second .play-pause-btn').click();
+        const beforeSubmit = await frame.locator('audio').evaluateAll(nodes => nodes.map(audio => audio.currentTime));
+        const finish = frame.locator(wrapped ? '[data-listening-action=finish]' : '#finish-btn');
+        if (action === 'api') {
+            assert.equal(await apiFrame.evaluate(() => window.__listeningBridgeComplete({ allowGenerated: true })), true);
+        } else if (action === 'observer') {
+            await frame.evaluate(() => document.dispatchEvent(new Event('source-review-ready')));
+        } else if (action === 'keyboard') {
+            await finish.press('Enter');
+        } else if (action === 'expiry') {
+            await page.clock.setFixedTime(startedAt + 61000);
+        } else {
+            await finish.click();
+        }
+        await page.waitForFunction(() => completions.length === 1, null, { timeout: 5000 });
+        const completion = await page.evaluate(() => completions[0]);
+        assert.deepEqual(completion.paused, [true, true], 'stop every recording before publishing completion');
+        assert.equal(completion.data.scoreInfo.correct, 1);
+        assert.equal(completion.data.answers.q1, 'answer');
+        await frame.waitForFunction(() => [...document.querySelectorAll('.play-pause-btn')].every(button => button.dataset.listeningPlayback === 'paused' && button.getAttribute('aria-label') === 'Play audio'));
+        const stoppedTimes = await frame.locator('audio').evaluateAll(nodes => nodes.map(audio => audio.currentTime));
+        stoppedTimes.forEach((time, index) => assert.ok(time >= beforeSubmit[index], 'submission must preserve the playback position'));
+        await page.waitForTimeout(250);
+        assert.deepEqual(await frame.locator('audio').evaluateAll(nodes => nodes.map(audio => audio.currentTime)), stoppedTimes, 'recordings must stay stopped after submission');
+
+        // Review playback is still available, and duplicate completion is harmless.
+        await frame.locator('#first .play-pause-btn').click();
+        await frame.waitForFunction(() => !document.querySelector('#first audio').paused);
+        assert.equal(await apiFrame.evaluate(() => window.__listeningBridgeComplete({ allowGenerated: true })), true);
+        assert.equal(await frame.locator('#first audio').evaluate(audio => audio.paused), false);
+        assert.equal(await page.evaluate(() => completions.length), 1);
+        assert.deepEqual(errors, []);
+        console.log('PASS ' + (wrapped ? 'wrapped' : 'direct') + ' ' + action + ': submission stops audio, preserves position, updates controls and permits review playback');
+    } finally {
+        await page.close();
+    }
+}
+
 try {
+    for (const wrapped of [false, true]) {
+        for (const action of ['click', 'keyboard', 'api', 'observer', 'already-paused']) {
+            await exerciseSubmission(wrapped, action);
+        }
+    }
+    await exerciseSubmission(true, 'expiry');
     await exerciseMouse('/fixture');
     await exerciseMouse('/wrapper');
     await exerciseTouch();

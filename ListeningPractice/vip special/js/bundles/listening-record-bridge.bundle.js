@@ -3285,6 +3285,16 @@
     }
 
     var payload = buildBridgePayload(details);
+    // Stop every recording once grading succeeds, before publishing completion.
+    // Native pause events update the controls while preserving review position.
+    var recordings = window.document.querySelectorAll('audio');
+    for (var i = 0; i < recordings.length; i++) {
+      try {
+        recordings[i].pause();
+      } catch (e) {
+        warn('failed to pause listening audio:', e);
+      }
+    }
     log('sending PRACTICE_COMPLETE, correct=' + payload.scoreInfo.correct + '/' + payload.scoreInfo.total);
     if (!state.initialized) {
       sendInitRequest('complete_before_init');
@@ -3516,7 +3526,10 @@
     var reviewSelectors = '.results-table, .result-table, .review-table, .ans-table, .feedback .grade-report, #reviewList';
     var observer = new MutationObserver(function () {
       var reviewEl = doc.querySelector(reviewSelectors);
-      if (reviewEl && !state.completed) {
+      // Source timers and wrapper navigation keep mutating the document after
+      // grading. Preserve an already queued completion (including its explicit
+      // submit options) instead of postponing it on every unrelated update.
+      if (reviewEl && !state.completed && !completionDebounceTimer) {
         debouncedOnComplete(1500, { allowGenerated: false });
       }
     });
