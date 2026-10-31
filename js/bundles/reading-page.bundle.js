@@ -1821,6 +1821,9 @@
                 width: min(340px, calc(100vw - 24px));
                 max-height: min(420px, calc(100vh - 24px));
                 overflow: auto;
+                overscroll-behavior: contain;
+                -webkit-user-select: text;
+                user-select: text;
                 border: 1px solid rgba(148, 163, 184, 0.45);
                 border-radius: 8px;
                 background: #ffffff;
@@ -2129,10 +2132,10 @@
         positionBubble(bubble, highlight);
         if (!outsideHandlerAttached) {
             outsideHandlerAttached = true;
-            document.addEventListener('click', handleOutsideClick, true);
+            document.addEventListener('pointerdown', handleOutsidePointerDown, true);
             document.addEventListener('keydown', handleDocumentKeydown, true);
             window.addEventListener('resize', closeBubble);
-            window.addEventListener('scroll', closeBubble, true);
+            window.addEventListener('scroll', handleOutsideScroll, true);
         }
     }
 
@@ -2146,13 +2149,22 @@
         activeLookup = null;
     }
 
-    function handleOutsideClick(event) {
+    function handleOutsidePointerDown(event) {
         const bubble = document.getElementById(BUBBLE_ID);
-        const target = event.target instanceof HTMLElement ? event.target : null;
+        const target = event.target instanceof Element ? event.target : null;
         if (!bubble || bubble.style.display === 'none' || !target) {
             return;
         }
+        // Judge the start of a gesture so dragging selected text past the edge stays open.
         if (bubble.contains(target) || target.closest(`.${INTERACTIVE_CLASS}`)) {
+            return;
+        }
+        closeBubble();
+    }
+
+    function handleOutsideScroll(event) {
+        const bubble = document.getElementById(BUBBLE_ID);
+        if (bubble && event.target instanceof Node && bubble.contains(event.target)) {
             return;
         }
         closeBubble();
