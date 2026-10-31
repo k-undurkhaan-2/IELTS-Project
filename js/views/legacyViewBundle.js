@@ -1659,8 +1659,8 @@
         var allCounts = {};
         var monthKey = toPracticeHeatmapMonthKey(monthStart);
         ensureArray(records).forEach(function collect(record) {
-            var timestamp = getRecordTimestamp(record);
-            if (!timestamp) {
+            var timestamp = resolvePracticeHeatmapTimestamp(record);
+            if (timestamp === null) {
                 return;
             }
             var date = new Date(timestamp);
@@ -1678,6 +1678,65 @@
             monthCounts: monthCounts,
             averageSetsPerActiveDay: activeDayKeys.length > 0 ? totalSets / activeDayKeys.length : 0
         };
+    }
+
+    function resolvePracticeHeatmapTimestamp(record) {
+        if (!record || typeof record !== 'object') {
+            return null;
+        }
+        var metadata = record.metadata || {};
+        var realData = record.realData || {};
+        // Match the explicit date precedence in PracticeCore.resolveRecordDate.
+        // Persistence timestamps must not move historical activity to the day it was saved.
+        var candidates = [
+            metadata.date, record.date,
+            record.endTime, record.completedAt, record.timestamp,
+            realData.date, realData.endTime, realData.completedAt, realData.timestamp,
+            metadata.completedAt,
+            record.startTime, record.startedAt, realData.startTime, realData.startedAt, metadata.startedAt,
+            record.createdAt, realData.createdAt, metadata.createdAt
+        ];
+        for (var i = 0; i < candidates.length; i += 1) {
+            var timestamp = parsePracticeHeatmapTimestamp(candidates[i]);
+            if (timestamp !== null) {
+                return timestamp;
+            }
+        }
+        return null;
+    }
+
+    function parsePracticeHeatmapTimestamp(value) {
+        if (typeof value === 'string') {
+            value = value.trim();
+            if (!value) {
+                return null;
+            }
+            var calendarDate = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+            if (calendarDate) {
+                // A date without a time is a local calendar day, not UTC midnight.
+                var localDate = new Date(value + 'T00:00:00');
+                return localDate.getFullYear() === Number(calendarDate[1])
+                    && localDate.getMonth() === Number(calendarDate[2]) - 1
+                    && localDate.getDate() === Number(calendarDate[3])
+                    ? localDate.getTime() : null;
+            }
+            if (/^\d+(?:\.\d+)?$/.test(value)) {
+                value = Number(value);
+            }
+        } else if (typeof value !== 'number' && !(value instanceof Date)) {
+            return null;
+        }
+        if (typeof value === 'number') {
+            if (!Number.isFinite(value)) {
+                return null;
+            }
+            // Accept contemporary Unix timestamps in either seconds or milliseconds.
+            if (Math.abs(value) < 100000000000) {
+                value *= 1000;
+            }
+        }
+        var timestamp = new Date(value).getTime();
+        return Number.isFinite(timestamp) ? timestamp : null;
     }
 
     function normalizePracticeHeatmapMonth(value) {
