@@ -19,7 +19,8 @@ const fixture = `<!doctype html><html><body>
         document.getElementById('finish-btn').addEventListener('click', function () {
             App.state.isReviewing = true;
             this.textContent = 'Submitted';
-            this.disabled = true;
+            // Some legacy templates disable all controls when showing results.
+            document.querySelectorAll('button').forEach(button => { button.disabled = true; });
         });
     </script>
 </body></html>`;
@@ -32,11 +33,17 @@ const server = http.createServer((request, response) => {
             <iframe id="wrapper" src="/wrapper" style="width:100%;height:700px"></iframe>
             <script>
                 window.forwardedCompletions = [];
+                window.forwardedExits = [];
                 window.addEventListener('message', event => {
                     const wrapper = document.getElementById('wrapper');
-                    if (event.source !== wrapper.contentWindow || event.data.type !== 'PRACTICE_COMPLETE') return;
-                    const timer = wrapper.contentDocument.getElementById('listening-practice-frame').contentDocument.querySelector('[data-wrapper-timer=true]');
-                    forwardedCompletions.push({ message: event.data, text: timer.textContent, paused: timer.classList.contains('paused') });
+                    if (event.source !== wrapper.contentWindow) return;
+                    if (event.data.type === 'SUITE_USER_EXIT') forwardedExits.push(event.data);
+                    if (event.data.type !== 'PRACTICE_COMPLETE') return;
+                    const source = wrapper.contentDocument.getElementById('listening-practice-frame').contentDocument;
+                    const timer = source.querySelector('[data-wrapper-timer=true]');
+                    const exit = source.querySelector('[data-listening-action=exit]');
+                    const notes = source.querySelector('[data-listening-action=notes]');
+                    forwardedCompletions.push({ message: event.data, text: timer.textContent, paused: timer.classList.contains('paused'), exitReady: !exit.hidden && !exit.disabled && notes.hidden });
                 });
             </script>
         </body></html>`);
@@ -69,7 +76,7 @@ try {
         { name: 'submit while paused', mode: 'elapsed', action: 'click', paused: true }
     ];
     for (const scenario of cases) {
-        const page = await browser.newPage();
+        const page = await browser.newPage({ viewport: { width: scenario.action === 'keyboard' ? 390 : 1280, height: 844 } });
         const errors = [];
         page.on('pageerror', error => errors.push(error.message));
         let now = Date.UTC(2026, 0, 1);
@@ -77,6 +84,8 @@ try {
             await page.clock.setFixedTime(now);
             await page.addInitScript(preferences => {
                 localStorage.setItem('ielts_listening_timer_preferences_v1', JSON.stringify(preferences));
+                window.closeCalls = 0;
+                window.close = () => { window.closeCalls++; };
             }, { mode: scenario.mode, countdownMinutes: 1, expiryAction: 'auto-submit' });
             await page.goto('http://127.0.0.1:' + server.address().port + '/host');
             const wrapper = page.frames().find(candidate => candidate.url().endsWith('/wrapper'));
@@ -85,13 +94,15 @@ try {
             await wrapper.evaluate(() => window.dispatchEvent(new MessageEvent('message', {
                 origin: location.origin,
                 source: parent,
-                data: { type: 'INIT_SESSION', data: { examId: 'listening-p1-timer', sessionId: 'timer-session', startTime: Date.now() } }
+                data: { type: 'INIT_SESSION', data: { examId: 'listening-p1-timer', sessionId: 'timer-session', suiteSessionId: 'timer-suite', startTime: Date.now() } }
             })));
             await frame.waitForFunction(() => window.__listeningBridgeGetState().initialized);
             const timer = frame.locator('[data-wrapper-timer=true]');
 
             // A failed completion and ordinary bridge messages must leave time running.
             assert.equal(await wrapper.evaluate(() => window.__listeningBridgeComplete()), false);
+            assert.equal(await frame.getByRole('button', { name: 'Notes', exact: true }).isVisible(), true);
+            assert.equal(await frame.getByRole('button', { name: 'Exit', exact: true }).isVisible(), false);
             await frame.evaluate(() => parent.postMessage({ type: 'SESSION_READY', data: {} }, location.origin));
             now += 5000;
             await page.clock.setFixedTime(now);
@@ -117,6 +128,11 @@ try {
             await page.waitForFunction(() => forwardedCompletions.length === 1);
             const completion = await page.evaluate(() => forwardedCompletions[0]);
             assert.equal(completion.paused, true, scenario.name + ': stop the timer before forwarding completion');
+            assert.equal(completion.exitReady, true, scenario.name + ': replace Notes with an enabled Exit before forwarding completion');
+            const exit = frame.getByRole('button', { name: 'Exit', exact: true });
+            assert.equal(await exit.isVisible(), true);
+            assert.equal(await exit.isEnabled(), true);
+            assert.equal(await frame.getByRole('button', { name: 'Notes', exact: true }).isVisible(), false);
             const stoppedText = scenario.action === 'expiry' ? '00:00' : beforeSubmit;
             assert.equal(completion.text, stoppedText);
             assert.equal(completion.message.data.scoreInfo.correct, 1);
@@ -138,10 +154,47 @@ try {
                 await page.clock.setFixedTime(now);
                 await frame.waitForFunction(() => document.querySelector('[data-wrapper-timer=true]').textContent === '00:08');
             }
+            assert.equal(await exit.count(), 1, 'duplicate completion must not duplicate Exit');
+            await exit.click();
+            await page.waitForFunction(() => forwardedExits.length === 1);
+            assert.equal(await wrapper.evaluate(() => closeCalls), 1, 'Exit must close the practice wrapper');
+            assert.equal(await frame.evaluate(() => closeCalls), 0, 'Exit must not try to close the source iframe');
+            assert.deepEqual(await page.evaluate(() => forwardedExits[0].data), {
+                examId: 'listening-p1-timer', sessionId: 'timer-session', suiteSessionId: 'timer-suite', submitted: true
+            });
             assert.deepEqual(errors, []);
-            console.log('PASS ' + scenario.name + ': completion forwarding, frozen review time and valid result payload');
+            console.log('PASS ' + scenario.name + ': completion forwarding, frozen review time, Notes/Exit swap and suite exit');
         } finally {
             await page.close();
+        }
+    }
+    for (const endless of [false, true]) {
+        const host = await browser.newPage();
+        try {
+            await host.goto('http://127.0.0.1:' + server.address().port + '/host');
+            await host.evaluate(() => {
+                window.endlessExits = 0;
+                window.addEventListener('message', event => {
+                    if (event.data?.type === 'ENDLESS_USER_EXIT') window.endlessExits++;
+                });
+            });
+            const popupPromise = host.waitForEvent('popup');
+            await host.evaluate(endless => window.open('/wrapper' + (endless ? '?endless=1' : ''), '_blank'), endless);
+            const popup = await popupPromise;
+            await popup.waitForLoadState();
+            const frame = popup.frameLocator('#listening-practice-frame');
+            await frame.getByRole('button', { name: 'Submit', exact: true }).click();
+            await frame.getByRole('button', { name: 'Exit', exact: true }).waitFor();
+            await Promise.all([
+                popup.waitForEvent('close'),
+                frame.getByRole('button', { name: 'Exit', exact: true }).click()
+            ]);
+            assert.equal(popup.isClosed(), true);
+            if (endless) await host.waitForFunction(() => endlessExits === 1);
+            else assert.equal(await host.evaluate(() => endlessExits), 0);
+            console.log('PASS ' + (endless ? 'endless' : 'standalone') + ' popup: Exit closes the practice window');
+        } finally {
+            await host.close();
         }
     }
 } finally {

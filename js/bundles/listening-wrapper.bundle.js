@@ -771,6 +771,13 @@
         if (timer) timer.disabled = false;
         Array.prototype.forEach.call(doc.querySelectorAll('[data-listening-action]'), function (button) {
             var role = button.dataset.listeningAction;
+            if (role === 'exit') {
+                button.hidden = !state.completed;
+                // Legacy review handlers can disable every button in the page.
+                button.disabled = false;
+                return;
+            }
+            if (role === 'notes') button.hidden = state.completed;
             var source = sourceControl(doc, role);
             if (!source) return;
             button.disabled = Boolean(source.disabled);
@@ -946,6 +953,7 @@
         pausedOffsetMs: 0,
         running: true,
         expiryHandled: false,
+        completed: false,
         bridgeInjected: false,
         bridgeReady: false,
         pendingMessages: [],
@@ -1361,6 +1369,20 @@
             var button = actionProxy(doc, entry[0], entry[1], entry[2]);
             if (button && button.parentNode !== actions) actions.appendChild(button);
         });
+        if (!actions.querySelector('[data-listening-action="exit"]')) {
+            var exit = doc.createElement('button');
+            exit.type = 'button';
+            exit.className = 'nav-action-btn';
+            exit.dataset.listeningAction = 'exit';
+            exit.textContent = 'Exit';
+            exit.hidden = true;
+            exit.addEventListener('click', function (event) {
+                event.stopPropagation();
+                handleExitClick();
+            });
+            actions.insertBefore(exit, actions.querySelector('[data-listening-action="finish"]'));
+        }
+        syncActionProxies(doc);
     }
 
     function syncQuestionColumnState(column, item) {
@@ -1634,6 +1656,7 @@
             'body.listening-unified-ui .q-nav-item.answered, body.listening-unified-ui .q-nav-item.correct, body.listening-unified-ui .q-nav-item.incorrect { color: #334155; }',
             'body.listening-unified-ui .q-column.is-active .q-nav-item, body.listening-unified-ui .q-nav-item.active, body.listening-unified-ui .q-nav-item.current, body.listening-unified-ui .q-nav-item[aria-current="true"] { border-color: #2563eb !important; background: transparent !important; color: #2563eb !important; }',
             'body.listening-unified-ui .nav-controls-right.listening-nav-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 10px; margin-left: auto; }',
+            'body.listening-unified-ui [data-listening-action][hidden] { display: none !important; }',
             'body.listening-unified-ui .nav-action-btn { height: 34px; border: 1px solid #d7dde5; border-radius: 6px; background: #ffffff; padding: 0 12px; color: #334155; font-size: .82rem; font-weight: 700; cursor: pointer; }',
             'body.listening-unified-ui .nav-action-btn:hover { background: #f8fafc; }',
             'body.listening-unified-ui .nav-submit-rect-btn, body.listening-unified-ui #finish-btn { display: inline-flex; align-items: center; justify-content: center; height: 36px; min-width: 72px; border: 0; border-radius: 6px; background-color: #0f172a; padding: 0 20px; color: #ffffff; font-size: 13px; font-weight: 700; box-shadow: 0 2px 6px rgba(15,23,42,.15); cursor: pointer; transition: background-color .15s ease, box-shadow .15s ease, transform .1s ease; }',
@@ -1774,6 +1797,27 @@
         } catch (_) { }
     }
 
+    function handleExitClick() {
+        if (!state.completed) return;
+        if (/(?:^|[?&])endless(?:=|&|$)/i.test(global.location.search || '')) {
+            forwardToParent({ type: 'ENDLESS_USER_EXIT' });
+        } else if (state.suiteSessionId) {
+            forwardToParent({
+                type: 'SUITE_USER_EXIT',
+                data: {
+                    examId: state.examId,
+                    sessionId: state.sessionId,
+                    suiteSessionId: state.suiteSessionId,
+                    submitted: true
+                }
+            });
+        }
+        // The controls live in the source iframe; close the practice wrapper.
+        try {
+            global.close();
+        } catch (_) { }
+    }
+
     function handleParentMessage(message, source) {
         if (source && source !== global && typeof source.postMessage === 'function') {
             state.parentWindow = source;
@@ -1796,6 +1840,7 @@
         var frameWindow = getFrameWindow();
         if (event.source && frameWindow && event.source === frameWindow) {
             if (event.data.type === 'PRACTICE_COMPLETE') {
+                state.completed = true;
                 updateClockPause(false);
                 updateTimerDisplay();
             }
@@ -1858,6 +1903,7 @@
         }
         frame.addEventListener('load', function onFrameLoad() {
             setStatus('', true);
+            state.completed = false;
             state.bridgeInjected = false;
             injectBridge(BRIDGE_SCRIPT_URL);
             adaptFrameUi();
