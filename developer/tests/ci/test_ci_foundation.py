@@ -553,6 +553,27 @@ _R2_A6_CONTENT_DELTA = {
 _R2_A6_SECURITY_COMBINED_MANIFEST_SHA256 = (
     "e6e997ca0d2e457bc4c89e48d217bfaf0ac375650af5fb1be09f9c5116c2f338"
 )
+# Issue #79 A7: the exact accepted A4 runtime on the preserved A6 CI sources.
+_R2_A7_SECURITY_A4_MANIFEST_SHA256 = (
+    "531d32b3d3f12ce998c28ad45c34dcb7880d543e4d435525d9e6ebcfb79591a2"
+)
+_R2_A7_SECURITY_A4_CONTENT_DELTA = {
+    "backend/src/app.js": {
+        "gitBlob": "c18e0b98772b80a218dc34d79b8bfc2508cffcbc",
+        "size": 82_196,
+        "sha256": "7e2a3c01fef143e952d2e5eada139ed79461a959721004d2bb6ac9cfca417513",
+    },
+    "backend/src/publicListeningFrontend.js": {
+        "gitBlob": "e4b5d6a67eff5e8de5718fa4ef744405c7829eb9",
+        "size": 36_102,
+        "sha256": "92ded411a1cc6de6d4bbfabe6294652ba5ed8d361c2b9c52edd8a71a22e4ce60",
+    },
+    "backend/test/publicListeningFrontend.test.js": {
+        "gitBlob": "475f2785d853213b1e7eeb5c8f1f0955267dae98",
+        "size": 43_973,
+        "sha256": "9b8917b372ee78fdab1f59659762d06d0fd5d6af9cd9f2bfc9021f8b83b0e695",
+    },
+}
 _R2_STATIC_COMMAND_PREFIX = (
     "baseline-schema",
     "node-version",
@@ -844,7 +865,13 @@ def _r2_validate_git_object_authority(
         profile is _R2_SECURITY_PROFILE
         and manifest_digest == _R2_A6_SECURITY_COMBINED_MANIFEST_SHA256
     )
-    if not (a5_security_combined or a6_ordinary or a6_security_combined) and manifest_digest not in (
+    a7_security_a4 = (
+        profile is _R2_SECURITY_PROFILE
+        and manifest_digest == _R2_A7_SECURITY_A4_MANIFEST_SHA256
+    )
+    if not (
+        a5_security_combined or a6_ordinary or a6_security_combined or a7_security_a4
+    ) and manifest_digest not in (
         profile.tree_manifest_sha256,
         profile.a1_integrated_tree_manifest_sha256,
         profile.a3_integrated_tree_manifest_sha256,
@@ -863,13 +890,15 @@ def _r2_validate_git_object_authority(
                if profile is _R2_ORDINARY_PROFILE
                else _R2_A4_1_SECURITY_CONTENT_DELTA),
         }
-    if a5_security_combined or a6_security_combined:
+    if a5_security_combined or a6_security_combined or a7_security_a4:
         content_authority = {
             **content_authority,
             **_R2_A5_SECURITY_COMBINED_CONTENT_DELTA,
         }
-    if a6_ordinary or a6_security_combined:
+    if a6_ordinary or a6_security_combined or a7_security_a4:
         content_authority = {**content_authority, **_R2_A6_CONTENT_DELTA}
+    if a7_security_a4:
+        content_authority = {**content_authority, **_R2_A7_SECURITY_A4_CONTENT_DELTA}
     for relative, expected in content_authority.items():
         entry = object_entries.get(relative)
         if entry is None or entry[2] != expected["gitBlob"]:
@@ -922,6 +951,135 @@ def _r2_fixture_content_authorities(
             {**security, **_R2_A4_1_SECURITY_CONTENT_DELTA},
         )
     return ordinary, security
+
+
+_R2_CHECKOUT_ATTRIBUTES = (
+    "text", "eol", "filter", "ident", "working-tree-encoding", "crlf",
+)
+
+
+def _r2_bind_checkout_content(
+    relative: str,
+    entry: tuple[str, str, str],
+    checkout: bytes,
+    *,
+    attributes: Mapping[str, str],
+    autocrlf: str,
+    source_content: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Authenticate source bytes first; retain the exact execution bytes."""
+    if (
+        entry[0] not in {"100644", "100755"}
+        or entry[1] != "blob"
+        or not re.fullmatch(r"[0-9a-f]{40}", entry[2])
+        or set(attributes) != set(_R2_CHECKOUT_ATTRIBUTES)
+        or autocrlf not in {"true", "false", "input"}
+        or any(attributes[key] != "unspecified" for key in (
+            "filter", "ident", "working-tree-encoding", "crlf",
+        ))
+        or (attributes["text"], attributes["eol"]) not in {
+            ("unspecified", "unspecified"), ("set", "lf"),
+        }
+    ):
+        raise AssertionError(f"R2 unsupported checkout transformation: {relative}")
+
+    def git_blob(content: bytes) -> str:
+        return hashlib.sha1(
+            b"blob " + str(len(content)).encode("ascii") + b"\0" + content
+        ).hexdigest()
+
+    source = checkout
+    if git_blob(source) != entry[2]:
+        # Model only Git's built-in CRLF-to-LF working-tree conversion, with
+        # effective attributes read independently. Mixed LF/CRLF is possible
+        # after edits; this does not assert a fresh checkout's canonical EOLs.
+        # Never run or accept arbitrary clean/smudge, ident, or encoding filters.
+        if autocrlf != "true" or attributes["text"] != "unspecified":
+            raise AssertionError(f"R2 checkout bytes are not authorized: {relative}")
+        source = checkout.replace(b"\r\n", b"\n")
+        try:
+            source.decode("utf-8", errors="strict")
+        except UnicodeError as exc:
+            raise AssertionError(f"R2 checkout is not supported UTF-8 text: {relative}") from exc
+        if (
+            b"\r\n" not in checkout
+            or b"\r" in source
+            or any(byte < 32 and byte not in (9, 10, 12) or byte == 127 for byte in source)
+            or git_blob(source) != entry[2]
+        ):
+            raise AssertionError(f"R2 checkout bytes are not authorized: {relative}")
+    # The manifest authenticates path/mode/type/blob. A matching Git blob
+    # authenticates these reconstructed source bytes, not a producer's hash.
+    # Registered source lengths/SHA-256 remain separate, immutable bindings.
+    if source_content is not None and (
+        source_content["gitBlob"] != entry[2]
+        or source_content["size"] != len(source)
+        or source_content["sha256"] != hashlib.sha256(source).hexdigest()
+    ):
+        raise AssertionError(f"R2 Git source content binding differs: {relative}")
+    return {
+        "gitBlob": entry[2],
+        "size": len(checkout),
+        "sha256": hashlib.sha256(checkout).hexdigest(),
+    }
+
+
+def _r2_checkout_execution_authority(
+    profile: _R2SourceInventoryProfile,
+    object_entries: Mapping[str, tuple[str, str, str]],
+    repo_root: Path = ci.REPO_ROOT,
+) -> dict[str, dict[str, object]]:
+    source_authority = _r2_validate_git_object_authority(profile, object_entries)
+    paths = tuple(sorted(object_entries))
+    autocrlf = (_r2_bounded_git(
+        repo_root, "config", "--default", "false", "--get", "core.autocrlf",
+    ).stdout_raw or b"").decode("ascii").strip()
+    attributes: dict[str, dict[str, str]] = {}
+    # Bound argv and NUL-framed output independently of the command producer.
+    for start in range(0, len(paths), 32):
+        selected = paths[start:start + 32]
+        output = _r2_bounded_git(
+            repo_root, "check-attr", "-z", *_R2_CHECKOUT_ATTRIBUTES, "--", *selected,
+        ).stdout_raw or b""
+        fields = output.decode("utf-8", errors="strict").split("\0")
+        if fields[-1] != "" or len(fields) != len(selected) * len(_R2_CHECKOUT_ATTRIBUTES) * 3 + 1:
+            raise AssertionError("R2 checkout attribute framing differs")
+        for index in range(0, len(fields) - 1, 3):
+            relative, name, value = fields[index:index + 3]
+            if relative not in selected or name not in _R2_CHECKOUT_ATTRIBUTES:
+                raise AssertionError("R2 checkout attribute identity differs")
+            record = attributes.setdefault(relative, {})
+            if name in record:
+                raise AssertionError("R2 duplicate checkout attribute")
+            record[name] = value
+    result: dict[str, dict[str, object]] = {}
+    root = repo_root.resolve(strict=True)
+    for relative, entry in object_entries.items():
+        path = root / relative
+        # Do not let a worktree symlink/reparse point supply execution bytes.
+        for candidate in (path, *path.parents):
+            if candidate == root:
+                break
+            info = candidate.lstat()
+            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                raise AssertionError(f"R2 checkout path redirects: {relative}")
+        if not stat.S_ISREG(path.stat().st_mode):
+            raise AssertionError(f"R2 checkout target is not a regular file: {relative}")
+        checkout = path.read_bytes()
+        if relative == _R2_AUTHORIZED_MUTABLE_PATH:
+            # Preserve the sole existing source-object sentinel. CI trust and
+            # the command plan separately bind the exact executing test bytes.
+            result[relative] = {
+                "gitBlob": entry[2], "size": len(checkout),
+                "sha256": hashlib.sha256(checkout).hexdigest(),
+            }
+        else:
+            result[relative] = _r2_bind_checkout_content(
+                relative, entry, checkout, attributes=attributes[relative],
+                autocrlf=autocrlf, source_content=source_authority.get(relative),
+            )
+    return result
+
 
 
 def _r2_bind_source_paths(
@@ -5515,6 +5673,76 @@ class AuthenticatedGitA6SourceAdmissionTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             _r2_validate_git_object_authority(_R2_ORDINARY_PROFILE, a6)
 
+        a7 = self._overlay(a6, _R2_A7_SECURITY_A4_CONTENT_DELTA)
+        expected_a7 = {**expected_a6, **_R2_A7_SECURITY_A4_CONTENT_DELTA}
+        self.assertEqual(_r2_validate_git_object_authority(_R2_SECURITY_PROFILE, a7), expected_a7)
+        ordinary_a7, security_a7 = _r2_fixture_content_authorities(_R2_SECURITY_PROFILE, a7)
+        self.assertEqual(ordinary_a7, ordinary_authority)
+        self.assertEqual(security_a7, expected_a7)
+        self.assertEqual(self._overlay(ordinary, security_a7), a7)
+        with self.assertRaises(AssertionError):
+            _r2_validate_git_object_authority(_R2_ORDINARY_PROFILE, a7)
+
+        # Source identity and execution identity are distinct even for mixed
+        # LF/CRLF worktrees. Authenticate against Git, never report fields.
+        relative = ".dockerignore"
+        identity = expected_a7[relative]
+        source = (_r2_bounded_git(
+            ci.REPO_ROOT, "cat-file", "blob", str(identity["gitBlob"]),
+        ).stdout_raw or b"")
+        attributes = dict.fromkeys(_R2_CHECKOUT_ATTRIBUTES, "unspecified")
+        for autocrlf, checkout in (
+            ("false", source), ("input", source), ("true", source),
+            ("true", source.replace(b"\n", b"\r\n")),
+            ("true", source.replace(b"\n", b"\r\n", 1)),
+        ):
+            with self.subTest(checkout_binding=autocrlf, crlf=checkout.count(b"\r\n")):
+                actual = _r2_bind_checkout_content(
+                    relative, a7[relative], checkout, attributes=attributes,
+                    autocrlf=autocrlf, source_content=identity,
+                )
+                self.assertEqual(actual, {
+                    "gitBlob": identity["gitBlob"], "size": len(checkout),
+                    "sha256": hashlib.sha256(checkout).hexdigest(),
+                })
+        # A source blob already containing CRLF stays byte-exact.
+        runner = _R2_A6_CONTENT_DELTA["developer/tests/ci/run_ci_foundation.py"]
+        runner_bytes = (_r2_bounded_git(
+            ci.REPO_ROOT, "cat-file", "blob", str(runner["gitBlob"]),
+        ).stdout_raw or b"")
+        self.assertIn(b"\r\n", runner_bytes)
+        self.assertEqual(_r2_bind_checkout_content(
+            "developer/tests/ci/run_ci_foundation.py",
+            a7["developer/tests/ci/run_ci_foundation.py"], runner_bytes,
+            attributes=attributes, autocrlf="true", source_content=runner,
+        ), runner)
+
+        # The authenticated full-tree manifest above fixes each exact mode;
+        # regular-file mode support alone does not authorize an entry.
+        regular_paths = (".dockerignore", *(
+            path for path, entry in a7.items() if entry[0] == "100755"
+        ))
+        self.assertEqual(len(regular_paths), 4)
+        for path in regular_paths:
+            entry = a7[path]
+            self.assertEqual(self.entries[path], entry)
+            content = (_r2_bounded_git(
+                ci.REPO_ROOT, "cat-file", "blob", entry[2],
+            ).stdout_raw or b"")
+            source_identity = {
+                "gitBlob": entry[2], "size": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            }
+            for checkout in (content, content.replace(b"\n", b"\r\n")):
+                with self.subTest(regular_blob_mode=entry[0], path=path):
+                    self.assertEqual(_r2_bind_checkout_content(
+                        path, entry, checkout, attributes=attributes,
+                        autocrlf="true", source_content=source_identity,
+                    ), {
+                        "gitBlob": entry[2], "size": len(checkout),
+                        "sha256": hashlib.sha256(checkout).hexdigest(),
+                    })
+
     def test_security_a6_mixed_malformed_and_additional_source_rejected(self) -> None:
         a5 = self._overlay(self._ordinary_a4(), {
             **_R2_SECURITY_CONTENT_DELTA, **_R2_A5_SECURITY_COMBINED_CONTENT_DELTA,
@@ -5523,6 +5751,35 @@ class AuthenticatedGitA6SourceAdmissionTest(unittest.TestCase):
         for path, identity in _R2_A6_CONTENT_DELTA.items():
             with self.subTest(one_sided=path), self.assertRaises(AssertionError):
                 _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, self._overlay(a5, {path: identity}))
+        a7 = self._overlay(a6, _R2_A7_SECURITY_A4_CONTENT_DELTA)
+        for count in (1, 2):
+            for paths in itertools.combinations(_R2_A7_SECURITY_A4_CONTENT_DELTA, count):
+                partial = {path: _R2_A7_SECURITY_A4_CONTENT_DELTA[path] for path in paths}
+                with self.subTest(partial_a4=paths), self.assertRaises(AssertionError):
+                    _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, self._overlay(a6, partial))
+        with self.assertRaises(AssertionError):
+            _r2_validate_git_object_authority(
+                _R2_SECURITY_PROFILE, self._overlay(a7, _R2_A5_SECURITY_COMBINED_CONTENT_DELTA),
+            )
+        for path in (*_R2_A7_SECURITY_A4_CONTENT_DELTA, *_R2_A6_CONTENT_DELTA,
+                     "docs/CI_POLICY.md", "README.md", _R2_AUTHORIZED_MUTABLE_PATH):
+            mode, kind, oid = a7[path]
+            replacements = [
+                ("100755", kind, oid), ("120000", kind, oid),
+                ("160000", "commit", oid), (mode, "tree", oid),
+            ]
+            if path != _R2_AUTHORIZED_MUTABLE_PATH:
+                replacements.append((mode, kind, "f" * 40))
+            for identity in replacements:
+                changed = {**a7, path: identity}
+                with self.subTest(a7_path=path, identity=identity), self.assertRaises(AssertionError):
+                    _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, changed)
+        for changed in (
+            {**a7, "unauthorized.py": ("100644", "blob", "f" * 40)},
+            {path: entry for path, entry in a7.items() if path != "README.md"},
+        ):
+            with self.subTest(a7_paths=tuple(sorted(changed))), self.assertRaises(AssertionError):
+                _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, changed)
         for path in (*_R2_SECURITY_CONTENT_DELTA, *_R2_A5_SECURITY_COMBINED_CONTENT_DELTA, 'README.md'):
             changed = dict(a6)
             mode, kind, _ = changed[path]
@@ -5551,6 +5808,124 @@ class AuthenticatedGitA6SourceAdmissionTest(unittest.TestCase):
         changed = dict(a6)
         changed[_R2_AUTHORIZED_MUTABLE_PATH] = ('100644', 'blob', 'f' * 40)
         _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, changed)
+
+        relative = ".dockerignore"
+        identity = _R2_SECURITY_CONTENT_DELTA[relative]
+        source = (_r2_bounded_git(
+            ci.REPO_ROOT, "cat-file", "blob", str(identity["gitBlob"]),
+        ).stdout_raw or b"")
+        attributes = dict.fromkeys(_R2_CHECKOUT_ATTRIBUTES, "unspecified")
+        checkout = source.replace(b"\n", b"\r\n")
+        for label, altered in (
+            ("appended-content", checkout + b"# unauthorized\n"),
+            ("same-length-content", b"!" + checkout[1:]),
+            ("bare-cr", source.replace(b"\n", b"\r", 1)),
+            ("double-cr", checkout.replace(b"\r\n", b"\r\r\n", 1)),
+            ("nul", checkout + b"\0"),
+            ("encoding", b"\xef\xbb\xbf" + checkout),
+            ("extra-line", checkout + b"\r\n"),
+        ):
+            with self.subTest(checkout_rejection=label), self.assertRaises(AssertionError):
+                _r2_bind_checkout_content(
+                    relative, a7[relative], altered, attributes=attributes,
+                    autocrlf="true", source_content=identity,
+                )
+        for key, value in (
+            ("gitBlob", "0" * 40), ("size", identity["size"] + 1),
+            ("sha256", "0" * 64),
+        ):
+            with self.subTest(source_content_rejection=key), self.assertRaises(AssertionError):
+                _r2_bind_checkout_content(
+                    relative, a7[relative], checkout, attributes=attributes,
+                    autocrlf="true", source_content={**identity, key: value},
+                )
+        for key, value in (
+            ("filter", "untrusted-clean"), ("ident", "set"),
+            ("working-tree-encoding", "UTF-16"), ("crlf", "set"),
+            ("text", "auto"), ("text", "unset"), ("eol", "crlf"),
+        ):
+            # Even byte-identical content must not enable an unsupported filter.
+            for observed in (source, checkout):
+                with self.subTest(transform_rejection=key, value=value), self.assertRaises(AssertionError):
+                    _r2_bind_checkout_content(
+                        relative, a7[relative], observed,
+                        attributes={**attributes, key: value}, autocrlf="true",
+                        source_content=identity,
+                    )
+        for autocrlf in ("false", "input", "invalid"):
+            with self.subTest(autocrlf_rejection=autocrlf), self.assertRaises(AssertionError):
+                _r2_bind_checkout_content(
+                    relative, a7[relative], checkout, attributes=attributes,
+                    autocrlf=autocrlf, source_content=identity,
+                )
+        for altered_attributes in (
+            {}, {**attributes, "unexpected": "set"},
+            {**attributes, "text": "set", "eol": "lf"},
+        ):
+            with self.subTest(attributes_rejection=altered_attributes), self.assertRaises(AssertionError):
+                _r2_bind_checkout_content(
+                    relative, a7[relative], checkout, attributes=altered_attributes,
+                    autocrlf="true", source_content=identity,
+                )
+        runner_path = "developer/tests/ci/run_ci_foundation.py"
+        runner = _R2_A6_CONTENT_DELTA[runner_path]
+        runner_bytes = (_r2_bounded_git(
+            ci.REPO_ROOT, "cat-file", "blob", str(runner["gitBlob"]),
+        ).stdout_raw or b"")
+        with self.assertRaises(AssertionError):
+            _r2_bind_checkout_content(
+                runner_path, a7[runner_path], runner_bytes.replace(b"\r\n", b"\n"),
+                attributes=attributes, autocrlf="true", source_content=runner,
+            )
+        # Conversion is not a blanket binary/encoding normalization rule.
+        for binary_source in (b"a\0\nb\n", b"a\r\nb\n", b"a\xff\nb\n", b"a\x01\nb\n"):
+            blob = hashlib.sha1(
+                b"blob " + str(len(binary_source)).encode() + b"\0" + binary_source
+            ).hexdigest()
+            with self.subTest(binary_rejection=blob), self.assertRaises(AssertionError):
+                _r2_bind_checkout_content(
+                    relative, ("100644", "blob", blob),
+                    binary_source.replace(b"\n", b"\r\n"),
+                    attributes=attributes, autocrlf="true",
+                )
+
+
+        # Exercise the execution-authority entry point: a valid regular mode
+        # never overrides the exact path/type/mode/blob authenticated by A7.
+        regular_paths = (".dockerignore", *(
+            path for path, entry in a7.items() if entry[0] == "100755"
+        ))
+        for path in regular_paths:
+            mode, kind, oid = a7[path]
+            for replacement in (
+                ("100755" if mode == "100644" else "100644", kind, oid),
+                ("120000", "blob", oid), ("040000", "tree", oid),
+                ("100600", "blob", oid), (mode, "tree", oid),
+                (mode, kind, "f" * 40),
+            ):
+                with self.subTest(exact_mode_rejection=path, identity=replacement):
+                    with self.assertRaises(AssertionError):
+                        _r2_checkout_execution_authority(
+                            _R2_SECURITY_PROFILE, {**a7, path: replacement},
+                        )
+            renamed = dict(a7)
+            renamed[path + ".substitute"] = renamed.pop(path)
+            with self.subTest(exact_path_rejection=path), self.assertRaises(AssertionError):
+                _r2_checkout_execution_authority(_R2_SECURITY_PROFILE, renamed)
+            content = (_r2_bounded_git(
+                ci.REPO_ROOT, "cat-file", "blob", oid,
+            ).stdout_raw or b"")
+            for altered in (
+                content + b"# unauthorized\n",
+                content.replace(b"\n", b"\r", 1),
+            ):
+                with self.subTest(regular_checkout_rejection=path, mode=mode):
+                    with self.assertRaises(AssertionError):
+                        _r2_bind_checkout_content(
+                            path, a7[path], altered, attributes=attributes,
+                            autocrlf="true",
+                        )
+
 
     def test_security_a6_test_sentinel_retains_exact_execution_content_binding(self) -> None:
         tools = _explicit_local_test_tool_map('git')
@@ -7103,6 +7478,26 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
         ordinary_content_authority, security_content_authority = (
             _r2_fixture_content_authorities(source_profile, live_object_authority)
         )
+        live_execution_authority = _r2_checkout_execution_authority(
+            source_profile, live_object_authority,
+        )
+
+        def execution_content_authority(frozen: Mapping[str, Mapping[str, object]]) -> dict:
+            # Historical counterparts retain frozen source bytes for paths that
+            # are not present at this source identity. Shared/live blobs use the
+            # independently authenticated working-tree representation.
+            return {
+                **live_execution_authority,
+                **{
+                    relative: content
+                    for relative, content in frozen.items()
+                    if relative not in live_execution_authority
+                    or content["gitBlob"] != live_execution_authority[relative]["gitBlob"]
+                },
+            }
+
+        ordinary_execution_authority = execution_content_authority(ordinary_content_authority)
+        security_execution_authority = execution_content_authority(security_content_authority)
         candidate_paths = list(immutable_source_paths)
         ordinary_paths, security_paths = _r2_counterpart_inventories(
             immutable_source_paths
@@ -7167,13 +7562,20 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 else:
                     live_target_authority[relative] = copy.deepcopy(target)
         self.assertEqual(set(live_target_authority), set(immutable_source_paths))
-        active_content_authority: Mapping[str, Mapping[str, object]] = {}
+        for relative, target in live_target_authority.items():
+            expected = live_execution_authority[relative]
+            self.assertEqual(
+                (target["size"], target["sha256"]),
+                (expected["size"], expected["sha256"]),
+                relative,
+            )
+        active_execution_authority: Mapping[str, Mapping[str, object]] = {}
 
         def structural_target_authority(_repo_root: Path, relative: str) -> dict:
             if relative in live_target_authority:
                 target = copy.deepcopy(live_target_authority[relative])
             else:
-                content = active_content_authority[relative]
+                content = active_execution_authority[relative]
                 identity_seed = int(content["gitBlob"][:16], 16)
                 target = {
                     "path": relative,
@@ -7188,7 +7590,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                     "modeType": "regular-file",
                     "reparsePoint": False,
                 }
-            content = active_content_authority.get(relative)
+            content = active_execution_authority.get(relative)
             if content is not None:
                 target["size"] = content["size"]
                 target["sha256"] = content["sha256"]
@@ -7217,7 +7619,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 side_effect=structural_parser_mode,
             ),
         ):
-            active_content_authority = ordinary_content_authority
+            active_execution_authority = ordinary_execution_authority
             ordinary_structural_plans = {
                 command_profile: build_structural_plan(
                     command_profile,
@@ -7225,7 +7627,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 )
                 for command_profile in ("static", "all")
             }
-            active_content_authority = security_content_authority
+            active_execution_authority = security_execution_authority
             security_structural_plans = {
                 command_profile: build_structural_plan(
                     command_profile,
@@ -7405,7 +7807,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 }
                 for target in security_targets:
                     relative = target["path"]
-                    content = security_content_authority.get(relative)
+                    content = security_execution_authority.get(relative)
                     if relative in ordinary_targets_by_path:
                         expected_target = copy.deepcopy(
                             ordinary_targets_by_path[relative]
@@ -7468,15 +7870,15 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                     [target["path"] for target in spec["targets"]],
                     [relative],
                 )
-                immutable_content = security_content_authority[relative]
+                execution_content = security_execution_authority[relative]
                 self.assertEqual(
                     (
                         spec["targets"][0]["size"],
                         spec["targets"][0]["sha256"],
                     ),
                     (
-                        immutable_content["size"],
-                        immutable_content["sha256"],
+                        execution_content["size"],
+                        execution_content["sha256"],
                     ),
                 )
                 self.assertEqual(spec["executionInputSize"], spec["targets"][0]["size"])
@@ -7712,8 +8114,10 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
             security_object_authority,
         )
 
+        # Restore the frozen pre-A4 runtime before applying the historical CI overlay.
         a5_object_authority = overlay_git_blobs(
-            security_object_authority, _R2_A5_SECURITY_COMBINED_CONTENT_DELTA,
+            overlay_git_blobs(security_object_authority, _R2_SECURITY_CONTENT_DELTA),
+            _R2_A5_SECURITY_COMBINED_CONTENT_DELTA,
         )
         a5_content_authority = _r2_validate_git_object_authority(
             _R2_SECURITY_PROFILE, a5_object_authority,
@@ -7936,6 +8340,25 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                         )
                     ],
                 )
+
+        # Source bytes remain bound even when forged records coherently replace
+        # both the target identity and its stdin execution identity.
+        for relative in _R2_A7_SECURITY_A4_CONTENT_DELTA:
+            ordinal = security_by_id[f"node-check:{relative}"]["ordinal"]
+            for field, forged_value in (("size", 1), ("sha256", "0" * 64)):
+                changed_records = list(security_records)
+                record = copy.deepcopy(changed_records[ordinal])
+                changed_records[ordinal] = record
+                record["targets"][0][field] = forged_value
+                execution_field = "executionInputSize" if field == "size" else "executionInputSha256"
+                record[execution_field] = forged_value
+                with self.subTest(r2_content_rejection=relative, field=field):
+                    self.assertIn(
+                        "COMMAND-AUTHORITY-MISMATCH",
+                        [item["id"] for item in ci._command_authority_violations(
+                            "all", changed_records, [], expected_plan=security_all,
+                        )],
+                    )
 
         security_static = security_structural_plans["static"]
         security_static_records = [
@@ -9003,11 +9426,11 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                             side_effect=structural_parser_mode,
                         ),
                     ):
-                        active_content_authority = (
-                            ordinary_content_authority
+                        active_execution_authority = (
+                            ordinary_execution_authority
                             if direction_counterpart_profile
                             is _R2_ORDINARY_PROFILE
-                            else security_content_authority
+                            else security_execution_authority
                         )
                         independently_rebuilt_counterpart_plan = (
                             build_structural_plan(
