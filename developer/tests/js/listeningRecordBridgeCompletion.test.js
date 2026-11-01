@@ -70,6 +70,9 @@ try {
             assert.equal(messages.length, 1, mode + ': completion is emitted exactly once');
             assert.equal(messages[0].scoreInfo.total, 2);
             assert.equal(messages[0].scoreInfo.correct, 1);
+            const summary = frame.locator('#listening-wrapper-result-summary');
+            assert.equal(await summary.isVisible(), true, mode + ': rendered review shows the score');
+            assert.equal(await summary.textContent(), '得分 1 / 2 · 正确率 50%');
             assert.equal(messages[0].answers.q1, 'answer');
             assert.equal(messages[0].answers.q2, 'wrong');
             assert.equal(await frame.evaluate(() => window.__listeningBridgeGetState().completed), true);

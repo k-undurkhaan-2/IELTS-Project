@@ -11,11 +11,15 @@ const { chromium } = require('playwright');
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const fixture = `<!doctype html><html><body>
     <div class="header"></div>
-    <main class="main-content"><label>Question 1 <input name="q1" value="answer"></label></main>
+    <main class="main-content">
+        <label>Question 1 <input name="q1" value="answer"></label>
+        <label>Question 2 <input name="q2"></label>
+        <label>Question 3 <input name="q3"></label>
+    </main>
     <div class="bottom-bar"><span id="timer">00:00</span><button id="finish-btn">Finish</button></div>
     <script>
-        window.ANSWER_KEY = { q1: 'answer' };
-        window.App = { state: { isReviewing: false }, config: { answerKey: ANSWER_KEY, questionList: [1] } };
+        window.ANSWER_KEY = { q1: 'answer', q2: 'second', q3: 'third' };
+        window.App = { state: { isReviewing: false }, config: { answerKey: ANSWER_KEY, questionList: [1, 2, 3] } };
         document.getElementById('finish-btn').addEventListener('click', function () {
             App.state.isReviewing = true;
             this.textContent = 'Submitted';
@@ -43,7 +47,8 @@ const server = http.createServer((request, response) => {
                     const timer = source.querySelector('[data-wrapper-timer=true]');
                     const exit = source.querySelector('[data-listening-action=exit]');
                     const notes = source.querySelector('[data-listening-action=notes]');
-                    forwardedCompletions.push({ message: event.data, text: timer.textContent, paused: timer.classList.contains('paused'), exitReady: !exit.hidden && !exit.disabled && notes.hidden });
+                    const summary = source.getElementById('listening-wrapper-result-summary');
+                    forwardedCompletions.push({ message: event.data, text: timer.textContent, paused: timer.classList.contains('paused'), exitReady: !exit.hidden && !exit.disabled && notes.hidden, summary: summary && summary.textContent });
                 });
             </script>
         </body></html>`);
@@ -73,7 +78,9 @@ try {
         { name: 'countdown keyboard submit', mode: 'countdown', action: 'keyboard' },
         { name: 'compatibility API completion', mode: 'elapsed', action: 'api' },
         { name: 'countdown auto-submit', mode: 'countdown', action: 'expiry' },
-        { name: 'submit while paused', mode: 'elapsed', action: 'click', paused: true }
+        { name: 'submit while paused', mode: 'elapsed', action: 'click', paused: true },
+        { name: 'all correct in dark mode', mode: 'elapsed', action: 'click', correct: 3, dark: 'dark-mode' },
+        { name: 'unanswered in narrow dark mode', mode: 'elapsed', action: 'keyboard', correct: 0, dark: 'dark' }
     ];
     for (const scenario of cases) {
         const page = await browser.newPage({ viewport: { width: scenario.action === 'keyboard' ? 390 : 1280, height: 844 } });
@@ -98,9 +105,21 @@ try {
             })));
             await frame.waitForFunction(() => window.__listeningBridgeGetState().initialized);
             const timer = frame.locator('[data-wrapper-timer=true]');
+            const summary = frame.locator('#listening-wrapper-result-summary');
+            const expectedCorrect = scenario.correct ?? 1;
+            const expectedSummary = `得分 ${expectedCorrect} / 3 · 正确率 ${Math.round(expectedCorrect / 3 * 100)}%`;
+            assert.equal(await summary.count(), 0, 'results stay hidden before submission');
+            if (scenario.correct === 3) {
+                await frame.locator('[name=q2]').fill('second');
+                await frame.locator('[name=q3]').fill('third');
+            } else if (scenario.correct === 0) {
+                await frame.locator('[name=q1]').fill('');
+            }
+            if (scenario.dark) await frame.evaluate(mode => document.body.classList.add(mode), scenario.dark);
 
             // A failed completion and ordinary bridge messages must leave time running.
             assert.equal(await wrapper.evaluate(() => window.__listeningBridgeComplete()), false);
+            assert.equal(await summary.count(), 0, 'failed completion must not show a score');
             assert.equal(await frame.getByRole('button', { name: 'Notes', exact: true }).isVisible(), true);
             assert.equal(await frame.getByRole('button', { name: 'Exit', exact: true }).isVisible(), false);
             await frame.evaluate(() => parent.postMessage({ type: 'SESSION_READY', data: {} }, location.origin));
@@ -135,7 +154,17 @@ try {
             assert.equal(await frame.getByRole('button', { name: 'Notes', exact: true }).isVisible(), false);
             const stoppedText = scenario.action === 'expiry' ? '00:00' : beforeSubmit;
             assert.equal(completion.text, stoppedText);
-            assert.equal(completion.message.data.scoreInfo.correct, 1);
+            assert.equal(completion.message.data.scoreInfo.correct, expectedCorrect);
+            assert.equal(completion.message.data.scoreInfo.total, 3);
+            assert.equal(completion.summary, expectedSummary, 'show the submitted score before forwarding completion');
+            assert.equal(await summary.isVisible(), true);
+            assert.equal(await summary.textContent(), expectedSummary);
+            const bounds = await summary.boundingBox();
+            const viewport = page.viewportSize();
+            assert.ok(bounds.x >= 0 && bounds.y >= 0 && bounds.x + bounds.width <= viewport.width && bounds.y + bounds.height <= viewport.height, 'score summary fits within the viewport');
+            if (scenario.dark) {
+                assert.equal(await summary.evaluate(node => getComputedStyle(node).color), 'rgb(191, 219, 254)');
+            }
             assert.equal(completion.message.data.sessionId, 'timer-session');
 
             // Several ticks in review and duplicate completion delivery keep the same time.
@@ -146,6 +175,8 @@ try {
             await page.waitForTimeout(1100);
             assert.equal(await timer.textContent(), stoppedText);
             assert.equal(await timer.evaluate(node => node.classList.contains('paused')), true);
+            assert.equal(await summary.count(), 1, 'duplicate completion must not duplicate the summary');
+            assert.equal(await summary.textContent(), expectedSummary);
 
             if (scenario.paused) {
                 // The existing manual resume control must exclude all paused/review time.
@@ -162,8 +193,11 @@ try {
             assert.deepEqual(await page.evaluate(() => forwardedExits[0].data), {
                 examId: 'listening-p1-timer', sessionId: 'timer-session', suiteSessionId: 'timer-suite', submitted: true
             });
+            await frame.evaluate(() => location.reload());
+            await frame.waitForFunction(() => typeof window.__listeningBridgeComplete === 'function');
+            assert.equal(await summary.count(), 0, 'reloading a practice clears the previous result');
             assert.deepEqual(errors, []);
-            console.log('PASS ' + scenario.name + ': completion forwarding, frozen review time, Notes/Exit swap and suite exit');
+            console.log('PASS ' + scenario.name + ': score summary, completion forwarding, frozen review time, Notes/Exit swap and suite exit');
         } finally {
             await page.close();
         }

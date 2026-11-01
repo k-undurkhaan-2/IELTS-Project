@@ -1237,6 +1237,7 @@
         running: true,
         expiryHandled: false,
         completed: false,
+        scoreInfo: null,
         bridgeInjected: false,
         bridgeReady: false,
         pendingMessages: [],
@@ -1847,11 +1848,36 @@
         ensurePartNavigation(doc);
     }
 
+    function syncResultSummary(doc) {
+        var score = state.scoreInfo;
+        var total = score && Number(score.total == null ? score.totalQuestions : score.total);
+        var correct = score && Number(score.correct);
+        var summary = doc.getElementById('listening-wrapper-result-summary');
+        if (!state.completed || !score || score.correct == null || !Number.isFinite(total) || total <= 0
+            || !Number.isFinite(correct) || correct < 0 || correct > total) {
+            if (summary) summary.remove();
+            return;
+        }
+        if (!summary) {
+            var anchor = doc.getElementById('listening-sub-header-bar') || doc.querySelector('.header');
+            if (!anchor || !anchor.parentNode) return;
+            summary = doc.createElement('div');
+            summary.id = 'listening-wrapper-result-summary';
+            summary.setAttribute('role', 'status');
+            summary.setAttribute('aria-live', 'polite');
+            summary.setAttribute('aria-atomic', 'true');
+            anchor.parentNode.insertBefore(summary, anchor.nextSibling);
+        }
+        var text = '得分 ' + correct + ' / ' + total + ' · 正确率 ' + Math.round(correct / total * 100) + '%';
+        if (summary.textContent !== text) summary.textContent = text;
+    }
+
     function updateTimerDisplay() {
         var doc = getFrameDocument();
         if (!doc) return;
         ensurePartNavigation(doc);
         syncActionProxies(doc);
+        syncResultSummary(doc);
         var timer = ensureWrapperTimer(doc);
         if (!timer) return;
         var preferences = readTimerPreferences();
@@ -1913,6 +1939,8 @@
             'body.listening-unified-ui .sub-header-bar { display: flex !important; flex: 0 0 auto !important; flex-direction: column !important; gap: 1px !important; min-height: 38px !important; padding: 8px 20px !important; background: #f1f5f9 !important; border-bottom: 1.5px solid #e2e8f0 !important; font-family: "SF Pro Text", "PingFang SC", "Noto Sans SC", system-ui, sans-serif !important; z-index: 990; }',
             'body.listening-unified-ui #sub-header-part { color: #0f172a !important; font-family: "SF Pro Text", "PingFang SC", "Noto Sans SC", system-ui, sans-serif !important; font-size: 13.5px !important; font-weight: 700 !important; line-height: 1.25 !important; white-space: nowrap !important; }',
             'body.listening-unified-ui #sub-header-instruction { min-width: 0 !important; overflow: hidden !important; color: #475569 !important; font-family: "SF Pro Text", "PingFang SC", "Noto Sans SC", system-ui, sans-serif !important; font-size: 12px !important; font-weight: 500 !important; line-height: 1.35 !important; text-overflow: ellipsis !important; white-space: nowrap !important; }',
+            'body.listening-unified-ui #listening-wrapper-result-summary { flex: 0 0 auto; box-sizing: border-box; margin: 0; padding: 10px 20px; border-bottom: 1px solid #bfdbfe; background: #eff6ff; color: #1e40af; font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.5; white-space: normal; overflow-wrap: anywhere; }',
+            'body.listening-unified-ui:is(.dark-mode, .dark) #listening-wrapper-result-summary { border-color: #334155; background: #172554; color: #bfdbfe; }',
             'body.listening-unified-ui .listening-wrapper-timer { border: 0 !important; background: transparent !important; margin: 0 !important; min-width: 0 !important; padding: 0 !important; color: #4b5563 !important; font-family: "SF Pro Text", "PingFang SC", "Noto Sans SC", system-ui, sans-serif !important; font-size: 11px !important; font-variant-numeric: tabular-nums !important; font-weight: 500 !important; line-height: 1.25 !important; text-align: left !important; cursor: pointer; transition: color .15s ease, opacity .2s ease; }',
             'body.listening-unified-ui .listening-wrapper-timer:hover { color: #1f2937; }',
             'body.listening-unified-ui .listening-wrapper-timer.timer-expired { color: #dc2626; }',
@@ -2124,6 +2152,7 @@
         if (event.source && frameWindow && event.source === frameWindow) {
             if (event.data.type === 'PRACTICE_COMPLETE') {
                 state.completed = true;
+                state.scoreInfo = event.data.data && event.data.data.scoreInfo || null;
                 updateClockPause(false);
                 updateTimerDisplay();
             }
@@ -2187,6 +2216,7 @@
         frame.addEventListener('load', function onFrameLoad() {
             setStatus('', true);
             state.completed = false;
+            state.scoreInfo = null;
             state.bridgeInjected = false;
             injectBridge(BRIDGE_SCRIPT_URL);
             adaptFrameUi();
