@@ -41,7 +41,19 @@
                 // The original event bubbles through its original ancestors.
                 event.stopPropagation();
                 var current = sourceControl(doc, role);
-                if (current && !current.disabled) current.click();
+                if (current && !current.disabled) {
+                    var beforeReset = role === 'reset' ? captureResetState(doc) : null;
+                    current.click();
+                    if (role === 'reset') {
+                        // Native handlers may cancel, clear in place, or reload.
+                        // A reload is handled by the frame's load listener below.
+                        global.setTimeout(function () {
+                            if (getFrameDocument() === doc && captureResetState(doc) !== beforeReset) {
+                                requestPracticeReset();
+                            }
+                        }, 0);
+                    }
+                }
                 syncActionProxies(doc);
             });
         }
@@ -50,6 +62,17 @@
         button.disabled = Boolean(source.disabled);
         hideSourceControl(source);
         return button;
+    }
+
+    function captureResetState(doc) {
+        var inputs = Array.prototype.map.call(doc.querySelectorAll('input, select, textarea'), function (input) {
+            return [input.value, input.checked, input.disabled];
+        });
+        var finish = sourceControl(doc, 'finish');
+        var reviews = Array.prototype.map.call(doc.querySelectorAll('.results-table, .result-table, .review-table, .ans-table, .feedback .grade-report, #reviewList'), function (review) {
+            return review.textContent;
+        });
+        return JSON.stringify([inputs, finish && finish.textContent, reviews]);
     }
 
     function syncActionProxies(doc) {
@@ -243,6 +266,8 @@
         scoreInfo: null,
         bridgeInjected: false,
         bridgeReady: false,
+        frameLoaded: false,
+        resetPending: false,
         pendingMessages: [],
         parentWindow: null,
         timerInterval: null,
@@ -1111,6 +1136,48 @@
         } catch (_) { }
     }
 
+    function resetAttempt(startTime) {
+        state.startTime = startTime || Date.now();
+        state.pausedAtMs = null;
+        state.pausedOffsetMs = 0;
+        state.running = true;
+        state.expiryHandled = false;
+        state.completed = false;
+        state.scoreInfo = null;
+        state.lastTimerText = '';
+        updateTimerDisplay();
+    }
+
+    function requestPracticeReset() {
+        if (state.resetPending) return;
+        state.resetPending = true;
+        resetAttempt(Date.now());
+        var target = state.parentWindow || global.opener;
+        if (!target || typeof target.postMessage !== 'function') {
+            // Standalone previews still need a fresh bridge attempt and clock.
+            handleParentMessage({ type: 'INIT_SESSION', data: {
+                examId: state.examId,
+                sessionId: state.examId + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+                startTime: state.startTime
+            } });
+            return;
+        }
+        forwardToParent({
+            type: 'PRACTICE_RESET_REQUEST',
+            source: 'listening_record_bridge',
+            data: {
+                examId: state.examId,
+                sessionId: state.sessionId,
+                previousSessionId: state.sessionId,
+                suiteSessionId: state.suiteSessionId || null,
+                pageType: 'listening',
+                reason: 'retake-after-reset',
+                url: global.location.href,
+                title: global.document.title
+            }
+        });
+    }
+
     function handleExitClick() {
         if (!state.completed) return;
         if (/(?:^|[?&])endless(?:=|&|$)/i.test(global.location.search || '')) {
@@ -1140,7 +1207,14 @@
         if (type === 'INIT_SESSION' || type === 'init_exam_session') {
             var payload = message.data || message;
             state.examId = normalizeSafeId(payload.examId, state.examId || 'listening-unknown');
-            state.sessionId = normalizeSafeId(payload.sessionId, state.sessionId || (state.examId + '_' + Date.now()));
+            var nextSessionId = normalizeSafeId(payload.sessionId, state.sessionId || (state.examId + '_' + Date.now()));
+            // Ignore an old handshake racing with the reset request.
+            if (state.resetPending && nextSessionId === state.sessionId) return;
+            if (state.resetPending || (state.sessionId && nextSessionId !== state.sessionId)) {
+                resetAttempt(Number(payload.startTime) || Date.now());
+            }
+            state.resetPending = false;
+            state.sessionId = nextSessionId;
             state.suiteSessionId = normalizeSafeId(payload.suiteSessionId, state.suiteSessionId || '');
             state.startTime = Number.isFinite(Number(payload.startTime)) ? Number(payload.startTime) : state.startTime;
         }
@@ -1154,8 +1228,10 @@
         var frameWindow = getFrameWindow();
         if (event.source && frameWindow && event.source === frameWindow) {
             if (event.data.type === 'PRACTICE_COMPLETE') {
+                var completion = event.data.data || {};
+                if (state.resetPending || (state.sessionId && completion.sessionId !== state.sessionId)) return;
                 state.completed = true;
-                state.scoreInfo = event.data.data && event.data.data.scoreInfo || null;
+                state.scoreInfo = completion.scoreInfo || null;
                 updateClockPause(false);
                 updateTimerDisplay();
             }
@@ -1218,9 +1294,10 @@
         }
         frame.addEventListener('load', function onFrameLoad() {
             setStatus('', true);
-            state.completed = false;
-            state.scoreInfo = null;
+            if (state.frameLoaded) requestPracticeReset();
+            state.frameLoaded = true;
             state.bridgeInjected = false;
+            state.bridgeReady = false;
             injectBridge(BRIDGE_SCRIPT_URL);
             adaptFrameUi();
         });

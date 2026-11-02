@@ -9182,6 +9182,7 @@
                         type === 'SESSION_READY'
                         || type === 'PRACTICE_COMPLETE'
                         || type === 'PRACTICE_RESULT'
+                        || type === 'PRACTICE_RESET_REQUEST'
                         || type === 'REQUEST_INIT'
                         || type === 'PROGRESS_UPDATE'
                     )
@@ -10483,7 +10484,7 @@
             }
         },
 
-        _isResetCapableUnifiedReadingCompletion(data, sourceWindow = null) {
+        _isResetCapablePracticeCompletion(data, sourceWindow = null) {
             if (!sourceWindow || sourceWindow.closed) {
                 return false;
             }
@@ -10499,11 +10500,14 @@
             }
             const renderMode = String(payload.renderMode || metadata.renderMode || '').toLowerCase();
             const pageType = String(payload.pageType || metadata.pageType || '').toLowerCase();
-            return renderMode === 'unified-reading' || pageType === 'unified-reading';
+            return renderMode === 'unified-reading' || pageType === 'unified-reading'
+                || this._isListeningBridgeCompletionPayload(payload);
         },
 
         async retainExamWindowAfterCompletion(examId, sourceWindow, data = {}) {
             const windowInfo = this.ensureExamWindowSession(examId);
+            // A reset can arrive while the preceding attempt is still saving.
+            if (data.sessionId && windowInfo.expectedSessionId !== data.sessionId) return;
             windowInfo.window = windowInfo.window || null;
             windowInfo.status = 'completed';
             windowInfo.completedAt = Date.now();
@@ -10563,13 +10567,14 @@
 
             await this.startPracticeSession(examId);
             this._syncRecorderSessionStarted(examId, windowInfo, {
-                pageType: 'unified-reading',
+                pageType: this._isListeningBridgeCompletionPayload(payload) ? 'listening' : 'unified-reading',
                 url: payload.normalUrl || payload.url || null,
                 title: payload.title || null,
                 resetReason: reason || 'reset'
             });
 
             this._sendExamInitEnvelope(examId, targetWindow, {
+                startTime: windowInfo.startTime,
                 practiceMode: null,
                 reviewMode: false,
                 readOnly: false
@@ -11105,7 +11110,7 @@
                 // 即使出错也要显示通知
                 window.showMessage('练习已完成，但数据保存可能有问题', 'warning');
             } finally {
-                if (this._isResetCapableUnifiedReadingCompletion(completionData, sourceWindow)) {
+                if (this._isResetCapablePracticeCompletion(completionData, sourceWindow)) {
                     await this.retainExamWindowAfterCompletion(examId, sourceWindow, completionData);
                 } else {
                     this.cleanupExamSession(examId);

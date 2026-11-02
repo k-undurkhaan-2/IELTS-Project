@@ -3551,6 +3551,7 @@
       return true;
     }
     state.completed = true;
+    awaitingSubmission = false;
 
     var allowGenerated = !!options.allowGenerated;
     var details = extractAttemptDetails(window, { allowGenerated: allowGenerated });
@@ -3590,6 +3591,19 @@
   var completionDebounceTimer = null;
   var completionDebounceOptions = null;
   var completionRetryTimers = [];
+  var awaitingSubmission = false;
+
+  function resetCompletionState() {
+    if (completionDebounceTimer) clearTimeout(completionDebounceTimer);
+    completionDebounceTimer = null;
+    completionDebounceOptions = null;
+    clearCompletionRetryTimers();
+    state.completed = false;
+    state.startTime = Date.now();
+    // Some templates retain the old review table after clearing answers.
+    // Wait for the next explicit submit before observing its results again.
+    awaitingSubmission = true;
+  }
   function clearCompletionRetryTimers() {
     for (var i = 0; i < completionRetryTimers.length; i++) {
       clearTimeout(completionRetryTimers[i]);
@@ -3812,7 +3826,7 @@
       // Source timers and wrapper navigation keep mutating the document after
       // grading. Preserve an already queued completion (including its explicit
       // submit options) instead of postponing it on every unrelated update.
-      if (reviewEl && !state.completed && !completionDebounceTimer) {
+      if (reviewEl && !state.completed && !awaitingSubmission && !completionDebounceTimer) {
         debouncedOnComplete(1500, { allowGenerated: false });
       }
     });
@@ -3832,9 +3846,13 @@
           state.parentWindow = event.source;
         }
         state.examId = normalizeListeningExamId(payload.examId, state.examId || 'listening-unknown');
-        state.sessionId = normalizeListeningSessionId(payload.sessionId, state.sessionId)
+        var nextSessionId = normalizeListeningSessionId(payload.sessionId, state.sessionId)
           || state.sessionId
           || createListeningSessionId(state.examId);
+        if (state.initialized && nextSessionId !== state.sessionId) {
+          resetCompletionState();
+        }
+        state.sessionId = nextSessionId;
         state.suiteSessionId = normalizeListeningSessionId(payload.suiteSessionId, state.suiteSessionId) || null;
         state.startTime = toTimestampMs(payload.startTime, toTimestampMs(state.startTime, Date.now()));
         state.initialized = true;
