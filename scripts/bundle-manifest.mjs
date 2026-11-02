@@ -100,6 +100,7 @@ const inputs = Object.freeze({
     readingPage: Object.freeze([
         'js/runtime/readingExamRegistry.js',
         'js/runtime/readingExplanationRegistry.js',
+        'js/runtime/highlightTextUtils.js',
         'js/runtime/readingHighlightShared.js',
         'js/utils/practiceTimerPreferences.js',
         'js/utils/answerSanitizer.js',
@@ -121,6 +122,7 @@ const inputs = Object.freeze({
         'js/app/spellingErrorCollector.js',
         'js/runtime/listeningAudioCache.js',
         'js/runtime/listeningAudioPlayer.js',
+        'js/runtime/highlightTextUtils.js',
         'js/runtime/listeningHighlighter.js',
         'js/listeningRecordBridge.js'
     ]),
@@ -128,6 +130,7 @@ const inputs = Object.freeze({
         'js/utils/practiceTimerPreferences.js',
         'js/runtime/listeningAudioCache.js',
         'js/runtime/listeningAudioPlayer.js',
+        'js/runtime/highlightTextUtils.js',
         'js/runtime/listeningHighlighter.js',
         'js/listeningUnifiedWrapper.js'
     ]),

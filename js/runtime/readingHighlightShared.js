@@ -178,18 +178,6 @@
         return node.dataset && node.dataset.hlType === 'note' ? 'note' : 'highlight';
     }
 
-    function applyHighlightKind(node, kind = 'highlight') {
-        if (!(node instanceof HTMLElement)) {
-            return;
-        }
-        node.classList.add('hl');
-        if (kind === 'note') {
-            node.dataset.hlType = 'note';
-        } else {
-            delete node.dataset.hlType;
-        }
-    }
-
     function snapshotHighlights(rootsByScope) {
         const records = [];
         if (!rootsByScope || typeof rootsByScope !== 'object') {
@@ -197,34 +185,35 @@
         }
         Object.entries(rootsByScope).forEach(([scope, root]) => {
             if (!root) return;
-            const seenByText = new Map();
-            const cursorByText = new Map();
+            const offsets = new Map();
+            let offset = 0;
+            getTextNodes(root).forEach((node) => {
+                offsets.set(node, offset);
+                offset += (node.textContent || '').length;
+            });
             const fullText = getText(root);
             Array.from(root.querySelectorAll('.hl')).forEach((node) => {
                 if (isInsideExplanation(node)) return;
-                const text = String(node.textContent || '').trim();
+                const rawText = getText(node);
+                const text = rawText.trim();
                 if (!text) return;
-                const key = `${scope}::${text}`;
-                const seen = seenByText.get(key) || 0;
-                seenByText.set(key, seen + 1);
-                let cursor = cursorByText.get(key) || 0;
-                let hit = -1;
-                for (let index = 0; index <= seen; index += 1) {
-                    hit = fullText.indexOf(text, cursor);
-                    if (hit < 0) break;
-                    cursor = hit + text.length;
+                const firstNode = getTextNodes(node)[0];
+                if (!offsets.has(firstNode)) return;
+                const startOffset = offsets.get(firstNode) + rawText.indexOf(text);
+                const endOffset = startOffset + text.length;
+                let occurrence = 0;
+                let hit = fullText.indexOf(text);
+                while (hit >= 0 && hit < startOffset) {
+                    occurrence += 1;
+                    hit = fullText.indexOf(text, hit + text.length);
                 }
-                if (hit < 0) return;
-                cursorByText.set(key, cursor);
-                const startOffset = hit;
-                const endOffset = hit + text.length;
                 const before = fullText.slice(Math.max(0, startOffset - 20), startOffset);
                 const after = fullText.slice(endOffset, endOffset + 20);
                 records.push({
                     scope,
                     text,
                     kind: resolveHighlightKind(node),
-                    occurrence: seen,
+                    occurrence,
                     start: startOffset,
                     end: endOffset,
                     startOffset,
@@ -246,6 +235,7 @@
             return;
         }
         const highlightKind = record.kind === 'note' ? 'note' : 'highlight';
+        const options = { attrs: highlightKind === 'note' ? { 'data-hl-type': 'note' } : {} };
         const normalizedRecordText = normalizeComparableText(record.text);
         const startOffset = Number(
             Object.prototype.hasOwnProperty.call(record, 'start')
@@ -295,13 +285,8 @@
             if (offsetLooksValid) {
                 const offsetRange = resolveRangeFromOffsets(root, startOffset, endOffset);
                 if (offsetRange && !offsetRange.collapsed) {
-                    const offsetSpan = document.createElement('span');
-                    applyHighlightKind(offsetSpan, highlightKind);
-                    try {
-                        offsetRange.surroundContents(offsetSpan);
+                    if (wrapRange(offsetRange, options).length) {
                         return true;
-                    } catch (_) {
-                        // fallback to text-based restore
                     }
                 }
             }
@@ -343,15 +328,7 @@
         if (!range || range.collapsed) {
             return false;
         }
-        const span = document.createElement('span');
-        applyHighlightKind(span, highlightKind);
-        try {
-            range.surroundContents(span);
-            return true;
-        } catch (_) {
-            // ignore malformed ranges
-        }
-        return false;
+        return wrapRange(range, options).length > 0;
     }
 
     function restoreHighlights(rootsByScope, records = []) {
@@ -399,6 +376,15 @@
         return span;
     }
 
+    function wrapRange(range, options = {}) {
+        return global.HighlightTextUtils.wrapRange(
+            range,
+            () => createInlineHighlight(options.className || 'hl', options.attrs || {}),
+            (node) => !shouldSkipTextNode(node, options.skipSelector || '.hl')
+                && !closestElement(node, 'script, style, noscript, input, textarea, select, button, [contenteditable]:not([contenteditable="false"])')
+        );
+    }
+
     function wrapTextMatches(root, needle, options = {}) {
         const text = String(needle || '').replace(/\s+/g, ' ').trim();
         if (!root || text.length < 3) {
@@ -422,6 +408,7 @@
                 if (hit < 0) {
                     break;
                 }
+                global.HighlightTextUtils.ensureTextContainer(current);
                 const matchedNode = current.splitText(hit);
                 const remainder = matchedNode.splitText(text.length);
                 const span = createInlineHighlight(className, attrs);
@@ -459,6 +446,7 @@
         getText,
         unwrapHighlights,
         unwrapMatchingHighlights,
+        wrapRange,
         wrapTextMatches,
         snapshotHighlights,
         restoreHighlights,

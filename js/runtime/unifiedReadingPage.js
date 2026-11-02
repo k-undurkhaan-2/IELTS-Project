@@ -573,14 +573,10 @@
         if (!interaction.lastRange || interaction.lastRange.collapsed || interaction.currentHighlightNode) {
             return;
         }
-        const span = document.createElement('span');
-        span.className = 'hl';
-        if (kind === 'note') {
-            span.dataset.hlType = 'note';
-        }
-        try {
-            interaction.lastRange.surroundContents(span);
-        } catch (_) {
+        const highlights = getHighlightShared().wrapRange(interaction.lastRange, {
+            attrs: kind === 'note' ? { 'data-hl-type': 'note' } : {}
+        });
+        if (!highlights.length) {
             return;
         }
         selection?.removeAllRanges();
@@ -590,24 +586,26 @@
         syncSimulationDraftSnapshot('highlight');
     }
 
+    function getSelectionHighlights() {
+        if (interaction.lastRange && !interaction.lastRange.collapsed) {
+            return Array.from(document.querySelectorAll('.hl'))
+                .filter((node) => interaction.lastRange.intersectsNode(node));
+        }
+        return interaction.currentHighlightNode ? [interaction.currentHighlightNode] : [];
+    }
+
     function removeSelectionHighlight() {
         const toolbar = document.getElementById('selbar');
         const selection = global.getSelection();
-        let target = interaction.currentHighlightNode;
-        if (!target && interaction.lastRange) {
-            const ancestor = interaction.lastRange.commonAncestorContainer;
-            target = ancestor.nodeType === Node.TEXT_NODE
-                ? ancestor.parentElement?.closest('.hl')
-                : ancestor.closest?.('.hl');
-        }
-        if (target && target.parentNode) {
+        getSelectionHighlights().forEach((target) => {
             const parent = target.parentNode;
+            if (!parent) return;
             while (target.firstChild) {
                 parent.insertBefore(target.firstChild, target);
             }
             parent.removeChild(target);
             parent.normalize();
-        }
+        });
         selection?.removeAllRanges();
         if (toolbar) toolbar.style.display = 'none';
         interaction.lastRange = null;
@@ -643,28 +641,25 @@
         });
         document.getElementById('btnHL')?.addEventListener('click', () => applySelectionHighlight('highlight'));
         document.getElementById('btnNote')?.addEventListener('click', () => {
-            let targetNode = interaction.currentHighlightNode;
+            const selectedHighlights = getSelectionHighlights();
             let text = '';
 
-            if (targetNode) {
-                if (targetNode.dataset.hlType !== 'note') {
-                    targetNode.dataset.hlType = 'note';
-                    syncSimulationDraftSnapshot('highlight');
-                }
-                text = (targetNode.textContent || '').trim();
+            if (selectedHighlights.length) {
+                selectedHighlights.forEach((node) => { node.dataset.hlType = 'note'; });
+                text = selectedHighlights.length === 1
+                    ? (selectedHighlights[0].textContent || '').trim()
+                    : (interaction.lastRange?.toString() || '').trim();
+                syncSimulationDraftSnapshot('highlight');
             } else if (interaction.lastRange && !interaction.lastRange.collapsed) {
-                const span = document.createElement('span');
-                span.className = 'hl';
-                span.dataset.hlType = 'note';
-                try {
-                    interaction.lastRange.surroundContents(span);
-                    targetNode = span;
-                    text = (span.textContent || '').trim();
+                const selectedText = interaction.lastRange.toString().trim();
+                const highlights = getHighlightShared().wrapRange(interaction.lastRange, {
+                    attrs: { 'data-hl-type': 'note' }
+                });
+                if (highlights.length) {
+                    text = selectedText;
                     const selection = global.getSelection();
                     selection?.removeAllRanges();
                     syncSimulationDraftSnapshot('highlight');
-                } catch (_) {
-                    // Ignore
                 }
             }
 

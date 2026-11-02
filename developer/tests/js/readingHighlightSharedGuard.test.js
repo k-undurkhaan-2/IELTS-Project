@@ -10,6 +10,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, '..', '..', '..');
 const source = fs.readFileSync(path.join(repoRoot, 'js', 'runtime', 'readingHighlightShared.js'), 'utf8');
+const highlightUtilsSource = fs.readFileSync(path.join(repoRoot, 'js', 'runtime', 'highlightTextUtils.js'), 'utf8');
 
 class FakeElement {
     constructor(tagName = 'div') {
@@ -124,6 +125,7 @@ function loadReadingHighlightShared(text = 'target text') {
     };
     context.globalThis = context;
     vm.createContext(context);
+    vm.runInContext(highlightUtilsSource, context, { filename: 'highlightTextUtils.js' });
     vm.runInContext(source, context, { filename: 'readingHighlightShared.js' });
     return { api: context.__READING_HIGHLIGHT_SHARED__, root };
 }

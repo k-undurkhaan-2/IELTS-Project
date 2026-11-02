@@ -155,30 +155,14 @@
 
         function wrapSelection(kind) {
             if (!lastRange || lastRange.collapsed || !allowed(lastRange.startContainer) || !allowed(lastRange.endContainer)) return [];
-            var range = lastRange;
-            var root = range.commonAncestorContainer;
-            var walker = doc.createTreeWalker(root, win.NodeFilter.SHOW_TEXT);
-            var nodes = [];
-            var node = root.nodeType === 3 ? root : walker.nextNode();
-            while (node) {
-                if (allowed(node) && range.intersectsNode(node) && !node.parentElement.closest(HIGHLIGHT_SELECTOR)) {
-                    var start = node === range.startContainer ? range.startOffset : 0;
-                    var end = node === range.endContainer ? range.endOffset : node.length;
-                    if (node.textContent.slice(start, end).trim()) nodes.push({ node: node, start: start, end: end });
-                }
-                node = walker.nextNode();
-            }
-            // Wrap only text slices, leaving answer controls and their handlers in place.
-            return nodes.map(function (entry) {
-                var slice = doc.createRange();
-                slice.setStart(entry.node, entry.start);
-                slice.setEnd(entry.node, entry.end);
+            return global.HighlightTextUtils.wrapRange(lastRange, function () {
                 var span = doc.createElement('span');
                 span.className = 'hl';
                 span.dataset.listeningHighlight = 'true';
                 if (kind === 'note') span.dataset.hlType = 'note';
-                slice.surroundContents(span);
                 return span;
+            }, function (node) {
+                return allowed(node) && !node.parentElement.closest(HIGHLIGHT_SELECTOR);
             });
         }
 
