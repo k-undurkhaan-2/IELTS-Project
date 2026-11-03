@@ -57,6 +57,9 @@ class _ProtocolDescriptor:
     duration_spans: int
     retained_segments: int
     expected_counts: tuple[int, ...]
+    parent_top_level_ordinals: tuple[int, ...] = ()
+    nested_members_by_parent: tuple[int, ...] = ()
+    diagnostic_line_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -296,6 +299,232 @@ _V3_NESTED_NAMES = (
 )
 
 
+
+# Issue #104 A8: disjoint, whole-source v4 alternatives for the shared path family.
+_V4_PROTOCOL = _ProtocolDescriptor(
+    version=4,
+    digest_domain="ieltmps-backend-canonical-portable-result-v4",
+    path_count=916,
+    path_bytes=40530,
+    path_sha256="5b9401b4afa1b964ebd2887ec023c247a605d4faad6532de6cc168720f70c786",
+    top_level_members=150,
+    nested_members=16,
+    total_executed_members=166,
+    hierarchy_inventory_digest="55d5faeaf78bdd5ef3968cae114ea479a088eef64550f2db716b6b23840ded9d",
+    parent_top_level_ordinal=None,
+    duration_spans=167,
+    retained_segments=168,
+    expected_counts=(166, 0, 166, 0, 0, 0, 0),
+    parent_top_level_ordinals=(143, 144, 146, 149),
+    nested_members_by_parent=(2, 2, 6, 6),
+    diagnostic_line_count=2,
+)
+_V4_SOURCE_PROFILES = (
+    ("LF", 574987, (
+            ("backend/Dockerfile", 1222, "be87830d91db221b19de4a67c67b953ba6ee111c29372e87c7e6397415d1c825"),
+            ("backend/package.json", 736, "64b7da71131e3012c15ca83dc9e434286763e5caa4deed5a1df27d59ff34ad4c"),
+            ("backend/src/app.js", 82196, "7e2a3c01fef143e952d2e5eada139ed79461a959721004d2bb6ac9cfca417513"),
+            ("backend/src/publicListeningFrontend.js", 36102, "92ded411a1cc6de6d4bbfabe6294652ba5ed8d361c2b9c52edd8a71a22e4ce60"),
+            ("backend/test/backend.test.js", 410758, "787d7c6763736960f7013b17161f2fc4445b2005a1d6c8b3ca04eb4cf13558ca"),
+            ("backend/test/publicListeningFrontend.test.js", 43973, "9b8917b372ee78fdab1f59659762d06d0fd5d6af9cd9f2bfc9021f8b83b0e695"),
+    )),
+    ("CRLF", 587449, (
+            ("backend/Dockerfile", 1258, "6a65d29fe167a6d9ef2364e1e3297257953ae31cbc82512ea4c103c6b145aebd"),
+            ("backend/package.json", 763, "2a4f5fc9c2587ff92598f83e9516212ced6304d5c4bceecf0797084423c7bdf7"),
+            ("backend/src/app.js", 84259, "889321f101eea48610cb82adadd3f9b80b6c9b648ff5689facb5445a9006033b"),
+            ("backend/src/publicListeningFrontend.js", 36976, "e609251b1665512646ac805987cbc1442de455e6b688c2414a68268db8fe9a04"),
+            ("backend/test/backend.test.js", 419284, "b638658447d0760d7ff6ce29bc3dd73dd02415cbe9e5e72f65d32d70b73988a3"),
+            ("backend/test/publicListeningFrontend.test.js", 44909, "9c3bc27da8d0391d6e5e4b8cbcd942a95ca2850591f9e1db2029fba93feb4096"),
+    )),
+)
+_SOURCE_PROTOCOLS = (
+    (_V3_PROTOCOL, _V3_SOURCE_PROFILES),
+    (_V4_PROTOCOL, _V4_SOURCE_PROFILES),
+)
+_V4_TOP_LEVEL_NAMES = (
+    "Docker COPY and ADD parser rejects private roots across equivalent forms",
+    "docker image hardening excludes secrets and runs app as non-root",
+    "production app rejects missing or placeholder session secrets",
+    "production app rejects weak TOTP encryption keys",
+    "production app rejects missing auth handoff public URLs at construction",
+    "production app validates public URL modes, handoff secrets, and trusted proxy config at construction",
+    "real production process dominates caller nodeEnv in integrated createApp security controls",
+    "auth registration rejects weak and duplicate credentials",
+    "auth write endpoints require a valid CSRF token",
+    "auth CSRF endpoint is rate limited to prevent session store flooding",
+    "rate limiter bounds tracked keys",
+    "rate limiter hashes oversized keys before tracking attempts",
+    "login, logout, and authenticated practice API access",
+    "authenticated APIs require the session verifier companion cookie",
+    "authenticated APIs require an active server-side auth session registry entry",
+    "business account session API lists safe metadata and revokes other sessions",
+    "admin session API lists target sessions and revokes copied user sessions",
+    "security epoch invalidates copied full cookie jars after account security changes",
+    "auth session registry rejects copied sessions on the wrong onion audience",
+    "TOTP verification rotates the session verifier for copied cookie jars",
+    "sensitive API responses are not cacheable",
+    "malformed JSON bodies return a stable validation error",
+    "oversized JSON bodies return a stable payload error",
+    "logout clears secure session cookies with matching attributes",
+    "production public URL policy controls session and handoff cookie Secure attributes",
+    "direct app always hides retired legacy account APIs",
+    "login performs a dummy password check for unknown users",
+    "password comparisons reject input beyond bcrypt byte limit",
+    "legacy direct account mutations stay retired",
+    "retired legacy account mutation routes do not revoke active sessions",
+    "retired legacy account routes are hidden before sensitive checks run",
+    "authenticated APIs refresh stale session users before trusting them",
+    "pending TOTP sessions refresh stale users before trusting them",
+    "legacy self-delete route is retired and preserves account data",
+    "legacy admin self-delete route is retired before last-admin checks",
+    "Auth stores refuse direct last-admin deletion",
+    "auth login rate limit returns 429 after repeated attempts",
+    "auth login rate limit applies across usernames from one IP",
+    "auth registration rate limit applies across usernames from one IP",
+    "auth and CSRF rate limits ignore X-Forwarded-For from untrusted clients",
+    "TOTP rate limits ignore X-Forwarded-For from untrusted clients",
+    "TOTP setup requires auth, CSRF, and returns recovery codes once",
+    "TOTP setup rejects legacy plaintext pending secrets in sessions",
+    "enabling TOTP revokes other active sessions for the same user",
+    "TOTP login requires a second factor before full session access",
+    "TOTP login treats corrupted stored secrets as invalid codes",
+    "invalid TOTP codes do not trigger recovery code bcrypt checks",
+    "TOTP setup code cannot be reused as a login code",
+    "TOTP login rejects replayed current time-step tokens",
+    "TOTP pending setup and login expire before verification",
+    "TOTP recovery codes are one-time and can be regenerated",
+    "Postgres TOTP recovery code consumption requires an unused row update",
+    "Postgres TOTP time-step consumption rejects stale updates",
+    "ordinary users can disable TOTP through scoped auth action state",
+    "admin users cannot disable TOTP through business scoped auth action state",
+    "managed TOTP disable revokes other active sessions for the same user",
+    "removed passkey API returns 404",
+    "practice API requires authentication",
+    "ordinary practice sync preserves unseen history without exporting it",
+    "copied authenticated session cannot export through sync or destructive routes",
+    "practice sync merges concurrent mutations and rejects identity collisions atomically",
+    "Postgres practice sync locks before reading and only writes merged changes",
+    "Postgres practice import supports valid session moves without intermediate uniqueness conflicts",
+    "Postgres partial merge preserves persisted ordering after deleting the first slot (P2 reproducer)",
+    "Postgres partial merge preserves an updated slot after a middle deletion",
+    "Postgres partial merge keeps session replacements in their persisted logical slot",
+    "Postgres partial import appends several new records after the persisted maximum",
+    "Postgres partial merge rejects identity conflicts without changing records or order",
+    "Postgres partial merge guards integer exhaustion before any record mutation",
+    "Postgres partial import preserves logical slots when an old ID is reused after session moves",
+    "Postgres partial merge serializes same-user appends without duplicate order keys",
+    "practice destructive data management requires data step-up bound to the business browser",
+    "practice import deduplicates by id and non-empty sessionId",
+    "PUT practice records replaces the list returned by GET",
+    "PUT practice records deduplicates duplicate session ids before storing",
+    "admin API rejects anonymous and non-admin users",
+    "site content API requires admin TOTP for writes and publishes sanitized public content",
+    "site content UI renders with text nodes and admin edit controls",
+    "admin dashboard redirects anonymous users through auth handoff",
+    "retired legacy admin login html is hidden from authenticated admin static access",
+    "admin shell and business account menu do not link back through the business home",
+    "business settings password and TOTP actions require scoped auth state",
+    "auth handoff creates a one-time business session ticket",
+    "auth logout handoff clears the shared auth session before returning to the target entry",
+    "auth handoff ignores poisoned forwarded hosts and validates canonical start hosts",
+    "auth handoff allows local-development relative redirects without public URLs",
+    "auth login binds signed handoff state to an audience-specific entry",
+    "auth audience login pages require a handoff state before showing credential forms",
+    "auth generic login page requires a handoff state before showing credential forms",
+    "auth audience login pages hide credentials for mismatched handoff state",
+    "auth login page lets admin flow switch away from an existing learner auth session",
+    "auth login page does not redeem admin handoff after learner credentials",
+    "auth login page lets business flow switch away from an existing admin auth session",
+    "auth login session conflict restart logs out and returns to the same flow",
+    "auth API enforces account type for signed business and admin flows",
+    "auth proxy rejects no-state login and registration mutations",
+    "auth complete JSON mode returns redirect payloads and structured errors",
+    "auth handoff rejects unsafe return paths and audience mismatches",
+    "auth callback uses proxy audience headers to rescue misdirected tickets",
+    "auth handoff rejects expired tickets",
+    "admin auth handoff requires admin role and TOTP verification",
+    "admin auth handoff preserves existing TOTP freshness without extending it",
+    "practice API rejects unsafe record identifiers and oversized batches",
+    "practice record import cannot grow beyond the batch record cap",
+    "practice record normalization rejects circular payloads without overflowing the stack",
+    "practice record normalization and memory store do not expose mutable payload aliases",
+    "practice record normalization rejects non-JSON payload values before serialization",
+    "practice record normalization clamps numeric statistics",
+    "practice record metadata truncation preserves valid Unicode",
+    "admin record serialization redacts sensitive payload fields",
+    "admin record serialization preserves shared references while still detecting cycles",
+    "admin record serialization caps display payload text and normalizes scalar fields",
+    "admin can list users, inspect records, and delete one record",
+    "admin sensitive mutations are rate limited",
+    "admin mutation rate limits ignore X-Forwarded-For from untrusted clients",
+    "admin API does not expose internal error messages",
+    "admin routes require TOTP verification in the current session",
+    "admin TOTP verification expires and can be renewed in-session",
+    "admin sensitive mutations require recent password step-up",
+    "admin account center and user-list sensitive reads require recent password step-up",
+    "admin exports require one-time password step-up tokens",
+    "admin mutations rotate the session verifier for copied cookie jars",
+    "admin can manage users and inspect learning and traffic stats",
+    "PostgresAdminStore refuses last-admin demotion inside a locked transaction",
+    "MemoryAdminStore refuses direct last-admin demotion and deletion",
+    "PostgresAdminStore deletes sessions and users inside a locked transaction",
+    "admin user deletion clears target TOTP state in memory store",
+    "memory admin session deletion skips oversized serialized sessions",
+    "memory auth session deletion skips oversized serialized sessions",
+    "admin search query normalization preserves valid Unicode",
+    "traffic middleware minimizes untrusted request metadata",
+    "traffic visitor hashing ignores raw user-agent entropy",
+    "traffic middleware rejects weak hashing secrets in production",
+    "Postgres traffic recent events respect the selected day window",
+    "memory traffic store caps retained events",
+    "admin user changes invalidate target sessions and stale admin roles",
+    "admin web routes reject self password changes",
+    "retired legacy admin account mutations preserve current TOTP verification",
+    "migration runner serializes migrations with a PostgreSQL advisory lock",
+    "migration runner releases the advisory lock after migration failure",
+    "bootstrap admin creates and updates an admin user",
+    "static hosting serves index and denies dotfiles with security headers",
+    "static boundary rechecks optional roots created after an initial miss",
+    "nested private Listening routes reject roots and ancestors outside the top-level mount",
+    "generated dependency dot aliases cannot serve unverified static bytes",
+    "public Listening loader verifies its exact synthetic inventory and serves only retained bytes",
+    "public Listening loader rejects Locator, Manifest, Payload and inventory corruption",
+    "public Listening loader rejects symlinked Payload entries and path escape",
+    "authenticated A2 public routes enforce allowlists, CSP separation and private containment",
+    "production readiness fails closed and production rejects fixture or root overrides",
+)
+_V4_CHILDREN = (
+    (143, (
+        "nested-root",
+        "intermediate-ancestor",
+    )),
+    (144, (
+        "assets/generated/listening-exams/manifest.js",
+        "assets/generated/listening-exams/listening-index.compat.js",
+    )),
+    (146, (
+        "strict active locator schema",
+        "Manifest bytes and digest",
+        "same-length Manifest corruption is rejected by SHA-256",
+        "per-file Payload checksum",
+        "unexpected Payload file",
+        "image-root-only dependency checksum",
+    )),
+    (149, (
+        "node-env-backstop: assets/generated/listening-exams/manifest.js",
+        "node-env-backstop: assets/generated/listening-exams/listening-index.compat.js",
+        "missing: assets/generated/listening-exams/manifest.js",
+        "missing: assets/generated/listening-exams/listening-index.compat.js",
+        "corrupted: assets/generated/listening-exams/manifest.js",
+        "corrupted: assets/generated/listening-exams/listening-index.compat.js",
+    )),
+)
+_V4_DIAGNOSTICS = (
+    (143, 0, "  ℹ {\"scenario\":\"nested-root\",\"authenticatedStatus\":403,\"outsideMarkerReturned\":false}"),
+    (143, 1, "  ℹ {\"scenario\":\"intermediate-ancestor\",\"authenticatedStatus\":403,\"outsideMarkerReturned\":false}"),
+)
+
+
 @dataclass(frozen=True)
 class _ReplayEvidence:
     """Full local replay facts, constructed only from the completed fresh runner."""
@@ -374,6 +603,7 @@ def _trusted_path_profile(targets):
 def _select_protocol(targets):
     """Select solely from protected paths and source identities, never stdout."""
     profile = _trusted_path_profile(targets)
+    # First choose the path family; v3 and v4 deliberately share one inventory.
     descriptors = [
         descriptor for descriptor in (_V2_PROTOCOL, _V3_PROTOCOL)
         if profile == {
@@ -401,43 +631,53 @@ def _select_protocol(targets):
             _reject("invalid-source-tuple")
         actual.append((path, size, sha256))
     actual = tuple(actual)
-    for variant, total_bytes, source_tuple in _V3_SOURCE_PROFILES:
-        if actual == source_tuple:
-            if sum(item[1] for item in actual) != total_bytes:
-                _reject("invalid-source-tuple")
-            return _ProtocolSelection(descriptor, variant, source_tuple)
+    matches = [
+        _ProtocolSelection(protocol, variant, source_tuple)
+        for protocol, profiles in _SOURCE_PROTOCOLS
+        for variant, total_bytes, source_tuple in profiles
+        if actual == source_tuple and sum(item[1] for item in actual) == total_bytes
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        _reject("ambiguous-source-tuple")
 
-    individually_approved = []
-    for index, item in enumerate(actual):
+    for _protocol, profiles in _SOURCE_PROTOCOLS:
         variants = [
-            variant for variant, _total_bytes, source_tuple in _V3_SOURCE_PROFILES
-            if item == source_tuple[index]
+            [variant for variant, _total, source_tuple in profiles
+             if item == source_tuple[index]]
+            for index, item in enumerate(actual)
         ]
-        if len(variants) != 1:
-            _reject("invalid-source-tuple")
-        individually_approved.append(variants[0])
-    if len(set(individually_approved)) > 1:
-        _reject("mixed-source-tuple")
+        if all(len(matches) == 1 for matches in variants):
+            if len({matches[0] for matches in variants}) > 1:
+                _reject("mixed-source-tuple")
     _reject("invalid-source-tuple")
 
 
 _KNOWN_PROTOCOL_SELECTIONS = (
     _ProtocolSelection(_V2_PROTOCOL, None, ()),
     *(
-        _ProtocolSelection(_V3_PROTOCOL, variant, source_tuple)
-        for variant, _total_bytes, source_tuple in _V3_SOURCE_PROFILES
+        _ProtocolSelection(protocol, variant, source_tuple)
+        for protocol, profiles in _SOURCE_PROTOCOLS
+        for variant, _total_bytes, source_tuple in profiles
     ),
 )
 
 
 def _protocol_binding(selection):
     """Project only a known immutable selection into the side binding."""
-    if type(selection) is not _ProtocolSelection or selection not in _KNOWN_PROTOCOL_SELECTIONS:
+    if type(selection) is not _ProtocolSelection or not any(
+        selection == known and selection.descriptor is known.descriptor
+        for known in _KNOWN_PROTOCOL_SELECTIONS
+    ):
         _reject("protocol-binding")
     descriptor = selection.descriptor
     source_tuple = None
     if selection.source_variant is not None:
-        totals = {variant: total for variant, total, _sources in _V3_SOURCE_PROFILES}
+        totals = {
+            variant: total for protocol, profiles in _SOURCE_PROTOCOLS
+            if protocol is descriptor for variant, total, _sources in profiles
+        }
         source_tuple = {
             "variant": selection.source_variant,
             "totalBytes": totals[selection.source_variant],
@@ -446,7 +686,7 @@ def _protocol_binding(selection):
                 for path, size, sha256 in selection.source_tuple
             ],
         }
-    return {
+    binding = {
         "schema": SCHEMA,
         "version": descriptor.version,
         "digestDomain": descriptor.digest_domain,
@@ -465,11 +705,23 @@ def _protocol_binding(selection):
         "reporterCounts": dict(zip(COUNTS, descriptor.expected_counts)),
         "sourceTuple": source_tuple,
     }
+    if descriptor is _V4_PROTOCOL:
+        del binding["parentTopLevelOrdinal"]
+        binding.update(
+            parentTopLevelOrdinals=list(descriptor.parent_top_level_ordinals),
+            nestedMembersByParent=list(descriptor.nested_members_by_parent),
+            diagnosticLineCount=descriptor.diagnostic_line_count,
+        )
+    return binding
 
 
 def _selection_from_protocol_binding(value):
     for selection in _KNOWN_PROTOCOL_SELECTIONS:
-        if value == _protocol_binding(selection):
+        expected = _protocol_binding(selection)
+        if value == expected and (
+            selection.descriptor is not _V4_PROTOCOL
+            or _json_bytes(value) == _json_bytes(expected)
+        ):
             return selection
     _reject("protocol-binding")
 
@@ -490,12 +742,21 @@ def _identity_v3(ci, value):
     })
 
 
+def _identity_v4(ci, value):
+    return ci.canonical_failure_digest({
+        "digestDomain": "ieltmps-backend-canonical-portable-result-v4",
+        "resultUtf8": _json_bytes(value),
+    })
+
+
 def _identity_for_protocol(ci, value, protocol_binding):
     selection = _selection_from_protocol_binding(protocol_binding)
     if selection.descriptor is _V2_PROTOCOL:
         return _identity(ci, value)
     if selection.descriptor is _V3_PROTOCOL:
         return _identity_v3(ci, value)
+    if selection.descriptor is _V4_PROTOCOL:
+        return _identity_v4(ci, value)
     _reject("protocol-binding")
 
 
@@ -663,12 +924,138 @@ def _parse_stdout_v3(stdout, package):
     return members, gaps
 
 
+def _parse_stdout_v4(stdout, package):
+    """Consume the exact hierarchy-aware v4 reporter and its 168 byte gaps."""
+    if type(stdout) is not bytes or not 0 < len(stdout) <= MAX_STREAM_BYTES:
+        _reject("stream-boundary")
+    try:
+        stdout.decode("utf-8", errors="strict")
+    except UnicodeError:
+        _reject("stream-encoding")
+    if any((byte < 32 and byte not in (10, 13)) or byte == 127 for byte in stdout):
+        _reject("stream-encoding")
+    raw_lines = stdout.splitlines(keepends=True)
+    if len(raw_lines) not in (183, 184) or len(raw_lines) > MAX_STREAM_LINES:
+        _reject("line-boundary")
+    lines, offsets, offset = [], [], 0
+    for line in raw_lines:
+        if not line.endswith(b"\n") or len(line) > 2048:
+            _reject("line-boundary")
+        body = line[:-2] if line.endswith(b"\r\n") else line[:-1]
+        if b"\r" in body:
+            _reject("line-boundary")
+        offsets.append(offset)
+        lines.append(body)
+        offset += len(line)
+
+    start = 1 if lines[0] == b"" else 0
+    try:
+        banner = f"> {package['name']}@{package['version']} test".encode("utf-8")
+    except (KeyError, TypeError, UnicodeError):
+        _reject("banner-mismatch")
+    if lines[start:start + 3] != [banner, b"> node --test", b""]:
+        _reject("banner-mismatch")
+
+    cursor = start + 3
+    spans = []
+    members = []
+    children_by_parent = dict(_V4_CHILDREN)
+    diagnostics = {(parent, child): line.encode("utf-8")
+                   for parent, child, line in _V4_DIAGNOSTICS}
+
+    def completion(prefix, name, mismatch_reason):
+        nonlocal cursor
+        if cursor >= len(lines):
+            _reject(mismatch_reason)
+        line = lines[cursor]
+        name_bytes = name.encode("utf-8")
+        stem = prefix + "✔ ".encode() + name_bytes
+        framed = stem + b" ("
+        if not line.startswith(framed) or not line.endswith(b"ms)"):
+            stripped = line.lstrip(b" ")
+            if prefix == b"  " and stripped.startswith("✔ ".encode() + name_bytes + b" ("):
+                _reject("hierarchy-indentation-mismatch")
+            _reject(mismatch_reason)
+        number = line[len(framed):-3]
+        if re.fullmatch(_DECIMAL, number) is None:
+            _reject("duration-grammar")
+        spans.append((offsets[cursor] + len(framed), offsets[cursor] + len(line) - 3))
+        cursor += 1
+
+    for ordinal, name in enumerate(_V4_TOP_LEVEL_NAMES):
+        if ordinal not in children_by_parent:
+            completion(b"", name, "hierarchy-member-mismatch")
+            members.append({"name": name, "status": "pass"})
+            continue
+
+        parent_name = name
+        parent_completion_prefix = "✔ ".encode() + name.encode("utf-8") + b" ("
+        heading = "▶ ".encode() + parent_name.encode("utf-8")
+        if cursor >= len(lines):
+            _reject("hierarchy-heading-mismatch")
+        if lines[cursor] != heading:
+            if lines[cursor].startswith(parent_completion_prefix):
+                _reject("parent-completion-placement")
+            _reject("hierarchy-heading-mismatch")
+        cursor += 1
+        children = []
+        for child_ordinal, child in enumerate(children_by_parent[ordinal]):
+            if cursor < len(lines) and lines[cursor].startswith(parent_completion_prefix):
+                _reject("parent-completion-placement")
+            completion(b"  ", child, "hierarchy-member-mismatch")
+            children.append({"name": child, "status": "pass"})
+            diagnostic = diagnostics.get((ordinal, child_ordinal))
+            if diagnostic is not None:
+                if cursor >= len(lines) or lines[cursor] != diagnostic:
+                    _reject("diagnostic-mismatch")
+                cursor += 1
+        if cursor >= len(lines) or not lines[cursor].startswith(parent_completion_prefix):
+            _reject("parent-completion-placement")
+        completion(b"", parent_name, "parent-completion-placement")
+        members.append({"name": parent_name, "status": "pass", "children": children})
+
+    if cursor < len(lines) and lines[cursor].lstrip(b" ").startswith(
+            ("✔ ".encode(), "▶ ".encode())):
+        _reject("hierarchy-member-mismatch")
+    expected_counts = dict(zip(COUNTS, _V4_PROTOCOL.expected_counts))
+    for key in COUNTS:
+        if cursor >= len(lines) or lines[cursor] != f"ℹ {key} {expected_counts[key]}".encode():
+            _reject("footer-mismatch")
+        cursor += 1
+    duration_prefix = "ℹ duration_ms ".encode()
+    if cursor >= len(lines):
+        _reject("footer-mismatch")
+    duration_line = lines[cursor]
+    if not duration_line.startswith(duration_prefix):
+        _reject("footer-mismatch")
+    duration = duration_line[len(duration_prefix):]
+    if re.fullmatch(_DECIMAL, duration) is None:
+        _reject("duration-grammar")
+    spans.append((offsets[cursor] + len(duration_prefix), offsets[cursor] + len(duration_line)))
+    cursor += 1
+    if cursor != len(lines):
+        _reject("footer-mismatch")
+
+    gaps, offset = [], 0
+    for begin, end in spans:
+        gaps.append(stdout[offset:begin].hex())
+        offset = end
+    gaps.append(stdout[offset:].hex())
+    if (len(members) != _V4_PROTOCOL.top_level_members
+            or len(spans) != _V4_PROTOCOL.duration_spans
+            or len(gaps) != _V4_PROTOCOL.retained_segments):
+        _reject("hierarchy-member-mismatch")
+    return members, gaps
+
+
 def _parse_selected_stdout(stdout, package, protocol_binding):
     selection = _selection_from_protocol_binding(protocol_binding)
     if selection.descriptor is _V2_PROTOCOL:
         return _parse_stdout(stdout, package)
     if selection.descriptor is _V3_PROTOCOL:
         return _parse_stdout_v3(stdout, package)
+    if selection.descriptor is _V4_PROTOCOL:
+        return _parse_stdout_v4(stdout, package)
     _reject("protocol-binding")
 
 
@@ -1032,7 +1419,7 @@ def _derive_equal_result(ci, pair):
                 "portableInputBundleDigest": bound["inputBundleDigest"],
                 "dependencyClosureDigest": bound["dependencyClosureDigest"],
             }
-            if descriptor is _V3_PROTOCOL:
+            if descriptor is _V3_PROTOCOL or descriptor is _V4_PROTOCOL:
                 value["protocol"] = copy.deepcopy(bound["protocol"])
             values.append(value)
         results = [

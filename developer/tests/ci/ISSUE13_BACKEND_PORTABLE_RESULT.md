@@ -634,3 +634,318 @@ integration and the separately governed Issue #109 integration decision have
 not started. Hosted CI has not been dispatched or rerun for this candidate.
 The candidate remains unstaged, uncommitted, and unpublished until a later
 maintainer disposition explicitly authorizes the next transaction.
+
+
+## Version 4 — Issue #104 A8 Backend canonical portable result
+
+This additive contract implements the [published A8 specification](https://github.com/k-undurkhaan-2/IELTS-Project/issues/104#issuecomment-6560907296). The v2 and v3 sections above remain authoritative and unchanged. The source tuples, member inventory and framing below are normative; retained producer observations are corroborating evidence only.
+
+## Exact source authority
+
+
+The protected path profile remains 916 paths, 40,530 serialized UTF-8 bytes and SHA-256 `5b9401b4afa1b964ebd2887ec023c247a605d4faad6532de6cc168720f70c786`. Serialize the complete sorted paths as LF-separated UTF-8 with one terminal LF, as the existing selector does. The unchanged count does not identify a protocol by itself.
+
+The following six rows, in this order, define the complete source tuple. Git object identity is separate from checkout-byte identity. Every row is a regular mode-100644 blob in the accepted Head and the independently refreshed Git tree.
+
+| Source path | Mode and type | Accepted Git blob | Git bytes | Git content SHA-256 |
+| --- | --- | --- | ---: | --- |
+| backend/Dockerfile | 100644 blob | 3cda28fa6fe82476f6b4750b282075b36f1d771c | 1222 | be87830d91db221b19de4a67c67b953ba6ee111c29372e87c7e6397415d1c825 |
+| backend/package.json | 100644 blob | 98de1aeca0ada9aa3dff4127bb2baf5bb84ae1b5 | 736 | 64b7da71131e3012c15ca83dc9e434286763e5caa4deed5a1df27d59ff34ad4c |
+| backend/src/app.js | 100644 blob | c18e0b98772b80a218dc34d79b8bfc2508cffcbc | 82196 | 7e2a3c01fef143e952d2e5eada139ed79461a959721004d2bb6ac9cfca417513 |
+| backend/src/publicListeningFrontend.js | 100644 blob | e4b5d6a67eff5e8de5718fa4ef744405c7829eb9 | 36102 | 92ded411a1cc6de6d4bbfabe6294652ba5ed8d361c2b9c52edd8a71a22e4ce60 |
+| backend/test/backend.test.js | 100644 blob | 1692e8f51d2d537d8776931003cd3e46b1bfcdc3 | 410758 | 787d7c6763736960f7013b17161f2fc4445b2005a1d6c8b3ca04eb4cf13558ca |
+| backend/test/publicListeningFrontend.test.js | 100644 blob | 475f2785d853213b1e7eeb5c8f1f0955267dae98 | 43973 | 9b8917b372ee78fdab1f59659762d06d0fd5d6af9cd9f2bfc9021f8b83b0e695 |
+
+The exact accepted LF representation is the Git-object content. The exact CRLF representation is independently derived by replacing every LF in those verified LF-only blobs with CRLF. The measured retained Linux producer tuple equals the complete LF tuple; the Windows producer tuple equals the complete CRLF tuple.
+
+| Source path | LF bytes | LF SHA-256 | CRLF bytes | CRLF SHA-256 |
+| --- | ---: | --- | ---: | --- |
+| backend/Dockerfile | 1222 | be87830d91db221b19de4a67c67b953ba6ee111c29372e87c7e6397415d1c825 | 1258 | 6a65d29fe167a6d9ef2364e1e3297257953ae31cbc82512ea4c103c6b145aebd |
+| backend/package.json | 736 | 64b7da71131e3012c15ca83dc9e434286763e5caa4deed5a1df27d59ff34ad4c | 763 | 2a4f5fc9c2587ff92598f83e9516212ced6304d5c4bceecf0797084423c7bdf7 |
+| backend/src/app.js | 82196 | 7e2a3c01fef143e952d2e5eada139ed79461a959721004d2bb6ac9cfca417513 | 84259 | 889321f101eea48610cb82adadd3f9b80b6c9b648ff5689facb5445a9006033b |
+| backend/src/publicListeningFrontend.js | 36102 | 92ded411a1cc6de6d4bbfabe6294652ba5ed8d361c2b9c52edd8a71a22e4ce60 | 36976 | e609251b1665512646ac805987cbc1442de455e6b688c2414a68268db8fe9a04 |
+| backend/test/backend.test.js | 410758 | 787d7c6763736960f7013b17161f2fc4445b2005a1d6c8b3ca04eb4cf13558ca | 419284 | b638658447d0760d7ff6ce29bc3dd73dd02415cbe9e5e72f65d32d70b73988a3 |
+| backend/test/publicListeningFrontend.test.js | 43973 | 9b8917b372ee78fdab1f59659762d06d0fd5d6af9cd9f2bfc9021f8b83b0e695 | 44909 | 9c3bc27da8d0391d6e5e4b8cbcd942a95ca2850591f9e1db2029fba93feb4096 |
+
+The complete LF tuple totals **574,987 bytes**; the complete CRLF tuple totals **587,449 bytes**. These are two whole-tuple alternatives, not six independently selectable per-file alternatives. Arbitrary text conversion, mixed LF/CRLF within a file, cross-file mixing, partial A4 substitutions, or bytes accepted solely because a producer reports them remain ineligible for v4.
+
+The three changed identities relative to both frozen v3 alternatives are backend/src/app.js, backend/src/publicListeningFrontend.js and backend/test/publicListeningFrontend.test.js. Dockerfile, package.json and backend.test.js retain their v3 identities. The Git sources are already accepted Security A4 inputs under [Issue #104 A7](https://github.com/k-undurkhaan-2/IELTS-Project/issues/104#issuecomment-6529041606) and [Issue #79 A7](https://github.com/k-undurkhaan-2/IELTS-Project/issues/79#issuecomment-6539468720); A8 proposes their new portable-result applicability without changing them.
+
+A platform label does not select a source variant. Only an exact, independently authenticated protected path/source tuple may select it. Linux LF and Windows CRLF are the observed hosted representations, not permission to infer arbitrary bytes from an operating-system label.
+
+
+## Separate v4 selection and binding
+
+Preserve public historical constants `VERSION = 2` and `TEST_COUNT = 141`, the v2 914-path contract, v2 digest/result representation, every v3 LF/CRLF profile, v3 148+6 grammar, v3 digest/result representation and their protected negatives.
+
+The existing selector first demands a single descriptor for a path profile. Simply appending a second 916-path descriptor would reject both v3 and v4 as ambiguous. Replace only that decision with a bounded two-stage lookup: select the protected path family, then match the whole protected source tuple against the disjoint frozen v3 and v4 alternatives. The unchanged 914-path v2 path keeps its existing behavior. The 916-path family must yield exactly one immutable (protocol, variant, source tuple) selection; zero or multiple matches reject.
+
+No reporter bytes, counts, environment/branch labels, claimed version, parser probing or fallback may select a protocol. Producer and independently prepared expected targets must select the same value. A selected parser's failure is final. Preserve existing v3 negative classifications where currently tested, including its 62 mixed LF/CRLF tuples; only the two explicitly new complete source tuples gain v4 applicability.
+
+The v4 protocol binding uses these exact fields, without adding keys to v2/v3 serialized bindings:
+
+~~~yaml
+schema: BackendCanonicalPortableResult
+version: 4
+digestDomain: ieltmps-backend-canonical-portable-result-v4
+pathProfile:
+  trackedPaths: 916
+  serializedUtf8Bytes: 40530
+  sortedPathSha256: 5b9401b4afa1b964ebd2887ec023c247a605d4faad6532de6cc168720f70c786
+hierarchyInventoryDigest: 55d5faeaf78bdd5ef3968cae114ea479a088eef64550f2db716b6b23840ded9d
+topLevelMembers: 150
+nestedMembers: 16
+totalExecutedMembers: 166
+parentTopLevelOrdinals: [143, 144, 146, 149]
+nestedMembersByParent: [2, 2, 6, 6]
+diagnosticLineCount: 2
+durationSpans: 167
+retainedSegments: 168
+reporterCounts:
+  tests: 166
+  suites: 0
+  pass: 166
+  fail: 0
+  cancelled: 0
+  skipped: 0
+  todo: 0
+sourceTuple:
+  variant: EXACT_LF_OR_CRLF_SELECTION
+  totalBytes: EXACT_574987_OR_587449_FOR_SELECTED_VARIANT
+  sources: EXACT_ORDERED_SIX_PATH_SIZE_SHA256_ROWS_ABOVE
+~~~
+
+The uppercase sourceTuple values describe substitution from the selected frozen rows; they are not literal wire strings. Bind totalBytes by protocol **and** variant, avoiding the current v3-only LF/CRLF lookup. Register only known immutable selections. A caller-created descriptor or a partially modified protocol binding rejects.
+
+Retain the existing result fields for command, orderedTests, reporterCounts, package and its byte digest, lifecycle, tools, exitCode, stdoutNonDurationSegmentsHex, empty-stderr identity, portableAuthorityDigest, portableInputBundleDigest and dependencyClosureDigest. For v4 include its complete protocol binding, as v3 already does for v3. Compute v4 identity through the existing canonical codec with a frame whose digestDomain is `ieltmps-backend-canonical-portable-result-v4` and resultUtf8 is the strict UTF-8 canonical JSON bytes of the complete value. Preserve byte framing so Unicode cannot be folded by a general codec. Never send v4 through a v2/v3 identity function.
+
+Keep the four existing module entry points and runner interface unchanged. The runner already cross-binds and leases the module, validates ordinary producer snapshots, executes a fresh verifier, rechecks source/context/evidence/cleanup, and only then permits parsing and detached comparison. Preserve _bind_producer, _bind_replay, _derive_equal_result and _comparison_views authority boundaries. Retained producer claims alone never grant execution or result acceptance.
+
+## Exact current reporter contract
+
+
+Both retained producers report the same 150 ordered top-level members and 16 ordered nested members, all successful, with 166 tests and passes. There are **four** parent groups:
+
+| Zero-based parent ordinal | One-based position | Exact parent name | Children |
+| ---: | ---: | --- | ---: |
+| 143 | 144 | nested private Listening routes reject roots and ancestors outside the top-level mount | 2 |
+| 144 | 145 | generated dependency dot aliases cannot serve unverified static bytes | 2 |
+| 146 | 147 | public Listening loader rejects Locator, Manifest, Payload and inventory corruption | 6 |
+| 149 | 150 | production readiness fails closed and production rejects fixture or root overrides | 6 |
+
+The historical v3 corruption parent was ordinal 144; in the current contract it is ordinal 146. The final existing top-level production-readiness test now has six children. The two new top-level members occupy ordinals 143 and 144. All old top-level names retain their relative order.
+
+The complete ordered inventory is frozen below. Ordinals are zero-based. Every listed top-level member and child has status `pass`; every other member, status, child association or ordering rejects. The first 143 top-level names exactly match declarations in [backend.test.js](https://github.com/k-undurkhaan-2/IELTS-Project/blob/751ab5aceeba90f8eca0058d5f6a289d3a2971e1/backend/test/backend.test.js); the last seven match [publicListeningFrontend.test.js](https://github.com/k-undurkhaan-2/IELTS-Project/blob/751ab5aceeba90f8eca0058d5f6a289d3a2971e1/backend/test/publicListeningFrontend.test.js#L432). Its explicit scenario order, two dependency constants, six named corruption tests and three ordered readiness calls establish every child name and parent relationship independently of reporter selection.
+
+| Zero-based top-level ordinal | Exact name | Child count |
+| ---: | --- | ---: |
+| 0 | Docker COPY and ADD parser rejects private roots across equivalent forms | 0 |
+| 1 | docker image hardening excludes secrets and runs app as non-root | 0 |
+| 2 | production app rejects missing or placeholder session secrets | 0 |
+| 3 | production app rejects weak TOTP encryption keys | 0 |
+| 4 | production app rejects missing auth handoff public URLs at construction | 0 |
+| 5 | production app validates public URL modes, handoff secrets, and trusted proxy config at construction | 0 |
+| 6 | real production process dominates caller nodeEnv in integrated createApp security controls | 0 |
+| 7 | auth registration rejects weak and duplicate credentials | 0 |
+| 8 | auth write endpoints require a valid CSRF token | 0 |
+| 9 | auth CSRF endpoint is rate limited to prevent session store flooding | 0 |
+| 10 | rate limiter bounds tracked keys | 0 |
+| 11 | rate limiter hashes oversized keys before tracking attempts | 0 |
+| 12 | login, logout, and authenticated practice API access | 0 |
+| 13 | authenticated APIs require the session verifier companion cookie | 0 |
+| 14 | authenticated APIs require an active server-side auth session registry entry | 0 |
+| 15 | business account session API lists safe metadata and revokes other sessions | 0 |
+| 16 | admin session API lists target sessions and revokes copied user sessions | 0 |
+| 17 | security epoch invalidates copied full cookie jars after account security changes | 0 |
+| 18 | auth session registry rejects copied sessions on the wrong onion audience | 0 |
+| 19 | TOTP verification rotates the session verifier for copied cookie jars | 0 |
+| 20 | sensitive API responses are not cacheable | 0 |
+| 21 | malformed JSON bodies return a stable validation error | 0 |
+| 22 | oversized JSON bodies return a stable payload error | 0 |
+| 23 | logout clears secure session cookies with matching attributes | 0 |
+| 24 | production public URL policy controls session and handoff cookie Secure attributes | 0 |
+| 25 | direct app always hides retired legacy account APIs | 0 |
+| 26 | login performs a dummy password check for unknown users | 0 |
+| 27 | password comparisons reject input beyond bcrypt byte limit | 0 |
+| 28 | legacy direct account mutations stay retired | 0 |
+| 29 | retired legacy account mutation routes do not revoke active sessions | 0 |
+| 30 | retired legacy account routes are hidden before sensitive checks run | 0 |
+| 31 | authenticated APIs refresh stale session users before trusting them | 0 |
+| 32 | pending TOTP sessions refresh stale users before trusting them | 0 |
+| 33 | legacy self-delete route is retired and preserves account data | 0 |
+| 34 | legacy admin self-delete route is retired before last-admin checks | 0 |
+| 35 | Auth stores refuse direct last-admin deletion | 0 |
+| 36 | auth login rate limit returns 429 after repeated attempts | 0 |
+| 37 | auth login rate limit applies across usernames from one IP | 0 |
+| 38 | auth registration rate limit applies across usernames from one IP | 0 |
+| 39 | auth and CSRF rate limits ignore X-Forwarded-For from untrusted clients | 0 |
+| 40 | TOTP rate limits ignore X-Forwarded-For from untrusted clients | 0 |
+| 41 | TOTP setup requires auth, CSRF, and returns recovery codes once | 0 |
+| 42 | TOTP setup rejects legacy plaintext pending secrets in sessions | 0 |
+| 43 | enabling TOTP revokes other active sessions for the same user | 0 |
+| 44 | TOTP login requires a second factor before full session access | 0 |
+| 45 | TOTP login treats corrupted stored secrets as invalid codes | 0 |
+| 46 | invalid TOTP codes do not trigger recovery code bcrypt checks | 0 |
+| 47 | TOTP setup code cannot be reused as a login code | 0 |
+| 48 | TOTP login rejects replayed current time-step tokens | 0 |
+| 49 | TOTP pending setup and login expire before verification | 0 |
+| 50 | TOTP recovery codes are one-time and can be regenerated | 0 |
+| 51 | Postgres TOTP recovery code consumption requires an unused row update | 0 |
+| 52 | Postgres TOTP time-step consumption rejects stale updates | 0 |
+| 53 | ordinary users can disable TOTP through scoped auth action state | 0 |
+| 54 | admin users cannot disable TOTP through business scoped auth action state | 0 |
+| 55 | managed TOTP disable revokes other active sessions for the same user | 0 |
+| 56 | removed passkey API returns 404 | 0 |
+| 57 | practice API requires authentication | 0 |
+| 58 | ordinary practice sync preserves unseen history without exporting it | 0 |
+| 59 | copied authenticated session cannot export through sync or destructive routes | 0 |
+| 60 | practice sync merges concurrent mutations and rejects identity collisions atomically | 0 |
+| 61 | Postgres practice sync locks before reading and only writes merged changes | 0 |
+| 62 | Postgres practice import supports valid session moves without intermediate uniqueness conflicts | 0 |
+| 63 | Postgres partial merge preserves persisted ordering after deleting the first slot (P2 reproducer) | 0 |
+| 64 | Postgres partial merge preserves an updated slot after a middle deletion | 0 |
+| 65 | Postgres partial merge keeps session replacements in their persisted logical slot | 0 |
+| 66 | Postgres partial import appends several new records after the persisted maximum | 0 |
+| 67 | Postgres partial merge rejects identity conflicts without changing records or order | 0 |
+| 68 | Postgres partial merge guards integer exhaustion before any record mutation | 0 |
+| 69 | Postgres partial import preserves logical slots when an old ID is reused after session moves | 0 |
+| 70 | Postgres partial merge serializes same-user appends without duplicate order keys | 0 |
+| 71 | practice destructive data management requires data step-up bound to the business browser | 0 |
+| 72 | practice import deduplicates by id and non-empty sessionId | 0 |
+| 73 | PUT practice records replaces the list returned by GET | 0 |
+| 74 | PUT practice records deduplicates duplicate session ids before storing | 0 |
+| 75 | admin API rejects anonymous and non-admin users | 0 |
+| 76 | site content API requires admin TOTP for writes and publishes sanitized public content | 0 |
+| 77 | site content UI renders with text nodes and admin edit controls | 0 |
+| 78 | admin dashboard redirects anonymous users through auth handoff | 0 |
+| 79 | retired legacy admin login html is hidden from authenticated admin static access | 0 |
+| 80 | admin shell and business account menu do not link back through the business home | 0 |
+| 81 | business settings password and TOTP actions require scoped auth state | 0 |
+| 82 | auth handoff creates a one-time business session ticket | 0 |
+| 83 | auth logout handoff clears the shared auth session before returning to the target entry | 0 |
+| 84 | auth handoff ignores poisoned forwarded hosts and validates canonical start hosts | 0 |
+| 85 | auth handoff allows local-development relative redirects without public URLs | 0 |
+| 86 | auth login binds signed handoff state to an audience-specific entry | 0 |
+| 87 | auth audience login pages require a handoff state before showing credential forms | 0 |
+| 88 | auth generic login page requires a handoff state before showing credential forms | 0 |
+| 89 | auth audience login pages hide credentials for mismatched handoff state | 0 |
+| 90 | auth login page lets admin flow switch away from an existing learner auth session | 0 |
+| 91 | auth login page does not redeem admin handoff after learner credentials | 0 |
+| 92 | auth login page lets business flow switch away from an existing admin auth session | 0 |
+| 93 | auth login session conflict restart logs out and returns to the same flow | 0 |
+| 94 | auth API enforces account type for signed business and admin flows | 0 |
+| 95 | auth proxy rejects no-state login and registration mutations | 0 |
+| 96 | auth complete JSON mode returns redirect payloads and structured errors | 0 |
+| 97 | auth handoff rejects unsafe return paths and audience mismatches | 0 |
+| 98 | auth callback uses proxy audience headers to rescue misdirected tickets | 0 |
+| 99 | auth handoff rejects expired tickets | 0 |
+| 100 | admin auth handoff requires admin role and TOTP verification | 0 |
+| 101 | admin auth handoff preserves existing TOTP freshness without extending it | 0 |
+| 102 | practice API rejects unsafe record identifiers and oversized batches | 0 |
+| 103 | practice record import cannot grow beyond the batch record cap | 0 |
+| 104 | practice record normalization rejects circular payloads without overflowing the stack | 0 |
+| 105 | practice record normalization and memory store do not expose mutable payload aliases | 0 |
+| 106 | practice record normalization rejects non-JSON payload values before serialization | 0 |
+| 107 | practice record normalization clamps numeric statistics | 0 |
+| 108 | practice record metadata truncation preserves valid Unicode | 0 |
+| 109 | admin record serialization redacts sensitive payload fields | 0 |
+| 110 | admin record serialization preserves shared references while still detecting cycles | 0 |
+| 111 | admin record serialization caps display payload text and normalizes scalar fields | 0 |
+| 112 | admin can list users, inspect records, and delete one record | 0 |
+| 113 | admin sensitive mutations are rate limited | 0 |
+| 114 | admin mutation rate limits ignore X-Forwarded-For from untrusted clients | 0 |
+| 115 | admin API does not expose internal error messages | 0 |
+| 116 | admin routes require TOTP verification in the current session | 0 |
+| 117 | admin TOTP verification expires and can be renewed in-session | 0 |
+| 118 | admin sensitive mutations require recent password step-up | 0 |
+| 119 | admin account center and user-list sensitive reads require recent password step-up | 0 |
+| 120 | admin exports require one-time password step-up tokens | 0 |
+| 121 | admin mutations rotate the session verifier for copied cookie jars | 0 |
+| 122 | admin can manage users and inspect learning and traffic stats | 0 |
+| 123 | PostgresAdminStore refuses last-admin demotion inside a locked transaction | 0 |
+| 124 | MemoryAdminStore refuses direct last-admin demotion and deletion | 0 |
+| 125 | PostgresAdminStore deletes sessions and users inside a locked transaction | 0 |
+| 126 | admin user deletion clears target TOTP state in memory store | 0 |
+| 127 | memory admin session deletion skips oversized serialized sessions | 0 |
+| 128 | memory auth session deletion skips oversized serialized sessions | 0 |
+| 129 | admin search query normalization preserves valid Unicode | 0 |
+| 130 | traffic middleware minimizes untrusted request metadata | 0 |
+| 131 | traffic visitor hashing ignores raw user-agent entropy | 0 |
+| 132 | traffic middleware rejects weak hashing secrets in production | 0 |
+| 133 | Postgres traffic recent events respect the selected day window | 0 |
+| 134 | memory traffic store caps retained events | 0 |
+| 135 | admin user changes invalidate target sessions and stale admin roles | 0 |
+| 136 | admin web routes reject self password changes | 0 |
+| 137 | retired legacy admin account mutations preserve current TOTP verification | 0 |
+| 138 | migration runner serializes migrations with a PostgreSQL advisory lock | 0 |
+| 139 | migration runner releases the advisory lock after migration failure | 0 |
+| 140 | bootstrap admin creates and updates an admin user | 0 |
+| 141 | static hosting serves index and denies dotfiles with security headers | 0 |
+| 142 | static boundary rechecks optional roots created after an initial miss | 0 |
+| 143 | nested private Listening routes reject roots and ancestors outside the top-level mount | 2 |
+| 144 | generated dependency dot aliases cannot serve unverified static bytes | 2 |
+| 145 | public Listening loader verifies its exact synthetic inventory and serves only retained bytes | 0 |
+| 146 | public Listening loader rejects Locator, Manifest, Payload and inventory corruption | 6 |
+| 147 | public Listening loader rejects symlinked Payload entries and path escape | 0 |
+| 148 | authenticated A2 public routes enforce allowlists, CSP separation and private containment | 0 |
+| 149 | production readiness fails closed and production rejects fixture or root overrides | 6 |
+
+| Parent ordinal | Child ordinal | Exact child name |
+| ---: | ---: | --- |
+| 143 | 0 | nested-root |
+| 143 | 1 | intermediate-ancestor |
+| 144 | 0 | assets/generated/listening-exams/manifest.js |
+| 144 | 1 | assets/generated/listening-exams/listening-index.compat.js |
+| 146 | 0 | strict active locator schema |
+| 146 | 1 | Manifest bytes and digest |
+| 146 | 2 | same-length Manifest corruption is rejected by SHA-256 |
+| 146 | 3 | per-file Payload checksum |
+| 146 | 4 | unexpected Payload file |
+| 146 | 5 | image-root-only dependency checksum |
+| 149 | 0 | node-env-backstop: assets/generated/listening-exams/manifest.js |
+| 149 | 1 | node-env-backstop: assets/generated/listening-exams/listening-index.compat.js |
+| 149 | 2 | missing: assets/generated/listening-exams/manifest.js |
+| 149 | 3 | missing: assets/generated/listening-exams/listening-index.compat.js |
+| 149 | 4 | corrupted: assets/generated/listening-exams/manifest.js |
+| 149 | 5 | corrupted: assets/generated/listening-exams/listening-index.compat.js |
+
+Exactly these two diagnostic lines occur, respectively after child 0 and child 1 of parent 143, before the next completion or the parent completion:
+
+~~~text
+  ℹ {"scenario":"nested-root","authenticatedStatus":403,"outsideMarkerReturned":false}
+  ℹ {"scenario":"intermediate-ancestor","authenticatedStatus":403,"outsideMarkerReturned":false}
+~~~
+
+These are exact UTF-8 lines with two leading spaces. Key order, punctuation, values, indentation and placement are fixed by the successful source assertions at [publicListeningFrontend.test.js lines 469 onward](https://github.com/k-undurkhaan-2/IELTS-Project/blob/751ab5aceeba90f8eca0058d5f6a289d3a2971e1/backend/test/publicListeningFrontend.test.js#L469). They are retained byte evidence; do not parse and reserialize their JSON, strip them, normalize the 403, or admit arbitrary diagnostic output.
+
+The stdout grammar is:
+
+1. Zero or one initial empty line, followed by `> ielts-practice-backend@0.1.0 test`, `> node --test` and one empty line. Bind package name, version and test lifecycle to the independently authenticated package bytes.
+2. For each flat member, exactly `✔ NAME (Dms)`. For each parent, exactly `▶ NAME`, its ordered child completions `  ✔ CHILD (Dms)` with the two prescribed diagnostics where applicable, then exactly `✔ NAME (Dms)`. A heading is not an execution.
+3. Exactly the ordered footer `ℹ tests 166`, `ℹ suites 0`, `ℹ pass 166`, `ℹ fail 0`, `ℹ cancelled 0`, `ℹ skipped 0`, `ℹ todo 0`, then `ℹ duration_ms D`. There is one terminal newline and no extra output.
+4. Every line must terminate with LF or CRLF; reject embedded/bare CR, invalid UTF-8, forbidden controls, incomplete lines and oversized streams. Retain the existing 2-MiB stream, 2,048-line and 2,048-byte per-line bounds. Exact line endings, optional initial blank presence and all Unicode bytes remain identity-significant.
+5. Only the numeric D spans may be omitted: exactly 166 terminal completion durations plus one final duration, **167 spans and 168 retained segments**. D must fully match `[0-9]{1,16}(?:\.[0-9]{1,16})?`. No signs, exponents, NaN, whitespace or unbounded numbers. Keep units, parentheses, names, all other numbers, diagnostics and every gap byte.
+6. There are 183 lines without the optional initial blank and 184 with it. Both captured reports have 184 LF-terminated lines. This follows from 166 completions + four headings + two diagnostics + three banner lines + eight footer lines + one initial blank.
+7. Stderr is exactly empty, the command exits 0, and existing completed-execution, containment, protected-input and fresh-replay checks must already have passed. Reported success alone never establishes verifier acceptance.
+
+The normative inventory object uses schema `BackendCanonicalPortableHierarchyInventory`, version 4, ordinalBase 0, topLevelMembers 150, nestedMembers 16, totalExecutedMembers 166, orderedTests and diagnosticLines. orderedTests contains the rows above as ordered objects with name and status; only the four parents also have ordered children objects with name and status. diagnosticLines is the ordered two-object list with keys topLevelOrdinal=143, childOrdinal=0 or 1, position=`after-child-completion`, and utf8 equal to the exact corresponding line.
+
+Its SHA-256 is **`55d5faeaf78bdd5ef3968cae114ea479a088eef64550f2db716b6b23840ded9d`**, computed over UTF-8 `json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False)` with no terminal newline. This newly defined v4 inventory identity does not reinterpret either historical inventory digest.
+
+Ubuntu stdout is 14,588 bytes, SHA-256 `b522cbb8d361a4e981b1e260e0e3b2b03ab5a6680dd4fa10090d946059fb65a7`. Windows stdout is 14,273 bytes, SHA-256 `7083d4cb8c424b6eebab0178796c9dedccc0ec545b2e8d55d4a333781125bc01`. Their ordered inventories and 168 retained non-duration segments are equal. Their complete protocol bindings need not be equal across operating systems: each producer must match its own independently executed verifier, including its source variant and tool/runtime authority.
+
+
+
+### Source admission and local candidate identity
+
+The four-file Security adaptation freezes the final portable module, its independent tests and this document in `_R2_A8_SECURITY_CONTENT_DELTA`, together with one exact sorted path/mode/type/object manifest. The only object sentinel remains `developer/tests/ci/test_ci_foundation.py`; it does not exempt that file's execution bytes from command authority. Historical A1/A3/A4.1/A5/A6/A7 manifests and the A7.1 distinction between authenticated Git objects and measured checkout bytes remain intact. Historical fixture reconstruction restores the old module/test/document and Runtime objects before applying each historical overlay.
+
+An uncommitted candidate is measured separately from accepted HEAD. Precommit source-admission validation must use an independently fixed prospective inventory and measured byte fixtures, without staging or presenting the worktree as accepted Git history. A standalone filtered hash cannot establish a future Index blob. Any later staging transaction must independently read its actual Index blobs and tree.
+
+### Required rejection and compatibility controls
+
+The union of the six per-file v3/v4 LF/CRLF alternatives has 512 assignments. Exactly four complete tuples are valid. Reject every partial old/current replacement, all 62 mixed LF/CRLF tuples for either protocol, within-file mixed newlines, substituted length or hash, missing/duplicated/extra path and same-count path replacement. Source metadata, stdout and OS labels cannot select a version. Unknown, ambiguous, forged or disagreeing bindings reject without parser probing or fallback.
+
+Require the exact 150+16 hierarchy and diagnostic placements. Reject missing, duplicate, renamed, reordered or reparented members, changed statuses, misplaced headings or completions, diagnostic JSON/value/spacing changes, missing or extra banner/footer/stream material, malformed duration numbers, nonempty stderr, unsafe streams and partial consumption. Only the 167 bounded numeric duration spans may vary; every one of the other 168 segments remains identity-significant.
+
+Both complete streams must parse before either identity is computed. Preserve the held-module outer path, independent source/package/tool/runtime/input authority, exact observations, repeated snapshots, context checks, containment and cleanup. Rejection retains raw differences and produces no detached portable acceptance. Attach a result only after all outer checks and complete producer/replay value equality. Preserve ordinary static/all counts 677/705, Security 679/707, and the fixed 33,554,432-byte command-results ceiling.

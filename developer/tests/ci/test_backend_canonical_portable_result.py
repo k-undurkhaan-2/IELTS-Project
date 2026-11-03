@@ -8,6 +8,7 @@ from dataclasses import replace
 import hashlib
 import inspect
 import io
+import itertools
 import json
 from pathlib import Path
 import sys
@@ -272,7 +273,308 @@ V3_NESTED_NAMES = (
     "image-root-only dependency checksum",
 )
 V3_PARENT_ORDINAL = 144
+
+# Independent Issue #104 A8 constants, transcribed from comment #6560907296.
+V4_HIERARCHY_DIGEST = "55d5faeaf78bdd5ef3968cae114ea479a088eef64550f2db716b6b23840ded9d"
+V4_SOURCE_PROFILES = {
+    "LF": (574987, (
+        ("backend/Dockerfile", 1222, "be87830d91db221b19de4a67c67b953ba6ee111c29372e87c7e6397415d1c825"),
+        ("backend/package.json", 736, "64b7da71131e3012c15ca83dc9e434286763e5caa4deed5a1df27d59ff34ad4c"),
+        ("backend/src/app.js", 82196, "7e2a3c01fef143e952d2e5eada139ed79461a959721004d2bb6ac9cfca417513"),
+        ("backend/src/publicListeningFrontend.js", 36102, "92ded411a1cc6de6d4bbfabe6294652ba5ed8d361c2b9c52edd8a71a22e4ce60"),
+        ("backend/test/backend.test.js", 410758, "787d7c6763736960f7013b17161f2fc4445b2005a1d6c8b3ca04eb4cf13558ca"),
+        ("backend/test/publicListeningFrontend.test.js", 43973, "9b8917b372ee78fdab1f59659762d06d0fd5d6af9cd9f2bfc9021f8b83b0e695"),
+    )),
+    "CRLF": (587449, (
+        ("backend/Dockerfile", 1258, "6a65d29fe167a6d9ef2364e1e3297257953ae31cbc82512ea4c103c6b145aebd"),
+        ("backend/package.json", 763, "2a4f5fc9c2587ff92598f83e9516212ced6304d5c4bceecf0797084423c7bdf7"),
+        ("backend/src/app.js", 84259, "889321f101eea48610cb82adadd3f9b80b6c9b648ff5689facb5445a9006033b"),
+        ("backend/src/publicListeningFrontend.js", 36976, "e609251b1665512646ac805987cbc1442de455e6b688c2414a68268db8fe9a04"),
+        ("backend/test/backend.test.js", 419284, "b638658447d0760d7ff6ce29bc3dd73dd02415cbe9e5e72f65d32d70b73988a3"),
+        ("backend/test/publicListeningFrontend.test.js", 44909, "9c3bc27da8d0391d6e5e4b8cbcd942a95ca2850591f9e1db2029fba93feb4096"),
+    )),
+}
+V4_GIT_SOURCES = (
+    ("backend/Dockerfile", "3cda28fa6fe82476f6b4750b282075b36f1d771c"),
+    ("backend/package.json", "98de1aeca0ada9aa3dff4127bb2baf5bb84ae1b5"),
+    ("backend/src/app.js", "c18e0b98772b80a218dc34d79b8bfc2508cffcbc"),
+    ("backend/src/publicListeningFrontend.js", "e4b5d6a67eff5e8de5718fa4ef744405c7829eb9"),
+    ("backend/test/backend.test.js", "1692e8f51d2d537d8776931003cd3e46b1bfcdc3"),
+    ("backend/test/publicListeningFrontend.test.js", "475f2785d853213b1e7eeb5c8f1f0955267dae98"),
+)
+V4_TOP_LEVEL_NAMES = (
+    "Docker COPY and ADD parser rejects private roots across equivalent forms",
+    "docker image hardening excludes secrets and runs app as non-root",
+    "production app rejects missing or placeholder session secrets",
+    "production app rejects weak TOTP encryption keys",
+    "production app rejects missing auth handoff public URLs at construction",
+    "production app validates public URL modes, handoff secrets, and trusted proxy config at construction",
+    "real production process dominates caller nodeEnv in integrated createApp security controls",
+    "auth registration rejects weak and duplicate credentials",
+    "auth write endpoints require a valid CSRF token",
+    "auth CSRF endpoint is rate limited to prevent session store flooding",
+    "rate limiter bounds tracked keys",
+    "rate limiter hashes oversized keys before tracking attempts",
+    "login, logout, and authenticated practice API access",
+    "authenticated APIs require the session verifier companion cookie",
+    "authenticated APIs require an active server-side auth session registry entry",
+    "business account session API lists safe metadata and revokes other sessions",
+    "admin session API lists target sessions and revokes copied user sessions",
+    "security epoch invalidates copied full cookie jars after account security changes",
+    "auth session registry rejects copied sessions on the wrong onion audience",
+    "TOTP verification rotates the session verifier for copied cookie jars",
+    "sensitive API responses are not cacheable",
+    "malformed JSON bodies return a stable validation error",
+    "oversized JSON bodies return a stable payload error",
+    "logout clears secure session cookies with matching attributes",
+    "production public URL policy controls session and handoff cookie Secure attributes",
+    "direct app always hides retired legacy account APIs",
+    "login performs a dummy password check for unknown users",
+    "password comparisons reject input beyond bcrypt byte limit",
+    "legacy direct account mutations stay retired",
+    "retired legacy account mutation routes do not revoke active sessions",
+    "retired legacy account routes are hidden before sensitive checks run",
+    "authenticated APIs refresh stale session users before trusting them",
+    "pending TOTP sessions refresh stale users before trusting them",
+    "legacy self-delete route is retired and preserves account data",
+    "legacy admin self-delete route is retired before last-admin checks",
+    "Auth stores refuse direct last-admin deletion",
+    "auth login rate limit returns 429 after repeated attempts",
+    "auth login rate limit applies across usernames from one IP",
+    "auth registration rate limit applies across usernames from one IP",
+    "auth and CSRF rate limits ignore X-Forwarded-For from untrusted clients",
+    "TOTP rate limits ignore X-Forwarded-For from untrusted clients",
+    "TOTP setup requires auth, CSRF, and returns recovery codes once",
+    "TOTP setup rejects legacy plaintext pending secrets in sessions",
+    "enabling TOTP revokes other active sessions for the same user",
+    "TOTP login requires a second factor before full session access",
+    "TOTP login treats corrupted stored secrets as invalid codes",
+    "invalid TOTP codes do not trigger recovery code bcrypt checks",
+    "TOTP setup code cannot be reused as a login code",
+    "TOTP login rejects replayed current time-step tokens",
+    "TOTP pending setup and login expire before verification",
+    "TOTP recovery codes are one-time and can be regenerated",
+    "Postgres TOTP recovery code consumption requires an unused row update",
+    "Postgres TOTP time-step consumption rejects stale updates",
+    "ordinary users can disable TOTP through scoped auth action state",
+    "admin users cannot disable TOTP through business scoped auth action state",
+    "managed TOTP disable revokes other active sessions for the same user",
+    "removed passkey API returns 404",
+    "practice API requires authentication",
+    "ordinary practice sync preserves unseen history without exporting it",
+    "copied authenticated session cannot export through sync or destructive routes",
+    "practice sync merges concurrent mutations and rejects identity collisions atomically",
+    "Postgres practice sync locks before reading and only writes merged changes",
+    "Postgres practice import supports valid session moves without intermediate uniqueness conflicts",
+    "Postgres partial merge preserves persisted ordering after deleting the first slot (P2 reproducer)",
+    "Postgres partial merge preserves an updated slot after a middle deletion",
+    "Postgres partial merge keeps session replacements in their persisted logical slot",
+    "Postgres partial import appends several new records after the persisted maximum",
+    "Postgres partial merge rejects identity conflicts without changing records or order",
+    "Postgres partial merge guards integer exhaustion before any record mutation",
+    "Postgres partial import preserves logical slots when an old ID is reused after session moves",
+    "Postgres partial merge serializes same-user appends without duplicate order keys",
+    "practice destructive data management requires data step-up bound to the business browser",
+    "practice import deduplicates by id and non-empty sessionId",
+    "PUT practice records replaces the list returned by GET",
+    "PUT practice records deduplicates duplicate session ids before storing",
+    "admin API rejects anonymous and non-admin users",
+    "site content API requires admin TOTP for writes and publishes sanitized public content",
+    "site content UI renders with text nodes and admin edit controls",
+    "admin dashboard redirects anonymous users through auth handoff",
+    "retired legacy admin login html is hidden from authenticated admin static access",
+    "admin shell and business account menu do not link back through the business home",
+    "business settings password and TOTP actions require scoped auth state",
+    "auth handoff creates a one-time business session ticket",
+    "auth logout handoff clears the shared auth session before returning to the target entry",
+    "auth handoff ignores poisoned forwarded hosts and validates canonical start hosts",
+    "auth handoff allows local-development relative redirects without public URLs",
+    "auth login binds signed handoff state to an audience-specific entry",
+    "auth audience login pages require a handoff state before showing credential forms",
+    "auth generic login page requires a handoff state before showing credential forms",
+    "auth audience login pages hide credentials for mismatched handoff state",
+    "auth login page lets admin flow switch away from an existing learner auth session",
+    "auth login page does not redeem admin handoff after learner credentials",
+    "auth login page lets business flow switch away from an existing admin auth session",
+    "auth login session conflict restart logs out and returns to the same flow",
+    "auth API enforces account type for signed business and admin flows",
+    "auth proxy rejects no-state login and registration mutations",
+    "auth complete JSON mode returns redirect payloads and structured errors",
+    "auth handoff rejects unsafe return paths and audience mismatches",
+    "auth callback uses proxy audience headers to rescue misdirected tickets",
+    "auth handoff rejects expired tickets",
+    "admin auth handoff requires admin role and TOTP verification",
+    "admin auth handoff preserves existing TOTP freshness without extending it",
+    "practice API rejects unsafe record identifiers and oversized batches",
+    "practice record import cannot grow beyond the batch record cap",
+    "practice record normalization rejects circular payloads without overflowing the stack",
+    "practice record normalization and memory store do not expose mutable payload aliases",
+    "practice record normalization rejects non-JSON payload values before serialization",
+    "practice record normalization clamps numeric statistics",
+    "practice record metadata truncation preserves valid Unicode",
+    "admin record serialization redacts sensitive payload fields",
+    "admin record serialization preserves shared references while still detecting cycles",
+    "admin record serialization caps display payload text and normalizes scalar fields",
+    "admin can list users, inspect records, and delete one record",
+    "admin sensitive mutations are rate limited",
+    "admin mutation rate limits ignore X-Forwarded-For from untrusted clients",
+    "admin API does not expose internal error messages",
+    "admin routes require TOTP verification in the current session",
+    "admin TOTP verification expires and can be renewed in-session",
+    "admin sensitive mutations require recent password step-up",
+    "admin account center and user-list sensitive reads require recent password step-up",
+    "admin exports require one-time password step-up tokens",
+    "admin mutations rotate the session verifier for copied cookie jars",
+    "admin can manage users and inspect learning and traffic stats",
+    "PostgresAdminStore refuses last-admin demotion inside a locked transaction",
+    "MemoryAdminStore refuses direct last-admin demotion and deletion",
+    "PostgresAdminStore deletes sessions and users inside a locked transaction",
+    "admin user deletion clears target TOTP state in memory store",
+    "memory admin session deletion skips oversized serialized sessions",
+    "memory auth session deletion skips oversized serialized sessions",
+    "admin search query normalization preserves valid Unicode",
+    "traffic middleware minimizes untrusted request metadata",
+    "traffic visitor hashing ignores raw user-agent entropy",
+    "traffic middleware rejects weak hashing secrets in production",
+    "Postgres traffic recent events respect the selected day window",
+    "memory traffic store caps retained events",
+    "admin user changes invalidate target sessions and stale admin roles",
+    "admin web routes reject self password changes",
+    "retired legacy admin account mutations preserve current TOTP verification",
+    "migration runner serializes migrations with a PostgreSQL advisory lock",
+    "migration runner releases the advisory lock after migration failure",
+    "bootstrap admin creates and updates an admin user",
+    "static hosting serves index and denies dotfiles with security headers",
+    "static boundary rechecks optional roots created after an initial miss",
+    "nested private Listening routes reject roots and ancestors outside the top-level mount",
+    "generated dependency dot aliases cannot serve unverified static bytes",
+    "public Listening loader verifies its exact synthetic inventory and serves only retained bytes",
+    "public Listening loader rejects Locator, Manifest, Payload and inventory corruption",
+    "public Listening loader rejects symlinked Payload entries and path escape",
+    "authenticated A2 public routes enforce allowlists, CSP separation and private containment",
+    "production readiness fails closed and production rejects fixture or root overrides",
+)
+V4_CHILDREN = {
+    143: (
+        "nested-root",
+        "intermediate-ancestor",
+    ),
+    144: (
+        "assets/generated/listening-exams/manifest.js",
+        "assets/generated/listening-exams/listening-index.compat.js",
+    ),
+    146: (
+        "strict active locator schema",
+        "Manifest bytes and digest",
+        "same-length Manifest corruption is rejected by SHA-256",
+        "per-file Payload checksum",
+        "unexpected Payload file",
+        "image-root-only dependency checksum",
+    ),
+    149: (
+        "node-env-backstop: assets/generated/listening-exams/manifest.js",
+        "node-env-backstop: assets/generated/listening-exams/listening-index.compat.js",
+        "missing: assets/generated/listening-exams/manifest.js",
+        "missing: assets/generated/listening-exams/listening-index.compat.js",
+        "corrupted: assets/generated/listening-exams/manifest.js",
+        "corrupted: assets/generated/listening-exams/listening-index.compat.js",
+    ),
+}
+V4_DIAGNOSTICS = (
+    "  ℹ {\"scenario\":\"nested-root\",\"authenticatedStatus\":403,\"outsideMarkerReturned\":false}",
+    "  ℹ {\"scenario\":\"intermediate-ancestor\",\"authenticatedStatus\":403,\"outsideMarkerReturned\":false}",
+)
+
 REAL_REPO_ROOT = ci.REPO_ROOT
+
+
+def v4_ordered_tests():
+    return [
+        {"name": name, "status": "pass", **(
+            {"children": [{"name": child, "status": "pass"}
+                          for child in V4_CHILDREN[ordinal]]}
+            if ordinal in V4_CHILDREN else {})}
+        for ordinal, name in enumerate(V4_TOP_LEVEL_NAMES)
+    ]
+
+
+def v4_inventory():
+    return {
+        "schema": "BackendCanonicalPortableHierarchyInventory", "version": 4,
+        "ordinalBase": 0, "topLevelMembers": 150, "nestedMembers": 16,
+        "totalExecutedMembers": 166, "orderedTests": v4_ordered_tests(),
+        "diagnosticLines": [
+            {"topLevelOrdinal": 143, "childOrdinal": child,
+             "position": "after-child-completion", "utf8": line}
+            for child, line in enumerate(V4_DIAGNOSTICS)
+        ],
+    }
+
+
+def v4_expected_binding(variant):
+    total, rows = V4_SOURCE_PROFILES[variant]
+    return {
+        "schema": "BackendCanonicalPortableResult", "version": 4,
+        "digestDomain": "ieltmps-backend-canonical-portable-result-v4",
+        "pathProfile": {
+            "trackedPaths": 916, "serializedUtf8Bytes": 40530,
+            "sortedPathSha256": "5b9401b4afa1b964ebd2887ec023c247a605d4faad6532de6cc168720f70c786",
+        },
+        "hierarchyInventoryDigest": V4_HIERARCHY_DIGEST,
+        "topLevelMembers": 150, "nestedMembers": 16, "totalExecutedMembers": 166,
+        "parentTopLevelOrdinals": [143, 144, 146, 149],
+        "nestedMembersByParent": [2, 2, 6, 6], "diagnosticLineCount": 2,
+        "durationSpans": 167, "retainedSegments": 168,
+        "reporterCounts": {"tests": 166, "suites": 0, "pass": 166, "fail": 0,
+                           "cancelled": 0, "skipped": 0, "todo": 0},
+        "sourceTuple": {"variant": variant, "totalBytes": total,
+                        "sources": [{"path": path, "size": size, "sha256": sha256}
+                                    for path, size, sha256 in rows]},
+    }
+
+
+def v4_reporter_lines(duration="1.25", total="99.5", *, initial=True):
+    lines = ([""] if initial else []) + [
+        "> ielts-practice-backend@0.1.0 test", "> node --test", "",
+    ]
+    for ordinal, name in enumerate(V4_TOP_LEVEL_NAMES):
+        if ordinal in V4_CHILDREN:
+            lines.append(f"▶ {name}")
+            for child_ordinal, child in enumerate(V4_CHILDREN[ordinal]):
+                lines.append(f"  ✔ {child} ({duration}ms)")
+                if ordinal == 143:
+                    lines.append(V4_DIAGNOSTICS[child_ordinal])
+        lines.append(f"✔ {name} ({duration}ms)")
+    lines.extend(("ℹ tests 166", "ℹ suites 0", "ℹ pass 166", "ℹ fail 0",
+                  "ℹ cancelled 0", "ℹ skipped 0", "ℹ todo 0",
+                  f"ℹ duration_ms {total}"))
+    return lines
+
+
+def npm_stdout_v4(duration="1.25", total="99.5", *, newline="\n", initial=True):
+    return encode_reporter_lines(v4_reporter_lines(duration, total, initial=initial),
+                                 newline=newline)
+
+
+def v4_fixture(platform="ubuntu", *, duration="1.25", total="99.5", physical="1",
+               ordinal=0, source_variant="LF", stdout=None, stderr=b""):
+    package = v3_package_bytes(source_variant)  # The package is unchanged in A4.
+    _, expected_size, expected_hash = V4_SOURCE_PROFILES[source_variant][1][1]
+    if (len(package), digest(package)) != (expected_size, expected_hash):
+        raise AssertionError("v4 package preimage differs")
+    evidence = fixture(platform, stdout=(npm_stdout_v4(duration, total) if stdout is None else stdout),
+                       stderr=stderr, physical=physical, ordinal=ordinal)
+    spec = copy.deepcopy(evidence.expected_authority)
+    spec["targets"] = protocol_targets(4, source_variant=source_variant,
+                                       complete=True, physical=physical)
+    rebuilt = fixtures.synthetic_record_from_spec(spec)
+    record = copy.deepcopy(evidence.command_record)
+    for key in (*portable.AUTHORITY_KEYS, "executionInputs", "executionInputBundleDigest",
+                "protectedTargetBundle"):
+        record[key] = copy.deepcopy(rebuilt[key])
+    return replace(evidence, command_record=record, expected_authority=spec,
+                   package_json=package)
+
 
 def independent_path_profile(paths):
     serialized = ("\n".join(sorted(paths)) + "\n").encode("utf-8")
@@ -280,7 +582,7 @@ def independent_path_profile(paths):
 
 
 def protocol_paths(version):
-    if version not in (2, 3):
+    if version not in (2, 3, 4):
         raise AssertionError(("unknown-protocol-version", version))
     # Authenticate every live inventory, including after earlier fixture calls.
     paths, errors = ci.deterministic_candidate_paths(REAL_REPO_ROOT)
@@ -291,7 +593,7 @@ def protocol_paths(version):
         raise AssertionError(("unexpected-live-path-profile", source_profile))
     if version == 2 and source_profile == V3_PATH_PROFILE:
         paths = [path for path in paths if path not in V3_ADDED_PATHS]
-    elif version == 3 and source_profile == V2_PATH_PROFILE:
+    elif version in (3, 4) and source_profile == V2_PATH_PROFILE:
         paths = [*paths, *V3_ADDED_PATHS]
     expected = V2_PATH_PROFILE if version == 2 else V3_PATH_PROFILE
     target_profile = independent_path_profile(paths)
@@ -319,12 +621,13 @@ def protocol_targets(version, *, source_variant="LF", source_mask=None,
             })
         else:
             targets.append({"path": path})
-    if version == 3:
+    if version in (3, 4):
+        profiles = V3_SOURCE_PROFILES if version == 3 else V4_SOURCE_PROFILES
         by_path = {target["path"]: target for target in targets}
-        lf_sources = V3_SOURCE_PROFILES["LF"][1]
-        crlf_sources = V3_SOURCE_PROFILES["CRLF"][1]
+        lf_sources = profiles["LF"][1]
+        crlf_sources = profiles["CRLF"][1]
         if source_mask is None:
-            selected = V3_SOURCE_PROFILES[source_variant][1]
+            selected = profiles[source_variant][1]
         else:
             selected = tuple(crlf_sources[index] if source_mask & (1 << index)
                              else lf_sources[index] for index in range(6))
@@ -1978,7 +2281,7 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                  mock.patch(__name__ + ".V3_ADDED_PATHS", (V3_ADDED_PATHS[0], "backend/wrong.js")), \
                  self.assertRaisesRegex(AssertionError, "unexpected-target-path-profile"):
                 forced_selector_targets(requested)
-        for version in (0, 1, 4, "3"):
+        for version in (0, 1, 5, "3"):
             with self.assertRaisesRegex(AssertionError, "unknown-protocol-version"):
                 forced_selector_targets(version)
         original_selector = portable._select_protocol
@@ -2362,6 +2665,358 @@ class BackendCanonicalPortableResultTest(unittest.TestCase):
                 self.assert_rejected(case, "candidate-supplied protocol selector")
             rejected_parser.assert_not_called()
             rejected_identity.assert_not_called()
+
+
+    def test_issue104_a8_exact_git_sources_inventory_and_bindings(self):
+        self.assertEqual(digest(json_bytes(v4_inventory())), V4_HIERARCHY_DIGEST)
+        self.assertEqual(len(V4_TOP_LEVEL_NAMES), 150)
+        self.assertEqual(tuple(V4_CHILDREN), (143, 144, 146, 149))
+        self.assertEqual(tuple(map(len, V4_CHILDREN.values())), (2, 2, 6, 6))
+        for index, (path, oid) in enumerate(V4_GIT_SOURCES):
+            data = fixtures._r2_bounded_git(
+                REAL_REPO_ROOT, "cat-file", "blob", oid).stdout_raw
+            self.assertIsInstance(data, bytes)
+            self.assertNotIn(b"\r", data)
+            self.assertEqual(hashlib.sha1(
+                b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest(), oid)
+            for variant, content in (("LF", data), ("CRLF", data.replace(b"\n", b"\r\n"))):
+                self.assertEqual((path, len(content), digest(content)),
+                                 V4_SOURCE_PROFILES[variant][1][index])
+        for variant in ("LF", "CRLF"):
+            targets = protocol_targets(4, source_variant=variant)
+            selection = portable._select_protocol(targets)
+            self.assertEqual(portable._protocol_binding(selection), v4_expected_binding(variant))
+            self.assertEqual(sum(row[1] for row in V4_SOURCE_PROFILES[variant][1]),
+                             V4_SOURCE_PROFILES[variant][0])
+            # Metadata never selects or alters this authenticated source decision.
+            for target in targets:
+                target.update(version=3, platform="invented", branch="ci/master")
+            self.assertEqual(portable._protocol_binding(portable._select_protocol(targets)),
+                             v4_expected_binding(variant))
+            forged = replace(selection, descriptor=replace(selection.descriptor))
+            self.assert_private_rejection("protocol-binding", portable._protocol_binding, forged)
+        targets = protocol_targets(4)
+        with mock.patch.object(portable, "_SOURCE_PROTOCOLS",
+                               (*portable._SOURCE_PROTOCOLS, portable._SOURCE_PROTOCOLS[-1])):
+            self.assert_private_rejection("ambiguous-source-tuple", portable._select_protocol, targets)
+
+    def test_issue104_a8_source_selector_512_assignments_exactly_four_tuples(self):
+        targets = protocol_targets(4)
+        by_path = {target["path"]: target for target in targets}
+        whole = {
+            tuple(rows): (version, variant)
+            for version, profiles in ((3, V3_SOURCE_PROFILES), (4, V4_SOURCE_PROFILES))
+            for variant, (_total, rows) in profiles.items()
+        }
+        alternatives = [
+            tuple(dict.fromkeys(rows[index] for profiles in (V3_SOURCE_PROFILES, V4_SOURCE_PROFILES)
+                                for _total, rows in profiles.values()))
+            for index in range(6)
+        ]
+        accepted, assignments = set(), 0
+        for rows in itertools.product(*alternatives):
+            assignments += 1
+            for path, size, sha256 in rows:
+                by_path[path].update(size=size, sha256=sha256)
+            if rows in whole:
+                binding = portable._protocol_binding(portable._select_protocol(targets))
+                self.assertEqual((binding["version"], binding["sourceTuple"]["variant"]), whole[rows])
+                accepted.add(whole[rows])
+            else:
+                with self.assertRaises(ValueError):
+                    portable._select_protocol(targets)
+        self.assertEqual(assignments, 512)
+        self.assertEqual(accepted, {(3, "LF"), (3, "CRLF"), (4, "LF"), (4, "CRLF")})
+        # Explicitly retain the new protocol's 62 cross-file newline negatives.
+        for mask in range(1, 63):
+            for index, (path, _size, _sha256) in enumerate(V4_SOURCE_PROFILES["LF"][1]):
+                row = V4_SOURCE_PROFILES["CRLF" if mask & (1 << index) else "LF"][1][index]
+                by_path[path].update(size=row[1], sha256=row[2])
+            self.assert_private_rejection("mixed-source-tuple", portable._select_protocol, targets)
+
+    def test_issue104_a8_source_and_path_substitution_rejections(self):
+        baseline = protocol_targets(4)
+        for kind in ("missing", "duplicate", "extra", "renamed", "size", "hash", "within-file-mixed"):
+            targets = copy.deepcopy(baseline)
+            source = next(t for t in targets if t["path"] == "backend/package.json")
+            if kind == "missing":
+                targets.remove(source)
+            elif kind == "duplicate":
+                targets.append(copy.deepcopy(source))
+            elif kind == "extra":
+                targets.append({"path": "backend/unauthorized.js"})
+            elif kind == "renamed":
+                source["path"] += ".renamed"
+            elif kind == "size":
+                source["size"] += 1
+            elif kind == "hash":
+                source["sha256"] = "0" * 64
+            else:
+                mixed = V3_PACKAGE_LF.replace(b"\n", b"\r\n", 1)
+                source.update(size=len(mixed), sha256=digest(mixed))
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                portable._select_protocol(targets)
+
+    def test_issue104_a8_reporter_exact_hierarchy_and_duration_only_bytes(self):
+        expected_members = v4_ordered_tests()
+        package = json.loads(V3_PACKAGE_LF)
+        identities = set()
+        for newline, initial in itertools.product(("\n", "\r\n"), (False, True)):
+            stdout = npm_stdout_v4(newline=newline, initial=initial)
+            self.assertEqual(len(stdout.splitlines()), 183 + initial)
+            spans = v3_duration_spans(stdout)  # Independent completion-span locator.
+            self.assertEqual(len(spans), 167)
+            members, gaps = portable._parse_stdout_v4(stdout, package)
+            self.assertEqual(members, expected_members)
+            self.assertEqual(gaps, retained_segments(stdout, spans))
+            self.assertEqual(len(gaps), 168)
+            replacement = [b"0", b"9999999999999999.9999999999999999", b"003.10"]
+            altered = replace_spans(stdout, spans, [replacement[i % 3] for i in range(167)])
+            self.assertNotEqual(stdout, altered)
+            self.assertEqual(portable._parse_stdout_v4(altered, package), (members, gaps))
+            identities.add(portable._identity_v4(ci, {"gaps": gaps}))
+            for diagnostic in V4_DIAGNOSTICS:
+                self.assertIn(diagnostic.encode().hex(), "".join(gaps))
+        self.assertEqual(len(identities), 4)
+
+    def test_issue104_a8_member_heading_and_parent_rejection_matrix(self):
+        baseline = v4_reporter_lines()
+        package = json.loads(V3_PACKAGE_LF)
+        completions = [i for i, line in enumerate(baseline)
+                       if line.startswith(("✔ ", "  ✔ "))]
+        self.assertEqual(len(completions), 166)
+        for index in completions:
+            for kind in ("missing", "duplicate", "renamed", "reordered", "indentation"):
+                lines = list(baseline)
+                if kind == "missing":
+                    lines.pop(index)
+                elif kind == "duplicate":
+                    lines.insert(index, lines[index])
+                elif kind == "renamed":
+                    lines[index] = lines[index].replace("✔ ", "✔ renamed ", 1)
+                elif kind == "reordered":
+                    neighbor = completions[(completions.index(index) + 1) % len(completions)]
+                    lines[index], lines[neighbor] = lines[neighbor], lines[index]
+                else:
+                    lines[index] = (" " + lines[index]) if lines[index].startswith("✔") else lines[index][1:]
+                with self.subTest(index=index, kind=kind), self.assertRaises(ValueError):
+                    portable._parse_stdout_v4(encode_reporter_lines(lines), package)
+        for ordinal, children in V4_CHILDREN.items():
+            heading = baseline.index("▶ " + V4_TOP_LEVEL_NAMES[ordinal])
+            completion = baseline.index("✔ " + V4_TOP_LEVEL_NAMES[ordinal] + " (1.25ms)")
+            for kind in ("missing-heading", "duplicate-heading", "heading-status", "early-parent"):
+                lines = list(baseline)
+                if kind == "missing-heading":
+                    lines.pop(heading)
+                elif kind == "duplicate-heading":
+                    lines.insert(heading, lines[heading])
+                elif kind == "heading-status":
+                    lines[heading] = lines[heading].replace("▶", "✔")
+                else:
+                    lines.insert(heading + 1, lines.pop(completion))
+                with self.subTest(parent=ordinal, kind=kind), self.assertRaises(ValueError):
+                    portable._parse_stdout_v4(encode_reporter_lines(lines), package)
+        # Keep all counts and names while moving children to different parents.
+        lines = list(baseline)
+        first = lines.index("  ✔ " + V4_CHILDREN[143][0] + " (1.25ms)")
+        second = lines.index("  ✔ " + V4_CHILDREN[144][0] + " (1.25ms)")
+        lines[first], lines[second] = lines[second], lines[first]
+        with self.assertRaises(ValueError):
+            portable._parse_stdout_v4(encode_reporter_lines(lines), package)
+
+    def test_issue104_a8_diagnostics_footer_and_stream_rejection_matrix(self):
+        baseline = v4_reporter_lines()
+        package = json.loads(V3_PACKAGE_LF)
+        variants = {}
+        for diagnostic in V4_DIAGNOSTICS:
+            index = baseline.index(diagnostic)
+            for kind in ("missing", "duplicate", "moved", "status", "marker", "key-order", "whitespace"):
+                lines = list(baseline)
+                if kind == "missing":
+                    lines.pop(index)
+                elif kind == "duplicate":
+                    lines.insert(index, diagnostic)
+                elif kind == "moved":
+                    lines[index - 1], lines[index] = lines[index], lines[index - 1]
+                elif kind == "status":
+                    lines[index] = diagnostic.replace("403", "200")
+                elif kind == "marker":
+                    lines[index] = diagnostic.replace("false", "true")
+                elif kind == "key-order":
+                    scenario = "nested-root" if index == baseline.index(V4_DIAGNOSTICS[0]) else "intermediate-ancestor"
+                    lines[index] = '  ℹ {"authenticatedStatus":403,"scenario":"' + scenario + '","outsideMarkerReturned":false}'
+                else:
+                    lines[index] = diagnostic.replace('":', '": ')
+                variants[f"diagnostic-{index}-{kind}"] = encode_reporter_lines(lines)
+        for index in range(len(baseline) - 8, len(baseline) - 1):
+            lines = list(baseline)
+            lines[index] += "0"
+            variants[f"footer-value-{index}"] = encode_reporter_lines(lines)
+            lines = list(baseline)
+            lines.pop(index)
+            variants[f"footer-missing-{index}"] = encode_reporter_lines(lines)
+        stdout = npm_stdout_v4()
+        variants.update({
+            "empty": b"", "missing-banner": encode_reporter_lines(baseline[1:3] + baseline[4:]),
+            "double-initial-blank": b"\n" + stdout, "wrong-banner": stdout.replace(b"@0.1.0", b"@0.2.0"),
+            "extra-footer": stdout + "ℹ pass 166\n".encode(), "no-terminal": stdout[:-1],
+            "bare-cr": stdout.replace(b"\n", b"\r", 1), "embedded-cr": stdout.replace(b" test", b" te\rst", 1),
+            "invalid-utf8": stdout + b"\xff\n", "control": stdout.replace(b"test", b"te\x00st", 1),
+            "oversize": b"x" * (2 * 1024 * 1024 + 1), "oversize-line": b"x" * 2049 + b"\n" + stdout,
+            "extra-diagnostic": stdout.replace(b"> node --test", "> node --test\nℹ extra".encode()),
+            "rejected-status": stdout.replace("✔ ".encode(), "✖ ".encode(), 1),
+        })
+        for label, data in variants.items():
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                portable._parse_stdout_v4(data, package)
+        spans = v3_duration_spans(stdout)
+        for number in (b"", b"-1", b"+1", b".1", b"1.", b"1e2", b"NaN", b" 1",
+                       b"1 ", b"1" * 17, b"1." + b"2" * 17):
+            for index in (0, 143, 165, 166):
+                replacements = [stdout[a:b] for a, b in spans]
+                replacements[index] = number
+                with self.subTest(number=number, span=index), self.assertRaises(ValueError):
+                    portable._parse_stdout_v4(replace_spans(stdout, spans, replacements), package)
+
+    def test_issue104_a8_domain_metadata_disagreement_and_no_fallback(self):
+        probe = {"text": "é e\u0301", "number": 403}
+        self.assertEqual(portable._identity_v4(ci, probe), ci.canonical_failure_digest({
+            "digestDomain": "ieltmps-backend-canonical-portable-result-v4",
+            "resultUtf8": json_bytes(probe),
+        }))
+        self.assertEqual(len({portable._identity(ci, probe), portable._identity_v3(ci, probe),
+                              portable._identity_v4(ci, probe)}), 3)
+        bindings = [portable._protocol_binding(portable._select_protocol(
+            protocol_targets(version, source_variant=variant)))
+            for version in (2, 3, 4) for variant in ("LF", "CRLF") if version != 2 or variant == "LF"]
+        for variant in ("LF", "CRLF"):
+            binding = v4_expected_binding(variant)
+            result = portable._derive_equal_result(ci, selected_bound_pair(
+                npm_stdout_v4(), npm_stdout_v4("91", "812"), binding))
+            self.assertIsNotNone(result)
+            self.assertEqual(result["result"]["protocol"], binding)
+            self.assertEqual(result["result"]["orderedTests"], v4_ordered_tests())
+            self.assertEqual(result["result"]["reporterCounts"], binding["reporterCounts"])
+            self.assertEqual(portable._identity_for_protocol(ci, probe, binding),
+                             portable._identity_v4(ci, probe))
+        changes = {
+            "version": lambda b: b.update(version=3),
+            "float-version": lambda b: b.update(version=4.0),
+            "domain": lambda b: b.update(digestDomain="ieltmps-backend-canonical-portable-result-v3"),
+            "hierarchy": lambda b: b.update(hierarchyInventoryDigest="0" * 64),
+            "parents": lambda b: b["parentTopLevelOrdinals"].reverse(),
+            "children": lambda b: b.update(nestedMembersByParent=[2, 2, 5, 7]),
+            "diagnostic": lambda b: b.update(diagnosticLineCount=0),
+            "spans": lambda b: b.update(durationSpans=155),
+            "gaps": lambda b: b.update(retainedSegments=156),
+            "count": lambda b: b["reporterCounts"].update(tests=154),
+            "source-total": lambda b: b["sourceTuple"].update(totalBytes=564843),
+            "source-hash": lambda b: b["sourceTuple"]["sources"][0].update(sha256="0" * 64),
+            "source-variant": lambda b: b["sourceTuple"].update(variant="CRLF"),
+            "extra": lambda b: b.update(untrusted=True),
+            "missing": lambda b: b.pop("diagnosticLineCount"),
+        }
+        for label, change in changes.items():
+            forged = v4_expected_binding("LF")
+            change(forged)
+            with self.subTest(label=label):
+                self.assert_private_rejection("protocol-binding", portable._identity_for_protocol,
+                                              ci, probe, forged)
+                self.assert_private_rejection("protocol-binding", portable._parse_selected_stdout,
+                                              npm_stdout_v4(), json.loads(V3_PACKAGE_LF), forged)
+        for other in bindings:
+            if other == v4_expected_binding("LF"):
+                continue
+            with mock.patch.object(portable, "_parse_selected_stdout") as parser:
+                self.assertIsNone(portable._derive_equal_result(ci, selected_bound_pair(
+                    npm_stdout_v4(), npm_stdout_v4(), v4_expected_binding("LF"), other)))
+                parser.assert_not_called()
+        # A failed selected parser is final, before any identity computation.
+        for version, stdout in ((2, npm_stdout()), (3, npm_stdout_v3()), (4, npm_stdout_v4() + b"extra\n")):
+            with mock.patch.object(portable, "_parse_stdout") as v2, \
+                 mock.patch.object(portable, "_parse_stdout_v3") as v3, \
+                 mock.patch.object(portable, "_identity_for_protocol") as identity:
+                self.assertIsNone(portable._derive_equal_result(ci, selected_bound_pair(
+                    stdout, stdout, v4_expected_binding("LF"))), version)
+                v2.assert_not_called()
+                v3.assert_not_called()
+                identity.assert_not_called()
+        for binding in bindings[:3]:
+            with mock.patch.object(portable, "_parse_stdout_v4") as v4:
+                self.assertIsNone(portable._derive_equal_result(ci, selected_bound_pair(
+                    npm_stdout_v4(), npm_stdout_v4(), binding)))
+                v4.assert_not_called()
+
+    def test_issue104_a8_real_held_module_producer_replay_and_selector_claims(self):
+        for platform, variant in (("ubuntu", "LF"), ("windows", "CRLF")):
+            producer = v4_fixture(platform, source_variant=variant)
+            replay = v4_fixture(platform, duration="90", total="912", physical="9", source_variant=variant)
+            with self.subTest(platform=platform), outer_fixture(
+                    producer, replay, forced_protocol=None) as case:
+                with portable_spy("_select_protocol") as selector, \
+                     portable_spy("_parse_stdout_v4") as parser, \
+                     portable_spy("_identity_v4") as identity:
+                    errors, transcript = verify(case)
+                self.assertEqual(errors, [])
+                self.assertEqual(transcript["finalAcceptance"], "PASS")
+                result = transcript["backendCanonicalPortableResult"]["result"]
+                self.assertEqual(result["version"], 4)
+                self.assertEqual(result["protocol"], v4_expected_binding(variant))
+                self.assertEqual(result["orderedTests"], v4_ordered_tests())
+                self.assertEqual((parser.call_count, identity.call_count), (2, 2))
+                self.assertGreaterEqual(selector.call_count, 6)
+                for call in selector.call_args_list:
+                    self.assertEqual(portable._protocol_binding(portable._select_protocol(call.args[0])),
+                                     v4_expected_binding(variant))
+                case.documents["command-results.json"]["records"][0]["protocolVersion"] = 4
+                reseal_producer(case)
+                with portable_spy("_parse_stdout_v4") as parser, portable_spy("_identity_v4") as identity:
+                    self.assert_rejected(case, "candidate-supplied v4 selector")
+                parser.assert_not_called()
+                identity.assert_not_called()
+
+    def test_issue104_a8_outer_source_runtime_input_and_parse_fail_closed(self):
+        changes = {
+            "runtime": lambda r: r.runtime.update(node="v24.99.0"),
+            "tool": lambda r: r.runtime_closure_document["nodeExecutable"].update(sha256="0" * 64),
+            "source": lambda r: r.command_results[0]["targets"][0].update(sha256="0" * 64),
+            "input": lambda r: r.command_results[0]["executionInputs"][0].update(actualSha256="0" * 64),
+            "guard": lambda r: r.runtime_closure_guard_evidence.update(queueOverflow=True),
+            "cleanup": lambda r: setattr(r, "private_temp_handle", object()),
+            "capture": lambda r: setattr(r.captures[0], "stdout_raw", b"wrong"),
+        }
+        for label, change in changes.items():
+            with self.subTest(label=label), outer_fixture(
+                    v4_fixture(), v4_fixture(duration="90", physical="9"), forced_protocol=None) as case:
+                def run():
+                    change(case.runner)
+                    return case.comparison
+                case.runner.run.side_effect = run
+                with portable_spy("_parse_stdout_v4") as parser, portable_spy("_identity_v4") as identity:
+                    self.assert_rejected(case, label)
+                parser.assert_not_called()
+                identity.assert_not_called()
+                case.runner.close_execution_leases.assert_called_once()
+        with outer_fixture(v4_fixture(), v4_fixture(duration="90"), forced_protocol=None) as case:
+            (case.root / "backend/package.json").write_bytes(V3_PACKAGE_LF + b" ")
+            with portable_spy("_parse_stdout_v4") as parser:
+                self.assert_rejected(case, "changed authenticated package")
+            parser.assert_not_called()
+        for side in ("producer", "replay"):
+            sources = {"producer": v4_fixture(), "replay": v4_fixture(duration="90")}
+            sources[side] = v4_fixture(stdout=npm_stdout_v4() + b"extra\n")
+            with self.subTest(parse_failure=side), outer_fixture(
+                    **sources, forced_protocol=None) as case, \
+                 portable_spy("_parse_stdout_v4") as parser, \
+                 portable_spy("_identity_v4") as identity:
+                errors, transcript = verify(case)
+                self.assertTrue(errors)
+                self.assertNotIn("backendCanonicalPortableResult", transcript or {})
+                self.assertIn("backend-canonical", {
+                    item["commandClass"] for item in case.documents["command-results.json"]["records"]})
+                self.assertGreaterEqual(parser.call_count, 1)
+                identity.assert_not_called()
+
 
     def test_v2_retained_bytes_and_142_duration_span_controls(self):
         stdout = npm_stdout(initial=False)

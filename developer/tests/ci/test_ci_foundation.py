@@ -574,6 +574,38 @@ _R2_A7_SECURITY_A4_CONTENT_DELTA = {
         "sha256": "9b8917b372ee78fdab1f59659762d06d0fd5d6af9cd9f2bfc9021f8b83b0e695",
     },
 }
+
+# Issue #79 A8 / Issue #104 A8: independently measured prospective portable
+# sources. The manifest still substitutes only the existing test-file sentinel.
+_R2_A8_SECURITY_MANIFEST_SHA256 = (
+    "4997be9f15a29304335e049403856092b557c29fa454b2b3fbdc2a24b23fa861"
+)
+_R2_A8_SECURITY_CONTENT_DELTA = {
+    "developer/tests/ci/backend_canonical_portable_result.py": {
+        "gitBlob": "4311c71b1e0fd7061abd5a616c01118ce535f966",
+        "size": 75189,
+        "sha256": "03823e57363e7874989a8f194ec98a5131d58fe017aa752c1ab98ef9a76eac9c",
+    },
+    "developer/tests/ci/test_backend_canonical_portable_result.py": {
+        "gitBlob": "c191b3edf3aa74e285d3052f4813eff3d41b4993",
+        "size": 201985,
+        "sha256": "ec09c36854c2dc2ada6ba1ed2305d16b958787dd719453563df263ed2d59a23e",
+    },
+    "developer/tests/ci/ISSUE13_BACKEND_PORTABLE_RESULT.md": {
+        "gitBlob": "0e96d07cb016d8109417fa967e45295b58621259",
+        "size": 68122,
+        "sha256": "85875f5b5eba6b1fd1ca48d44493df2430e653e9f3089b45acf6724e0ef85d63",
+    },
+}
+_R2_HISTORICAL_PORTABLE_CONTENT = {
+    path: _R2_A5_SECURITY_COMBINED_CONTENT_DELTA[path]
+    for path in (
+        "developer/tests/ci/backend_canonical_portable_result.py",
+        "developer/tests/ci/test_backend_canonical_portable_result.py",
+        "developer/tests/ci/ISSUE13_BACKEND_PORTABLE_RESULT.md",
+    )
+}
+
 _R2_STATIC_COMMAND_PREFIX = (
     "baseline-schema",
     "node-version",
@@ -869,8 +901,13 @@ def _r2_validate_git_object_authority(
         profile is _R2_SECURITY_PROFILE
         and manifest_digest == _R2_A7_SECURITY_A4_MANIFEST_SHA256
     )
+    a8_security = (
+        profile is _R2_SECURITY_PROFILE
+        and manifest_digest == _R2_A8_SECURITY_MANIFEST_SHA256
+    )
     if not (
-        a5_security_combined or a6_ordinary or a6_security_combined or a7_security_a4
+        a5_security_combined or a6_ordinary or a6_security_combined
+        or a7_security_a4 or a8_security
     ) and manifest_digest not in (
         profile.tree_manifest_sha256,
         profile.a1_integrated_tree_manifest_sha256,
@@ -890,15 +927,17 @@ def _r2_validate_git_object_authority(
                if profile is _R2_ORDINARY_PROFILE
                else _R2_A4_1_SECURITY_CONTENT_DELTA),
         }
-    if a5_security_combined or a6_security_combined or a7_security_a4:
+    if a5_security_combined or a6_security_combined or a7_security_a4 or a8_security:
         content_authority = {
             **content_authority,
             **_R2_A5_SECURITY_COMBINED_CONTENT_DELTA,
         }
-    if a6_ordinary or a6_security_combined or a7_security_a4:
+    if a6_ordinary or a6_security_combined or a7_security_a4 or a8_security:
         content_authority = {**content_authority, **_R2_A6_CONTENT_DELTA}
-    if a7_security_a4:
+    if a7_security_a4 or a8_security:
         content_authority = {**content_authority, **_R2_A7_SECURITY_A4_CONTENT_DELTA}
+    if a8_security:
+        content_authority = {**content_authority, **_R2_A8_SECURITY_CONTENT_DELTA}
     for relative, expected in content_authority.items():
         entry = object_entries.get(relative)
         if entry is None or entry[2] != expected["gitBlob"]:
@@ -919,7 +958,11 @@ def _r2_fixture_content_authorities(
         object_entries[relative][2] == content["gitBlob"]
         for relative, content in _R2_A6_CONTENT_DELTA.items()
     ):
-        # Validation above binds all A5 CI/runtime entries before A6 selection.
+        # Validation above binds the complete source composition first. A8's
+        # Ordinary counterpart restores the historical portable sources as well.
+        if all(object_entries[path][2] == content["gitBlob"]
+               for path, content in _R2_A8_SECURITY_CONTENT_DELTA.items()):
+            ordinary = {**ordinary, **_R2_HISTORICAL_PORTABLE_CONTENT}
         return {**ordinary, **_R2_A6_CONTENT_DELTA}, live_content_authority
     if source_profile is _R2_ORDINARY_PROFILE and all(
         object_entries[relative][2] == content['gitBlob']
@@ -1080,6 +1123,60 @@ def _r2_checkout_execution_authority(
             )
     return result
 
+
+
+
+def _r2_a8_validation_object_inventory(
+    profile: _R2SourceInventoryProfile,
+    head_entries: Mapping[str, tuple[str, str, str]],
+    repo_root: Path = ci.REPO_ROOT,
+) -> dict[str, tuple[str, str, str]]:
+    """Separate the frozen local A8 candidate from authenticated Git HEAD.
+
+    This test-only prospective fixture never changes Git admission or claims a
+    new commit. All other entries come from the independently validated HEAD;
+    only the three fixed A8 objects may replace their exact A7 predecessors.
+    The caller subsequently binds every checkout byte through A7.1.
+    """
+    head_authority = _r2_validate_git_object_authority(profile, head_entries)
+    if profile is not _R2_SECURITY_PROFILE or all(
+        head_entries[path][2] == content["gitBlob"]
+        for path, content in _R2_A8_SECURITY_CONTENT_DELTA.items()
+    ):
+        return dict(head_entries)
+    matches = []
+    root = repo_root.resolve(strict=True)
+    for relative, expected in _R2_A8_SECURITY_CONTENT_DELTA.items():
+        path = root / relative
+        for component in (path, *path.parents):
+            if component == root:
+                break
+            metadata = component.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or getattr(metadata, "st_file_attributes", 0) & 0x400:
+                raise AssertionError("A8 prospective source redirects")
+        if not stat.S_ISREG(path.stat().st_mode):
+            raise AssertionError("A8 prospective source is not a regular file")
+        content = path.read_bytes()
+        matches.append(
+            len(content) == expected["size"]
+            and hashlib.sha256(content).hexdigest() == expected["sha256"]
+            and hashlib.sha1(b"blob " + str(len(content)).encode("ascii")
+                             + b"\0" + content).hexdigest() == expected["gitBlob"]
+        )
+    if not any(matches):
+        # Historical checkouts retain their original authority. This is not a
+        # content bypass: the complete checkout binding still follows.
+        return dict(head_entries)
+    if not all(matches) or head_authority != {
+        **_R2_SECURITY_CONTENT_DELTA, **_R2_A5_SECURITY_COMBINED_CONTENT_DELTA,
+        **_R2_A6_CONTENT_DELTA, **_R2_A7_SECURITY_A4_CONTENT_DELTA,
+    }:
+        raise AssertionError("A8 prospective source is partial or has the wrong predecessor")
+    prospective = dict(head_entries)
+    for relative, content in _R2_A8_SECURITY_CONTENT_DELTA.items():
+        prospective[relative] = ("100644", "blob", str(content["gitBlob"]))
+    _r2_validate_git_object_authority(profile, prospective)
+    return prospective
 
 
 def _r2_bind_source_paths(
@@ -5554,7 +5651,10 @@ class AuthenticatedGitA6Test(unittest.TestCase):
 class AuthenticatedGitA6SourceAdmissionTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        _, _, _, cls.entries = _r2_git_head_inventory()
+        _, _, paths, cls.head_entries = _r2_git_head_inventory()
+        cls.entries = _r2_a8_validation_object_inventory(
+            _r2_profile_for_paths(paths), cls.head_entries,
+        )
 
     @staticmethod
     def _overlay(entries, authority):
@@ -5564,7 +5664,7 @@ class AuthenticatedGitA6SourceAdmissionTest(unittest.TestCase):
         return result
 
     def _ordinary_a4(self):
-        entries = dict(self.entries)
+        entries = self._overlay(self.entries, _R2_HISTORICAL_PORTABLE_CONTENT)
         for path in _R2_ADDED_JAVASCRIPT_PATHS:
             entries.pop(path, None)
         return self._overlay(entries, {**_R2_ORDINARY_CONTENT_AUTHORITY, **_R2_A4_1_ORDINARY_CONTENT_DELTA})
@@ -5926,6 +6026,143 @@ class AuthenticatedGitA6SourceAdmissionTest(unittest.TestCase):
                             autocrlf="true",
                         )
 
+
+
+    def test_security_a8_exact_source_map_and_historical_counterpart(self) -> None:
+        a4 = self._ordinary_a4()
+        a7 = self._overlay(a4, {
+            **_R2_SECURITY_CONTENT_DELTA, **_R2_A5_SECURITY_COMBINED_CONTENT_DELTA,
+            **_R2_A6_CONTENT_DELTA, **_R2_A7_SECURITY_A4_CONTENT_DELTA,
+        })
+        a8 = self._overlay(a7, _R2_A8_SECURITY_CONTENT_DELTA)
+        expected = {
+            **_R2_SECURITY_CONTENT_DELTA, **_R2_A5_SECURITY_COMBINED_CONTENT_DELTA,
+            **_R2_A6_CONTENT_DELTA, **_R2_A7_SECURITY_A4_CONTENT_DELTA,
+            **_R2_A8_SECURITY_CONTENT_DELTA,
+        }
+        self.assertEqual(_r2_validate_git_object_authority(_R2_SECURITY_PROFILE, a8), expected)
+        manifest = "".join(
+            f"{path}\t{mode}\t{kind}\t"
+            + ("AUTHORIZED-TEST-CONTENT" if path == "developer/tests/ci/test_ci_foundation.py" else oid)
+            + "\n"
+            for path, (mode, kind, oid) in sorted(a8.items())
+        ).encode("utf-8")
+        self.assertEqual(hashlib.sha256(manifest).hexdigest(),
+                         "4997be9f15a29304335e049403856092b557c29fa454b2b3fbdc2a24b23fa861")
+        self.assertEqual(_R2_A7_SECURITY_A4_MANIFEST_SHA256,
+                         "531d32b3d3f12ce998c28ad45c34dcb7880d543e4d435525d9e6ebcfb79591a2")
+        ordinary_content, security_content = _r2_fixture_content_authorities(_R2_SECURITY_PROFILE, a8)
+        self.assertEqual(security_content, expected)
+        self.assertEqual(ordinary_content, {
+            **_R2_ORDINARY_CONTENT_AUTHORITY, **_R2_A6_CONTENT_DELTA,
+            **_R2_HISTORICAL_PORTABLE_CONTENT,
+        })
+        ordinary = self._overlay(a4, ordinary_content)
+        _r2_validate_git_object_authority(_R2_ORDINARY_PROFILE, ordinary)
+        self.assertEqual(self._overlay(ordinary, security_content), a8)
+        with mock.patch.object(self, "entries", a8):
+            self.assertEqual(self._ordinary_a4(), a4)
+        with self.assertRaises(AssertionError):
+            _r2_validate_git_object_authority(_R2_ORDINARY_PROFILE, a8)
+        self.assertEqual(len(a8), 916)
+        self.assertEqual(
+            (_R2_ORDINARY_PROFILE.static_command_count, _R2_ORDINARY_PROFILE.all_command_count,
+             _R2_SECURITY_PROFILE.static_command_count, _R2_SECURITY_PROFILE.all_command_count,
+             ci.MAX_COMMAND_RESULTS_JSON_BYTES),
+            (677, 705, 679, 707, 33554432),
+        )
+        # No fabricated commit/tree: the separate prospective map may overlay
+        # only the measured three fixed blobs, leaving the Git HEAD map intact.
+        head_before = dict(self.head_entries)
+        prospective = _r2_a8_validation_object_inventory(_R2_SECURITY_PROFILE, self.head_entries)
+        self.assertEqual(prospective, a8)
+        self.assertEqual(self.head_entries, head_before)
+        for path, identity in _R2_A8_SECURITY_CONTENT_DELTA.items():
+            content = (ci.REPO_ROOT / path).read_bytes()
+            self.assertEqual((len(content), hashlib.sha256(content).hexdigest()),
+                             (identity["size"], identity["sha256"]))
+            self.assertEqual(hashlib.sha1(
+                b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest(),
+                identity["gitBlob"])
+
+    def test_security_a8_partial_sources_and_protected_substitutions_reject(self) -> None:
+        a4 = self._ordinary_a4()
+        a6 = self._overlay(a4, {
+            **_R2_SECURITY_CONTENT_DELTA, **_R2_A5_SECURITY_COMBINED_CONTENT_DELTA,
+            **_R2_A6_CONTENT_DELTA,
+        })
+        a7 = self._overlay(a6, _R2_A7_SECURITY_A4_CONTENT_DELTA)
+        a8 = self._overlay(a7, _R2_A8_SECURITY_CONTENT_DELTA)
+        for count in (1, 2):
+            for selected in itertools.combinations(_R2_A8_SECURITY_CONTENT_DELTA, count):
+                partial = self._overlay(a7, {path: _R2_A8_SECURITY_CONTENT_DELTA[path] for path in selected})
+                with self.subTest(partial=selected), self.assertRaises(AssertionError):
+                    _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, partial)
+        with self.assertRaises(AssertionError):
+            _r2_validate_git_object_authority(
+                _R2_SECURITY_PROFILE, self._overlay(a6, _R2_A8_SECURITY_CONTENT_DELTA))
+        protected = (*_R2_A8_SECURITY_CONTENT_DELTA, *_R2_A7_SECURITY_A4_CONTENT_DELTA,
+                     *_R2_A6_CONTENT_DELTA, "docs/CI_POLICY.md", "README.md")
+        for path in protected:
+            mode, kind, oid = a8[path]
+            for entry in ((mode, kind, "f" * 40), ("100755", kind, oid),
+                          ("120000", kind, oid), ("160000", "commit", oid)):
+                with self.subTest(path=path, entry=entry), self.assertRaises(AssertionError):
+                    _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, {**a8, path: entry})
+        extra = {**a8, "developer/tests/ci/unauthorized.py": ("100644", "blob", "a" * 40)}
+        with self.assertRaises(AssertionError):
+            _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, extra)
+        renamed = dict(a8)
+        renamed["README-substitute.md"] = renamed.pop("README.md")
+        with self.assertRaises(AssertionError):
+            _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, renamed)
+        # Only the original test-file object is a sentinel, with its mode/type fixed.
+        sentinel = {**a8, _R2_AUTHORIZED_MUTABLE_PATH: ("100644", "blob", "f" * 40)}
+        _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, sentinel)
+        with self.assertRaises(AssertionError):
+            _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, {
+                **sentinel, _R2_AUTHORIZED_MUTABLE_PATH: ("100755", "blob", "f" * 40),
+            })
+
+    def test_security_a8_prospective_bytes_and_checkout_authority_reject_forgery(self) -> None:
+        a7 = self._overlay(self._ordinary_a4(), {
+            **_R2_SECURITY_CONTENT_DELTA, **_R2_A5_SECURITY_COMBINED_CONTENT_DELTA,
+            **_R2_A6_CONTENT_DELTA, **_R2_A7_SECURITY_A4_CONTENT_DELTA,
+        })
+        a8 = self._overlay(a7, _R2_A8_SECURITY_CONTENT_DELTA)
+        attributes = dict.fromkeys(_R2_CHECKOUT_ATTRIBUTES, "unspecified")
+        original_read = Path.read_bytes
+        for relative, identity in _R2_A8_SECURITY_CONTENT_DELTA.items():
+            path = ci.REPO_ROOT / relative
+            source = path.read_bytes()
+            for checkout in (source, source.replace(b"\n", b"\r\n")):
+                self.assertEqual(_r2_bind_checkout_content(
+                    relative, a8[relative], checkout, attributes=attributes,
+                    autocrlf="true", source_content=identity,
+                ), {"gitBlob": identity["gitBlob"], "size": len(checkout),
+                    "sha256": hashlib.sha256(checkout).hexdigest()})
+            with self.subTest(prospective_byte_substitution=relative):
+                def changed_read(candidate):
+                    data = original_read(candidate)
+                    return data + b"\n" if candidate == path else data
+                with mock.patch.object(Path, "read_bytes", changed_read), self.assertRaises(AssertionError):
+                    _r2_a8_validation_object_inventory(_R2_SECURITY_PROFILE, a7)
+            for field, value in (("gitBlob", "0" * 40), ("size", len(source) + 1), ("sha256", "0" * 64)):
+                with self.subTest(source_claim=relative, field=field), self.assertRaises(AssertionError):
+                    _r2_bind_checkout_content(
+                        relative, a8[relative], source, attributes=attributes,
+                        autocrlf="true", source_content={**identity, field: value},
+                    )
+            with self.assertRaises(AssertionError):
+                _r2_bind_checkout_content(
+                    relative, a8[relative], source + b"substitute",
+                    attributes=attributes, autocrlf="true", source_content=identity,
+                )
+        # Current bytes do not grant use of a different historical predecessor.
+        a6 = self._overlay(a7, _R2_SECURITY_CONTENT_DELTA)
+        a6 = self._overlay(a6, _R2_A6_CONTENT_DELTA)
+        with self.assertRaises(AssertionError):
+            _r2_a8_validation_object_inventory(_R2_SECURITY_PROFILE, a6)
 
     def test_security_a6_test_sentinel_retains_exact_execution_content_binding(self) -> None:
         tools = _explicit_local_test_tool_map('git')
@@ -7474,7 +7711,10 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
     def test_full_scale_command_results_retain_705_records_under_fixed_limit(self) -> None:
         baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
         source_profile, immutable_source_paths = _r2_current_source_inventory()
-        _, _, _, live_object_authority = _r2_git_head_inventory()
+        _, _, _, accepted_head_objects = _r2_git_head_inventory()
+        live_object_authority = _r2_a8_validation_object_inventory(
+            source_profile, accepted_head_objects,
+        )
         ordinary_content_authority, security_content_authority = (
             _r2_fixture_content_authorities(source_profile, live_object_authority)
         )
