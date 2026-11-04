@@ -597,6 +597,20 @@ _R2_A8_SECURITY_CONTENT_DELTA = {
         "sha256": "85875f5b5eba6b1fd1ca48d44493df2430e653e9f3089b45acf6724e0ef85d63",
     },
 }
+# Issue #79 A9 / Issue #104 A9: exact measured runner alternative.
+# Historical manifests and the existing test-file-only sentinel remain intact.
+_R2_A9_SECURITY_MANIFEST_SHA256 = (
+    "1f1a17bd0ddddbf52b421310af2d6def0808f0a22012a79c8e9633f4a3ff5375"
+)
+_R2_A9_SECURITY_CONTENT_DELTA = {
+    "developer/tests/ci/run_ci_foundation.py": {
+        "gitBlob": "cc013237ad95a489ef5f71e933fdec2e84fb06a5",
+        "size": 1166031,
+        "sha256": "8e1b3e33ff93cf6a0e904e3aacfdf21a8c8f4cf01740c88c044b25bf8b7f7f8f",
+    },
+}
+
+
 _R2_HISTORICAL_PORTABLE_CONTENT = {
     path: _R2_A5_SECURITY_COMBINED_CONTENT_DELTA[path]
     for path in (
@@ -905,9 +919,13 @@ def _r2_validate_git_object_authority(
         profile is _R2_SECURITY_PROFILE
         and manifest_digest == _R2_A8_SECURITY_MANIFEST_SHA256
     )
+    a9_security = (
+        profile is _R2_SECURITY_PROFILE
+        and manifest_digest == _R2_A9_SECURITY_MANIFEST_SHA256
+    )
     if not (
         a5_security_combined or a6_ordinary or a6_security_combined
-        or a7_security_a4 or a8_security
+        or a7_security_a4 or a8_security or a9_security
     ) and manifest_digest not in (
         profile.tree_manifest_sha256,
         profile.a1_integrated_tree_manifest_sha256,
@@ -927,17 +945,19 @@ def _r2_validate_git_object_authority(
                if profile is _R2_ORDINARY_PROFILE
                else _R2_A4_1_SECURITY_CONTENT_DELTA),
         }
-    if a5_security_combined or a6_security_combined or a7_security_a4 or a8_security:
+    if a5_security_combined or a6_security_combined or a7_security_a4 or a8_security or a9_security:
         content_authority = {
             **content_authority,
             **_R2_A5_SECURITY_COMBINED_CONTENT_DELTA,
         }
-    if a6_ordinary or a6_security_combined or a7_security_a4 or a8_security:
+    if a6_ordinary or a6_security_combined or a7_security_a4 or a8_security or a9_security:
         content_authority = {**content_authority, **_R2_A6_CONTENT_DELTA}
-    if a7_security_a4 or a8_security:
+    if a7_security_a4 or a8_security or a9_security:
         content_authority = {**content_authority, **_R2_A7_SECURITY_A4_CONTENT_DELTA}
-    if a8_security:
+    if a8_security or a9_security:
         content_authority = {**content_authority, **_R2_A8_SECURITY_CONTENT_DELTA}
+    if a9_security:
+        content_authority = {**content_authority, **_R2_A9_SECURITY_CONTENT_DELTA}
     for relative, expected in content_authority.items():
         entry = object_entries.get(relative)
         if entry is None or entry[2] != expected["gitBlob"]:
@@ -954,6 +974,14 @@ def _r2_fixture_content_authorities(
     )
     ordinary = _R2_ORDINARY_CONTENT_AUTHORITY
     security = _R2_SECURITY_CONTENT_DELTA
+    if source_profile is _R2_SECURITY_PROFILE and all(
+        object_entries[path][2] == content["gitBlob"]
+        for path, content in _R2_A9_SECURITY_CONTENT_DELTA.items()
+    ):
+        return (
+            {**ordinary, **_R2_A6_CONTENT_DELTA, **_R2_HISTORICAL_PORTABLE_CONTENT},
+            live_content_authority,
+        )
     if source_profile is _R2_SECURITY_PROFILE and all(
         object_entries[relative][2] == content["gitBlob"]
         for relative, content in _R2_A6_CONTENT_DELTA.items()
@@ -1177,6 +1205,53 @@ def _r2_a8_validation_object_inventory(
         prospective[relative] = ("100644", "blob", str(content["gitBlob"]))
     _r2_validate_git_object_authority(profile, prospective)
     return prospective
+
+
+def _r2_a9_validation_object_inventory(
+    profile: _R2SourceInventoryProfile,
+    head_entries: Mapping[str, tuple[str, str, str]],
+    repo_root: Path = ci.REPO_ROOT,
+) -> dict[str, tuple[str, str, str]]:
+    """Admit only the frozen A9 runner over the exact authenticated A8 tree.
+
+    This is a prospective test fixture, never a staged or committed identity.
+    The unchanged test-file sentinel is still bound by checkout authority.
+    """
+    head_authority = _r2_validate_git_object_authority(profile, head_entries)
+    runner_path = "developer/tests/ci/run_ci_foundation.py"
+    if profile is not _R2_SECURITY_PROFILE or head_entries[runner_path][2] == (
+        _R2_A9_SECURITY_CONTENT_DELTA[runner_path]["gitBlob"]
+    ):
+        return dict(head_entries)
+    root = repo_root.resolve(strict=True)
+    path = root / runner_path
+    for component in (path, *path.parents):
+        if component == root:
+            break
+        metadata = component.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or getattr(metadata, "st_file_attributes", 0) & 0x400:
+            raise AssertionError("A9 prospective source redirects")
+    if not stat.S_ISREG(path.stat().st_mode):
+        raise AssertionError("A9 prospective source is not a regular file")
+    data = path.read_bytes()
+    identity = {
+        "gitBlob": hashlib.sha1(b"blob " + str(len(data)).encode("ascii") + b"\0" + data).hexdigest(),
+        "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+    }
+    if identity != _R2_A9_SECURITY_CONTENT_DELTA[runner_path]:
+        # Historical trees keep their historical admission and byte checks.
+        return _r2_a8_validation_object_inventory(profile, head_entries, repo_root)
+    if head_authority != {
+        **_R2_SECURITY_CONTENT_DELTA, **_R2_A5_SECURITY_COMBINED_CONTENT_DELTA,
+        **_R2_A6_CONTENT_DELTA, **_R2_A7_SECURITY_A4_CONTENT_DELTA,
+        **_R2_A8_SECURITY_CONTENT_DELTA,
+    }:
+        raise AssertionError("A9 prospective source is partial or has the wrong predecessor")
+    prospective = dict(head_entries)
+    prospective[runner_path] = ("100644", "blob", str(identity["gitBlob"]))
+    _r2_validate_git_object_authority(profile, prospective)
+    return prospective
+
 
 
 def _r2_bind_source_paths(
@@ -5652,7 +5727,7 @@ class AuthenticatedGitA6SourceAdmissionTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         _, _, paths, cls.head_entries = _r2_git_head_inventory()
-        cls.entries = _r2_a8_validation_object_inventory(
+        cls.entries = _r2_a9_validation_object_inventory(
             _r2_profile_for_paths(paths), cls.head_entries,
         )
 
@@ -5673,11 +5748,17 @@ class AuthenticatedGitA6SourceAdmissionTest(unittest.TestCase):
         base = self._ordinary_a4()
         a6 = self._overlay(base, _R2_A6_CONTENT_DELTA)
         selected = _r2_validate_git_object_authority(_R2_ORDINARY_PROFILE, a6)
+        live_selected = _r2_validate_git_object_authority(
+            _r2_profile_for_paths(tuple(sorted(self.entries))), self.entries,
+        )
         for path, identity in _R2_A6_CONTENT_DELTA.items():
             content = (ci.REPO_ROOT / path).read_bytes()
-            self.assertEqual(hashlib.sha256(content).hexdigest(), identity["sha256"])
-            self.assertEqual(len(content), identity["size"])
-            self.assertEqual(hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest(), identity["gitBlob"])
+            # Historical A6 tuples stay exact; checkout bytes must match the
+            # separately frozen, full-tree-validated current source variant.
+            live_identity = live_selected[path]
+            self.assertEqual(hashlib.sha256(content).hexdigest(), live_identity["sha256"])
+            self.assertEqual(len(content), live_identity["size"])
+            self.assertEqual(hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest(), live_identity["gitBlob"])
             self.assertEqual(selected[path], identity)
         a5 = self._overlay(base, {**_R2_SECURITY_CONTENT_DELTA, **_R2_A5_SECURITY_COMBINED_CONTENT_DELTA})
         _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, a5)
@@ -6026,6 +6107,114 @@ class AuthenticatedGitA6SourceAdmissionTest(unittest.TestCase):
                             autocrlf="true",
                         )
 
+
+
+    def test_security_a9_exact_manifest_runner_and_historical_counterparts(self) -> None:
+        runner_path = "developer/tests/ci/run_ci_foundation.py"
+        expected = {
+            "gitBlob": "cc013237ad95a489ef5f71e933fdec2e84fb06a5",
+            "size": 1166031,
+            "sha256": "8e1b3e33ff93cf6a0e904e3aacfdf21a8c8f4cf01740c88c044b25bf8b7f7f8f",
+        }
+        self.assertEqual(_R2_A9_SECURITY_CONTENT_DELTA, {runner_path: expected})
+        self.assertEqual(_R2_A9_SECURITY_MANIFEST_SHA256,
+                         "1f1a17bd0ddddbf52b421310af2d6def0808f0a22012a79c8e9633f4a3ff5375")
+        candidate = dict(self.head_entries)
+        candidate[runner_path] = ("100644", "blob", "cc013237ad95a489ef5f71e933fdec2e84fb06a5")
+        selected = _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, candidate)
+        self.assertEqual(selected[runner_path], expected)
+        manifest = "".join(
+            f"{path}\t{mode}\t{kind}\t"
+            + ("AUTHORIZED-TEST-CONTENT" if path == "developer/tests/ci/test_ci_foundation.py" else oid)
+            + "\n" for path, (mode, kind, oid) in sorted(candidate.items())
+        ).encode()
+        self.assertEqual(hashlib.sha256(manifest).hexdigest(),
+                         "1f1a17bd0ddddbf52b421310af2d6def0808f0a22012a79c8e9633f4a3ff5375")
+        self.assertEqual(len(candidate), 916)
+        self.assertEqual(_R2_AUTHORIZED_MUTABLE_PATH, "developer/tests/ci/test_ci_foundation.py")
+        historical = dict(candidate)
+        historical[runner_path] = ("100644", "blob", "8c8a3247ebdf3f4ee40843c924abe2c052635d68")
+        old = _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, historical)
+        self.assertEqual(old[runner_path], {
+            "gitBlob": "8c8a3247ebdf3f4ee40843c924abe2c052635d68", "size": 1147901,
+            "sha256": "d9450c326176fb76e18b8c39dd055b15235e0705d2abdb43cc8666a54c96034e",
+        })
+        ordinary, security = _r2_fixture_content_authorities(_R2_SECURITY_PROFILE, candidate)
+        self.assertEqual(security, selected)
+        self.assertEqual(ordinary[runner_path], old[runner_path])
+        self.assertEqual(ordinary["developer/tests/ci/backend_canonical_portable_result.py"]["gitBlob"],
+                         "00694ffbe4780e13a8c57dee1ae39e40dfc7a9cd")
+        self.assertEqual(security["developer/tests/ci/backend_canonical_portable_result.py"]["gitBlob"],
+                         "4311c71b1e0fd7061abd5a616c01118ce535f966")
+        head_before = copy.deepcopy(self.head_entries)
+        self.assertEqual(_r2_a9_validation_object_inventory(_R2_SECURITY_PROFILE, self.head_entries), candidate)
+        self.assertEqual(self.head_entries, head_before)
+
+    def test_security_a9_partial_overlay_modes_unknown_paths_and_blob_substitutions_reject(self) -> None:
+        runner_path = "developer/tests/ci/run_ci_foundation.py"
+        candidate = dict(self.entries)
+        candidate[runner_path] = ("100644", "blob", "cc013237ad95a489ef5f71e933fdec2e84fb06a5")
+        for path in (runner_path, "developer/tests/ci/test_ci_foundation.py",
+                     ".github/workflows/ci.yml", "backend/src/app.js"):
+            for mode in ("100755", "120000"):
+                altered = dict(candidate)
+                altered[path] = (mode, altered[path][1], altered[path][2])
+                with self.subTest(path=path, mode=mode), self.assertRaises(AssertionError):
+                    _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, altered)
+        for oid in ("0" * 40, "f" * 40, "AUTHORIZED-TEST-CONTENT"):
+            altered = dict(candidate)
+            altered[runner_path] = ("100644", "blob", oid)
+            with self.subTest(oid=oid), self.assertRaises(AssertionError):
+                _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, altered)
+        for path, old_blob in (
+            ("developer/tests/ci/backend_canonical_portable_result.py", "00694ffbe4780e13a8c57dee1ae39e40dfc7a9cd"),
+            ("developer/tests/ci/test_backend_canonical_portable_result.py", "b41be609abec19c96577ce2446dcabc8eb649ea1"),
+            ("backend/src/app.js", "0" * 40),
+        ):
+            altered = dict(candidate)
+            altered[path] = ("100644", "blob", old_blob)
+            with self.subTest(partial=path), self.assertRaises(AssertionError):
+                _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, altered)
+        altered = {**candidate, "developer/tests/ci/unauthorized_a9.py": ("100644", "blob", "a" * 40)}
+        with self.assertRaises(AssertionError):
+            _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, altered)
+        del altered["developer/tests/ci/unauthorized_a9.py"]
+        del altered["README.md"]
+        with self.assertRaises(AssertionError):
+            _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, altered)
+        with self.assertRaises(AssertionError):
+            _r2_validate_git_object_authority(_R2_ORDINARY_PROFILE, candidate)
+
+    def test_security_a9_raw_checkout_binding_and_test_only_sentinel(self) -> None:
+        runner_path = "developer/tests/ci/run_ci_foundation.py"
+        candidate = dict(self.entries)
+        candidate[runner_path] = ("100644", "blob", "cc013237ad95a489ef5f71e933fdec2e84fb06a5")
+        authority = _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, candidate)
+        data = (ci.REPO_ROOT / runner_path).read_bytes()
+        self.assertEqual((len(data), hashlib.sha256(data).hexdigest()),
+                         (1166031, "8e1b3e33ff93cf6a0e904e3aacfdf21a8c8f4cf01740c88c044b25bf8b7f7f8f"))
+        attributes = {key: "unspecified" for key in
+                      ("text", "eol", "filter", "ident", "working-tree-encoding", "crlf")}
+        actual = _r2_bind_checkout_content(runner_path, candidate[runner_path], data,
+                                          attributes=attributes, autocrlf="true", source_content=authority[runner_path])
+        self.assertEqual(actual, authority[runner_path])
+        for forged in (data + b"\n", data[:-1], data.replace(b"\r\n", b"\n"),
+                       data.replace(b"_A9_DETAIL_UTF8_LIMIT = 16_384", b"_A9_DETAIL_UTF8_LIMIT = 99_999")):
+            with self.subTest(bytes=len(forged)), self.assertRaises(AssertionError):
+                _r2_bind_checkout_content(runner_path, candidate[runner_path], forged,
+                                          attributes=attributes, autocrlf="true", source_content=authority[runner_path])
+        # The sentinel remains only at the historical test path; its execution
+        # bytes still have to bind the actual supplied object identity.
+        test_path = "developer/tests/ci/test_ci_foundation.py"
+        test_bytes = (ci.REPO_ROOT / test_path).read_bytes()
+        test_oid = hashlib.sha1(b"blob " + str(len(test_bytes)).encode() + b"\0" + test_bytes).hexdigest()
+        candidate[test_path] = ("100644", "blob", test_oid)
+        _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, candidate)
+        _r2_bind_checkout_content(test_path, candidate[test_path], test_bytes,
+                                  attributes=attributes, autocrlf="true")
+        with self.assertRaises(AssertionError):
+            _r2_bind_checkout_content(test_path, candidate[test_path], test_bytes + b"# injected\n",
+                                      attributes=attributes, autocrlf="true")
 
 
     def test_security_a8_exact_source_map_and_historical_counterpart(self) -> None:
@@ -7712,7 +7901,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
         baseline = ci.strict_json_load_file(ci.BASELINE_PATH)
         source_profile, immutable_source_paths = _r2_current_source_inventory()
         _, _, _, accepted_head_objects = _r2_git_head_inventory()
-        live_object_authority = _r2_a8_validation_object_inventory(
+        live_object_authority = _r2_a9_validation_object_inventory(
             source_profile, accepted_head_objects,
         )
         ordinary_content_authority, security_content_authority = (
@@ -18005,6 +18194,432 @@ class CI5TargetExecutionLeaseTest(unittest.TestCase):
         self.assertNotIn(self.relative, plan["executionArgv"])
         self.assertEqual(plan["executionInputMode"], "TARGET-BYTES-STDIN")
         self.assertEqual(plan["executionInputSha256"], plan["targets"][0]["sha256"])
+
+
+class A9LearnerReplayDiagnosticTest(unittest.TestCase):
+    # Independent schema inventory; production expected constants are not imported.
+    raw_fields = (
+        "executed", "started", "setupFailure", "exitCode", "timeoutStatus",
+        "outputLimitStatus", "executionDurationClass", "containment", "processTreeStatus",
+        "containmentDisposition", "descendantsObserved", "descendantsReaped",
+        "descendantsTerminated", "descendantsSurviving", "processTreeError", "error",
+        "limitReason", "protectedTargetBundle.cleanupState",
+        "protectedTargetBundle.mutationDetected", "stdoutBytesObserved", "stdoutSha256",
+        "stdoutByteLimit", "stderrBytesObserved", "stderrSha256", "stderrByteLimit",
+        "directNodeTestRawStreams.stdout", "directNodeTestRawStreams.stderr",
+        "producerObservationSetDigest", "semanticSourceOutputDigest",
+        "producerObservations", "diagnosticPreview", "parsedFailureSummary",
+    )
+    observation_fields = (
+        "commandOrdinal", "observationOrdinal", "observationKind", "sourceOutputDigest",
+        "producerRecordDigest", "rawStructuredFields", "sourceResultId", "sourcePath",
+        "failurePathAuthority",
+    )
+    canary = "A9_PRIVATE_\U0001f512_\u79d8\u5bc6_C:\\private\\token.env --credential=do-not-print"
+
+    @staticmethod
+    def digest(value):
+        # The existing independent reference encoder fixes canonical identities.
+        return "sha256:" + hashlib.sha256(ci11_reference_frame(value)).hexdigest()
+
+    @staticmethod
+    def context():
+        return ci.ExternallyExpectedVerificationContext(
+            binding_mode="github-actions", expected_profile="all", release_gate_required=False,
+            producer_job_id="windows-compatibility-producer",
+            verifier_job_id="windows-compatibility-validation", runner_os="Windows",
+            run_id="123456789", run_attempt="2", event_name="pull_request",
+            repository="example/fixture", checkout_commit="1" * 40, checkout_tree="2" * 40,
+            baseline_commit="3" * 40, baseline_tree="4" * 40, trust_file_digest="5" * 64,
+            command_plan_digest="6" * 64, producer_invocation_id="7" * 64,
+            fresh_runtime_closure_digest="8" * 64, verifier_invocation_id="9" * 64,
+        )
+
+    def record(self, *, ordinal=23, replay=False):
+        stdout = ("replay:" if replay else "producer:") + self.canary
+        stderr = "stderr:" + self.canary
+        observations = [{
+            "commandId": "learner-focused", "commandOrdinal": ordinal,
+            "observationOrdinal": index, "observationKind": "process-output-v1",
+            "sourceOutputDigest": "sha256:" + ("b" if replay else "a") * 64,
+            "producerRecordDigest": "sha256:" + ("d" if replay else "c") * 64,
+            "rawStructuredFields": {"private": self.canary, "side": "R" if replay else "P"},
+            "sourceResultId": self.canary, "sourcePath": self.canary,
+            "failurePathAuthority": {"private": self.canary},
+        } for index in range(2)]
+        return {
+            "commandId": "learner-focused", "commandClass": "learner-focused",
+            "ordinal": ordinal, "platform": "windows", "executed": True, "started": True,
+            "setupFailure": False, "exitCode": 1, "timeoutStatus": "within-limit",
+            "outputLimitStatus": "within-limit", "executionDurationClass": "bounded",
+            "containment": "windows-job-object", "processTreeStatus": "contained-clean",
+            "containmentDisposition": "natural-exit-reaped" if replay else "forced-terminated",
+            "descendantsObserved": 2 if replay else 1, "descendantsReaped": 2 if replay else 1,
+            "descendantsTerminated": 0 if replay else 1, "descendantsSurviving": 0,
+            "processTreeError": None, "error": None, "limitReason": None,
+            "protectedTargetBundle": {"cleanupState": "closed", "mutationDetected": False},
+            "stdoutBytesObserved": len(stdout.encode("utf-8")),
+            "stdoutSha256": hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
+            "stdoutByteLimit": 1048576, "stderrBytesObserved": len(stderr.encode("utf-8")),
+            "stderrSha256": hashlib.sha256(stderr.encode("utf-8")).hexdigest(),
+            "stderrByteLimit": 1048576, "directNodeTestRawStreams": {"stdout": stdout, "stderr": stderr},
+            "producerObservations": observations, "producerObservationSetDigest": self.digest(observations),
+            "diagnosticPreview": self.canary, "parsedFailureSummary": {"private": self.canary},
+        }
+
+    def diagnostics(self, producer=None, replay=None, *, source_producer=None, source_replay=None,
+                    context=None):
+        producer = self.record() if producer is None else producer
+        replay = self.record(replay=True) if replay is None else replay
+        return ci.replay_transcript_difference_diagnostics(
+            [ci._canonical_transcript_record(producer)],
+            [ci._canonical_transcript_record(replay)],
+            producer_source_records=[producer if source_producer is None else source_producer],
+            replay_source_records=[replay if source_replay is None else source_replay],
+            expected_context=self.context() if context is None else context,
+        )
+
+    def test_exact_paired_schema_direction_and_observed_ordinal(self):
+        for ordinal in (0, 23, 711):
+            with self.subTest(ordinal=ordinal):
+                left, right = self.record(ordinal=ordinal), self.record(ordinal=ordinal, replay=True)
+                before = copy.deepcopy((left, right))
+                diagnostic = self.diagnostics(left, right)[0]
+                detail = diagnostic["learnerFailureDetail"]
+                self.assertEqual(detail["status"], "available")
+                self.assertEqual(detail["ordinal"], ordinal)
+                self.assertEqual(detail["commandId"], "learner-focused")
+                self.assertEqual(detail["commandClass"], "learner-focused")
+                self.assertEqual(detail["commandIdDigest"],
+                                 "sha256:" + hashlib.sha256(b"learner-focused").hexdigest())
+                self.assertEqual(set(detail), {
+                    "schemaVersion", "status", "commandId", "commandClass", "ordinal", "commandIdDigest",
+                    "correlation", "producer", "replay", "changedRawFields",
+                    "changedComparableFields", "firstUnequalObservation",
+                })
+                for side, raw, terminated, disposition in (
+                    ("producer", left, 1, "forced-terminated"), ("replay", right, 0, "natural-exit-reaped"),
+                ):
+                    facts = detail[side]
+                    self.assertEqual(set(facts["raw"]), {*self.raw_fields, "sourceOutputDigest"})
+                    self.assertEqual(facts["rawRecordDigest"], self.digest(raw))
+                    self.assertEqual(facts["comparableRecordDigest"],
+                                     self.digest(ci._canonical_transcript_record(raw)))
+                    self.assertEqual(facts["raw"]["descendantsTerminated"]["value"], terminated)
+                    self.assertEqual(facts["raw"]["containmentDisposition"]["value"], disposition)
+                    self.assertEqual(facts["raw"]["protectedTargetBundle.cleanupState"]["value"], "closed")
+                    self.assertFalse(facts["raw"]["protectedTargetBundle.mutationDetected"]["value"])
+                    self.assertEqual(facts["eligibilityObservations"]["zeroTerminatedDescendants"]["value"],
+                                     terminated == 0)
+                    self.assertEqual(facts["raw"]["producerObservations"]["count"], 2)
+                    self.assertEqual(facts["raw"]["producerObservations"]["canonicalDigest"],
+                                     self.digest(raw["producerObservations"]))
+                self.assertEqual((left, right), before)
+                self.assertIsNone(ci._validated_direct_node_test_semantic_projection(
+                    left, protected_bundle_valid=True))
+                self.assertLessEqual(len(json.dumps(detail, separators=(",", ":")).encode("utf-8")), 16384)
+
+    def test_pairing_rejects_swaps_substitutions_classes_and_ordinals(self):
+        left, right = self.record(), self.record(replay=True)
+        variants = [right, {**left, "stdoutSha256": "e" * 64},
+                    {**left, "ordinal": 688}, {**left, "commandClass": "frontend-security"},
+                    {**left, "commandId": "frontend-security:private.test.js"}]
+        for wrong in variants:
+            with self.subTest(mutation=tuple(key for key in left if left[key] != wrong.get(key))):
+                detail = self.diagnostics(left, right, source_producer=wrong)[0]["learnerFailureDetail"]
+                self.assertEqual(detail, {"schemaVersion": 1, "status": "unavailable",
+                                          "reason": "source-correspondence"})
+                self.assertNotIn("producer", detail)
+        for missing_side in ("producer", "replay"):
+            kwargs = {"producer_source_records": [left], "replay_source_records": [right]}
+            kwargs[missing_side + "_source_records"] = []
+            detail = ci.replay_transcript_difference_diagnostics(
+                [ci._canonical_transcript_record(left)], [ci._canonical_transcript_record(right)],
+                expected_context=self.context(), **kwargs)[0]["learnerFailureDetail"]
+            self.assertEqual(detail["status"], "unavailable")
+        renumbered = self.record(ordinal=24, replay=True)
+        self.assertEqual(self.diagnostics(left, renumbered)[0]["learnerFailureDetail"]["status"], "unavailable")
+
+    def test_raw_stream_and_semantic_stdout_are_separate(self):
+        raw = self.record()
+        canonical = ci._canonical_transcript_record(raw)
+        canonical.pop("directNodeTestRawStreams")
+        canonical.update(stdoutSha256="e" * 64, stdoutBytesObserved=91,
+                         semanticSourceOutputDigest="sha256:" + "f" * 64)
+        # Inspect serialization of an already formed comparison view independently
+        # of source pairing. The public diagnostic rejects this invented pairing.
+        facts = ci._a9_record_facts(raw, canonical)
+        self.assertEqual(facts["raw"]["stdoutSha256"]["value"], raw["stdoutSha256"])
+        self.assertEqual(facts["comparable"]["stdoutSha256"]["value"], "e" * 64)
+        self.assertEqual(facts["comparable"]["stdoutRepresentation"], "direct-node-semantic-v1")
+        self.assertTrue(facts["eligibilityObservations"]["comparableSemanticSourceOutputDigestPresent"])
+        streams = raw["directNodeTestRawStreams"]
+        for name in ("stdout", "stderr"):
+            field = facts["raw"]["directNodeTestRawStreams." + name]
+            self.assertEqual(field["utf8Bytes"], len(streams[name].encode("utf-8")))
+            self.assertEqual(field["sha256"], hashlib.sha256(streams[name].encode("utf-8")).hexdigest())
+            self.assertNotIn(streams[name], json.dumps(facts))
+        self.assertFalse(ci._a9_source_corresponds(raw, canonical))
+        self.assertEqual(ci._a9_record_facts(raw, ci._canonical_transcript_record(raw))
+                         ["comparable"]["stdoutRepresentation"], "canonical-raw-stdout")
+
+    def test_first_unequal_observation_and_changed_field_allowlist(self):
+        left, right = self.record(), self.record(replay=True)
+        right["producerObservations"][0] = copy.deepcopy(left["producerObservations"][0])
+        right["protectedTargetBundle"].update(cleanupState="failed", mutationDetected=True)
+        right[self.canary] = {"unknown": self.canary}
+        detail = self.diagnostics(left, right)[0]["learnerFailureDetail"]
+        unequal = detail["firstUnequalObservation"]
+        self.assertEqual(unequal["index"], 1)
+        for side in ("producer", "replay"):
+            self.assertEqual(set(unequal[side]["comparable"]), set(self.observation_fields))
+            self.assertEqual(unequal[side]["raw"],
+                             {"presence": True, "representation": "same-side-comparable"})
+            self.assertEqual(unequal[side]["comparable"]["observationOrdinal"]["value"], 1)
+            self.assertEqual(unequal[side]["comparable"]["commandOrdinal"]["value"], 23)
+        self.assertEqual(unequal["changedFields"],
+                         ["sourceOutputDigest", "producerRecordDigest", "rawStructuredFields"])
+        self.assertIn("protectedTargetBundle.cleanupState", detail["changedRawFields"])
+        self.assertIn("protectedTargetBundle.mutationDetected", detail["changedRawFields"])
+        self.assertTrue(set(detail["changedRawFields"]) <= set(self.raw_fields))
+        self.assertNotIn(self.canary, json.dumps(detail, ensure_ascii=False))
+
+    def test_absent_null_malformed_and_unsupported_fields_are_explicit(self):
+        scalar_cases = (
+            ("executed", 1), ("exitCode", True), ("exitCode", -1), ("exitCode", 256),
+            ("descendantsObserved", 4097), ("stdoutBytesObserved", 8388608 + 16385),
+            ("stdoutSha256", self.canary), ("stdoutSha256", "A" * 64),
+            ("producerObservationSetDigest", "b" * 64), ("timeoutStatus", [self.canary]),
+            ("containment", {"private": self.canary}), ("executionDurationClass", self.canary),
+        )
+        for key, value in scalar_cases:
+            with self.subTest(key=key, value_type=type(value).__name__):
+                field = ci._a9_field({key: value}, key)
+                self.assertTrue(field["presence"])
+                self.assertEqual(field["status"], "invalid")
+                self.assertNotIn("value", field)
+                self.assertNotIn(self.canary, json.dumps(field, ensure_ascii=False))
+        for key in self.raw_fields:
+            self.assertEqual(ci._a9_field({}, key), {"presence": False})
+        self.assertEqual(ci._a9_field({"exitCode": None}, "exitCode"),
+                         {"presence": True, "type": "null", "status": "null"})
+        for value in (object(), float("nan"), float("inf"), 2 ** 100, "\ud800"):
+            field = ci._a9_metadata(value)
+            self.assertEqual(field["status"], "unavailable")
+            self.assertNotIn("canonicalDigest", field)
+        raw = self.record()
+        del raw["stderrSha256"]
+        raw["error"] = {"unexpected": self.canary}
+        detail = self.diagnostics(raw)[0]["learnerFailureDetail"]
+        self.assertFalse(detail["producer"]["raw"]["stderrSha256"]["presence"])
+        self.assertEqual(detail["producer"]["raw"]["error"]["type"], "object")
+
+    def test_private_canaries_paths_commands_environment_and_unknown_keys_never_emit(self):
+        left, right = self.record(), self.record(replay=True)
+        private = [self.canary, "/home/fixture/.ssh/private-key", "TOKEN=private-env-value",
+                   "node private.js --password=canary"]
+        for field in ("diagnosticPreview", "parsedFailureSummary", "processTreeError", "error", "limitReason"):
+            left[field] = {private[0]: private}
+        for raw in left["producerObservations"]:
+            for field in ("rawStructuredFields", "sourceResultId", "sourcePath", "failurePathAuthority"):
+                raw[field] = {private[0]: private}
+            raw[private[0]] = private
+        left[private[0]] = private
+        diagnostic = self.diagnostics(left, right)[0]
+        detail = diagnostic["learnerFailureDetail"]
+        self.assertEqual(detail["status"], "available")
+        serialized = json.dumps(diagnostic, ensure_ascii=False)
+        for value in private:
+            self.assertNotIn(value, serialized)
+        self.assertEqual(detail["producer"]["raw"]["error"]["canonicalDigest"],
+                         self.digest(left["error"]))
+
+    def test_utf8_ceiling_oversized_streams_collections_and_recursive_values(self):
+        raw = self.record()
+        raw["directNodeTestRawStreams"]["stdout"] = "\U0001f512" * (2097152 + 4097)
+        self.assertEqual(ci._a9_stream(raw, "stdout"),
+                         {"presence": True, "type": "string", "status": "oversized"})
+        raw = self.record()
+        raw["producerObservations"] = [None] * 20001
+        self.assertEqual(self.diagnostics(raw)[0]["learnerFailureDetail"]["status"], "unavailable")
+        recursive = []
+        recursive.append(recursive)
+        self.assertEqual(ci._a9_metadata(recursive)["status"], "unavailable")
+        for size in (16300, 16384, 16385, 50000):
+            value = {"schemaVersion": 1, "status": "available", "fixed": "\U0001f512" * size}
+            bounded = ci._a9_bounded_detail(value)
+            self.assertEqual(bounded, {"schemaVersion": 1, "status": "unavailable",
+                                      "reason": "detail-byte-limit"})
+            self.assertLessEqual(len(json.dumps(bounded).encode("utf-8")), 16384)
+        value = {"schemaVersion": 1, "status": "available", "fixed": "x" * 16000}
+        self.assertEqual(ci._a9_bounded_detail(value), value)
+
+    def test_trusted_correlation_never_uses_producer_claims(self):
+        left, right = self.record(), self.record(replay=True)
+        left["executionBinding"] = {key: self.canary for key in ("runId", "runAttempt", "repository")}
+        left["verifierJobId"] = self.canary
+        detail = self.diagnostics(left, right)[0]["learnerFailureDetail"]
+        correlation = detail["correlation"]
+        expected = {"repository": "example/fixture", "checkoutCommit": "1" * 40,
+                    "checkoutTree": "2" * 40, "runId": "123456789", "runAttempt": "2",
+                    "producerJobId": "windows-compatibility-producer",
+                    "verifierJobId": "windows-compatibility-validation"}
+        for key, value in expected.items():
+            self.assertEqual(correlation[key]["canonicalDigest"], self.digest(value))
+        self.assertEqual(correlation["source"], "externally-expected-verification-context")
+        self.assertEqual(correlation["hostedRunAttemptUrl"]["value"],
+                         "https://github.com/example/fixture/actions/runs/123456789/attempts/2")
+        self.assertEqual(correlation["hostedJobUrl"], {"presence": False, "status": "unavailable"})
+        context = ci.ExternallyExpectedVerificationContext(
+            **{**vars(self.context()), "verifier_job_id": "987654321"})
+        self.assertEqual(ci._a9_trusted_correlation(context)["hostedJobUrl"]["value"],
+                         "https://github.com/example/fixture/actions/runs/123456789/job/987654321")
+        self.assertNotIn(self.canary, json.dumps(correlation, ensure_ascii=False))
+
+    def test_success_other_platforms_and_eight_command_cap_remain_unchanged(self):
+        left, right = self.record(), self.record(replay=True)
+        canonical = ci._canonical_transcript_record(left)
+        with mock.patch.object(ci, "_a9_learner_failure_detail", side_effect=AssertionError("unexpected")) as build:
+            self.assertEqual(ci.replay_transcript_difference_diagnostics(
+                [canonical], [copy.deepcopy(canonical)], producer_source_records=[left],
+                replay_source_records=[left], expected_context=self.context()), [])
+            build.assert_not_called()
+        context = ci.ExternallyExpectedVerificationContext(**{**vars(self.context()), "runner_os": "Linux"})
+        self.assertNotIn("learnerFailureDetail", self.diagnostics(left, right, context=context)[0])
+        producer = [self.record(ordinal=index) for index in range(10)]
+        replay = [self.record(ordinal=index, replay=True) for index in range(10)]
+        diagnostics = ci.replay_transcript_difference_diagnostics(
+            [ci._canonical_transcript_record(r) for r in producer],
+            [ci._canonical_transcript_record(r) for r in replay],
+            producer_source_records=producer, replay_source_records=replay, expected_context=self.context())
+        self.assertEqual(len(diagnostics), 8)
+        self.assertEqual(sum("learnerFailureDetail" in item for item in diagnostics), 1)
+        original = ci.replay_transcript_difference_diagnostics(
+            [canonical], [ci._canonical_transcript_record(right)],
+            producer_source_records=[left], replay_source_records=[right])
+        current = self.diagnostics(left, right)
+        current[0].pop("learnerFailureDetail")
+        self.assertEqual(current, original)
+
+    def test_construction_failure_preserves_original_categories_and_record_digests(self):
+        original = self.diagnostics()[0]
+        before = {key: value for key, value in original.items() if key != "learnerFailureDetail"}
+        for failure in (RuntimeError(self.canary), TypeError(self.canary), RecursionError(self.canary)):
+            with self.subTest(failure=type(failure).__name__):
+                with mock.patch.object(ci, "_a9_learner_failure_detail", side_effect=failure):
+                    actual = self.diagnostics()[0]
+                self.assertEqual(actual.pop("learnerFailureDetail"),
+                                 {"schemaVersion": 1, "status": "unavailable", "reason": "construction-failed"})
+                self.assertEqual(actual, before)
+
+    def test_comparator_failure_details_do_not_change_inputs_digests_or_rejection(self):
+        spec = synthetic_command_spec("learner-focused", "learner-focused", 0,
+                                      command_role="observation-producing", allowed_exits=[0, 1])
+        spec["profile"] = "frontend"
+        record = synthetic_record_from_spec(spec)
+        record.update(self.record(ordinal=0, replay=True))
+        record["producerObservations"] = []
+        runner = SimpleNamespace(
+            profile="frontend", release_gate_required=False, command_plan=[spec],
+            command_results=[record], observations=[], completed_classes=set(),
+            hard_gate_results=[], violations=[], runtime_closure_digest="4" * 64,
+            dependency_closure_digest="6" * 64, dependency_member_count=0,
+        )
+        ci.finalize_evidence_transcript(runner)
+        runner.execution_binding = synthetic_execution_binding("frontend", runner.command_plan_digest)
+        runner.verifier_execution_binding = synthetic_external_context(runner.execution_binding).verifier_binding()
+        initial = ci.verification_replay_transcript(runner)
+        comparison = empty_comparison()
+        documents = {
+            "command-results.json": {
+                **copy.deepcopy(initial), "commandAuthority": copy.deepcopy(runner.command_plan),
+                "records": copy.deepcopy(runner.command_results), "observations": [],
+                "completedCommandClasses": initial["actualCompletedCommandClasses"],
+            },
+            "summary.json": {
+                **{key: copy.deepcopy(initial[key]) for key in (
+                    "profile", "executionBinding", "executionBindingDigest",
+                    "authorizationContextBinding", "authorizationContextBindingDigest")},
+                "knownDebtsObserved": [], "resolvedCandidates": [], "expectedOmissions": [],
+                "releaseOnlySkips": [],
+            },
+        }
+        accepted, accepted_errors = ci._compare_verification_replay_claims(
+            documents, runner, comparison, expected_context=self.context())
+        self.assertEqual(accepted_errors, [])
+        accepted_without, accepted_errors_without = ci._compare_verification_replay_claims(
+            documents, runner, comparison)
+        self.assertEqual((accepted, accepted_errors), (accepted_without, accepted_errors_without))
+        documents["command-results.json"]["records"][0].update(
+            descendantsTerminated=1, containmentDisposition="forced-terminated")
+
+        before = copy.deepcopy((documents, runner.command_results, runner.observations))
+        original_transcript, original_errors = ci._compare_verification_replay_claims(
+            documents, runner, comparison)
+        self.assertIn("verification replay command execution transcript mismatch", original_errors)
+        prefix = "verification replay first command differences: "
+        def without_detail(errors):
+            cleaned = []
+            for error in errors:
+                if error.startswith(prefix):
+                    value = json.loads(error[len(prefix):])
+                    for item in value:
+                        item.pop("learnerFailureDetail", None)
+                    error = prefix + json.dumps(value, sort_keys=True, separators=(",", ":"))
+                cleaned.append(error)
+            return cleaned
+        for fail in (False, True):
+            manager = (mock.patch.object(ci, "_a9_learner_failure_detail", side_effect=RuntimeError(self.canary))
+                       if fail else contextlib.nullcontext())
+            with manager:
+                transcript, errors = ci._compare_verification_replay_claims(
+                    documents, runner, comparison, expected_context=self.context())
+            self.assertEqual(transcript, original_transcript)
+            self.assertEqual(self.digest(transcript), self.digest(original_transcript))
+            self.assertEqual(without_detail(errors), original_errors)
+            self.assertTrue(errors)
+            self.assertEqual((documents, runner.command_results, runner.observations), before)
+            self.assertNotIn(self.canary, "\n".join(errors))
+
+    def test_verifier_failure_exit_and_stderr_preserve_primary_messages(self):
+        expected = self.context()
+        runner = SimpleNamespace(cleanup_task_resources=mock.Mock())
+        base = ["verification replay command execution transcript mismatch"]
+        for extra in ([], ["verification replay first command differences: " + json.dumps(self.diagnostics())]):
+            stderr = io.StringIO()
+            with tempfile.TemporaryDirectory(prefix="a9-exit-") as temp, \
+                 mock.patch.object(ci, "prepare_verification_authority", return_value=(expected, runner)), \
+                 mock.patch.object(ci, "verify_evidence_with_replay", return_value=(base + extra, None)), \
+                 contextlib.redirect_stderr(stderr):
+                status = ci.main([
+                    "--verify-evidence", "--expected-profile", "all",
+                    "--untrusted-evidence-root", temp,
+                ])
+            self.assertEqual(status, 2)
+            self.assertIn("CI foundation evidence verification failed:", stderr.getvalue())
+            self.assertIn("- verification replay command execution transcript mismatch", stderr.getvalue())
+            self.assertNotIn(self.canary, stderr.getvalue())
+
+    def test_real_direct_node_projection_keeps_forced_termination_ineligible(self):
+        # This existing adapter requires the unchanged production Tool Authority
+        # before using a local Node identity. No runtime exception is embedded.
+        fixture = CI6ReplayVerificationTest()
+        _, good, _ = fixture.direct_node_test_fixture(
+            fixture.node_test_reporter_fixture(), platform_name="windows")
+        bad = copy.deepcopy(good)
+        bad.update(descendantsObserved=1, descendantsReaped=1, descendantsTerminated=1,
+                   containmentDisposition="forced-terminated")
+        good_canonical, bad_canonical = ci._canonical_transcript_record(good), ci._canonical_transcript_record(bad)
+        self.assertIn("semanticSourceOutputDigest", good_canonical)
+        self.assertNotIn("semanticSourceOutputDigest", bad_canonical)
+        self.assertIsNone(ci._validated_direct_node_test_semantic_projection(bad, protected_bundle_valid=True))
+        detail = ci.replay_transcript_difference_diagnostics(
+            [bad_canonical], [good_canonical], producer_source_records=[bad],
+            replay_source_records=[good], expected_context=self.context())[0]["learnerFailureDetail"]
+        self.assertEqual(detail["status"], "available")
+        self.assertEqual(detail["producer"]["comparable"]["stdoutRepresentation"], "canonical-raw-stdout")
+        self.assertEqual(detail["replay"]["comparable"]["stdoutRepresentation"], "direct-node-semantic-v1")
+
 
 
 class CI6ReplayVerificationTest(unittest.TestCase):

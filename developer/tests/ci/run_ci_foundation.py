@@ -21357,16 +21357,352 @@ def _replay_target_input_difference_subcategories(
     return sorted(categories)
 
 
+# Issue #104 A9: failure-only metadata; none of this is an acceptance input.
+_A9_DETAIL_UTF8_LIMIT = 16_384
+_A9_MISSING = object()
+_A9_ENUMS = {
+    "timeoutStatus": frozenset({"within-limit", "TIMED-OUT"}),
+    "outputLimitStatus": frozenset({"within-limit", "OUTPUT-LIMIT-EXCEEDED"}),
+    "executionDurationClass": frozenset({"bounded", "not-started"}),
+    "containment": frozenset({"internal", "not-started", "windows-job-object",
+                              "linux-subreaper-pidfd-proc-supervisor"}),
+    "processTreeStatus": frozenset({"not-applicable", "not-started", "setup-failed",
+                                    "contained-clean", "cleanup-failed"}),
+    "containmentDisposition": frozenset({"not-applicable", "no-descendants",
+        "natural-exit-reaped", "forced-terminated", "survivor", "unknown-ancestry"}),
+    "cleanupState": frozenset({"open", "closed", "failed"}),
+    "observationKind": frozenset({"static-producer-v1", "process-output-v1",
+                                  "standalone-membership-v1", "normalized-fields-v1"}),
+}
+_A9_RAW_FIELDS = (
+    "executed", "started", "setupFailure", "exitCode", "timeoutStatus",
+    "outputLimitStatus", "executionDurationClass", "containment", "processTreeStatus",
+    "containmentDisposition", "descendantsObserved", "descendantsReaped",
+    "descendantsTerminated", "descendantsSurviving", "processTreeError", "error",
+    "limitReason", "protectedTargetBundle.cleanupState",
+    "protectedTargetBundle.mutationDetected", "stdoutBytesObserved", "stdoutSha256",
+    "stdoutByteLimit", "stderrBytesObserved", "stderrSha256", "stderrByteLimit",
+    "directNodeTestRawStreams.stdout", "directNodeTestRawStreams.stderr",
+    "producerObservationSetDigest", "semanticSourceOutputDigest",
+    "producerObservations", "diagnosticPreview", "parsedFailureSummary",
+)
+_A9_OBSERVATION_FIELDS = (
+    "commandOrdinal", "observationOrdinal", "observationKind", "sourceOutputDigest",
+    "producerRecordDigest", "rawStructuredFields", "sourceResultId", "sourcePath",
+    "failurePathAuthority",
+)
+_A9_COMPARABLE_FIELDS = (
+    "stdoutBytesObserved", "stdoutSha256", "stdoutByteLimit",
+    "producerObservationSetDigest", "semanticSourceOutputDigest",
+    "producerObservations", "diagnosticPreview", "parsedFailureSummary",
+)
+
+
+def _a9_value(record: Any, path: str) -> Any:
+    for key in path.split("."):
+        if type(record) is not dict or key not in record:
+            return _A9_MISSING
+        record = record[key]
+    return record
+
+
+def _a9_type(value: Any) -> str:
+    return {type(None): "null", bool: "boolean", int: "integer", float: "number",
+            str: "string", list: "array", dict: "object"}.get(type(value), "unsupported")
+
+
+def _a9_bounded_value(value: Any) -> None:
+    """Bound work before canonical hashing; never stringify an arbitrary object."""
+    budget = [MAX_COMMAND_RESULTS_JSON_BYTES, MAX_EVIDENCE_COLLECTION_ITEMS]
+    def visit(item: Any, depth: int) -> None:
+        budget[1] -= 1
+        if budget[1] < 0 or depth > MAX_EVIDENCE_JSON_DEPTH:
+            raise ValueError("unavailable")
+        kind = type(item)
+        if kind is str:
+            if len(item) > budget[0]:
+                raise ValueError("unavailable")
+            budget[0] -= len(item.encode("utf-8", errors="strict"))
+        elif kind in (dict, list):
+            if len(item) > budget[1]:
+                raise ValueError("unavailable")
+            if kind is dict:
+                for key, child in item.items():
+                    if type(key) is not str:
+                        raise ValueError("unavailable")
+                    visit(key, depth + 1)
+                    visit(child, depth + 1)
+            else:
+                for child in item:
+                    visit(child, depth + 1)
+        elif kind is int:
+            if not -(2 ** 63) <= item < 2 ** 63:
+                raise ValueError("unavailable")
+        elif kind is float:
+            if not math.isfinite(item):
+                raise ValueError("unavailable")
+        elif kind not in (type(None), bool):
+            raise ValueError("unavailable")
+        if budget[0] < 0:
+            raise ValueError("unavailable")
+    visit(value, 0)
+
+
+def _a9_metadata(value: Any) -> dict[str, Any]:
+    if value is _A9_MISSING:
+        return {"presence": False}
+    result: dict[str, Any] = {"presence": True, "type": _a9_type(value)}
+    try:
+        _a9_bounded_value(value)
+        result["canonicalDigest"] = canonical_failure_digest(value)
+        if type(value) is str:
+            result["utf8Bytes"] = len(value.encode("utf-8", errors="strict"))
+        elif type(value) in (dict, list):
+            result["count"] = len(value)
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        result["status"] = "unavailable"
+    return result
+
+
+def _a9_field(record: Any, path: str) -> dict[str, Any]:
+    value = _a9_value(record, path)
+    if value is _A9_MISSING:
+        return {"presence": False}
+    result: dict[str, Any] = {"presence": True, "type": _a9_type(value)}
+    if value is None:
+        return {**result, "status": "null"}
+    name = path.rsplit(".", 1)[-1]
+    valid = False
+    if name in {"executed", "started", "setupFailure", "mutationDetected"}:
+        valid = type(value) is bool
+    elif name in _A9_ENUMS:
+        valid = type(value) is str and value in _A9_ENUMS[name]
+    elif name in {"stdoutSha256", "stderrSha256"}:
+        valid = type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+    elif name in {"producerObservationSetDigest", "semanticSourceOutputDigest",
+                  "sourceOutputDigest", "producerRecordDigest"}:
+        valid = type(value) is str and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None
+    elif name in {"exitCode", "ordinal", "commandOrdinal", "observationOrdinal",
+                  "stdoutBytesObserved", "stderrBytesObserved", "stdoutByteLimit",
+                  "stderrByteLimit", "descendantsObserved", "descendantsReaped",
+                  "descendantsTerminated", "descendantsSurviving"}:
+        maximum = (255 if name == "exitCode" else
+                   4096 if name.startswith("descendants") else
+                   MAX_PROFILE_COMMANDS - 1 if name in {"ordinal", "commandOrdinal"} else
+                   MAX_EVIDENCE_COLLECTION_ITEMS - 1 if name == "observationOrdinal" else
+                   MAX_RECORDED_STREAM_BYTES)
+        valid = type(value) is int and 0 <= value <= maximum
+    else:
+        return _a9_metadata(value)
+    if valid:
+        return {**result, "value": value}
+    return {**_a9_metadata(value), "status": "invalid"}
+
+
+def _a9_stream(record: Any, stream: str) -> dict[str, Any]:
+    value = _a9_value(record, "directNodeTestRawStreams." + stream)
+    result = _a9_metadata(value)
+    if type(value) is str and "canonicalDigest" in result:
+        data = value.encode("utf-8", errors="strict")
+        if len(data) <= MAX_RECORDED_STREAM_BYTES:
+            result["sha256"] = hashlib.sha256(data).hexdigest()
+        else:
+            return {"presence": True, "type": "string", "status": "oversized"}
+    return result
+
+
+def _a9_values_equal(left: Any, right: Any) -> bool:
+    if left is _A9_MISSING or right is _A9_MISSING:
+        return left is right
+    _a9_bounded_value(left)
+    _a9_bounded_value(right)
+    return _json_bytes(left) == _json_bytes(right)
+
+
+def _a9_changed_fields(left: Any, right: Any, fields: Sequence[str]) -> list[str]:
+    return [name for name in fields
+            if not _a9_values_equal(_a9_value(left, name), _a9_value(right, name))]
+
+
+def _a9_source_corresponds(source: Any, comparable: Any) -> bool:
+    if type(source) is not dict or type(comparable) is not dict:
+        return False
+    _a9_bounded_value(source)
+    _a9_bounded_value(comparable)
+    # Full correspondence, not a join on producer-supplied command labels.
+    # This pure projection validates correspondence only; it grants no admission.
+    return _json_bytes(_canonical_transcript_record(source)) == _json_bytes(comparable)
+
+
+def _a9_record_facts(source: dict[str, Any], comparable: dict[str, Any]) -> dict[str, Any]:
+    raw = {name: _a9_field(source, name) for name in _A9_RAW_FIELDS}
+    for stream in ("stdout", "stderr"):
+        raw["directNodeTestRawStreams." + stream] = _a9_stream(source, stream)
+    raw["sourceOutputDigest"] = _a9_field(
+        {"sourceOutputDigest": command_output_digest(source)}, "sourceOutputDigest")
+    semantic = _a9_field(comparable, "semanticSourceOutputDigest")
+    return {
+        "rawRecordDigest": canonical_failure_digest(source),
+        "comparableRecordDigest": canonical_failure_digest(comparable),
+        "raw": raw,
+        "comparable": {
+            "stdoutRepresentation": (
+                "direct-node-semantic-v1"
+                if "value" in semantic and "directNodeTestRawStreams" not in comparable
+                and type(source.get("directNodeTestRawStreams")) is dict
+                else "canonical-raw-stdout"
+            ),
+            **{name: _a9_field(comparable, name) for name in _A9_COMPARABLE_FIELDS},
+        },
+        "eligibilityObservations": {
+            "zeroTerminatedDescendants": (
+                {"presence": True, "value": source["descendantsTerminated"] == 0}
+                if type(source.get("descendantsTerminated")) is int
+                and 0 <= source["descendantsTerminated"] <= 4096
+                else {"presence": "descendantsTerminated" in source, "status": "unavailable"}
+            ),
+            "naturalOrNoDescendantDisposition": (
+                {"presence": True, "value": source["containmentDisposition"] in {
+                    "natural-exit-reaped", "no-descendants"}}
+                if type(source.get("containmentDisposition")) is str
+                and source["containmentDisposition"] in _A9_ENUMS["containmentDisposition"]
+                else {"presence": "containmentDisposition" in source, "status": "unavailable"}
+            ),
+            "comparableSemanticSourceOutputDigestPresent": "semanticSourceOutputDigest" in comparable,
+        },
+    }
+
+
+def _a9_first_unequal_observation(
+    producer: dict[str, Any], replay: dict[str, Any],
+    producer_source: dict[str, Any], replay_source: dict[str, Any],
+) -> dict[str, Any]:
+    left, right = producer.get("producerObservations"), replay.get("producerObservations")
+    if type(left) is not list or type(right) is not list:
+        return {"presence": False, "status": "unavailable"}
+    if max(len(left), len(right)) > MAX_EVIDENCE_COLLECTION_ITEMS:
+        return {"presence": False, "status": "oversized"}
+    for index in range(max(len(left), len(right))):
+        lvalue = left[index] if index < len(left) else _A9_MISSING
+        rvalue = right[index] if index < len(right) else _A9_MISSING
+        if _a9_values_equal(lvalue, rvalue):
+            continue
+        detail: dict[str, Any] = {
+            "presence": True, "index": index,
+            "changedFields": _a9_changed_fields(lvalue, rvalue, _A9_OBSERVATION_FIELDS),
+        }
+        for side, value, source in (("producer", lvalue, producer_source),
+                                    ("replay", rvalue, replay_source)):
+            observations = source.get("producerObservations")
+            raw = (observations[index] if type(observations) is list
+                   and index < len(observations) else _A9_MISSING)
+            corresponds = type(value) is dict and type(raw) is dict and all(
+                type(raw.get(key)) is int and raw[key] == value.get(key)
+                for key in ("commandOrdinal", "observationOrdinal")
+            ) and raw["commandOrdinal"] == source["ordinal"] and raw["observationOrdinal"] == index
+            detail[side] = {
+                "comparable": {name: _a9_field(value, name) for name in _A9_OBSERVATION_FIELDS},
+                "raw": (
+                    {"presence": True, "representation": "same-side-comparable"}
+                    if corresponds and _a9_values_equal(raw, value) else
+                    {name: _a9_field(raw, name) for name in _A9_OBSERVATION_FIELDS}
+                    if corresponds else {"presence": False, "status": "unavailable"}
+                ),
+            }
+        return detail
+    return {"presence": False, "status": "equal"}
+
+
+def _a9_trusted_correlation(context: ExternallyExpectedVerificationContext) -> dict[str, Any]:
+    fields = {
+        "repository": "repository", "checkoutCommit": "checkout_commit",
+        "checkoutTree": "checkout_tree", "runId": "run_id", "runAttempt": "run_attempt",
+        "producerJobId": "producer_job_id", "verifierJobId": "verifier_job_id",
+        "producerInvocationId": "producer_invocation_id",
+        "verifierInvocationId": "verifier_invocation_id",
+    }
+    result = {name: _a9_metadata(getattr(context, attr)) for name, attr in fields.items()}
+    result["source"] = "externally-expected-verification-context"
+    result["authorizationContextDigest"] = _a9_metadata(context.authorization_context_binding())
+    # Existing trusted job identities can be workflow job keys rather than API
+    # numeric IDs. Do not fabricate a numeric job link or read new authority.
+    result["hostedJobUrl"] = {"presence": False, "status": "unavailable"}
+    result["hostedRunAttemptUrl"] = {"presence": False, "status": "unavailable"}
+    if (context.binding_mode == "github-actions" and type(context.repository) is str
+        and re.fullmatch(r"[A-Za-z0-9_-]{1,100}/[A-Za-z0-9_.-]{1,100}", context.repository)
+        and context.repository.split("/")[1] not in {".", ".."}
+        and all(type(value) is str and re.fullmatch(r"[1-9][0-9]{0,19}", value)
+                for value in (context.run_id, context.run_attempt))):
+        run_url = f"https://github.com/{context.repository}/actions/runs/{context.run_id}"
+        result["hostedRunAttemptUrl"] = {
+            "presence": True, "value": run_url + "/attempts/" + context.run_attempt,
+        }
+        if (type(context.verifier_job_id) is str
+            and re.fullmatch(r"[1-9][0-9]{0,19}", context.verifier_job_id)):
+            result["hostedJobUrl"] = {
+                "presence": True, "value": run_url + "/job/" + context.verifier_job_id,
+            }
+    return result
+
+
+def _a9_bounded_detail(detail: dict[str, Any]) -> dict[str, Any]:
+    serialized = json.dumps(detail, ensure_ascii=True, sort_keys=True,
+                            separators=(",", ":"), allow_nan=False).encode("utf-8")
+    if len(serialized) <= _A9_DETAIL_UTF8_LIMIT:
+        return detail
+    return {"schemaVersion": 1, "status": "unavailable", "reason": "detail-byte-limit"}
+
+
+def _a9_learner_failure_detail(
+    producer: dict[str, Any], replay: dict[str, Any], *,
+    producer_source: Any, replay_source: Any,
+    expected_context: ExternallyExpectedVerificationContext,
+) -> dict[str, Any]:
+    detail: dict[str, Any] = {
+        "schemaVersion": 1, "status": "unavailable", "reason": "source-correspondence",
+    }
+    if not (_a9_source_corresponds(producer_source, producer)
+            and _a9_source_corresponds(replay_source, replay)):
+        return detail
+    for record in (producer, replay, producer_source, replay_source):
+        if (record.get("commandId") != "learner-focused"
+            or record.get("commandClass") != "learner-focused"
+            or type(record.get("ordinal")) is not int
+            or not 0 <= record["ordinal"] < MAX_PROFILE_COMMANDS):
+            return detail
+    if len({record["ordinal"] for record in (producer, replay, producer_source, replay_source)}) != 1:
+        return detail
+    if producer_source.get("platform") != "windows" or replay_source.get("platform") != "windows":
+        return detail
+    detail = {
+        "schemaVersion": 1, "status": "available",
+        "commandId": "learner-focused", "commandClass": "learner-focused",
+        "ordinal": producer["ordinal"],
+        "commandIdDigest": "sha256:" + hashlib.sha256(b"learner-focused").hexdigest(),
+        "correlation": _a9_trusted_correlation(expected_context),
+        "producer": _a9_record_facts(producer_source, producer),
+        "replay": _a9_record_facts(replay_source, replay),
+        "changedRawFields": _a9_changed_fields(producer_source, replay_source, _A9_RAW_FIELDS),
+        "changedComparableFields": _a9_changed_fields(producer, replay, _A9_RAW_FIELDS),
+        "firstUnequalObservation": _a9_first_unequal_observation(
+            producer, replay, producer_source, replay_source),
+    }
+    return _a9_bounded_detail(detail)
+
+
+
 def replay_transcript_difference_diagnostics(
     producer_records: Sequence[Mapping[str, Any]],
     replay_records: Sequence[Mapping[str, Any]],
     *,
     producer_source_records: Sequence[Mapping[str, Any]] | None = None,
     replay_source_records: Sequence[Mapping[str, Any]] | None = None,
+    expected_context: ExternallyExpectedVerificationContext | None = None,
 ) -> list[dict[str, Any]]:
     """Describe at most eight unequal canonical records; never authorize replay."""
 
     diagnostics: list[dict[str, Any]] = []
+    learner_detail_emitted = False
     for index in range(max(len(producer_records), len(replay_records))):
         producer = producer_records[index] if index < len(producer_records) else None
         replay = replay_records[index] if index < len(replay_records) else None
@@ -21404,6 +21740,28 @@ def replay_transcript_difference_diagnostics(
                     else None
                 ),
             ))
+        if (not learner_detail_emitted and producer is not None and replay is not None
+            and producer.get("commandId") == replay.get("commandId") == "learner-focused"
+            and type(expected_context) is ExternallyExpectedVerificationContext
+            and expected_context.runner_os == "Windows"):
+            learner_detail_emitted = True
+            try:
+                diagnostic["learnerFailureDetail"] = _a9_learner_failure_detail(
+                    producer, replay,
+                    producer_source=(producer_source_records[index]
+                        if producer_source_records is not None and index < len(producer_source_records)
+                        else None),
+                    replay_source=(replay_source_records[index]
+                        if replay_source_records is not None and index < len(replay_source_records)
+                        else None),
+                    expected_context=expected_context,
+                )
+            except Exception:
+                # The already established rejection and its original diagnostic
+                # survive every failure of this optional observational extension.
+                diagnostic["learnerFailureDetail"] = {
+                    "schemaVersion": 1, "status": "unavailable", "reason": "construction-failed",
+                }
         diagnostics.append(diagnostic)
         if len(diagnostics) == _MAX_REPLAY_TRANSCRIPT_DIAGNOSTICS:
             break
@@ -24059,6 +24417,7 @@ def _compare_verification_replay_claims(
     *,
     comparison_views: Mapping[str, Any] | None = None,
     collection_views: Mapping[str, Any] | None = None,
+    expected_context: ExternallyExpectedVerificationContext | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Aggregate exact command differences, with only proven portable views."""
     transcript, errors = _verification_replay_eligibility(documents, runner, comparison)
@@ -24086,6 +24445,7 @@ def _compare_verification_replay_claims(
                     record for record in evidence_records if isinstance(record, Mapping)
                 ],
                 replay_source_records=runner.command_results,
+                expected_context=expected_context,
             )
             if diagnostics:
                 errors.append("verification replay first command differences: " + json.dumps(
@@ -24206,8 +24566,8 @@ def _run_verification_replay(
     )
     if comparison is None:
         return None, errors
-    transcript, comparison_errors = compare_verification_replay_claims(
-        documents, verification_runner, comparison,
+    transcript, comparison_errors = _compare_verification_replay_claims(
+        documents, verification_runner, comparison, expected_context=expected_context,
     )
     errors.extend(comparison_errors)
     return _finish_verification_replay(
@@ -24993,7 +25353,7 @@ def verify_evidence_with_replay(
                             documents, verification_runner, comparison, views) if not errors else None)
                         transcript, comparison_errors = _compare_verification_replay_claims(
                             documents, verification_runner, comparison, comparison_views=views,
-                            collection_views=collection_views,
+                            collection_views=collection_views, expected_context=expected_context,
                         )
                     except (OSError, AttributeError, KeyError, TypeError, ValueError) as exc:
                         return sorted(set(errors + [
