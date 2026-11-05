@@ -2743,6 +2743,293 @@ def _secure_regular_file(path: Path) -> tuple[bool, str]:
     return True, ""
 
 
+# Issue #104 A6: qualified Ubuntu Archive supply, independent of producer evidence.
+A6_GIT_SNAPSHOT = "https://snapshot.ubuntu.com/ubuntu/20261028T000000Z/"
+A6_GIT_SIGNING_KEY = "F6ECB3762474EDA9D21B7022871920D1991BC93C"
+A6_GIT_PACKAGE_VERSION = "1:2.43.0-1ubuntu7.4"
+A6_GIT_ARCHIVE_PATH = "pool/main/g/git/git_2.43.0-1ubuntu7.4_amd64.deb"
+A6_GIT_PATH = "/usr/bin/git"
+A6_GIT_SHA256 = "eb54b535467e0975c1284d4c4d08eea779aeb248a5d34b02e2ee171382e22201"
+A6_GIT_SIZE = 4_066_232
+A6_GIT_SUPPLY = MappingProxyType({
+    "InRelease": ("03b4a340344bee27fe5de728cf9060b9a30a102a85ca30f25c209980c0d4f184", 126_127),
+    "Packages.xz": ("b1966b71cca741b2253ffe9c14bb14c5eeb0032ee6f065d9d0e454e372ef5b58", 1_146_096),
+    "Packages": ("6aca30ff476fab7b627369a756b02b1ac59cf59b01776f8c9b0b144dec301ce7", 6_241_173),
+    "git.deb": ("c79b7948ef9860c97ec74293a90178676e63368a0711c95c28a55af4edf1adab", 3_680_654),
+})
+A6_GIT_JOBS = frozenset({
+    "repository-policy-producer", "ubuntu-canonical-producer",
+    "repository-policy", "ubuntu-canonical",
+})
+A6_GIT_PROVISION_COMMAND = (
+    'sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_ARCH -- '
+    '"$pythonLocation/bin/python" -I -B developer/tests/ci/run_ci_foundation.py '
+    '--provision-authenticated-git'
+)
+A6_GIT_PROVISION_STEP = MappingProxyType({
+    "name": "Provision authenticated Ubuntu Git",
+    "shell": "bash",
+    "run": A6_GIT_PROVISION_COMMAND,
+})
+A6_WORKFLOW_SHA256 = frozenset({
+    '233461e15af069c501074aa091fafb4fdb22dd8d8a80e431e1fd2a29ab798666',
+    '5dcf45101a4ad5f147b6f2011d3fa96023175bb759d486b81aa9d3174903acff',
+})
+A6_HISTORICAL_WORKFLOW_SHA256 = frozenset({
+    '126d341de4e7efdbd2a9fada79fc9aad01180de353a91e193d2313c348e5513e',
+    '2f72bb442faeb43ab200a0058d97755801c1073abf82e2f642507c76646121e9',
+    '424e61cc604a05850799d947e7e6071d4fd767b741e1311ad332974efbf258c0',
+    '5f75af5ed06ff08e1804cfb04079eeefd3bdddb7e3561dc60856ca5df349efe9',
+    '67824377f673ff821a8a769a1884c9908b46b7ae365a7d78077a63939547b6c7',
+    '67db5c35542ebf3993b02fdd13102ff929d7d159674bf32d9406d5a09b4f433a',
+    'b1836c822e1d9742bf82bffca67f1a421ca74a82e00b68860448c251bc6b3f0f',
+    'c406e7277affaa37a9debf7782572e39078e81156295bdb19c8c7037d41e9fbf',
+})
+
+
+def _a6_git_required(repo_root: Path, platform_name: str) -> bool:
+    # The source profile, never a caller environment switch, selects Ubuntu A6.
+    if platform_name == "Windows":
+        return False
+    digest = hashlib.sha256(
+        (repo_root / ".github" / "workflows" / "ci.yml").read_bytes()
+    ).hexdigest()
+    if digest in A6_WORKFLOW_SHA256:
+        return True
+    if digest in A6_HISTORICAL_WORKFLOW_SHA256:
+        return False
+    raise OSError("Git workflow source authority is not recognized")
+
+
+def _a6_verify_bytes(content: bytes, identity: tuple[str, int], label: str) -> None:
+    digest, size = identity
+    if len(content) != size or hashlib.sha256(content).hexdigest() != digest:
+        raise ValueError(f"A6 {label} identity mismatch")
+
+
+def _a6_download(relative: str, destination: Path, label: str) -> bytes:
+    from urllib.request import urlopen
+
+    identity = A6_GIT_SUPPLY[label]
+    with urlopen(A6_GIT_SNAPSHOT + relative, timeout=60) as response:
+        if urlsplit(response.url).scheme != "https":
+            raise ValueError("A6 supply transport is not HTTPS")
+        content = response.read(identity[1] + 1)
+    _a6_verify_bytes(content, identity, label)
+    with destination.open("xb") as output:
+        output.write(content)
+    return content
+
+
+def _a6_deb822(text: str) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    record: dict[str, str] = {}
+    field_name = ""
+    for line in [*text.splitlines(), ""]:
+        if not line:
+            if record:
+                records.append(record)
+            record, field_name = {}, ""
+        elif line[0] in " \t":
+            if not field_name:
+                raise ValueError("A6 metadata has an orphan continuation")
+            record[field_name] += "\n" + line[1:]
+        else:
+            field_name, separator, value = line.partition(":")
+            if not separator or not field_name or field_name in record:
+                raise ValueError("A6 metadata has an invalid or duplicate field")
+            record[field_name] = value.strip()
+    return records
+
+
+def _a6_verify_release_signature(stage: Path) -> bytes:
+    completed = subprocess.run(
+        ["/usr/bin/gpgv", "--homedir", str(stage), "--keyring",
+         "/usr/share/keyrings/ubuntu-archive-keyring.gpg", "--status-fd", "1",
+         "--output", str(stage / "Release"), str(stage / "InRelease")],
+        cwd=stage, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        check=False, timeout=60,
+    )
+    statuses = [line.split() for line in completed.stdout.decode("ascii", errors="strict").splitlines()]
+    valid = [parts for parts in statuses if parts[:2] == ["[GNUPG:]", "VALIDSIG"]]
+    rejected = {"BADSIG", "ERRSIG", "EXPSIG", "EXPKEYSIG", "REVKEYSIG", "NO_PUBKEY", "NODATA", "FAILURE"}
+    if (
+        completed.returncode != 0 or len(valid) != 1
+        or len(valid[0]) not in {11, 12}
+        or valid[0][2] != A6_GIT_SIGNING_KEY
+        or (len(valid[0]) == 12 and valid[0][-1] != A6_GIT_SIGNING_KEY)
+        or any(len(parts) > 1 and parts[1] in rejected for parts in statuses)
+    ):
+        raise ValueError("A6 Ubuntu Archive signature or signing identity rejected")
+    return (stage / "Release").read_bytes()
+
+
+def _a6_verify_release_metadata(release: bytes) -> None:
+    records = _a6_deb822(release.decode("utf-8", errors="strict"))
+    if len(records) != 1:
+        raise ValueError("A6 Release metadata is not one record")
+    record = records[0]
+    if any(record.get(key) != value for key, value in {
+        "Origin": "Ubuntu", "Label": "Ubuntu", "Suite": "noble-security", "Codename": "noble",
+    }.items()) or "amd64" not in record.get("Architectures", "").split():
+        raise ValueError("A6 Release distribution identity mismatch")
+    members: dict[str, tuple[str, int]] = {}
+    for line in record.get("SHA256", "").splitlines():
+        if not line.strip():
+            continue
+        fields = line.split()
+        if len(fields) != 3 or fields[2] in members or not fields[1].isdigit():
+            raise ValueError("A6 Release SHA256 inventory is malformed")
+        members[fields[2]] = (fields[0], int(fields[1]))
+    for label in ("Packages.xz", "Packages"):
+        if members.get("main/binary-amd64/" + label) != A6_GIT_SUPPLY[label]:
+            raise ValueError("A6 Release package-index binding mismatch")
+
+
+def _a6_verify_package_metadata(packages: bytes) -> None:
+    records = _a6_deb822(packages.decode("utf-8", errors="strict"))
+    matches = [record for record in records if record.get("Package") == "git"]
+    expected_hash, expected_size = A6_GIT_SUPPLY["git.deb"]
+    expected = {
+        "Package": "git", "Version": A6_GIT_PACKAGE_VERSION, "Architecture": "amd64",
+        "Filename": A6_GIT_ARCHIVE_PATH, "SHA256": expected_hash, "Size": str(expected_size),
+    }
+    if len(matches) != 1 or any(matches[0].get(key) != value for key, value in expected.items()):
+        raise ValueError("A6 package identity or archive binding mismatch")
+
+
+def _a6_verify_executable_bytes(content: bytes) -> None:
+    _a6_verify_bytes(content, (A6_GIT_SHA256, A6_GIT_SIZE), "Git executable")
+    if content[:6] != b"\x7fELF\x02\x01" or content[18:20] != b"\x3e\x00":
+        raise ValueError("A6 Git executable is not ELF64 x86-64")
+
+
+def _a6_stage_git(stage: Path) -> Path:
+    """Authenticate the entire pinned supply before extracting its one executable."""
+    import lzma
+    import tarfile
+
+    _a6_download("dists/noble-security/InRelease", stage / "InRelease", "InRelease")
+    _a6_verify_release_metadata(_a6_verify_release_signature(stage))
+    compressed = _a6_download(
+        "dists/noble-security/main/binary-amd64/Packages.xz",
+        stage / "Packages.xz", "Packages.xz",
+    )
+    decoder = lzma.LZMADecompressor()
+    packages = decoder.decompress(compressed, max_length=A6_GIT_SUPPLY["Packages"][1] + 1)
+    if not decoder.eof or decoder.unused_data:
+        raise ValueError("A6 package index compression is not exact")
+    _a6_verify_bytes(packages, A6_GIT_SUPPLY["Packages"], "Packages")
+    _a6_verify_package_metadata(packages)
+    _a6_download(A6_GIT_ARCHIVE_PATH, stage / "git.deb", "git.deb")
+    completed = subprocess.run(
+        ["/usr/bin/dpkg-deb", "--fsys-tarfile", str(stage / "git.deb")],
+        cwd=stage, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        check=False, timeout=60,
+    )
+    if completed.returncode != 0:
+        raise ValueError("A6 authenticated package extraction failed")
+    with tarfile.open(fileobj=io.BytesIO(completed.stdout), mode="r:") as archive:
+        members = [member for member in archive if member.name in {"./usr/bin/git", "usr/bin/git"}]
+        if len(members) != 1:
+            raise ValueError("A6 package must contain exactly one Git executable")
+        member = members[0]
+        if (not member.isfile() or member.mode != 0o755 or member.uid != 0
+                or member.gid != 0 or member.size != A6_GIT_SIZE):
+            raise ValueError("A6 package Git member type, permissions or size rejected")
+        source = archive.extractfile(member)
+        if source is None:
+            raise ValueError("A6 package Git member is unavailable")
+        with source:
+            content = source.read(A6_GIT_SIZE + 1)
+    _a6_verify_executable_bytes(content)
+    executable = stage / "git"
+    with executable.open("xb") as output:
+        output.write(content)
+    executable.chmod(0o755)
+    return executable
+
+
+def _a6_git_identity_error(
+    path: Path, *, digest: str, size: int,
+) -> str | None:
+    """Recheck filesystem authority as well as the immutable measured identity."""
+    try:
+        metadata = path.lstat()
+        if str(path) != A6_GIT_PATH or str(path.resolve(strict=True)) != A6_GIT_PATH:
+            return "A6 Git canonical destination mismatch"
+        if (not stat.S_ISREG(metadata.st_mode) or _is_reparse_point(metadata)
+                or metadata.st_nlink != 1):
+            return "A6 Git must be a regular, unlinked executable"
+        if metadata.st_uid != 0 or metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) != 0o755:
+            return "A6 Git ownership or permissions mismatch"
+        for directory in (path.parent, *path.parent.parents):
+            entry = directory.lstat()
+            if (not stat.S_ISDIR(entry.st_mode) or entry.st_uid != 0
+                    or entry.st_mode & 0o022 or directory.resolve(strict=True) != directory):
+                return "A6 Git installation root is unsafe"
+        if (size != A6_GIT_SIZE or metadata.st_size != A6_GIT_SIZE
+                or digest != A6_GIT_SHA256):
+            return "A6 Git executable identity mismatch"
+    except OSError:
+        return "A6 Git executable identity is unavailable"
+    return None
+
+
+def _a6_install_git(staged: Path) -> None:
+    destination = Path(A6_GIT_PATH)
+    parent = destination.parent
+    for directory in (parent, *parent.parents):
+        metadata = directory.lstat()
+        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0
+                or metadata.st_mode & 0o022 or directory.resolve(strict=True) != directory):
+            raise ValueError("A6 Git installation root is unsafe")
+    if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+        raise ValueError("A6 Git destination is not a regular file")
+    _a6_verify_executable_bytes(staged.read_bytes())
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".ci-a6-git-", dir=parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(staged.read_bytes())
+            output.flush()
+            os.fsync(output.fileno())
+            os.fchown(output.fileno(), 0, 0)
+            os.fchmod(output.fileno(), 0o755)
+        os.replace(temporary, destination)
+        error = _a6_git_identity_error(
+            destination, digest=_sha256_file(destination), size=destination.stat().st_size,
+        )
+        if error:
+            raise ValueError(error)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def provision_authenticated_git() -> None:
+    # This privileged path is only used by ephemeral hosted Ubuntu jobs.
+    if (sys.platform != "linux" or os.geteuid() != 0 or platform.machine() != "x86_64"
+            or any(os.environ.get(key) != value for key, value in {
+                "GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted",
+                "RUNNER_OS": "Linux", "RUNNER_ARCH": "X64",
+            }.items())):
+        raise ValueError("A6 provisioning requires an ephemeral hosted Ubuntu amd64 runner")
+    distribution = platform.freedesktop_os_release()
+    if distribution.get("ID") != "ubuntu" or distribution.get("VERSION_ID") != "24.04":
+        raise ValueError("A6 provisioning requires Ubuntu 24.04")
+    if not _a6_git_required(REPO_ROOT, "Linux"):
+        raise ValueError("A6 provisioning requires the exact authorized workflow")
+    with tempfile.TemporaryDirectory(prefix="ci-a6-git-", dir="/var/tmp") as temporary:
+        stage = Path(temporary)
+        metadata = stage.lstat()
+        if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise ValueError("A6 staging directory is not private and root-owned")
+        _a6_install_git(_a6_stage_git(stage))
+    print("Authenticated Ubuntu Git provisioned: " + A6_GIT_SHA256)
+
+
 TOOL_AUTHORITY_UNAVAILABLE_CODE = "CI_TOOL_AUTHORITY_UNAVAILABLE"
 WINDOWS_GIT_EXECUTABLE_SUFFIXES = (
     ("bin", "git.exe"),
@@ -4593,6 +4880,15 @@ def resolve_trusted_tools(
                 entry["classification"] = classification
             diagnostics.append(entry)
 
+    git_requires_pin = False
+    git_source_invalid = False
+    if "git" in requested and not selected_policy.synthetic:
+        try:
+            git_requires_pin = _a6_git_required(repo_root, selected_policy.platform_name)
+        except OSError:
+            record_issue(ToolAuthorityIssue("git", TOOL_CANDIDATE_INVALID))
+            git_source_invalid = True
+
     for override in (
         "NODE_EXE",
         "NPM_EXE",
@@ -4861,6 +5157,17 @@ def resolve_trusted_tools(
                 )
             )
             continue
+        if name == "git" and git_requires_pin:
+            try:
+                identity_error = _a6_git_identity_error(
+                    canonical_candidate, digest=_sha256_file(canonical_candidate),
+                    size=canonical_candidate.stat().st_size,
+                )
+            except OSError:
+                identity_error = "A6 Git executable cannot be measured"
+            if identity_error:
+                record_issue(ToolAuthorityIssue("git", TOOL_IDENTITY_DRIFT))
+                continue
         resolved_tools[name] = str(canonical_candidate)
     if windows_git_bash:
         git = resolved_tools.get("git")
@@ -4920,6 +5227,9 @@ def resolve_trusted_tools(
                                 entry["pathShadowDisposition"] = "accepted"
                                 break
                     resolved_tools["bash"] = bash
+    if git_source_invalid:
+        # Preserve PATH/override diagnostics without admitting unknown source authority.
+        resolved_tools.clear()
     return resolved_tools, sorted(set(errors))
 
 
@@ -7803,7 +8113,9 @@ def _validate_action_step(step: Mapping[str, Any], label: str, errors: list[str]
     return repository
 
 
-def _validate_workflow_steps(job_name: str, steps: Any, errors: list[str]) -> None:
+def _validate_workflow_steps(
+    job_name: str, steps: Any, errors: list[str], *, a6: bool = False,
+) -> None:
     if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
         errors.append(f"{job_name}.steps must be a sequence of mappings")
         return
@@ -7868,10 +8180,13 @@ def _validate_workflow_steps(job_name: str, steps: Any, errors: list[str]) -> No
             "Require every fresh verifier to succeed",
         ],
     }[job_name]
+    if a6 and job_name in A6_GIT_JOBS:
+        expected_names.insert(3, A6_GIT_PROVISION_STEP["name"])
     names = [step.get("name") for step in steps]
     if names != expected_names:
         errors.append(f"{job_name} step graph/order is not exact")
     trusted_scripts = {
+        *({A6_GIT_PROVISION_COMMAND} if a6 and job_name in A6_GIT_JOBS else set()),
         LINUX_RUNTIME_CAPTURE,
         LINUX_RUNTIME_CAPTURE_FRESH,
         WINDOWS_RUNTIME_CAPTURE,
@@ -7899,6 +8214,10 @@ def _validate_workflow_steps(job_name: str, steps: Any, errors: list[str]) -> No
     by_name = {str(step.get("name")): step for step in steps}
     if len(by_name) != len(steps):
         errors.append(f"{job_name} contains duplicate step names")
+    if a6 and job_name in A6_GIT_JOBS:
+        provisioning = by_name.get(A6_GIT_PROVISION_STEP["name"], {})
+        if tuple(provisioning) != tuple(A6_GIT_PROVISION_STEP) or provisioning != A6_GIT_PROVISION_STEP:
+            errors.append(f"{job_name} authenticated Git provisioning is not exact")
     checkout = by_name.get("Check out repository", {})
     if job_name != "final-result":
         if tuple(checkout) != ("name", "uses", "with") or checkout.get("with") != {
@@ -7912,7 +8231,7 @@ def _validate_workflow_steps(job_name: str, steps: Any, errors: list[str]) -> No
 
     setup_python = by_name.get("Set up Python", {})
     if job_name != "final-result":
-        if tuple(setup_python) != ("name", "uses", "with") or setup_python.get("with") != {"python-version": "3.12"}:
+        if tuple(setup_python) != ("name", "uses", "with") or setup_python.get("with") != {"python-version": "3.12.10"}:
             errors.append(f"{job_name} Python setup is not exact")
         if setup_python.get("uses") != f"actions/setup-python@{APPROVED_ACTIONS['actions/setup-python']['sha']}":
             errors.append(f"{job_name} Python action pin is not exact")
@@ -8114,8 +8433,18 @@ def check_workflow_text(text: str) -> list[str]:
     ):
         return sorted(set(errors + _validate_scalar_token_policy(workflow)))
 
+    # Issue #104 A4.1 admits only these exact LF/CRLF workflow sources.
+    a4_1_workflow_sha256 = (
+        "b1836c822e1d9742bf82bffca67f1a421ca74a82e00b68860448c251bc6b3f0f",
+        "424e61cc604a05850799d947e7e6071d4fd767b741e1311ad332974efbf258c0",
+    )
+    workflow_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    a6 = workflow_digest in A6_WORKFLOW_SHA256
+    repository_policy_timeout = (
+        "35" if a6 or workflow_digest in a4_1_workflow_sha256 else "20"
+    )
     job_schemas = {
-        "repository-policy-producer": (("name", "runs-on", "timeout-minutes", "steps"), "Repository policy producer (untrusted evidence)", None, "ubuntu-latest", "20"),
+        "repository-policy-producer": (("name", "runs-on", "timeout-minutes", "steps"), "Repository policy producer (untrusted evidence)", None, "ubuntu-latest", repository_policy_timeout),
         "ubuntu-canonical-producer": (("name", "runs-on", "timeout-minutes", "steps"), "Ubuntu canonical producer (untrusted evidence)", None, "ubuntu-latest", "45"),
         "windows-compatibility-producer": (("name", "runs-on", "timeout-minutes", "steps"), "Windows compatibility producer (untrusted evidence)", None, "windows-latest", "45"),
         "repository-policy": (("name", "needs", "runs-on", "timeout-minutes", "steps"), "Repository policy", ["repository-policy-producer"], "ubuntu-latest", "25"),
@@ -8125,13 +8454,15 @@ def check_workflow_text(text: str) -> list[str]:
     }
     for job_name, (keys, display_name, needs, runner_name, timeout_value) in job_schemas.items():
         job = jobs.get(job_name)
+        if a6 and job_name in A6_GIT_JOBS:
+            runner_name = "ubuntu-24.04"
         if not _require_exact_keys(job, keys, f"job {job_name}", errors):
             continue
         if job.get("name") != display_name or job.get("runs-on") != runner_name or job.get("timeout-minutes") != timeout_value:
             errors.append(f"job {job_name} metadata is not exact")
         if needs is not None and job.get("needs") != needs:
             errors.append(f"job {job_name} needs graph is not exact")
-        _validate_workflow_steps(job_name, job.get("steps"), errors)
+        _validate_workflow_steps(job_name, job.get("steps"), errors, a6=a6)
     _validate_final_result_semantics(jobs["final-result"], errors)
     errors.extend(_validate_scalar_token_policy(workflow))
     for warning in TRUST_WARNING_LINES:
@@ -14478,7 +14809,9 @@ class ExecutableIdentityLease:
         *,
         repo_root: Path = REPO_ROOT,
         allow_dependency_root: bool = False,
+        require_authenticated_git: bool = False,
     ) -> None:
+        self.require_authenticated_git = require_authenticated_git
         candidate = Path(path)
         if not candidate.is_absolute():
             raise OSError(f"{role} path is not absolute")
@@ -14604,8 +14937,13 @@ class ExecutableIdentityLease:
                     return False, f"{self.role} descriptor identity drifted"
                 if _stable_file_identity(path.lstat()) != self._initial_identity:
                     return False, f"{self.role} path identity drifted"
-            if self._hash_open_identity() != self.expected_sha256:
+            digest = self._hash_open_identity()
+            if digest != self.expected_sha256:
                 return False, f"{self.role} SHA-256 drifted"
+            if self.require_authenticated_git:
+                error = _a6_git_identity_error(path, digest=digest, size=self.expected_size)
+                if error:
+                    return False, error
         except OSError as exc:
             return False, f"{self.role} lease verification failed: {type(exc).__name__}"
         return True, None
@@ -14849,6 +15187,7 @@ class RuntimeDependencyClosure:
         repo_root: Path = REPO_ROOT,
         require_fresh_dependencies: bool = False,
         source_environment: Mapping[str, str] | None = None,
+        require_authenticated_git: bool = False,
     ) -> "RuntimeDependencyClosure":
         source = os.environ if source_environment is None else source_environment
         if source.get("NODE_PATH"):
@@ -14925,7 +15264,10 @@ class RuntimeDependencyClosure:
                 )
             git_value = tools.get("git")
             if git_value:
-                leases["git"] = ExecutableIdentityLease(git_value, "git-authority")
+                leases["git"] = ExecutableIdentityLease(
+                    git_value, "git-authority",
+                    require_authenticated_git=require_authenticated_git,
+                )
             # Keep the schema-v1 field as an explicit null sentinel.  No
             # production profile resolves or leases Vitest after the
             # message-origin guard moved to Node's built-in test runner.
@@ -18351,6 +18693,15 @@ class FoundationRunner:
             )
             self.runtime["platform"] = self.platform
         self.tools_injected = tools is not None or self.tool_policy.synthetic
+        self.authenticated_git_required = False
+        git_profile_error = None
+        if not self.tools_injected:
+            try:
+                self.authenticated_git_required = _a6_git_required(
+                    REPO_ROOT, self.tool_policy.platform_name,
+                )
+            except OSError:
+                git_profile_error = ToolAuthorityIssue("git", TOOL_CANDIDATE_INVALID).error_text()
         self.tool_authority_diagnostics: list[dict[str, Any]] = []
         if tools is None:
             self.tools, self.tool_resolution_errors = resolve_trusted_tools(
@@ -18363,6 +18714,8 @@ class FoundationRunner:
         else:
             self.tools = dict(tools)
             self.tool_resolution_errors = []
+        if git_profile_error:
+            self.tool_resolution_errors.append(git_profile_error)
         self.tool_authority_failure: ToolAuthorityUnavailable | None = None
         self.tool_authority_frozen = False
         try:
@@ -18458,6 +18811,9 @@ class FoundationRunner:
                         path,
                         f"trusted-{name}",
                         allow_dependency_root=name == "npm",
+                        require_authenticated_git=(
+                            name == "git" and self.authenticated_git_required
+                        ),
                     )
                     self.tool_leases[name] = lease
                 for name, lease in self.tool_leases.items():
@@ -18621,6 +18977,7 @@ class FoundationRunner:
                     self.child_environment,
                     repo_root=REPO_ROOT,
                     require_fresh_dependencies=require_fresh_runtime_closure,
+                    require_authenticated_git=self.authenticated_git_required,
                     source_environment=self.source_environment,
                 )
                 self.runtime_dependency_closure = closure
@@ -21000,16 +21357,352 @@ def _replay_target_input_difference_subcategories(
     return sorted(categories)
 
 
+# Issue #104 A9: failure-only metadata; none of this is an acceptance input.
+_A9_DETAIL_UTF8_LIMIT = 16_384
+_A9_MISSING = object()
+_A9_ENUMS = {
+    "timeoutStatus": frozenset({"within-limit", "TIMED-OUT"}),
+    "outputLimitStatus": frozenset({"within-limit", "OUTPUT-LIMIT-EXCEEDED"}),
+    "executionDurationClass": frozenset({"bounded", "not-started"}),
+    "containment": frozenset({"internal", "not-started", "windows-job-object",
+                              "linux-subreaper-pidfd-proc-supervisor"}),
+    "processTreeStatus": frozenset({"not-applicable", "not-started", "setup-failed",
+                                    "contained-clean", "cleanup-failed"}),
+    "containmentDisposition": frozenset({"not-applicable", "no-descendants",
+        "natural-exit-reaped", "forced-terminated", "survivor", "unknown-ancestry"}),
+    "cleanupState": frozenset({"open", "closed", "failed"}),
+    "observationKind": frozenset({"static-producer-v1", "process-output-v1",
+                                  "standalone-membership-v1", "normalized-fields-v1"}),
+}
+_A9_RAW_FIELDS = (
+    "executed", "started", "setupFailure", "exitCode", "timeoutStatus",
+    "outputLimitStatus", "executionDurationClass", "containment", "processTreeStatus",
+    "containmentDisposition", "descendantsObserved", "descendantsReaped",
+    "descendantsTerminated", "descendantsSurviving", "processTreeError", "error",
+    "limitReason", "protectedTargetBundle.cleanupState",
+    "protectedTargetBundle.mutationDetected", "stdoutBytesObserved", "stdoutSha256",
+    "stdoutByteLimit", "stderrBytesObserved", "stderrSha256", "stderrByteLimit",
+    "directNodeTestRawStreams.stdout", "directNodeTestRawStreams.stderr",
+    "producerObservationSetDigest", "semanticSourceOutputDigest",
+    "producerObservations", "diagnosticPreview", "parsedFailureSummary",
+)
+_A9_OBSERVATION_FIELDS = (
+    "commandOrdinal", "observationOrdinal", "observationKind", "sourceOutputDigest",
+    "producerRecordDigest", "rawStructuredFields", "sourceResultId", "sourcePath",
+    "failurePathAuthority",
+)
+_A9_COMPARABLE_FIELDS = (
+    "stdoutBytesObserved", "stdoutSha256", "stdoutByteLimit",
+    "producerObservationSetDigest", "semanticSourceOutputDigest",
+    "producerObservations", "diagnosticPreview", "parsedFailureSummary",
+)
+
+
+def _a9_value(record: Any, path: str) -> Any:
+    for key in path.split("."):
+        if type(record) is not dict or key not in record:
+            return _A9_MISSING
+        record = record[key]
+    return record
+
+
+def _a9_type(value: Any) -> str:
+    return {type(None): "null", bool: "boolean", int: "integer", float: "number",
+            str: "string", list: "array", dict: "object"}.get(type(value), "unsupported")
+
+
+def _a9_bounded_value(value: Any) -> None:
+    """Bound work before canonical hashing; never stringify an arbitrary object."""
+    budget = [MAX_COMMAND_RESULTS_JSON_BYTES, MAX_EVIDENCE_COLLECTION_ITEMS]
+    def visit(item: Any, depth: int) -> None:
+        budget[1] -= 1
+        if budget[1] < 0 or depth > MAX_EVIDENCE_JSON_DEPTH:
+            raise ValueError("unavailable")
+        kind = type(item)
+        if kind is str:
+            if len(item) > budget[0]:
+                raise ValueError("unavailable")
+            budget[0] -= len(item.encode("utf-8", errors="strict"))
+        elif kind in (dict, list):
+            if len(item) > budget[1]:
+                raise ValueError("unavailable")
+            if kind is dict:
+                for key, child in item.items():
+                    if type(key) is not str:
+                        raise ValueError("unavailable")
+                    visit(key, depth + 1)
+                    visit(child, depth + 1)
+            else:
+                for child in item:
+                    visit(child, depth + 1)
+        elif kind is int:
+            if not -(2 ** 63) <= item < 2 ** 63:
+                raise ValueError("unavailable")
+        elif kind is float:
+            if not math.isfinite(item):
+                raise ValueError("unavailable")
+        elif kind not in (type(None), bool):
+            raise ValueError("unavailable")
+        if budget[0] < 0:
+            raise ValueError("unavailable")
+    visit(value, 0)
+
+
+def _a9_metadata(value: Any) -> dict[str, Any]:
+    if value is _A9_MISSING:
+        return {"presence": False}
+    result: dict[str, Any] = {"presence": True, "type": _a9_type(value)}
+    try:
+        _a9_bounded_value(value)
+        result["canonicalDigest"] = canonical_failure_digest(value)
+        if type(value) is str:
+            result["utf8Bytes"] = len(value.encode("utf-8", errors="strict"))
+        elif type(value) in (dict, list):
+            result["count"] = len(value)
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        result["status"] = "unavailable"
+    return result
+
+
+def _a9_field(record: Any, path: str) -> dict[str, Any]:
+    value = _a9_value(record, path)
+    if value is _A9_MISSING:
+        return {"presence": False}
+    result: dict[str, Any] = {"presence": True, "type": _a9_type(value)}
+    if value is None:
+        return {**result, "status": "null"}
+    name = path.rsplit(".", 1)[-1]
+    valid = False
+    if name in {"executed", "started", "setupFailure", "mutationDetected"}:
+        valid = type(value) is bool
+    elif name in _A9_ENUMS:
+        valid = type(value) is str and value in _A9_ENUMS[name]
+    elif name in {"stdoutSha256", "stderrSha256"}:
+        valid = type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+    elif name in {"producerObservationSetDigest", "semanticSourceOutputDigest",
+                  "sourceOutputDigest", "producerRecordDigest"}:
+        valid = type(value) is str and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None
+    elif name in {"exitCode", "ordinal", "commandOrdinal", "observationOrdinal",
+                  "stdoutBytesObserved", "stderrBytesObserved", "stdoutByteLimit",
+                  "stderrByteLimit", "descendantsObserved", "descendantsReaped",
+                  "descendantsTerminated", "descendantsSurviving"}:
+        maximum = (255 if name == "exitCode" else
+                   4096 if name.startswith("descendants") else
+                   MAX_PROFILE_COMMANDS - 1 if name in {"ordinal", "commandOrdinal"} else
+                   MAX_EVIDENCE_COLLECTION_ITEMS - 1 if name == "observationOrdinal" else
+                   MAX_RECORDED_STREAM_BYTES)
+        valid = type(value) is int and 0 <= value <= maximum
+    else:
+        return _a9_metadata(value)
+    if valid:
+        return {**result, "value": value}
+    return {**_a9_metadata(value), "status": "invalid"}
+
+
+def _a9_stream(record: Any, stream: str) -> dict[str, Any]:
+    value = _a9_value(record, "directNodeTestRawStreams." + stream)
+    result = _a9_metadata(value)
+    if type(value) is str and "canonicalDigest" in result:
+        data = value.encode("utf-8", errors="strict")
+        if len(data) <= MAX_RECORDED_STREAM_BYTES:
+            result["sha256"] = hashlib.sha256(data).hexdigest()
+        else:
+            return {"presence": True, "type": "string", "status": "oversized"}
+    return result
+
+
+def _a9_values_equal(left: Any, right: Any) -> bool:
+    if left is _A9_MISSING or right is _A9_MISSING:
+        return left is right
+    _a9_bounded_value(left)
+    _a9_bounded_value(right)
+    return _json_bytes(left) == _json_bytes(right)
+
+
+def _a9_changed_fields(left: Any, right: Any, fields: Sequence[str]) -> list[str]:
+    return [name for name in fields
+            if not _a9_values_equal(_a9_value(left, name), _a9_value(right, name))]
+
+
+def _a9_source_corresponds(source: Any, comparable: Any) -> bool:
+    if type(source) is not dict or type(comparable) is not dict:
+        return False
+    _a9_bounded_value(source)
+    _a9_bounded_value(comparable)
+    # Full correspondence, not a join on producer-supplied command labels.
+    # This pure projection validates correspondence only; it grants no admission.
+    return _json_bytes(_canonical_transcript_record(source)) == _json_bytes(comparable)
+
+
+def _a9_record_facts(source: dict[str, Any], comparable: dict[str, Any]) -> dict[str, Any]:
+    raw = {name: _a9_field(source, name) for name in _A9_RAW_FIELDS}
+    for stream in ("stdout", "stderr"):
+        raw["directNodeTestRawStreams." + stream] = _a9_stream(source, stream)
+    raw["sourceOutputDigest"] = _a9_field(
+        {"sourceOutputDigest": command_output_digest(source)}, "sourceOutputDigest")
+    semantic = _a9_field(comparable, "semanticSourceOutputDigest")
+    return {
+        "rawRecordDigest": canonical_failure_digest(source),
+        "comparableRecordDigest": canonical_failure_digest(comparable),
+        "raw": raw,
+        "comparable": {
+            "stdoutRepresentation": (
+                "direct-node-semantic-v1"
+                if "value" in semantic and "directNodeTestRawStreams" not in comparable
+                and type(source.get("directNodeTestRawStreams")) is dict
+                else "canonical-raw-stdout"
+            ),
+            **{name: _a9_field(comparable, name) for name in _A9_COMPARABLE_FIELDS},
+        },
+        "eligibilityObservations": {
+            "zeroTerminatedDescendants": (
+                {"presence": True, "value": source["descendantsTerminated"] == 0}
+                if type(source.get("descendantsTerminated")) is int
+                and 0 <= source["descendantsTerminated"] <= 4096
+                else {"presence": "descendantsTerminated" in source, "status": "unavailable"}
+            ),
+            "naturalOrNoDescendantDisposition": (
+                {"presence": True, "value": source["containmentDisposition"] in {
+                    "natural-exit-reaped", "no-descendants"}}
+                if type(source.get("containmentDisposition")) is str
+                and source["containmentDisposition"] in _A9_ENUMS["containmentDisposition"]
+                else {"presence": "containmentDisposition" in source, "status": "unavailable"}
+            ),
+            "comparableSemanticSourceOutputDigestPresent": "semanticSourceOutputDigest" in comparable,
+        },
+    }
+
+
+def _a9_first_unequal_observation(
+    producer: dict[str, Any], replay: dict[str, Any],
+    producer_source: dict[str, Any], replay_source: dict[str, Any],
+) -> dict[str, Any]:
+    left, right = producer.get("producerObservations"), replay.get("producerObservations")
+    if type(left) is not list or type(right) is not list:
+        return {"presence": False, "status": "unavailable"}
+    if max(len(left), len(right)) > MAX_EVIDENCE_COLLECTION_ITEMS:
+        return {"presence": False, "status": "oversized"}
+    for index in range(max(len(left), len(right))):
+        lvalue = left[index] if index < len(left) else _A9_MISSING
+        rvalue = right[index] if index < len(right) else _A9_MISSING
+        if _a9_values_equal(lvalue, rvalue):
+            continue
+        detail: dict[str, Any] = {
+            "presence": True, "index": index,
+            "changedFields": _a9_changed_fields(lvalue, rvalue, _A9_OBSERVATION_FIELDS),
+        }
+        for side, value, source in (("producer", lvalue, producer_source),
+                                    ("replay", rvalue, replay_source)):
+            observations = source.get("producerObservations")
+            raw = (observations[index] if type(observations) is list
+                   and index < len(observations) else _A9_MISSING)
+            corresponds = type(value) is dict and type(raw) is dict and all(
+                type(raw.get(key)) is int and raw[key] == value.get(key)
+                for key in ("commandOrdinal", "observationOrdinal")
+            ) and raw["commandOrdinal"] == source["ordinal"] and raw["observationOrdinal"] == index
+            detail[side] = {
+                "comparable": {name: _a9_field(value, name) for name in _A9_OBSERVATION_FIELDS},
+                "raw": (
+                    {"presence": True, "representation": "same-side-comparable"}
+                    if corresponds and _a9_values_equal(raw, value) else
+                    {name: _a9_field(raw, name) for name in _A9_OBSERVATION_FIELDS}
+                    if corresponds else {"presence": False, "status": "unavailable"}
+                ),
+            }
+        return detail
+    return {"presence": False, "status": "equal"}
+
+
+def _a9_trusted_correlation(context: ExternallyExpectedVerificationContext) -> dict[str, Any]:
+    fields = {
+        "repository": "repository", "checkoutCommit": "checkout_commit",
+        "checkoutTree": "checkout_tree", "runId": "run_id", "runAttempt": "run_attempt",
+        "producerJobId": "producer_job_id", "verifierJobId": "verifier_job_id",
+        "producerInvocationId": "producer_invocation_id",
+        "verifierInvocationId": "verifier_invocation_id",
+    }
+    result = {name: _a9_metadata(getattr(context, attr)) for name, attr in fields.items()}
+    result["source"] = "externally-expected-verification-context"
+    result["authorizationContextDigest"] = _a9_metadata(context.authorization_context_binding())
+    # Existing trusted job identities can be workflow job keys rather than API
+    # numeric IDs. Do not fabricate a numeric job link or read new authority.
+    result["hostedJobUrl"] = {"presence": False, "status": "unavailable"}
+    result["hostedRunAttemptUrl"] = {"presence": False, "status": "unavailable"}
+    if (context.binding_mode == "github-actions" and type(context.repository) is str
+        and re.fullmatch(r"[A-Za-z0-9_-]{1,100}/[A-Za-z0-9_.-]{1,100}", context.repository)
+        and context.repository.split("/")[1] not in {".", ".."}
+        and all(type(value) is str and re.fullmatch(r"[1-9][0-9]{0,19}", value)
+                for value in (context.run_id, context.run_attempt))):
+        run_url = f"https://github.com/{context.repository}/actions/runs/{context.run_id}"
+        result["hostedRunAttemptUrl"] = {
+            "presence": True, "value": run_url + "/attempts/" + context.run_attempt,
+        }
+        if (type(context.verifier_job_id) is str
+            and re.fullmatch(r"[1-9][0-9]{0,19}", context.verifier_job_id)):
+            result["hostedJobUrl"] = {
+                "presence": True, "value": run_url + "/job/" + context.verifier_job_id,
+            }
+    return result
+
+
+def _a9_bounded_detail(detail: dict[str, Any]) -> dict[str, Any]:
+    serialized = json.dumps(detail, ensure_ascii=True, sort_keys=True,
+                            separators=(",", ":"), allow_nan=False).encode("utf-8")
+    if len(serialized) <= _A9_DETAIL_UTF8_LIMIT:
+        return detail
+    return {"schemaVersion": 1, "status": "unavailable", "reason": "detail-byte-limit"}
+
+
+def _a9_learner_failure_detail(
+    producer: dict[str, Any], replay: dict[str, Any], *,
+    producer_source: Any, replay_source: Any,
+    expected_context: ExternallyExpectedVerificationContext,
+) -> dict[str, Any]:
+    detail: dict[str, Any] = {
+        "schemaVersion": 1, "status": "unavailable", "reason": "source-correspondence",
+    }
+    if not (_a9_source_corresponds(producer_source, producer)
+            and _a9_source_corresponds(replay_source, replay)):
+        return detail
+    for record in (producer, replay, producer_source, replay_source):
+        if (record.get("commandId") != "learner-focused"
+            or record.get("commandClass") != "learner-focused"
+            or type(record.get("ordinal")) is not int
+            or not 0 <= record["ordinal"] < MAX_PROFILE_COMMANDS):
+            return detail
+    if len({record["ordinal"] for record in (producer, replay, producer_source, replay_source)}) != 1:
+        return detail
+    if producer_source.get("platform") != "windows" or replay_source.get("platform") != "windows":
+        return detail
+    detail = {
+        "schemaVersion": 1, "status": "available",
+        "commandId": "learner-focused", "commandClass": "learner-focused",
+        "ordinal": producer["ordinal"],
+        "commandIdDigest": "sha256:" + hashlib.sha256(b"learner-focused").hexdigest(),
+        "correlation": _a9_trusted_correlation(expected_context),
+        "producer": _a9_record_facts(producer_source, producer),
+        "replay": _a9_record_facts(replay_source, replay),
+        "changedRawFields": _a9_changed_fields(producer_source, replay_source, _A9_RAW_FIELDS),
+        "changedComparableFields": _a9_changed_fields(producer, replay, _A9_RAW_FIELDS),
+        "firstUnequalObservation": _a9_first_unequal_observation(
+            producer, replay, producer_source, replay_source),
+    }
+    return _a9_bounded_detail(detail)
+
+
+
 def replay_transcript_difference_diagnostics(
     producer_records: Sequence[Mapping[str, Any]],
     replay_records: Sequence[Mapping[str, Any]],
     *,
     producer_source_records: Sequence[Mapping[str, Any]] | None = None,
     replay_source_records: Sequence[Mapping[str, Any]] | None = None,
+    expected_context: ExternallyExpectedVerificationContext | None = None,
 ) -> list[dict[str, Any]]:
     """Describe at most eight unequal canonical records; never authorize replay."""
 
     diagnostics: list[dict[str, Any]] = []
+    learner_detail_emitted = False
     for index in range(max(len(producer_records), len(replay_records))):
         producer = producer_records[index] if index < len(producer_records) else None
         replay = replay_records[index] if index < len(replay_records) else None
@@ -21047,6 +21740,28 @@ def replay_transcript_difference_diagnostics(
                     else None
                 ),
             ))
+        if (not learner_detail_emitted and producer is not None and replay is not None
+            and producer.get("commandId") == replay.get("commandId") == "learner-focused"
+            and type(expected_context) is ExternallyExpectedVerificationContext
+            and expected_context.runner_os == "Windows"):
+            learner_detail_emitted = True
+            try:
+                diagnostic["learnerFailureDetail"] = _a9_learner_failure_detail(
+                    producer, replay,
+                    producer_source=(producer_source_records[index]
+                        if producer_source_records is not None and index < len(producer_source_records)
+                        else None),
+                    replay_source=(replay_source_records[index]
+                        if replay_source_records is not None and index < len(replay_source_records)
+                        else None),
+                    expected_context=expected_context,
+                )
+            except Exception:
+                # The already established rejection and its original diagnostic
+                # survive every failure of this optional observational extension.
+                diagnostic["learnerFailureDetail"] = {
+                    "schemaVersion": 1, "status": "unavailable", "reason": "construction-failed",
+                }
         diagnostics.append(diagnostic)
         if len(diagnostics) == _MAX_REPLAY_TRANSCRIPT_DIAGNOSTICS:
             break
@@ -23702,6 +24417,7 @@ def _compare_verification_replay_claims(
     *,
     comparison_views: Mapping[str, Any] | None = None,
     collection_views: Mapping[str, Any] | None = None,
+    expected_context: ExternallyExpectedVerificationContext | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Aggregate exact command differences, with only proven portable views."""
     transcript, errors = _verification_replay_eligibility(documents, runner, comparison)
@@ -23729,6 +24445,7 @@ def _compare_verification_replay_claims(
                     record for record in evidence_records if isinstance(record, Mapping)
                 ],
                 replay_source_records=runner.command_results,
+                expected_context=expected_context,
             )
             if diagnostics:
                 errors.append("verification replay first command differences: " + json.dumps(
@@ -23849,8 +24566,8 @@ def _run_verification_replay(
     )
     if comparison is None:
         return None, errors
-    transcript, comparison_errors = compare_verification_replay_claims(
-        documents, verification_runner, comparison,
+    transcript, comparison_errors = _compare_verification_replay_claims(
+        documents, verification_runner, comparison, expected_context=expected_context,
     )
     errors.extend(comparison_errors)
     return _finish_verification_replay(
@@ -24636,7 +25353,7 @@ def verify_evidence_with_replay(
                             documents, verification_runner, comparison, views) if not errors else None)
                         transcript, comparison_errors = _compare_verification_replay_claims(
                             documents, verification_runner, comparison, comparison_views=views,
-                            collection_views=collection_views,
+                            collection_views=collection_views, expected_context=expected_context,
                         )
                     except (OSError, AttributeError, KeyError, TypeError, ValueError) as exc:
                         return sorted(set(errors + [
@@ -25479,6 +26196,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     group.add_argument("--profile", choices=PROFILES)
     group.add_argument("--list-profiles", action="store_true")
     group.add_argument("--prepare-developer-esbuild", action="store_true")
+    group.add_argument("--provision-authenticated-git", action="store_true")
     group.add_argument("--verify-evidence", action="store_true")
     parser.add_argument("--verify-only", action="store_true")
     parser.add_argument("--require-install-tools", action="store_true")
@@ -25508,6 +26226,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args = parser.parse_args(selected_argv)
     except argparse.ArgumentError as exc:
         raise ValueError(str(exc)) from exc
+    if args.provision_authenticated_git and selected_argv != ["--provision-authenticated-git"]:
+        raise ValueError("authenticated Git provisioning accepts no other options")
     if args.verify_only and args.profile != "policy":
         raise ValueError("--verify-only is supported only with --profile policy")
     if args.require_install_tools and not (args.verify_only and args.profile == "policy"):
@@ -25647,6 +26367,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return EXIT_SUCCESS
         print(f"CI foundation argument error: {sanitize_text(str(exc))}", file=sys.stderr)
         return EXIT_CONFIGURATION_ERROR
+    if args.provision_authenticated_git:
+        try:
+            provision_authenticated_git()
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            print("Authenticated Git provisioning failed: " + type(exc).__name__, file=sys.stderr)
+            return EXIT_CONFIGURATION_ERROR
+        return EXIT_SUCCESS
     if args.list_profiles:
         print("\n".join(PROFILES))
         return EXIT_SUCCESS
