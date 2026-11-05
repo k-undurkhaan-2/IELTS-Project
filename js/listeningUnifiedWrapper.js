@@ -91,6 +91,7 @@
             if (!source) return;
             button.disabled = Boolean(source.disabled);
             if (role === 'finish') {
+                button.disabled = button.disabled || state.resetPending || state.pendingReturnToTest;
                 var label = String(source.textContent || '').trim();
                 button.textContent = /^(?:finish|submit(?: answers)?)$/i.test(label) || !label ? 'Submit' : label;
             }
@@ -103,7 +104,7 @@
         finish.dataset.wrapperReviewStateBound = 'true';
         var beforeReview = null;
         function returningToTest() {
-            return /return\s+to\s+(?:the\s+)?test/i.test(finish.textContent || '');
+            return /(?:return|back)\s+to\s+(?:the\s+)?test/i.test(finish.textContent || '');
         }
         function captureControls() {
             var controls = [];
@@ -123,14 +124,24 @@
         finish.addEventListener('click', function () {
             var wasReviewing = returningToTest();
             var previous = wasReviewing ? null : captureControls();
+            // Capture the graded attempt before a fast return hides its review.
+            var frameWindow = getFrameWindow();
+            var completionQueued = wasReviewing && !state.completed && frameWindow
+                && typeof frameWindow.__listeningBridgeComplete === 'function'
+                && frameWindow.__listeningBridgeComplete({ allowGenerated: true });
             doc.defaultView.queueMicrotask(function () {
                 var isReviewing = returningToTest();
                 if (!wasReviewing && isReviewing) beforeReview = previous;
-                if (wasReviewing && !isReviewing && beforeReview) {
-                    beforeReview.forEach(function (entry) {
+                if (wasReviewing && !isReviewing) {
+                    (beforeReview || []).forEach(function (entry) {
                         if (entry.control.isConnected) entry.control.disabled = entry.disabled;
                     });
                     beforeReview = null;
+                    if (completionQueued && !state.completed) {
+                        state.pendingReturnToTest = true;
+                    } else {
+                        requestPracticeReset('retake-after-return');
+                    }
                 }
                 syncActionProxies(doc);
             });
@@ -268,6 +279,7 @@
         bridgeReady: false,
         frameLoaded: false,
         resetPending: false,
+        pendingReturnToTest: false,
         pendingMessages: [],
         parentWindow: null,
         timerInterval: null,
@@ -1148,7 +1160,7 @@
         updateTimerDisplay();
     }
 
-    function requestPracticeReset() {
+    function requestPracticeReset(reason) {
         if (state.resetPending) return;
         state.resetPending = true;
         resetAttempt(Date.now());
@@ -1171,7 +1183,7 @@
                 previousSessionId: state.sessionId,
                 suiteSessionId: state.suiteSessionId || null,
                 pageType: 'listening',
-                reason: 'retake-after-reset',
+                reason: reason || 'retake-after-reset',
                 url: global.location.href,
                 title: global.document.title
             }
@@ -1236,6 +1248,11 @@
                 updateTimerDisplay();
             }
             forwardToParent(event.data);
+            if (event.data.type === 'PRACTICE_COMPLETE' && state.pendingReturnToTest) {
+                // Deliver the old result before asking the parent for a new ID.
+                state.pendingReturnToTest = false;
+                requestPracticeReset('retake-after-return');
+            }
             return;
         }
         handleParentMessage(event.data, event.source);

@@ -14,11 +14,13 @@ const examId = 'listening-p1-retake';
 function host(mode) {
     return `<!doctype html><html><body>
       <iframe id="practice" style="width:100%;height:750px"></iframe>
+      <script src="/js/core/practiceCore.js"></script>
       <script src="/js/app/examSessionMixin.js"></script>
       <script>
         window.storage = {
           async get(key, fallback) { return JSON.parse(localStorage.getItem(key)) ?? fallback; },
-          async set(key, value) { localStorage.setItem(key, JSON.stringify(value)); return true; }
+          async set(key, value) { localStorage.setItem(key, JSON.stringify(value)); return true; },
+          async writePersistentValue(key, value) { return this.set(key, value); }
         };
         window.examIndex = [{ id: '${examId}', title: 'Listening retake', type: 'listening', category: 'P1' }];
         window.showMessage = () => {};
@@ -32,7 +34,7 @@ function host(mode) {
         app.showRealCompletionNotification = () => {};
         const frame = document.getElementById('practice');
         app.setupExamWindowCommunication(frame.contentWindow, '${examId}', examIndex[0]);
-        frame.onload = () => app._sendExamInitEnvelope('${examId}', frame.contentWindow);
+        frame.onload = () => app.restartExamHandshake(frame.contentWindow, '${examId}');
         frame.src = '/wrapper?mode=${mode}';
       </script>
     </body></html>`;
@@ -51,19 +53,29 @@ function fixture(mode) {
           const finish = document.getElementById('finish-btn');
           const inputs = [...document.querySelectorAll('input')];
           const results = document.getElementById('results');
+          let reviewing = false;
           finish.onclick = () => {
+            if (reviewing) {
+              reviewing = false;
+              // Legacy templates can retain a hidden review table on return.
+              results.hidden = true;
+              finish.textContent = 'Finish';
+              return;
+            }
+            reviewing = true;
             results.hidden = false;
             results.innerHTML = '<table class="results-table"><tbody>' + inputs.map((input, index) => {
               const correct = input.value === ['answer', 'expected'][index];
               return '<tr><td>' + (index + 1) + '</td><td>' + input.value + '</td><td>' +
                 ['answer', 'expected'][index] + '</td><td>' + (correct ? 'Correct' : 'Incorrect') + '</td></tr>';
             }).join('') + '</tbody></table>';
-            finish.textContent = 'Return to Test';
+            finish.textContent = '${mode.startsWith('back') ? 'Back to Test' : 'Return to Test'}';
           };
           const reset = document.getElementById('clear-btn');
           if (reset) reset.onclick = () => {
             if (!confirm('Clear all progress?')) return;
             if ('${mode}' === 'reload') { location.reload(); return; }
+            reviewing = false;
             inputs.forEach(input => { input.value = ''; });
             if ('${mode}' === 'stale-review') results.hidden = true;
             else results.innerHTML = '';
@@ -76,7 +88,7 @@ function fixture(mode) {
 }
 
 const scriptPaths = new Set([
-    '/js/app/examSessionMixin.js', '/js/bundles/listening-wrapper.bundle.js',
+    '/js/core/practiceCore.js', '/js/app/examSessionMixin.js', '/js/bundles/listening-wrapper.bundle.js',
     '/js/bundles/listening-record-bridge.bundle.js'
 ]);
 const server = http.createServer((request, response) => {
@@ -104,8 +116,11 @@ try {
     });
     const scenarios = ['reload', 'in-place', 'stale-review', 'fallback'].map(mode => ({ mode, countdown: false }));
     scenarios.push({ mode: 'reload', countdown: true });
-    for (const { mode, countdown } of scenarios) {
+    scenarios.push({ mode: 'return', retake: 'Return to Test' }, { mode: 'back', retake: 'Back to Test' },
+        { mode: 'back', retake: 'Back to Test', countdown: true }, { mode: 'back-fast', retake: 'Back to Test' });
+    for (const { mode, countdown, retake = 'Reset' } of scenarios.filter(scenario => !process.argv[2] || scenario.mode === process.argv[2])) {
         const page = await browser.newPage();
+        page.setDefaultTimeout(8000);
         const errors = [];
         page.on('pageerror', error => errors.push(error.message));
         let now = Date.UTC(2026, 0, 1);
@@ -123,6 +138,7 @@ try {
             now += countdown ? 60000 : 5000;
             await page.clock.setFixedTime(now);
             if (!countdown) await frame.getByRole('button', { name: 'Submit', exact: true }).click();
+            if (mode === 'back-fast') await frame.getByRole('button', { name: retake, exact: true }).click();
             await page.waitForFunction(() => JSON.parse(localStorage.getItem('practice_records') || '[]').length === 1);
             const first = await page.evaluate(() => JSON.parse(localStorage.getItem('practice_records'))[0]);
             const firstCompletion = await page.evaluate(() => messages.find(message => message.type === 'PRACTICE_COMPLETE'));
@@ -130,7 +146,7 @@ try {
             assert.equal(await page.evaluate(id => app.messageHandlers.has(id), examId), true,
                 mode + ': completion must retain the parent message handler for Reset');
 
-            if (mode !== 'fallback') {
+            if (retake === 'Reset' && mode !== 'fallback') {
                 page.once('dialog', dialog => dialog.dismiss());
                 await frame.getByRole('button', { name: 'Reset', exact: true }).click();
                 await page.waitForTimeout(200);
@@ -140,14 +156,20 @@ try {
                 page.once('dialog', dialog => dialog.accept());
             }
 
-            now += 120000;
-            await page.clock.setFixedTime(now);
-            await frame.getByRole('button', { name: 'Reset', exact: true }).click();
+            if (mode !== 'back-fast') {
+                now += 120000;
+                await page.clock.setFixedTime(now);
+                await frame.getByRole('button', { name: retake, exact: true }).click();
+            }
             await page.waitForFunction(previousId => {
                 const state = document.getElementById('practice').contentWindow.__listeningBridgeGetState?.();
                 return state?.initialized && state.sessionId !== previousId && !state.completed;
             }, first.sessionId, { timeout: 5000 });
             frame = sourceFrame();
+            if (retake !== 'Reset') {
+                assert.equal(await frame.locator('[name=q1]').inputValue(), 'answer');
+                assert.equal(await frame.locator('[name=q2]').inputValue(), 'wrong', 'returning must preserve answers');
+            }
             await frame.waitForFunction(text => document.querySelector('[data-wrapper-timer=true]')?.textContent === text,
                 countdown ? '01:00' : '00:00');
             assert.equal(await frame.locator('#listening-wrapper-result-summary').count(), 0);
@@ -182,12 +204,27 @@ try {
             assert.equal(records.length, 2, 'duplicate submit must not add a third record');
             assert.notEqual(records[0].sessionId, records[1].sessionId);
             assert.notEqual(records[0].id, records[1].id);
-            assert.deepEqual(records[1].answers, { q1: 'answer', q2: 'wrong' }, 'first attempt stays intact');
-            assert.deepEqual(records[0].answers, { q1: 'answer', q2: 'expected' });
+            assert.deepEqual(records[1].realData.answers, { q1: 'answer', q2: 'wrong' }, 'first attempt stays intact');
+            assert.deepEqual(records[0].realData.answers, { q1: 'answer', q2: 'expected' });
             assert.equal(records[0].scoreInfo.correct, 2);
             assert.equal(records[0].realData.duration, countdown ? 60 : 3, 'retake excludes the previous attempt and review time');
+            if (retake !== 'Reset') {
+                now += 120000;
+                await page.clock.setFixedTime(now);
+                await frame.getByRole('button', { name: retake, exact: true }).press('Enter');
+                await frame.waitForFunction(previousId => window.__listeningBridgeGetState().sessionId !== previousId,
+                    records[0].sessionId);
+                now += countdown ? 60000 : 2000;
+                await page.clock.setFixedTime(now);
+                if (!countdown) await frame.getByRole('button', { name: 'Submit', exact: true }).click();
+                await page.waitForFunction(() => JSON.parse(localStorage.getItem('practice_records')).length === 3);
+                const repeated = await page.evaluate(() => JSON.parse(localStorage.getItem('practice_records')));
+                assert.equal(new Set(repeated.map(record => record.sessionId)).size, 3);
+                assert.deepEqual(repeated[0].realData.answers, records[0].realData.answers, 'unchanged answers still produce a new attempt');
+                assert.deepEqual(repeated.slice(1), records, 'previous attempts stay intact');
+            }
             assert.deepEqual(errors, []);
-            console.log('PASS: ' + mode + (countdown ? ' countdown auto-submit' : '') + ' Reset saves a separate listening attempt with fresh answers and timing');
+            console.log('PASS: ' + mode + (countdown ? ' countdown auto-submit' : '') + ' ' + retake + ' saves a separate listening attempt with fresh answers and timing');
         } catch (error) {
             console.error({ mode, errors, messages: await page.evaluate(() => window.messages?.slice(-5)) });
             throw error;

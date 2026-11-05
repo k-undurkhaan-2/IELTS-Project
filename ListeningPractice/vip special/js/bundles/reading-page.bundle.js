@@ -2543,6 +2543,7 @@
         currentActiveQuestionId: '',
         ready: false,
         submitted: false,
+        pendingRestart: null,
         initTimer: null,
         manifestLoaded: false,
         dataset: null,
@@ -5951,7 +5952,7 @@
                 } else if (!state.readOnly) {
                     setPrimaryButtonLabel(dom.submitBtn, dom.submitBtn.dataset.defaultLabel || 'Submit');
                 }
-                dom.submitBtn.disabled = state.readOnly && !canResume;
+                dom.submitBtn.disabled = Boolean(state.pendingRestart) || (state.readOnly && !canResume);
             }
             if (dom.resetBtn) {
                 dom.resetBtn.style.display = '';
@@ -6350,9 +6351,14 @@
     }
 
     function requestNormalPracticeRestart(reason = 'reset') {
+        if (state.pendingRestart) return;
+        const previousSessionId = state.sessionId;
+        state.pageStartTime = Date.now();
+        state.pagePausedAtMs = null;
+        state.pagePausedOffsetMs = 0;
         const delivered = postMessage('PRACTICE_RESET_REQUEST', {
             reason,
-            previousSessionId: state.sessionId || null,
+            previousSessionId: previousSessionId || null,
             fromPracticeMode: state.practiceMode || 'single',
             targetPracticeMode: 'single',
             dataKey: state.dataKey || state.examId || '',
@@ -6364,6 +6370,7 @@
             global.location.href = buildNormalPracticeUrl();
             return;
         }
+        if (delivered) state.pendingRestart = { previousSessionId };
         restartInitHandshake();
     }
 
@@ -6883,10 +6890,11 @@
             return;
         }
         if (canReturnToTest()) {
+            requestNormalPracticeRestart('retake-after-return');
             resetToAnsweringPresentation();
             return;
         }
-        if (state.readOnly) {
+        if (state.readOnly || state.pendingRestart) {
             return;
         }
         const submissionSnapshot = buildSubmissionSnapshot();
@@ -6904,12 +6912,6 @@
         state.lastResults = results;
         renderResults(results);
         enterSubmittedReadOnlyState(state.simulationMode ? 'simulation-final-submit' : 'final-submit');
-        await renderExplanations();
-        if (state.lastResults === results) {
-            applyHighlights(highlightSnapshot);
-            enhanceReviewHighlights();
-            updateNavStatuses(results);
-        }
         const messageType = state.simulationMode ? 'SIMULATION_SUBMIT' : 'PRACTICE_COMPLETE';
         const timing = resolvePracticeTiming(1, submissionSnapshot.timerSnapshot);
         postMessage(messageType, Object.assign({
@@ -6943,6 +6945,14 @@
             clearSimulationDraftMirror();
             state.simulationDraftFingerprint = '';
         }
+        // Publish this attempt before loading optional explanations: the user
+        // can return to the test and start another session while they load.
+        await renderExplanations();
+        if (state.lastResults === results) {
+            applyHighlights(highlightSnapshot);
+            enhanceReviewHighlights();
+            updateNavStatuses(results);
+        }
     }
 
     function handleReset() {
@@ -6951,9 +6961,9 @@
             return;
         }
         if (state.submitted && state.readOnlyReason === 'final-submit' && !state.suiteSessionId && !state.reviewMode) {
+            requestNormalPracticeRestart('retake-after-submit');
             resetToAnsweringPresentation();
             clearCurrentAnswers();
-            requestNormalPracticeRestart('retake-after-submit');
             return;
         }
         if (state.readOnly || state.submitted) {
@@ -7057,6 +7067,10 @@
         const type = String(payload.type || payload.action || '').toUpperCase();
         const data = payload.data || {};
         if (type === 'INIT_SESSION' || type === 'INIT_EXAM_SESSION') {
+            // A delayed handshake for the completed attempt cannot unlock a retake.
+            if (state.pendingRestart && (!data.sessionId || data.sessionId === state.pendingRestart.previousSessionId)) {
+                return;
+            }
             const initSignature = buildInitSignature(data);
             const isDuplicateInit = initSignature && initSignature === state.lastInitSignature;
             const incomingExamId = data && data.examId != null ? String(data.examId).trim() : '';
@@ -7069,6 +7083,7 @@
             }
             if (data.sessionId) {
                 state.sessionId = data.sessionId;
+                state.pendingRestart = null;
             }
             if (data.suiteSessionId) {
                 state.suiteSessionId = data.suiteSessionId;
