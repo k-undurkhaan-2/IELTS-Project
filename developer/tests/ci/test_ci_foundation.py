@@ -6260,12 +6260,30 @@ class AuthenticatedGitA6SourceAdmissionTest(unittest.TestCase):
              ci.MAX_COMMAND_RESULTS_JSON_BYTES),
             (677, 705, 679, 707, 33554432),
         )
-        # No fabricated commit/tree: the separate prospective map may overlay
-        # only the measured three fixed blobs, leaving the Git HEAD map intact.
+        # The historical A7 predecessor admits only the three measured A8 blobs.
+        a7_before = dict(a7)
+        with self.subTest(source_case="historical-a7-to-a8"):
+            prospective = _r2_a8_validation_object_inventory(_R2_SECURITY_PROFILE, a7)
+            self.assertEqual(prospective, a8)
+            self.assertEqual(a7, a7_before)
+        # Exact committed A8 retains its frozen inventory and manifest.
+        a8_before = dict(a8)
+        with self.subTest(source_case="committed-a8"):
+            self.assertEqual(_r2_a8_validation_object_inventory(_R2_SECURITY_PROFILE, a8), a8)
+            self.assertEqual(a8, a8_before)
+        # Authenticate current Git HEAD as exact A9 before testing pass-through.
         head_before = dict(self.head_entries)
-        prospective = _r2_a8_validation_object_inventory(_R2_SECURITY_PROFILE, self.head_entries)
-        self.assertEqual(prospective, a8)
-        self.assertEqual(self.head_entries, head_before)
+        with self.subTest(source_case="admitted-current-a9"):
+            a9 = self._overlay(a8, _R2_A9_SECURITY_CONTENT_DELTA)
+            self.assertEqual(
+                _r2_validate_git_object_authority(_R2_SECURITY_PROFILE, self.head_entries),
+                {**expected, **_R2_A9_SECURITY_CONTENT_DELTA},
+            )
+            self.assertEqual(self.head_entries, a9)
+            self.assertEqual(
+                _r2_a8_validation_object_inventory(_R2_SECURITY_PROFILE, self.head_entries), a9,
+            )
+            self.assertEqual(self.head_entries, head_before)
         for path, identity in _R2_A8_SECURITY_CONTENT_DELTA.items():
             content = (ci.REPO_ROOT / path).read_bytes()
             self.assertEqual((len(content), hashlib.sha256(content).hexdigest()),
@@ -18562,7 +18580,7 @@ class A9LearnerReplayDiagnosticTest(unittest.TestCase):
             cleaned = []
             for error in errors:
                 if error.startswith(prefix):
-                    value = json.loads(error[len(prefix):])
+                    value = ci.strict_json_loads(error[len(prefix):])
                     for item in value:
                         item.pop("learnerFailureDetail", None)
                     error = prefix + json.dumps(value, sort_keys=True, separators=(",", ":"))
