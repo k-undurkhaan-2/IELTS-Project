@@ -836,6 +836,52 @@
         }
 
         /* ---------------- Table Completion Layout ---------------- */
+        #right .table-completion {
+            display: block;
+            width: 100%;
+            overflow-x: auto;
+            margin: 12px 0;
+            border-collapse: collapse;
+            background: var(--panel);
+        }
+
+        #right .table-completion th,
+        #right .table-completion td {
+            min-width: 4rem;
+            border: 1px solid var(--line);
+            padding: 10px;
+            text-align: left;
+            vertical-align: top;
+            line-height: 1.5;
+        }
+
+        #right .table-completion thead th {
+            background: var(--panel-alt);
+            font-weight: 700;
+        }
+
+        #right .table-completion th[colspan] {
+            text-align: center;
+        }
+
+        #right .table-completion input[type="text"] {
+            display: block;
+            width: 7.5rem;
+            max-width: 100%;
+            margin: 4px 0;
+            border: 1px solid var(--line);
+            border-radius: 4px;
+            padding: 6px 8px;
+            background: var(--panel);
+            color: var(--text);
+            font: inherit;
+        }
+
+        #right .table-completion input[type="text"]:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 1px;
+        }
+
         .table-section {
             margin-top: 12px;
             overflow-x: auto;
