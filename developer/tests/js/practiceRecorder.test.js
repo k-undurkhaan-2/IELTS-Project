@@ -264,6 +264,45 @@ async function testRejectedCompletionPayloadStoresOnlySummary(PracticeRecorder) 
     });
 }
 
+async function testCompletionKeepsTimerTiming(PracticeRecorder) {
+    for (const duration of [0, 216, 426]) {
+        const recorder = Object.create(PracticeRecorder.prototype);
+        const examId = 'listening-timer-duration';
+        const startTime = Date.parse('2026-01-01T00:00:00Z');
+        const endTime = startTime + 3600000;
+        recorder.activeSessions = new Map([[examId, {
+            examId,
+            sessionId: 'timer-session',
+            // A parent session may be registered after the practice has finished.
+            startTime: new Date(endTime + 100).toISOString(),
+            metadata: { type: 'listening' },
+            progress: {},
+            answers: {}
+        }]]);
+        recorder.practiceTypeCache = new Map([[examId, { id: examId, type: 'listening' }]]);
+        recorder.savePracticeRecord = async record => record;
+        recorder.updateUserStats = async () => {};
+        recorder.endPracticeSession = () => recorder.activeSessions.delete(examId);
+        recorder.dispatchSessionEvent = () => {};
+        const record = await recorder.handleSessionCompleted({
+            examId,
+            sessionId: 'timer-session',
+            startTime,
+            endTime,
+            duration,
+            answers: { q1: 'answer' },
+            correctAnswers: { q1: 'answer' },
+            scoreInfo: { correct: 1, total: 1 },
+            realData: { duration: 3600 }
+        });
+        assert.strictEqual(record.duration, duration, 'saved duration must retain explicit timer seconds, including zero');
+        assert.strictEqual(record.realData.duration, duration, 'nested duration must agree with the saved timer value');
+        assert.strictEqual(record.startTime, new Date(startTime).toISOString(), 'the attempt timer start takes precedence over parent registration');
+        assert.strictEqual(record.endTime, new Date(endTime).toISOString(), 'completion keeps its actual end timestamp');
+    }
+    recordResult('Completion retains timer timing across parent session drift', { durations: [0, 216, 426] });
+}
+
 async function main() {
     const quietConsole = {
         log() {},
@@ -301,6 +340,7 @@ async function main() {
         await testNormalizeCompletionPayloadStripsPollutionKeys(PracticeRecorder);
         await testFallbackStandardizeStripsPollutionKeys(PracticeRecorder);
         await testRejectedCompletionPayloadStoresOnlySummary(PracticeRecorder);
+        await testCompletionKeepsTimerTiming(PracticeRecorder);
         console.log(JSON.stringify({
             status: 'pass',
             detail: `${results.length}/${results.length} 测试通过`,

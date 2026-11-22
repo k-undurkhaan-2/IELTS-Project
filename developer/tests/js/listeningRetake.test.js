@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
+const repoRoot = process.env.IELTS_TEST_SOURCE_ROOT || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const examId = 'listening-p1-retake';
 
 function host(mode) {
@@ -137,12 +137,21 @@ try {
             await frame.locator('[name=q2]').fill('wrong');
             now += countdown ? 60000 : 5000;
             await page.clock.setFixedTime(now);
+            if (!countdown) {
+                await frame.waitForFunction(() => document.querySelector('[data-wrapper-timer=true]')?.textContent === '00:05');
+                await frame.locator('[data-wrapper-timer=true]').click();
+                now += 120000;
+                await page.clock.setFixedTime(now);
+                await frame.locator('[data-wrapper-timer=true]').click();
+            }
             if (!countdown) await frame.getByRole('button', { name: 'Submit', exact: true }).click();
             if (mode === 'back-fast') await frame.getByRole('button', { name: retake, exact: true }).click();
             await page.waitForFunction(() => JSON.parse(localStorage.getItem('practice_records') || '[]').length === 1);
             const first = await page.evaluate(() => JSON.parse(localStorage.getItem('practice_records'))[0]);
             const firstCompletion = await page.evaluate(() => messages.find(message => message.type === 'PRACTICE_COMPLETE'));
             assert.equal(first.scoreInfo.correct, 1);
+            assert.equal(first.duration, countdown ? 60 : 5, 'normal saved record excludes paused window time');
+            assert.equal(first.realData.duration, first.duration, 'fallback duration must agree with the top-level record');
             assert.equal(await page.evaluate(id => app.messageHandlers.has(id), examId), true,
                 mode + ': completion must retain the parent message handler for Reset');
 
@@ -171,7 +180,14 @@ try {
                 assert.equal(await frame.locator('[name=q2]').inputValue(), 'wrong', 'returning must preserve answers');
             }
             await frame.waitForFunction(text => document.querySelector('[data-wrapper-timer=true]')?.textContent === text,
-                countdown ? '01:00' : '00:00');
+                retake === 'Reset' ? (countdown ? '01:00' : '00:00') : (countdown ? '00:00' : '00:05'));
+            if (retake !== 'Reset') {
+                now += 45000;
+                await page.clock.setFixedTime(now);
+                await page.evaluate(id => app._sendExamInitEnvelope(id, document.getElementById('practice').contentWindow), examId);
+                await page.waitForTimeout(1100);
+                assert.equal(await frame.locator('[data-wrapper-timer=true]').textContent(), countdown ? '00:00' : '00:05', 'Return to Test and repeated handshakes must not reset or advance the timer');
+            }
             assert.equal(await frame.locator('#listening-wrapper-result-summary').count(), 0);
             assert.equal(await frame.getByRole('button', { name: 'Notes', exact: true }).isVisible(), true);
             assert.equal(await frame.getByRole('button', { name: 'Exit', exact: true }).isVisible(), false);
@@ -187,15 +203,22 @@ try {
             assert.equal(await frame.evaluate(() => window.__listeningBridgeGetState().sessionId), resetSessionId);
             assert.equal(await frame.locator('#listening-wrapper-result-summary').count(), 0,
                 'a delayed completion from the old attempt must not restore its score or stop the new clock');
-            assert.equal(await frame.locator('[data-wrapper-timer=true]').evaluate(timer => timer.classList.contains('paused')), false);
+            assert.equal(await frame.locator('[data-wrapper-timer=true]').evaluate(timer => timer.classList.contains('paused')), retake !== 'Reset');
             assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem('practice_records')).length), 1,
                 'Reset and stale review DOM must not save an unsubmitted attempt');
 
             await frame.locator('[name=q1]').fill('answer');
             await frame.locator('[name=q2]').fill('expected');
+            if (retake !== 'Reset' && !countdown) await frame.locator('[data-wrapper-timer=true]').click();
             now += countdown ? 60000 : 3000;
             await page.clock.setFixedTime(now);
-            if (!countdown) await frame.getByRole('button', { name: 'Submit', exact: true }).press('Enter');
+            if (!countdown) {
+                await frame.waitForFunction(text => document.querySelector('[data-wrapper-timer=true]')?.textContent === text, retake === 'Reset' ? '00:03' : '00:08');
+                await frame.locator('[data-wrapper-timer=true]').click();
+                now += 90000;
+                await page.clock.setFixedTime(now);
+            }
+            if (!countdown || retake !== 'Reset') await frame.getByRole('button', { name: 'Submit', exact: true }).press('Enter');
             await page.waitForFunction(() => JSON.parse(localStorage.getItem('practice_records') || '[]').length === 2);
             await page.evaluate(id => app._sendExamInitEnvelope(id, document.getElementById('practice').contentWindow), examId);
             await frame.evaluate(() => { window.__listeningBridgeComplete({ allowGenerated: true }); });
@@ -207,7 +230,9 @@ try {
             assert.deepEqual(records[1].realData.answers, { q1: 'answer', q2: 'wrong' }, 'first attempt stays intact');
             assert.deepEqual(records[0].realData.answers, { q1: 'answer', q2: 'expected' });
             assert.equal(records[0].scoreInfo.correct, 2);
-            assert.equal(records[0].realData.duration, countdown ? 60 : 3, 'retake excludes the previous attempt and review time');
+            const expectedDuration = countdown ? 60 : (retake === 'Reset' ? 3 : 8);
+            assert.equal(records[0].realData.duration, expectedDuration, 'return preserves earlier active seconds and excludes review time');
+            assert.equal(records[0].duration, expectedDuration, 'saved duration must match the visible timer');
             if (retake !== 'Reset') {
                 now += 120000;
                 await page.clock.setFixedTime(now);
@@ -216,10 +241,13 @@ try {
                     records[0].sessionId);
                 now += countdown ? 60000 : 2000;
                 await page.clock.setFixedTime(now);
-                if (!countdown) await frame.getByRole('button', { name: 'Submit', exact: true }).click();
+                await page.waitForTimeout(1100);
+                assert.equal(await frame.locator('[data-wrapper-timer=true]').textContent(), countdown ? '00:00' : '00:08', 'repeated Return to Test stays paused');
+                await frame.getByRole('button', { name: 'Submit', exact: true }).click();
                 await page.waitForFunction(() => JSON.parse(localStorage.getItem('practice_records')).length === 3);
                 const repeated = await page.evaluate(() => JSON.parse(localStorage.getItem('practice_records')));
                 assert.equal(new Set(repeated.map(record => record.sessionId)).size, 3);
+                assert.equal(repeated[0].duration, expectedDuration, 'submitting without manually resuming preserves the final time');
                 assert.deepEqual(repeated[0].realData.answers, records[0].realData.answers, 'unchanged answers still produce a new attempt');
                 assert.deepEqual(repeated.slice(1), records, 'previous attempts stay intact');
             }

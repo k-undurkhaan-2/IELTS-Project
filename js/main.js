@@ -372,7 +372,7 @@ async function syncPracticeRecords(options = {}) {
         records = (records || []).map(r => {
             const rd = (r && r.realData) || {};
             let duration = (typeof r.duration === 'number') ? r.duration : undefined;
-            if (!(Number.isFinite(duration) && duration > 0)) {
+            if (!(Number.isFinite(duration) && duration >= 0)) {
                 const sInfo = r && (r.scoreInfo || rd.scoreInfo) || {};
                 const candidates = [
                     r.duration, rd.duration, r.durationSeconds, r.duration_seconds,
@@ -381,17 +381,18 @@ async function syncPracticeRecords(options = {}) {
                     sInfo.duration, sInfo.timeSpent
                 ];
                 for (const v of candidates) {
+                    if (v == null || v === '') continue;
                     const n = Number(v);
-                    if (Number.isFinite(n) && n > 0) { duration = Math.floor(n); break; }
+                    if (Number.isFinite(n) && n >= 0) { duration = Math.floor(n); break; }
                 }
-                if (!(Number.isFinite(duration) && duration > 0) && r && r.startTime && r.endTime) {
+                if (!(Number.isFinite(duration) && duration >= 0) && r && r.startTime && r.endTime) {
                     const s = new Date(r.startTime).getTime();
                     const e = new Date(r.endTime).getTime();
                     if (Number.isFinite(s) && Number.isFinite(e) && e > s) {
                         duration = Math.round((e - s) / 1000);
                     }
                 }
-                if (!(Number.isFinite(duration) && duration > 0) && rd && Array.isArray(rd.interactions) && rd.interactions.length) {
+                if (!(Number.isFinite(duration) && duration >= 0) && rd && Array.isArray(rd.interactions) && rd.interactions.length) {
                     try {
                         const ts = rd.interactions.map(x => x && Number(x.timestamp)).filter(n => Number.isFinite(n));
                         if (ts.length) {
@@ -479,7 +480,27 @@ function startPracticeRecordsSyncInBackground(trigger = 'default') {
     }
 }
 
-async function listCanonicalPracticeRecords() {
+function getPracticeMutationApiClient() {
+    const client = window.remoteApiClient || window.ExamData?.remoteApiClient;
+    return client && (client.available || client.isAuthenticated?.()) ? client : null;
+}
+
+function assertPracticeMutationSession(client = getPracticeMutationApiClient()) {
+    if (client && !client.isAuthenticated()) {
+        throw Object.assign(new Error('Authentication required'), { status: 401 });
+    }
+    return client;
+}
+
+async function listCanonicalPracticeRecords(options = {}) {
+    if (options.forMutation) {
+        const client = assertPracticeMutationSession();
+        if (client) {
+            // A failed refresh must not turn a remote deletion into a local-only edit.
+            const records = await client.listPracticeRecords();
+            return Array.isArray(records) ? records : [];
+        }
+    }
     const practiceKey = ['practice', 'records'].join('_');
     if (window.PracticeStore && typeof window.PracticeStore.list === 'function') {
         const records = await window.PracticeStore.list();
@@ -568,6 +589,7 @@ function syncLegacyPracticeRecordArtifacts(records) {
 }
 
 async function persistPracticeRecordsAndRefresh(records, trigger = 'manual-update') {
+    assertPracticeMutationSession();
     const finalRecords = Array.isArray(records) ? records : [];
     await replaceCanonicalPracticeRecords(finalRecords);
     syncLegacyPracticeRecordArtifacts(finalRecords);
@@ -1381,6 +1403,7 @@ async function savePracticeRecordFallback(examId, realData) {
             title: exam.title || realData.title || '',
             category: category,
             frequency: exam.frequency || 'unknown',
+            duration: realData.duration,
             realData: {
                 score: correct,
                 totalQuestions: total,
@@ -3405,8 +3428,7 @@ async function toggleBulkDelete() {
             try {
                 await bulkDeleteRecords(selected);
             } catch (error) {
-                console.error('[System] 批量删除失败:', summarizeMainErrorForLog(error));
-                showMessage('Bulk delete failed. Please retry.', 'error');
+                handlePracticeRecordMutationError(error, '批量删除失败，请检查连接后重试。');
             }
         }
     }
@@ -3423,7 +3445,7 @@ async function bulkDeleteRecords(selectedSnapshot = getSelectedRecordsState()) {
         return;
     }
 
-    const records = await listCanonicalPracticeRecords();
+    const records = await listCanonicalPracticeRecords({ forMutation: true });
     const baseList = Array.isArray(records) ? records : [];
     const recordsToKeep = baseList.filter(record => !normalizedIds.includes(normalizeRecordId(record && record.id)));
 
@@ -3457,38 +3479,53 @@ function toggleRecordSelection(recordId) {
 }
 
 
+function handlePracticeRecordMutationError(error, message) {
+    console.error('[System] Practice record mutation failed:', summarizeMainErrorForLog(error));
+    const needsStepUp = error?.status === 403 && error.payload?.requiresDataManageStepUp;
+    if (needsStepUp || error?.status === 401) {
+        showMessage(needsStepUp ? '删除练习记录前需要重新验证身份，验证后请再次操作。' : '登录已失效，请重新登录后再删除练习记录。', 'warning');
+        const returnTo = (window.location.pathname || '/') + (window.location.search || '');
+        const startPath = needsStepUp ? '/auth/business/data/start' : '/auth/business/start';
+        window.location.href = startPath + '?return_to=' + encodeURIComponent(returnTo);
+        return;
+    }
+    showMessage(message, 'error');
+}
+
 async function deleteRecord(recordId) {
     if (!recordId) {
         showMessage('记录ID无效', 'error');
         return;
     }
 
-    const records = await listCanonicalPracticeRecords();
-    const recordIndex = records.findIndex(record => String(record.id) === String(recordId));
-
-    if (recordIndex === -1) {
-        showMessage('未找到记录', 'error');
-        return;
-    }
-
-    const record = records[recordIndex];
-    const confirmMessage = `确定要删除这条练习记录吗？\n\n题目: ${record.title}\n时间: ${new Date(record.date).toLocaleString()}\n\n此操作不可恢复。`;
-
-    if (confirm(confirmMessage)) {
-        const nextRecords = records.filter((record) => String(record.id) !== String(recordId));
+    try {
+        const records = await listCanonicalPracticeRecords({ forMutation: true });
+        const record = records.find(record => String(record.id) === String(recordId));
+        if (!record) {
+            showMessage('未找到记录', 'error');
+            return;
+        }
+        const confirmMessage = `确定要删除这条练习记录吗？\n\n题目: ${record.title}\n时间: ${new Date(record.date).toLocaleString()}\n\n此操作不可恢复。`;
+        if (!confirm(confirmMessage)) return;
+        const nextRecords = records.filter(record => String(record.id) !== String(recordId));
         await persistPracticeRecordsAndRefresh(nextRecords, 'single-delete');
         showMessage('记录已删除', 'success');
+    } catch (error) {
+        handlePracticeRecordMutationError(error, '删除失败，请检查连接后重试。');
     }
 }
 
 async function clearPracticeData() {
-    if (confirm('确定要清除所有练习记录吗？此操作不可恢复。')) {
+    if (!confirm('确定要清除所有练习记录吗？此操作不可恢复。')) return;
+    try {
         await persistPracticeRecordsAndRefresh([], 'clear-all');
         processedSessions.clear();
         clearSelectedRecordsState();
         setBulkDeleteModeState(false);
         refreshBulkDeleteButton();
         showMessage('练习记录已清除', 'success');
+    } catch (error) {
+        handlePracticeRecordMutationError(error, '清除失败，请检查连接后重试。');
     }
 }
 

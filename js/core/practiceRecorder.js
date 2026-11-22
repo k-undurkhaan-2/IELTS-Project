@@ -1332,8 +1332,8 @@ class PracticeRecorder {
         })();
 
         const resolvedStartTime = (() => {
-            if (session?.startTime) return new Date(session.startTime).toISOString();
             if (results?.startTime) return new Date(results.startTime).toISOString();
+            if (session?.startTime) return new Date(session.startTime).toISOString();
             return new Date(new Date(resolvedEndTime).getTime() - (Number(results?.duration) || 0) * 1000).toISOString();
         })();
 
@@ -1423,6 +1423,7 @@ class PracticeRecorder {
             suiteSessionId,
             createdAt: resolvedEndTime,
             realData: Object.assign({}, results?.realData || {}, {
+                duration: Math.floor(durationMs / 1000),
                 answers: answerMap,
                 correctAnswers: correctAnswerMap,
                 questionTypeMap: results?.questionTypeMap || results?.realData?.questionTypeMap || {},

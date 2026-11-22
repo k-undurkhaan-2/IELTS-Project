@@ -4332,6 +4332,7 @@
                     frequency: exam.frequency,
 
                     // 真实数据
+                    duration: realData.duration,
                     realData: {
                         score: realData.scoreInfo?.correct || 0,
                         totalQuestions: realData.scoreInfo?.total || 0,

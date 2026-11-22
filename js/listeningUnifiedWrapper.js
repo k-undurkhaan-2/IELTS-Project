@@ -77,7 +77,7 @@
 
     function syncActionProxies(doc) {
         var timer = doc.getElementById('listening-wrapper-timer');
-        if (timer) timer.disabled = false;
+        if (timer) timer.disabled = state.completed || state.resetPending;
         Array.prototype.forEach.call(doc.querySelectorAll('[data-listening-action]'), function (button) {
             var role = button.dataset.listeningAction;
             if (role === 'exit') {
@@ -274,12 +274,14 @@
         running: true,
         expiryHandled: false,
         completed: false,
+        completionTiming: null,
         scoreInfo: null,
         bridgeInjected: false,
         bridgeReady: false,
         frameLoaded: false,
         resetPending: false,
         pendingReturnToTest: false,
+        preserveClockOnReset: false,
         pendingMessages: [],
         parentWindow: null,
         timerInterval: null,
@@ -340,7 +342,7 @@
     }
 
     function updateClockPause(running) {
-        var nextRunning = running !== false;
+        var nextRunning = running !== false && !state.completed;
         var now = Date.now();
         if (!nextRunning && state.running) {
             state.pausedAtMs = now;
@@ -353,6 +355,7 @@
     }
 
     function elapsedSeconds() {
+        if (state.completionTiming) return state.completionTiming.duration;
         var end = state.running ? Date.now() : (Number.isFinite(state.pausedAtMs) ? state.pausedAtMs : Date.now());
         return Math.max(0, Math.floor((end - state.startTime - Math.max(0, state.pausedOffsetMs || 0)) / 1000));
     }
@@ -936,9 +939,10 @@
         }
         timer.classList.toggle('timer-expired', expired);
         timer.classList.toggle('paused', !state.running);
+        timer.title = state.completed ? 'Completed practice time' : 'Click to pause or resume timer display';
         timer.dataset.timerMode = preferences.mode;
         timer.dataset.expiryAction = preferences.expiryAction;
-        if (expired) {
+        if (expired && state.running && !state.completed && !state.resetPending) {
             handleExpired(doc, preferences);
         }
     }
@@ -1148,22 +1152,26 @@
         } catch (_) { }
     }
 
-    function resetAttempt(startTime) {
-        state.startTime = startTime || Date.now();
-        state.pausedAtMs = null;
-        state.pausedOffsetMs = 0;
-        state.running = true;
-        state.expiryHandled = false;
+    function resetAttempt(startTime, preserveClock) {
+        state.preserveClockOnReset = Boolean(preserveClock);
+        if (!state.preserveClockOnReset) {
+            state.startTime = startTime || Date.now();
+            state.pausedAtMs = null;
+            state.pausedOffsetMs = 0;
+            state.running = true;
+            state.expiryHandled = false;
+            state.lastTimerText = '';
+        }
         state.completed = false;
+        state.completionTiming = null;
         state.scoreInfo = null;
-        state.lastTimerText = '';
         updateTimerDisplay();
     }
 
     function requestPracticeReset(reason) {
         if (state.resetPending) return;
         state.resetPending = true;
-        resetAttempt(Date.now());
+        resetAttempt(Date.now(), reason === 'retake-after-return');
         var target = state.parentWindow || global.opener;
         if (!target || typeof target.postMessage !== 'function') {
             // Standalone previews still need a fresh bridge attempt and clock.
@@ -1223,12 +1231,18 @@
             // Ignore an old handshake racing with the reset request.
             if (state.resetPending && nextSessionId === state.sessionId) return;
             if (state.resetPending || (state.sessionId && nextSessionId !== state.sessionId)) {
-                resetAttempt(Number(payload.startTime) || Date.now());
+                // Returning to the questions changes the record identity only.
+                // Keep its clock paused at the submitted value until a manual action.
+                if (!(state.resetPending && state.preserveClockOnReset)) {
+                    resetAttempt(Number(payload.startTime) || Date.now());
+                }
             }
             state.resetPending = false;
             state.sessionId = nextSessionId;
             state.suiteSessionId = normalizeSafeId(payload.suiteSessionId, state.suiteSessionId || '');
-            state.startTime = Number.isFinite(Number(payload.startTime)) ? Number(payload.startTime) : state.startTime;
+            if (!state.preserveClockOnReset) {
+                state.startTime = Number.isFinite(Number(payload.startTime)) ? Number(payload.startTime) : state.startTime;
+            }
         }
         forwardToIframe(message);
     }
@@ -1239,15 +1253,30 @@
         }
         var frameWindow = getFrameWindow();
         if (event.source && frameWindow && event.source === frameWindow) {
+            var message = event.data;
             if (event.data.type === 'PRACTICE_COMPLETE') {
                 var completion = event.data.data || {};
                 if (state.resetPending || (state.sessionId && completion.sessionId !== state.sessionId)) return;
                 state.completed = true;
                 state.scoreInfo = completion.scoreInfo || null;
                 updateClockPause(false);
+                // The wrapper owns the visible clock, including pauses and resets.
+                // Freeze its elapsed seconds once so retries cannot count review time.
+                if (!state.completionTiming) {
+                    var duration = elapsedSeconds();
+                    state.completionTiming = {
+                        startTime: state.startTime,
+                        endTime: Date.now(),
+                        duration: duration,
+                        effectiveEndTime: state.startTime + duration * 1000
+                    };
+                }
+                message = Object.assign({}, message, {
+                    data: Object.assign({}, completion, state.completionTiming)
+                });
                 updateTimerDisplay();
             }
-            forwardToParent(event.data);
+            forwardToParent(message);
             if (event.data.type === 'PRACTICE_COMPLETE' && state.pendingReturnToTest) {
                 // Deliver the old result before asking the parent for a new ID.
                 state.pendingReturnToTest = false;

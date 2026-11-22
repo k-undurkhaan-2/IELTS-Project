@@ -151,6 +151,7 @@ function createHarness(options = {}) {
         },
         window: {
             console: quietConsole,
+            getMessageCenter() { return { show(message, type) { messageLog.push({ message, type }); } }; },
             storage: storageStub,
             location: { origin: 'http://localhost', href: 'http://localhost/' },
             fallbackExamSessions: new Map(),
@@ -493,8 +494,69 @@ async function testFallbackCompletionRejectsUnknownWindowSideEffects() {
     );
 }
 
+async function testDeletionFailuresAreVisibleAndPreserveRecords() {
+    for (const operation of ['single', 'bulk', 'clear']) {
+        for (const status of [0, 401, 403, 500]) {
+            const h = createHarness();
+            h.sandbox.window.location.pathname = '/index.html';
+            h.sandbox.window.location.search = '?view=practice';
+            const error = Object.assign(new Error('Request failed'), {
+                status, payload: { requiresDataManageStepUp: status === 403, authActionStart: 'https://untrusted.invalid/' }
+            });
+            h.sandbox.window.PracticeCore.store.replacePracticeRecords = async () => { throw error; };
+            h.sandbox.getBulkDeleteModeState = () => true;
+            h.sandbox.getSelectedRecordsState = () => new Set(['record-1']);
+            if (operation === 'single') await h.sandbox.deleteRecord('record-1');
+            else if (operation === 'bulk') await h.sandbox.toggleBulkDelete();
+            else await h.sandbox.clearPracticeData();
+            assert.deepStrictEqual(h.practiceState.map(r => r.id), ['record-1', 'record-2']);
+            assert(h.messageLog.some(entry => ['error', 'warning'].includes(entry.type)), operation + ': failed deletion must be visible');
+            assert(!h.messageLog.some(entry => entry.type === 'success'), operation + ': failed deletion must not report success');
+            if (status === 401 || status === 403) {
+                const route = status === 403 ? '/auth/business/data/start' : '/auth/business/start';
+                assert.strictEqual(h.sandbox.window.location.href, route + '?return_to=%2Findex.html%3Fview%3Dpractice');
+            }
+        }
+    }
+    const h = createHarness();
+    h.sandbox.confirm = () => false;
+    await h.sandbox.deleteRecord('record-1');
+    assert.strictEqual(h.practiceState.length, 2, 'cancelling confirmation preserves the records');
+}
+
+async function testFailedRemoteReadCannotDeleteCachedRecords() {
+    for (const status of [0, 401, 403, 500]) {
+        const h = createHarness();
+        let writes = 0;
+        const error = Object.assign(new Error('Remote read failed'), { status, payload: { requiresDataManageStepUp: status === 403 } });
+        h.sandbox.window.remoteApiClient = { available: true, isAuthenticated: () => true, async listPracticeRecords() { throw error; } };
+        h.sandbox.window.PracticeCore.store.replacePracticeRecords = async () => { writes++; };
+        await h.sandbox.deleteRecord('record-1');
+        assert.strictEqual(writes, 0, 'a failed remote refresh must not delete from a cached snapshot');
+        assert.strictEqual(h.practiceState.length, 2);
+        assert(h.messageLog.some(entry => ['error', 'warning'].includes(entry.type)));
+    }
+    const h = createHarness();
+    h.sandbox.window.remoteApiClient = { available: true, isAuthenticated: () => false };
+    await h.sandbox.clearPracticeData();
+    assert.strictEqual(h.practiceState.length, 2, 'an expired remote session must not clear only the local mirror');
+}
+
+async function testHistoryKeepsExplicitZeroActiveSeconds() {
+    const h = createHarness();
+    h.practiceState[0].duration = 0;
+    h.practiceState[0].realData = { duration: 180 };
+    h.practiceState[0].startTime = '2026-11-23T10:00:00Z';
+    h.practiceState[0].endTime = '2026-11-23T10:03:00Z';
+    await h.sandbox.syncPracticeRecords({ forceRender: true });
+    assert.strictEqual(h.sandbox.window.app.state.practice.records[0].duration, 0, 'an explicit active duration must not be replaced with wall or pause time');
+}
+
 async function main() {
     try {
+        await testFailedRemoteReadCannotDeleteCachedRecords();
+        await testHistoryKeepsExplicitZeroActiveSeconds();
+        await testDeletionFailuresAreVisibleAndPreserveRecords();
         await testDeleteRecordPersistsAndCleansLegacyKeys();
         await testClearPracticeDataPersistsAndClearsLegacyKeys();
         await testDeleteRecordForcesUiRefreshWhenPracticeCoreAlreadySyncedState();

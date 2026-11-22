@@ -233,6 +233,11 @@
                 if (isUnauthorized(error)) {
                     clearApiAuthState(this.apiClient);
                 }
+                // Collection replacement may delete records. Never report a local-only
+                // replacement as a successful remote mutation.
+                if (!Array.isArray(options.syncRecords)) {
+                    throw error;
+                }
                 console.warn('[RemotePracticeDataSource] 写入远端练习记录失败，回退本地:', summarizeRemotePracticeErrorForLog(error));
                 return this.localDataSource.write(key, value);
             }
@@ -257,8 +262,7 @@
                 if (isUnauthorized(error)) {
                     clearApiAuthState(this.apiClient);
                 }
-                console.warn('[RemotePracticeDataSource] 清空远端练习记录失败，回退本地:', summarizeRemotePracticeErrorForLog(error));
-                return this.localDataSource.remove(key);
+                throw error;
             }
         }
 

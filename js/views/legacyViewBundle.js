@@ -2296,12 +2296,9 @@
 
     historyRenderer.helpers.formatDurationShort = function (seconds) {
         var s = Math.max(0, Math.floor(Number(seconds) || 0));
-        if (s < 60) return s + '秒';
-        var m = Math.floor(s / 60);
-        if (m < 60) return m + '分钟';
-        var h = Math.floor(m / 60);
-        var mm = m % 60;
-        return h + '小时' + mm + '分钟';
+        var minutes = String(Math.floor(s / 60)).padStart(2, '0');
+        var remainingSeconds = String(s % 60).padStart(2, '0');
+        return minutes + ':' + remainingSeconds;
     };
 
     historyRenderer.helpers.getDurationColor = function (seconds) {

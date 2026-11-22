@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
+const repoRoot = process.env.IELTS_TEST_SOURCE_ROOT || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const fixture = `<!doctype html><html><body>
     <div class="header"></div>
     <main class="main-content">
@@ -123,7 +123,7 @@ try {
             assert.equal(await frame.getByRole('button', { name: 'Notes', exact: true }).isVisible(), true);
             assert.equal(await frame.getByRole('button', { name: 'Exit', exact: true }).isVisible(), false);
             await frame.evaluate(() => parent.postMessage({ type: 'SESSION_READY', data: {} }, location.origin));
-            now += 5000;
+            now += 5900;
             await page.clock.setFixedTime(now);
             const beforeSubmit = scenario.mode === 'countdown' ? '00:55' : '00:05';
             await frame.waitForFunction(text => document.querySelector('[data-wrapper-timer=true]').textContent === text, beforeSubmit);
@@ -135,7 +135,7 @@ try {
             }
 
             if (scenario.action === 'expiry') {
-                now += 60000;
+                now += 54100;
                 await page.clock.setFixedTime(now);
             } else if (scenario.action === 'api') {
                 assert.equal(await wrapper.evaluate(() => window.__listeningBridgeComplete({ allowGenerated: true })), true);
@@ -146,6 +146,8 @@ try {
             }
             await page.waitForFunction(() => forwardedCompletions.length === 1);
             const completion = await page.evaluate(() => forwardedCompletions[0]);
+            assert.equal(completion.message.data.duration, scenario.action === 'expiry' ? 60 : 5,
+                scenario.name + ': saved duration must use the displayed active seconds, excluding pauses');
             assert.equal(completion.paused, true, scenario.name + ': stop the timer before forwarding completion');
             assert.equal(completion.exitReady, true, scenario.name + ': replace Notes with an enabled Exit before forwarding completion');
             const exit = frame.getByRole('button', { name: 'Exit', exact: true });
@@ -172,19 +174,22 @@ try {
             await page.clock.setFixedTime(now);
             await frame.evaluate(message => parent.postMessage(message, location.origin), completion.message);
             await page.waitForFunction(() => forwardedCompletions.length === 2);
+            assert.equal(await page.evaluate(() => forwardedCompletions[1].message.data.duration), completion.message.data.duration,
+                'duplicate completion must retain the original timer duration');
             await page.waitForTimeout(1100);
             assert.equal(await timer.textContent(), stoppedText);
             assert.equal(await timer.evaluate(node => node.classList.contains('paused')), true);
             assert.equal(await summary.count(), 1, 'duplicate completion must not duplicate the summary');
             assert.equal(await summary.textContent(), expectedSummary);
 
-            if (scenario.paused) {
-                // The existing manual resume control must exclude all paused/review time.
-                await timer.click();
-                now += 3000;
-                await page.clock.setFixedTime(now);
-                await frame.waitForFunction(() => document.querySelector('[data-wrapper-timer=true]').textContent === '00:08');
-            }
+            assert.equal(await timer.isDisabled(), true, 'a submitted attempt must keep its final clock frozen');
+            // Even a delayed click event must not resume the clock for a saved attempt.
+            await timer.dispatchEvent('click');
+            now += 3000;
+            await page.clock.setFixedTime(now);
+            await page.waitForTimeout(1100);
+            assert.equal(await timer.textContent(), stoppedText, 'review time must match the saved attempt');
+            assert.equal(await timer.evaluate(node => node.classList.contains('paused')), true);
             assert.equal(await exit.count(), 1, 'duplicate completion must not duplicate Exit');
             await exit.click();
             await page.waitForFunction(() => forwardedExits.length === 1);
