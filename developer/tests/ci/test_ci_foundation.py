@@ -5723,6 +5723,597 @@ class AuthenticatedGitA6Test(unittest.TestCase):
             self.assertIn("COMMAND-AUTHORITY-MISMATCH", {item["id"] for item in failures})
 
 
+# Issue #104 D4 / #111 D5 / #79 D6: this fixed worker is trusted test source.
+# The response is data only; it is never imported, executed, cached or installed.
+_A6_HISTORICAL_BLOB_WORKER = r"""
+import hashlib
+import re
+import socket
+import ssl
+import sys
+
+N = 1147901
+OID_SHA256 = "d9450c326176fb76e18b8c39dd055b15235e0705d2abdb43cc8666a54c96034e"
+HOST = "api.github.com"
+PATH = "/repos/k-undurkhaan-2/IELTS-Project/git/blobs/8c8a3247ebdf3f4ee40843c924abe2c052635d68"
+REQUEST = (
+    "GET " + PATH + " HTTP/1.1\r\nHost: api.github.com\r\n"
+    "Accept: application/vnd.github.raw+json\r\nAccept-Encoding: identity\r\n"
+    "User-Agent: IELTS-Project-A6-source-admission\r\nConnection: close\r\n\r\n"
+).encode("ascii")
+
+class Rejected(Exception):
+    pass
+
+def reject(kind="SOURCE_BOUNDS_FAILED"):
+    raise Rejected(kind)
+
+class Reader:
+    def __init__(self, stream):
+        self.stream = stream
+        self.pending = bytearray()
+        self.total = 0
+        self.header_bytes = 0
+        self.header_lines = 0
+
+    def read(self, count):
+        if not self.pending:
+            remaining = 1310720 - self.total
+            if remaining <= 0:
+                reject()
+            chunk = self.stream.recv(min(4096, remaining, count))
+            self.total += len(chunk)
+            self.pending.extend(chunk)
+        taken = bytes(self.pending[:count])
+        del self.pending[:count]
+        return taken
+
+    def exact(self, count):
+        result = bytearray()
+        while len(result) < count:
+            piece = self.read(min(4096, count - len(result)))
+            if not piece:
+                reject()
+            result.extend(piece)
+        return result
+
+    def line(self, header=False):
+        result = bytearray()
+        while True:
+            if len(result) >= 8192:
+                reject()
+            if header and (self.header_bytes >= 32768 or self.header_lines >= 64):
+                reject()
+            piece = self.read(1)
+            if not piece:
+                reject()
+            result.extend(piece)
+            if header:
+                self.header_bytes += 1
+            if piece == b"\n":
+                if not result.endswith(b"\r\n") or b"\r" in result[:-2]:
+                    reject()
+                if header:
+                    self.header_lines += 1
+                return bytes(result)
+
+    def headers(self):
+        result = {}
+        while True:
+            line = self.line(header=True)
+            if line == b"\r\n":
+                return result
+            match = re.fullmatch(rb"([!#$%&'*+.^_\x60|~0-9A-Za-z-]+):[ \t]*([\x20-\x7e\t]*)\r\n", line)
+            if not match:
+                reject()
+            key, value = match[1].lower(), match[2].strip(b" \t")
+            if key in result:
+                reject()
+            result[key] = value
+
+def acquire():
+    # No caller URL, proxy, credential lookup, alternate host, redirect or retry.
+    if (HOST != "api.github.com" or PATH !=
+        "/repos/k-undurkhaan-2/IELTS-Project/git/blobs/8c8a3247ebdf3f4ee40843c924abe2c052635d68"):
+        reject("SOURCE_AUTHENTICATION_FAILED")
+    expected = (
+        "GET " + PATH + " HTTP/1.1\r\nHost: api.github.com\r\n"
+        "Accept: application/vnd.github.raw+json\r\nAccept-Encoding: identity\r\n"
+        "User-Agent: IELTS-Project-A6-source-admission\r\nConnection: close\r\n\r\n"
+    ).encode("ascii")
+    if REQUEST != expected:
+        reject("SOURCE_AUTHENTICATION_FAILED")
+    context = ssl.create_default_context()
+    if context.verify_mode != ssl.CERT_REQUIRED or not context.check_hostname:
+        reject("SOURCE_AUTHENTICATION_FAILED")
+    with socket.create_connection((HOST, 443), timeout=5) as connection:
+        with context.wrap_socket(connection, server_hostname=HOST) as stream:
+            stream.settimeout(5)
+            stream.sendall(REQUEST)
+            reader = Reader(stream)
+            while True:
+                status = reader.line(header=True)
+                match = re.fullmatch(rb"HTTP/1\.[01] ([0-9]{3}) [\x20-\x7e]*\r\n", status)
+                if not match:
+                    reject()
+                code = int(match[1])
+                headers = reader.headers()
+                if code in (100, 102, 103):
+                    if b"content-length" in headers or b"transfer-encoding" in headers:
+                        reject()
+                    continue
+                break
+            if 300 <= code <= 399:
+                reject("SOURCE_AUTHENTICATION_FAILED")
+            if code != 200:
+                reject("SOURCE_UNAVAILABLE: HTTP_STATUS_" + str(code))
+            if headers.get(b"content-encoding", b"identity").lower() != b"identity":
+                reject()
+            length = headers.get(b"content-length")
+            transfer = headers.get(b"transfer-encoding")
+            if transfer is not None and (transfer.lower() != b"chunked" or length is not None):
+                reject()
+            payload = bytearray()
+            if transfer is not None:
+                while True:
+                    line = reader.line()
+                    if not re.fullmatch(rb"[0-9a-fA-F]{1,8}\r\n", line):
+                        reject()
+                    count = int(line[:-2], 16)
+                    if count == 0:
+                        trailers = reader.headers()
+                        if trailers:
+                            reject()
+                        break
+                    if count > N + 1 - len(payload):
+                        reject()
+                    payload.extend(reader.exact(count))
+                    if len(payload) > N or reader.exact(2) != b"\r\n":
+                        reject()
+            elif length is not None:
+                if not re.fullmatch(rb"[0-9]{1,8}", length) or int(length) != N:
+                    reject()
+                payload = reader.exact(N)
+            else:
+                while len(payload) <= N:
+                    piece = reader.read(min(4096, N + 1 - len(payload)))
+                    if not piece:
+                        break
+                    payload.extend(piece)
+                if len(payload) > N:
+                    reject()
+            if reader.read(1) or len(payload) != N:
+                reject()
+            if (hashlib.sha256(payload).hexdigest() != OID_SHA256
+                or payload.count(b"\r\n") != 25150):
+                reject("HISTORICAL_IDENTITY_MISMATCH")
+            return payload
+
+def run():
+    try:
+        payload = acquire()
+        sys.stdout.buffer.write(payload)
+        sys.stdout.buffer.flush()
+        return 0
+    except Rejected as exc:
+        message = str(exc)
+    except ssl.SSLError:
+        message = "SOURCE_AUTHENTICATION_FAILED"
+    except (OSError, TimeoutError):
+        message = "SOURCE_UNAVAILABLE"
+    except Exception:
+        message = "SOURCE_BOUNDS_FAILED"
+    sys.stderr.buffer.write((message + "\n").encode("ascii"))
+    return 1
+
+if __name__ == "__main__":
+    sys.exit(run())
+"""
+
+
+def _a6_check_historical_payload(payload: bytes) -> None:
+    if (
+        type(payload) is not bytes
+        or len(payload) != 1_147_901
+        or hashlib.sha256(payload).hexdigest()
+        != "d9450c326176fb76e18b8c39dd055b15235e0705d2abdb43cc8666a54c96034e"
+        or payload.count(b"\r\n") != 25_150
+    ):
+        raise AssertionError("HISTORICAL_IDENTITY_MISMATCH: raw historical payload")
+
+
+def _a6_acquisition_capture(capture: ci.CommandCapture, stage: str) -> bytes:
+    """Reject incomplete execution without disclosing response or stderr bytes."""
+    if not capture.executed:
+        reason = (
+            "CONTAINMENT_UNAVAILABLE"
+            if capture.process_tree_status == "setup-failed"
+            else "TOOL_AUTHORITY_UNAVAILABLE"
+        )
+        raise AssertionError(f"{reason}: {stage}")
+    if (
+        capture.process_tree_error is not None
+        or capture.process_tree_status != "contained-clean"
+        or capture.descendants_surviving != 0
+        or capture.descendants_observed != capture.descendants_reaped
+        or capture.descendants_terminated != 0
+    ):
+        raise AssertionError(f"CONTAINMENT_FAILED: {stage}")
+    if capture.output_limited:
+        raise AssertionError(f"SOURCE_BOUNDS_FAILED: {stage} output")
+    stdout_limit = 1_147_901 if stage == "network" else 41
+    if (
+        capture.stdout_bytes > stdout_limit or capture.stderr_bytes > 4_096
+        or (type(capture.stdout_raw) is bytes and len(capture.stdout_raw) > stdout_limit)
+        or (type(capture.stderr_raw) is bytes and len(capture.stderr_raw) > 4_096)
+    ):
+        raise AssertionError(f"SOURCE_BOUNDS_FAILED: {stage} output")
+    if capture.timed_out:
+        raise AssertionError(f"SOURCE_UNAVAILABLE: {stage} deadline")
+    if not capture.execution_passed() or capture.stderr_raw != b"" or capture.stderr_bytes != 0:
+        diagnostic = capture.stderr_raw
+        if (
+            stage == "network"
+            and capture.exit_code == 1
+            and type(diagnostic) is bytes
+            and len(diagnostic) <= 64
+            and re.fullmatch(
+                rb"(SOURCE_AUTHENTICATION_FAILED|SOURCE_UNAVAILABLE|"
+                rb"SOURCE_BOUNDS_FAILED|HISTORICAL_IDENTITY_MISMATCH)"
+                rb"(?:: HTTP_STATUS_[0-9]{3})?\n", diagnostic,
+            )
+        ):
+            raise AssertionError(diagnostic.decode("ascii").rstrip("\n"))
+        raise AssertionError(f"HISTORICAL_IDENTITY_MISMATCH: {stage} capture")
+    if type(capture.stdout_raw) is not bytes:
+        raise AssertionError(f"SOURCE_BOUNDS_FAILED: {stage} capture")
+    return capture.stdout_raw
+
+
+def _a6_acquire_historical_runner() -> bytes:
+    """Acquire only the D4/D5/D6 object, once per affected A6 invocation."""
+    if os.name != "nt" and not sys.platform.startswith("linux"):
+        raise AssertionError("CONTAINMENT_UNAVAILABLE: unsupported platform")
+    try:
+        policy, tools = _resolved_local_test_authority("python", "git")
+        root = ci.REPO_ROOT.resolve(strict=True)
+        environment = ci.child_process_environment(
+            tools, source_environment=_explicit_local_test_environment(),
+            repo_root=root, policy=policy,
+        )
+    except (AssertionError, OSError, ValueError, ci.ToolAuthorityUnavailable):
+        raise AssertionError("TOOL_AUTHORITY_UNAVAILABLE: A6 runtime admission") from None
+    python_argv = (tools["python"], "-I", "-B", "-c", _A6_HISTORICAL_BLOB_WORKER)
+    git_argv = (
+        tools["git"], "-c", f"safe.directory={root}", "-C", str(root),
+        "hash-object", "-t", "blob", "--stdin", "--no-filters",
+    )
+    if (
+        any(len(value) > 2_048 for value in (tools["python"], tools["git"], str(root)))
+        or len(_A6_HISTORICAL_BLOB_WORKER.encode("utf-8")) > 8_192
+        or (os.name == "nt" and any(
+            len(subprocess.list2cmdline(argv).encode("utf-16-le")) // 2 > 16_384
+            for argv in (python_argv, git_argv)
+        ))
+    ):
+        raise AssertionError("SOURCE_BOUNDS_FAILED: A6 arguments")
+    network = ci.execute_command(
+        "a6-historical-blob-acquisition", "a6-source-authority", python_argv,
+        timeout=20, cwd=root, env=environment, include_preview=False,
+        max_stdout_bytes=1_147_901, max_stderr_bytes=4_096,
+        max_line_bytes=16_384,
+    )
+    payload = _a6_acquisition_capture(network, "network")
+    _a6_check_historical_payload(payload)
+    verified = ci.execute_command(
+        "a6-historical-blob-verification", "a6-source-authority", git_argv,
+        timeout=20, cwd=root, env=environment, include_preview=False,
+        max_stdout_bytes=41, max_stderr_bytes=4_096, max_line_bytes=16_384,
+        stdin_data=payload,
+    )
+    if _a6_acquisition_capture(verified, "git") != b"8c8a3247ebdf3f4ee40843c924abe2c052635d68\n":
+        raise AssertionError("HISTORICAL_IDENTITY_MISMATCH: typed Git Blob")
+    return payload
+
+
+class A6BoundedHistoricalBlobAcquisitionTest(unittest.TestCase):
+    """Synthetic transport/capture controls; real HTTPS stays in two consumers."""
+
+    @staticmethod
+    def _capture(data=b"", **changes):
+        values = dict(
+            command_id="a6-fixture", command_class="a6-source-authority", argv=[],
+            executed=True, exit_code=0, duration_seconds=0, stdout="", stderr="",
+            stdout_raw=data, stderr_raw=b"", stdout_bytes=len(data),
+            containment="windows-job-object" if os.name == "nt" else "linux-subreaper",
+            process_tree_status="contained-clean",
+        )
+        values.update(changes)
+        return ci.CommandCapture(**values)
+
+    def _worker(self, response=b"", *, changes=None, tls_error=None, read_error=None, short=4096):
+        namespace = {"__name__": "a6_trusted_worker_fixture"}
+        exec(compile(_A6_HISTORICAL_BLOB_WORKER, "<a6-trusted-worker>", "exec"), namespace)
+
+        class Stream:
+            def __init__(self):
+                self.offset = 0
+                self.sent = []
+                self.requested = []
+                self.timeout = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def settimeout(self, value):
+                self.timeout = value
+
+            def sendall(self, request):
+                self.sent.append(request)
+
+            def recv(self, count):
+                self.requested.append(count)
+                if read_error is not None:
+                    raise read_error
+                part = response[self.offset:self.offset + min(count, short)]
+                self.offset += len(part)
+                return part
+
+        stream = Stream()
+        connection = mock.Mock(return_value=stream)
+        wrap = mock.Mock(return_value=stream, side_effect=tls_error)
+        context = SimpleNamespace(verify_mode=namespace["ssl"].CERT_REQUIRED,
+                                  check_hostname=True, wrap_socket=wrap)
+        factory = mock.Mock(return_value=context)
+        namespace["socket"] = SimpleNamespace(create_connection=connection)
+        real_ssl = namespace["ssl"]
+        namespace["ssl"] = SimpleNamespace(create_default_context=factory,
+                                           CERT_REQUIRED=real_ssl.CERT_REQUIRED,
+                                           SSLError=real_ssl.SSLError)
+        stdout, stderr = io.BytesIO(), io.BytesIO()
+        namespace["sys"] = SimpleNamespace(
+            stdout=SimpleNamespace(buffer=stdout), stderr=SimpleNamespace(buffer=stderr),
+        )
+        namespace.update(changes or {})
+        code = namespace["run"]()
+        self.assertLessEqual(len(stream.sent), 1)
+        self.assertLessEqual(connection.call_count, 1)
+        self.assertLessEqual(stream.offset, 1_310_720)
+        self.assertLessEqual(len(stdout.getvalue()), 1_147_901)
+        self.assertLessEqual(len(stderr.getvalue()), 4_096)
+        if connection.called:
+            connection.assert_called_once_with(("api.github.com", 443), timeout=5)
+            wrap.assert_called_once_with(stream, server_hostname="api.github.com")
+        if stream.sent:
+            self.assertEqual(stream.sent, [namespace["REQUEST"]])
+            self.assertEqual(stream.timeout, 5)
+        return code, stdout.getvalue(), stderr.getvalue(), namespace, stream
+
+    def test_fixed_origin_credentials_redirect_and_tls_rejections(self):
+        import ssl
+        for changes in (
+            {"HOST": "github.com"},
+            {"PATH": "/repos/other/IELTS-Project/git/blobs/" + "8c8a3247ebdf3f4ee40843c924abe2c052635d68"},
+            {"REQUEST": b"GET / HTTP/1.1\r\nAuthorization: Bearer fixture\r\n\r\n"},
+            {"REQUEST": b"GET https://proxy.invalid/ HTTP/1.1\r\n\r\n"},
+        ):
+            with self.subTest(changes=tuple(changes)):
+                code, out, err, _, stream = self._worker(changes=changes)
+                self.assertEqual((code, out, err), (1, b"", b"SOURCE_AUTHENTICATION_FAILED\n"))
+                self.assertEqual(stream.sent, [])
+        for status in (301, 302, 307, 308):
+            with self.subTest(redirect=status):
+                result = self._worker(
+                    f"HTTP/1.1 {status} Redirect\r\nLocation: https://elsewhere.invalid/\r\n\r\n".encode()
+                )
+                self.assertEqual(result[:3], (1, b"", b"SOURCE_AUTHENTICATION_FAILED\n"))
+        result = self._worker(tls_error=ssl.SSLCertVerificationError("synthetic certificate rejection"))
+        self.assertEqual(result[:3], (1, b"", b"SOURCE_AUTHENTICATION_FAILED\n"))
+        self.assertEqual(result[-1].sent, [])
+
+    def test_status_transport_and_socket_timeout_rejections(self):
+        for status in (101, 401, 403, 404, 429, 500):
+            with self.subTest(status=status):
+                result = self._worker(f"HTTP/1.1 {status} Rejected\r\n\r\n".encode())
+                self.assertEqual(result[:3], (1, b"", f"SOURCE_UNAVAILABLE: HTTP_STATUS_{status}\n".encode()))
+        for error in (TimeoutError("fixture"), OSError("fixture")):
+            with self.subTest(error=type(error).__name__):
+                self.assertEqual(self._worker(read_error=error)[:3],
+                                 (1, b"", b"SOURCE_UNAVAILABLE\n"))
+
+    def test_malformed_headers_framing_and_encoding_rejections(self):
+        responses = (
+            b"HTTP/1.1 200 OK\n\n",
+            b"HTTP/2 200 OK\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\n folded: value\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nBad Header: value\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nX: \x00\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1147901\r\ncontent-length: 1147901\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: br\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 1147901\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: +1147901\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 999999999999999999999999999999\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nx\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;extension=x\r\nx\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nxXX",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: trailer\r\n\r\n",
+            b"HTTP/1.1 100 Continue\r\nContent-Length: 1\r\n\r\n",
+        )
+        for index, response in enumerate(responses):
+            with self.subTest(case=index):
+                self.assertEqual(self._worker(response)[:3], (1, b"", b"SOURCE_BOUNDS_FAILED\n"))
+
+    def test_header_line_count_total_and_interim_bounds(self):
+        for label, response in (
+            ("line", b"HTTP/1.1 200 OK\r\nX: " + b"x" * 8192 + b"\r\n\r\n"),
+            ("count", b"HTTP/1.1 200 OK\r\n" + b"".join(f"X-{n}: x\r\n".encode() for n in range(64)) + b"\r\n"),
+            ("total", b"HTTP/1.1 200 OK\r\n" + b"".join(f"X-{n}: ".encode() + b"x" * 5000 + b"\r\n" for n in range(7)) + b"\r\n"),
+            ("interim", b"HTTP/1.1 103 Early Hints\r\n\r\n" * 33),
+        ):
+            with self.subTest(bound=label):
+                self.assertEqual(self._worker(response)[:3], (1, b"", b"SOURCE_BOUNDS_FAILED\n"))
+
+    def test_truncation_overflow_and_chunk_payload_sentinel(self):
+        n = 1_147_901
+        prefix = b"HTTP/1.1 200 OK\r\nContent-Length: 1147901\r\n\r\n"
+        for label, response in (
+            ("short", prefix + b"x" * (n - 1)),
+            ("long", prefix + b"x" * (n + 1)),
+            ("eof-overflow", b"HTTP/1.1 200 OK\r\n\r\n" + b"x" * (n + 1)),
+            ("chunk-overflow", b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + f"{n+1:x}\r\n".encode() + b"x" * (n + 1) + b"\r\n0\r\n\r\n"),
+            ("huge-chunk", b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffff\r\n"),
+        ):
+            with self.subTest(case=label):
+                self.assertEqual(self._worker(response)[:3], (1, b"", b"SOURCE_BOUNDS_FAILED\n"))
+
+    def test_supported_framing_short_reads_reach_independent_content_rejection(self):
+        # Deliberately wrong hash: reaching identity rejection proves parsing,
+        # without treating synthetic transport as a real-source acceptance.
+        payload = b"\r\n" * 25_150 + b"x" * (1_147_901 - 50_300)
+        for label, response in (
+            ("length", b"HTTP/1.1 200 OK\r\nContent-Length: 1147901\r\n\r\n" + payload),
+            ("close", b"HTTP/1.0 200 OK\r\n\r\n" + payload),
+            ("chunked", b"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + f"{len(payload):x}\r\n".encode() + payload + b"\r\n0\r\n\r\n"),
+        ):
+            with self.subTest(framing=label):
+                self.assertEqual(self._worker(response, short=257)[:3],
+                                 (1, b"", b"HISTORICAL_IDENTITY_MISMATCH\n"))
+
+    def test_cumulative_decrypted_limit_precedes_extra_read(self):
+        # Exercise the actual Reader bound, independently of payload framing.
+        _, _, _, namespace, _ = self._worker()
+        stream = SimpleNamespace(recv=mock.Mock(side_effect=lambda count: b"x" * count))
+        reader = namespace["Reader"](stream)
+        with self.assertRaises(namespace["Rejected"]):
+            while True:
+                reader.read(4096)
+        self.assertEqual(reader.total, 1_310_720)
+        self.assertEqual(sum(call.args[0] for call in stream.recv.call_args_list), 1_310_720)
+
+    def test_parent_independently_rechecks_length_hash_and_crlf(self):
+        payload = b"\r\n" * 25_150 + b"x" * (1_147_901 - 50_300)
+        for value in (b"", payload[:-1], payload + b"x", payload, bytearray(payload)):
+            with self.subTest(kind=type(value).__name__, size=len(value)):
+                with self.assertRaisesRegex(AssertionError, "HISTORICAL_IDENTITY_MISMATCH"):
+                    _a6_check_historical_payload(value)
+        digest = SimpleNamespace(hexdigest=lambda: "d9450c326176fb76e18b8c39dd055b15235e0705d2abdb43cc8666a54c96034e")
+        with mock.patch.object(hashlib, "sha256", return_value=digest):
+            with self.assertRaisesRegex(AssertionError, "HISTORICAL_IDENTITY_MISMATCH"):
+                _a6_check_historical_payload(b"x" * 1_147_901)
+
+    def test_failed_capture_timeout_stderr_bounds_and_containment_reject(self):
+        cases = (
+            (dict(executed=False, process_tree_status="setup-failed"), "CONTAINMENT_UNAVAILABLE"),
+            (dict(executed=False), "TOOL_AUTHORITY_UNAVAILABLE"),
+            (dict(process_tree_status="cleanup-failed"), "CONTAINMENT_FAILED"),
+            (dict(process_tree_error="fixture"), "CONTAINMENT_FAILED"),
+            (dict(descendants_surviving=1), "CONTAINMENT_FAILED"),
+            (dict(descendants_observed=1, descendants_reaped=0), "CONTAINMENT_FAILED"),
+            (dict(descendants_terminated=1), "CONTAINMENT_FAILED"),
+            (dict(timed_out=True, exit_code=124), "SOURCE_UNAVAILABLE"),
+            (dict(output_limited=True, exit_code=125), "SOURCE_BOUNDS_FAILED"),
+            (dict(stderr_raw=b"x" * 4097), "SOURCE_BOUNDS_FAILED"),
+            (dict(stdout_bytes=1_147_902), "SOURCE_BOUNDS_FAILED"),
+            (dict(stderr_bytes=4097), "SOURCE_BOUNDS_FAILED"),
+            (dict(stderr_raw=b"unexpected"), "HISTORICAL_IDENTITY_MISMATCH"),
+            (dict(stderr_bytes=1), "HISTORICAL_IDENTITY_MISMATCH"),
+            (dict(exit_code=7), "HISTORICAL_IDENTITY_MISMATCH"),
+            (dict(stdout_raw=None), "SOURCE_BOUNDS_FAILED"),
+        )
+        for stage in ("network", "git"):
+            for changes, classification in cases:
+                with self.subTest(stage=stage, changes=tuple(changes)):
+                    with self.assertRaisesRegex(AssertionError, classification):
+                        _a6_acquisition_capture(self._capture(**changes), stage)
+        for label in ("SOURCE_AUTHENTICATION_FAILED", "SOURCE_UNAVAILABLE",
+                      "SOURCE_BOUNDS_FAILED", "HISTORICAL_IDENTITY_MISMATCH"):
+            capture = self._capture(exit_code=1, stderr_raw=(label + "\n").encode())
+            with self.assertRaisesRegex(AssertionError, label):
+                _a6_acquisition_capture(capture, "network")
+
+    def test_registered_arguments_no_write_and_no_success_cache(self):
+        payload = b"synthetic command-interface fixture"
+        oid = b"8c8a3247ebdf3f4ee40843c924abe2c052635d68\n"
+        with mock.patch.object(ci, "execute_command", side_effect=[
+            self._capture(payload), self._capture(oid),
+            self._capture(payload), self._capture(oid),
+        ]) as execute, mock.patch(__name__ + "._a6_check_historical_payload") as check:
+            self.assertEqual(_a6_acquire_historical_runner(), payload)
+            self.assertEqual(_a6_acquire_historical_runner(), payload)
+        self.assertEqual(check.call_count, 2)
+        self.assertEqual(execute.call_count, 4)
+        _, tools = _resolved_local_test_authority("python", "git")
+        root = ci.REPO_ROOT.resolve(strict=True)
+        self.assertLessEqual(len(_A6_HISTORICAL_BLOB_WORKER.encode("utf-8")), 8192)
+        for network, git in (execute.call_args_list[:2], execute.call_args_list[2:]):
+            self.assertEqual(network.args[2], (tools["python"], "-I", "-B", "-c", _A6_HISTORICAL_BLOB_WORKER))
+            self.assertEqual(git.args[2], (tools["git"], "-c", f"safe.directory={root}", "-C", str(root),
+                                          "hash-object", "-t", "blob", "--stdin", "--no-filters"))
+            self.assertEqual(git.kwargs["stdin_data"], payload)
+            self.assertNotIn("stdin_data", network.kwargs)
+            for call, limit in ((network, 1_147_901), (git, 41)):
+                self.assertEqual(call.kwargs["timeout"], 20)
+                self.assertEqual(call.kwargs["max_stdout_bytes"], limit)
+                self.assertEqual(call.kwargs["max_stderr_bytes"], 4096)
+                self.assertEqual(call.kwargs["max_line_bytes"], 16384)
+                self.assertFalse(call.kwargs["include_preview"])
+                self.assertEqual(call.kwargs["cwd"], root)
+                self.assertNotIn("HTTP_PROXY", call.kwargs["env"])
+                self.assertNotIn("HTTPS_PROXY", call.kwargs["env"])
+                self.assertNotIn("GH_TOKEN", call.kwargs["env"])
+                self.assertNotIn("SSL_CERT_FILE", call.kwargs["env"])
+
+    def test_unavailable_runtime_and_argument_overflow_prevent_launch(self):
+        with mock.patch.object(ci, "execute_command") as execute:
+            with mock.patch(__name__ + "._resolved_local_test_authority", side_effect=AssertionError("fixture")):
+                with self.assertRaisesRegex(AssertionError, "TOOL_AUTHORITY_UNAVAILABLE"):
+                    _a6_acquire_historical_runner()
+            with mock.patch.object(os, "name", "posix"), mock.patch.object(sys, "platform", "darwin"):
+                with self.assertRaisesRegex(AssertionError, "CONTAINMENT_UNAVAILABLE"):
+                    _a6_acquire_historical_runner()
+            with mock.patch(__name__ + "._A6_HISTORICAL_BLOB_WORKER", "x" * 8193):
+                with self.assertRaisesRegex(AssertionError, "SOURCE_BOUNDS_FAILED"):
+                    _a6_acquire_historical_runner()
+            policy, tools = _resolved_local_test_authority("python", "git")
+            for role in ("python", "git"):
+                with mock.patch(__name__ + "._resolved_local_test_authority",
+                                return_value=(policy, {**tools, role: "x" * 2049})):
+                    with mock.patch.object(ci, "child_process_environment", return_value={}):
+                        with self.assertRaisesRegex(AssertionError, "SOURCE_BOUNDS_FAILED"):
+                            _a6_acquire_historical_runner()
+            if os.name == "nt":
+                with mock.patch.object(subprocess, "list2cmdline", return_value="x" * 16385):
+                    with self.assertRaisesRegex(AssertionError, "SOURCE_BOUNDS_FAILED"):
+                        _a6_acquire_historical_runner()
+            execute.assert_not_called()
+
+    def test_network_or_identity_failure_never_falls_back_or_reaches_git(self):
+        for capture in (
+            self._capture(exit_code=1, stderr_raw=b"SOURCE_UNAVAILABLE\n"),
+            self._capture(b"wrong historical bytes"),
+        ):
+            with mock.patch.object(ci, "execute_command", return_value=capture) as execute:
+                with self.assertRaises(AssertionError):
+                    _a6_acquire_historical_runner()
+                execute.assert_called_once()
+                self.assertEqual(execute.call_args.args[0], "a6-historical-blob-acquisition")
+
+    def test_typed_git_output_requires_exact_oid_and_framing(self):
+        for output in (b"", b"0" * 40 + b"\n", b"8c8a3247ebdf3f4ee40843c924abe2c052635d68",
+                       b"8c8a3247ebdf3f4ee40843c924abe2c052635d68\r\n"):
+            with self.subTest(output_bytes=len(output)):
+                with mock.patch.object(ci, "execute_command", side_effect=[
+                    self._capture(b"synthetic"), self._capture(output),
+                ]), mock.patch(__name__ + "._a6_check_historical_payload"):
+                    with self.assertRaisesRegex(AssertionError, "HISTORICAL_IDENTITY_MISMATCH|SOURCE_BOUNDS_FAILED"):
+                        _a6_acquire_historical_runner()
+
+
 class AuthenticatedGitA6SourceAdmissionTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -5888,9 +6479,7 @@ class AuthenticatedGitA6SourceAdmissionTest(unittest.TestCase):
                 })
         # A source blob already containing CRLF stays byte-exact.
         runner = _R2_A6_CONTENT_DELTA["developer/tests/ci/run_ci_foundation.py"]
-        runner_bytes = (_r2_bounded_git(
-            ci.REPO_ROOT, "cat-file", "blob", str(runner["gitBlob"]),
-        ).stdout_raw or b"")
+        runner_bytes = _a6_acquire_historical_runner()
         self.assertIn(b"\r\n", runner_bytes)
         self.assertEqual(_r2_bind_checkout_content(
             "developer/tests/ci/run_ci_foundation.py",
@@ -6050,9 +6639,7 @@ class AuthenticatedGitA6SourceAdmissionTest(unittest.TestCase):
                 )
         runner_path = "developer/tests/ci/run_ci_foundation.py"
         runner = _R2_A6_CONTENT_DELTA[runner_path]
-        runner_bytes = (_r2_bounded_git(
-            ci.REPO_ROOT, "cat-file", "blob", str(runner["gitBlob"]),
-        ).stdout_raw or b"")
+        runner_bytes = _a6_acquire_historical_runner()
         with self.assertRaises(AssertionError):
             _r2_bind_checkout_content(
                 runner_path, a7[runner_path], runner_bytes.replace(b"\r\n", b"\n"),
