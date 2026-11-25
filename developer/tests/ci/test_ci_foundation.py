@@ -27,7 +27,7 @@ import unittest
 import unicodedata
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -390,9 +390,43 @@ _R2_SECURITY_PROFILE = _R2SourceInventoryProfile(
         ("lockfile-integrity", 706),
     ),
 )
+# Issue #79 / PR #80: admit only the frozen staging delta on current ci/master.
+# The sole mutable blob remains this test module; every other mode and blob is
+# covered by the full-tree digest, including .gitignore and the exact manifest.
+_R2_STAGING_PATHS = (
+    "developer/tests/ci/public-listening-frontend/"
+    "lpf-v1-1a576be93d7d-a2-fad166773fa6259a.manifest.json",
+    "developer/tests/ci/stage_public_listening_frontend.py",
+    "developer/tests/ci/test_stage_public_listening_frontend.py",
+)
+_R2_STAGING_MANIFEST = (
+    "29429a7c07fd55e9e0b7db12d7c0bebd1958d6d3e1686f94711e6ac126157931"
+)
+_R2_STAGING_PROFILE = replace(
+    _R2_ORDINARY_PROFILE,
+    name="ci-staging-foundation",
+    authority_commit="46ab73e743bbb832fa582c2ed1003b58603178dc",
+    authority_tree="849b4071bf43642387b120c5ecefe2e833b33e9d",
+    tree_manifest_sha256=_R2_STAGING_MANIFEST,
+    a1_integrated_tree_manifest_sha256=_R2_STAGING_MANIFEST,
+    a3_integrated_tree_manifest_sha256=_R2_STAGING_MANIFEST,
+    a4_1_integrated_tree_manifest_sha256=_R2_STAGING_MANIFEST,
+    path_count=917,
+    serialized_bytes=40_658,
+    sorted_path_sha256=(
+        "098c1776cc517b3793e5848c2b30e90f30d4c56eefa18cf6592a34d92b1fda14"
+    ),
+    # Three new targets in 21 candidate-wide commands and two Python targets.
+    target_reference_count=20_005,
+)
+_R2_PRE_STAGING_GITIGNORE = {
+    "gitBlob": "b1678ed64b160bf63445fe166d2e6aad49b53f85",
+    "size": 5_734,
+    "sha256": "deba41e5b06609abf5ebfaaeb917127877c86ab5f01518cc0abe594fbdc6247b",
+}
 _R2_PROFILES_BY_IDENTITY = {
     (profile.path_count, profile.sorted_path_sha256): profile
-    for profile in (_R2_ORDINARY_PROFILE, _R2_SECURITY_PROFILE)
+    for profile in (_R2_ORDINARY_PROFILE, _R2_SECURITY_PROFILE, _R2_STAGING_PROFILE)
 }
 _R2_ORDINARY_CONTENT_AUTHORITY = {
     ".github/workflows/ci.yml": {
@@ -624,7 +658,7 @@ def _r2_profile_for_paths(candidate_paths: object) -> _R2SourceInventoryProfile:
         raise AssertionError("R2 source inventory metadata does not match its authority")
     additions = tuple(relative in paths for relative in _R2_ADDED_JAVASCRIPT_PATHS)
     expected_additions = (
-        (False, False) if profile is _R2_ORDINARY_PROFILE else (True, True)
+        (True, True) if profile is _R2_SECURITY_PROFILE else (False, False)
     )
     if additions != expected_additions:
         raise AssertionError("R2 source inventory has a partial or mixed protected delta")
@@ -791,14 +825,14 @@ def _r2_validate_git_object_authority(
         raise AssertionError("R2 immutable full-tree Git object authority does not match")
     content_authority = (
         _R2_ORDINARY_CONTENT_AUTHORITY
-        if profile is _R2_ORDINARY_PROFILE
+        if profile is not _R2_SECURITY_PROFILE
         else _R2_SECURITY_CONTENT_DELTA
     )
     if manifest_digest == profile.a4_1_integrated_tree_manifest_sha256:
         content_authority = {
             **content_authority,
             **(_R2_A4_1_ORDINARY_CONTENT_DELTA
-               if profile is _R2_ORDINARY_PROFILE
+               if profile is not _R2_SECURITY_PROFILE
                else _R2_A4_1_SECURITY_CONTENT_DELTA),
         }
     for relative, expected in content_authority.items():
@@ -845,6 +879,10 @@ def _r2_counterpart_inventories(
     live_paths: tuple[str, ...],
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     live_profile = _r2_profile_for_paths(live_paths)
+    if live_profile is _R2_STAGING_PROFILE:
+        # Historical comparison fixtures retain their exact pre-staging paths.
+        live_paths = tuple(path for path in live_paths if path not in _R2_STAGING_PATHS)
+        live_profile = _r2_profile_for_paths(live_paths)
     if live_profile is _R2_ORDINARY_PROFILE:
         ordinary_paths = live_paths
         security_paths = tuple(sorted((*ordinary_paths, *_R2_ADDED_JAVASCRIPT_PATHS)))
@@ -5450,6 +5488,51 @@ class WorkflowPolicyTest(unittest.TestCase):
         )
 
 
+class StagingSourceInventoryTest(unittest.TestCase):
+    def setUp(self) -> None:
+        _, _, self.paths, self.objects = _r2_git_head_inventory()
+
+    def test_exact_staging_paths_and_object_authority(self) -> None:
+        self.assertIs(_r2_profile_for_paths(self.paths), _R2_STAGING_PROFILE)
+        _r2_validate_git_object_authority(_R2_STAGING_PROFILE, self.objects)
+        ordinary, security = _r2_counterpart_inventories(self.paths)
+        self.assertEqual(set(self.paths) - set(ordinary), set(_R2_STAGING_PATHS))
+        self.assertEqual(set(security) - set(ordinary), set(_R2_ADDED_JAVASCRIPT_PATHS))
+
+    def test_partial_extra_and_renamed_staging_paths_reject(self) -> None:
+        for relative in _R2_STAGING_PATHS:
+            with self.subTest(path=relative), self.assertRaises(AssertionError):
+                _r2_profile_for_paths(tuple(path for path in self.paths if path != relative))
+        for paths in (
+            tuple(sorted((*self.paths, "developer/tests/ci/unregistered.py"))),
+            tuple(sorted("developer/tests/ci/renamed.py" if path == _R2_STAGING_PATHS[1] else path
+                         for path in self.paths)),
+            tuple(sorted((*self.paths, *_R2_ADDED_JAVASCRIPT_PATHS))),
+        ):
+            with self.subTest(paths=paths[-1:]), self.assertRaises(AssertionError):
+                _r2_profile_for_paths(paths)
+
+    def test_staging_blob_mode_and_baseline_drift_reject(self) -> None:
+        for relative in (*_R2_STAGING_PATHS, ".gitignore", ".github/workflows/ci.yml",
+                         "developer/tests/ci/run_ci_foundation.py", "README.md"):
+            mode, kind, oid = self.objects[relative]
+            for changed in ((mode, kind, "f" * 40), ("100755", kind, oid)):
+                objects = {**self.objects, relative: changed}
+                with self.subTest(path=relative, identity=changed), self.assertRaises(AssertionError):
+                    _r2_validate_git_object_authority(_R2_STAGING_PROFILE, objects)
+
+    def test_only_test_blob_is_mutable_and_runner_inventory_must_match(self) -> None:
+        mode, kind, _ = self.objects[_R2_AUTHORIZED_MUTABLE_PATH]
+        objects = {**self.objects, _R2_AUTHORIZED_MUTABLE_PATH: (mode, kind, "f" * 40)}
+        _r2_validate_git_object_authority(_R2_STAGING_PROFILE, objects)
+        objects[_R2_AUTHORIZED_MUTABLE_PATH] = ("100755", kind, "f" * 40)
+        with self.assertRaises(AssertionError):
+            _r2_validate_git_object_authority(_R2_STAGING_PROFILE, objects)
+        with self.assertRaises(AssertionError):
+            _r2_bind_source_paths(immutable_tree_paths=self.paths,
+                                  runner_candidate_paths=self.paths[:-1])
+
+
 class SanitizationAndEvidenceTest(unittest.TestCase):
     def setUp(self) -> None:
         self.policy_fixture_plan = compact_policy_fixture_plan()
@@ -6442,7 +6525,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
         security_content_authority = _R2_SECURITY_CONTENT_DELTA
         a4_1_live_delta = (
             _R2_A4_1_ORDINARY_CONTENT_DELTA
-            if source_profile is _R2_ORDINARY_PROFILE
+            if source_profile is not _R2_SECURITY_PROFILE
             else _R2_A4_1_SECURITY_CONTENT_DELTA
         )
         if all(
@@ -6454,6 +6537,13 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
             }
             security_content_authority = {
                 **security_content_authority, **_R2_A4_1_SECURITY_CONTENT_DELTA,
+            }
+        if source_profile is _R2_STAGING_PROFILE:
+            ordinary_content_authority = {
+                **ordinary_content_authority, ".gitignore": _R2_PRE_STAGING_GITIGNORE,
+            }
+            security_content_authority = {
+                **security_content_authority, ".gitignore": _R2_PRE_STAGING_GITIGNORE,
             }
         candidate_paths = list(immutable_source_paths)
         ordinary_paths, security_paths = _r2_counterpart_inventories(
@@ -7022,10 +7112,16 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 )
             return overlaid
 
-        if source_profile is _R2_ORDINARY_PROFILE:
+        if source_profile is not _R2_SECURITY_PROFILE:
             ordinary_object_authority = dict(live_object_authority)
+            if source_profile is _R2_STAGING_PROFILE:
+                for relative in _R2_STAGING_PATHS:
+                    ordinary_object_authority.pop(relative)
+                ordinary_object_authority = overlay_git_blobs(
+                    ordinary_object_authority, ordinary_content_authority,
+                )
             security_object_authority = overlay_git_blobs(
-                live_object_authority,
+                ordinary_object_authority,
                 security_content_authority,
             )
         else:
@@ -7080,7 +7176,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
         def counterpart_profile_for(
             trusted_profile: _R2SourceInventoryProfile,
         ) -> _R2SourceInventoryProfile:
-            if trusted_profile is _R2_ORDINARY_PROFILE:
+            if trusted_profile in (_R2_ORDINARY_PROFILE, _R2_STAGING_PROFILE):
                 return _R2_SECURITY_PROFILE
             if trusted_profile is _R2_SECURITY_PROFILE:
                 return _R2_ORDINARY_PROFILE
@@ -8177,6 +8273,43 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 source_profile.name: plan,
                 counterpart_profile.name: counterpart_plan,
             }
+
+            if source_profile is _R2_STAGING_PROFILE:
+                # Persist the historical Ordinary fixture separately. The live
+                # staging transcript above still covers all 917 actual targets.
+                ordinary_records = [synthetic_record_from_spec(spec) for spec in ordinary_all]
+                ordinary_observations = enrich_live_shaped_records(ordinary_all, ordinary_records)
+                for record in ordinary_records:
+                    if record.get("dependencyBacked") is True:
+                        record["runtimeClosureDigest"] = runtime_digest
+                        record["dependencyClosureDigest"] = dependency_digest
+                ordinary_runner = fake_runner(baseline)
+                ordinary_runner.profile = "all"
+                ordinary_runner.platform = "ubuntu"
+                ordinary_runner.command_plan = ordinary_all
+                ordinary_runner.command_results = ordinary_records
+                ordinary_runner.observations = ordinary_observations
+                ordinary_runner.completed_classes = set()
+                ordinary_runner.command_plan_digest = ci.command_plan_digest(ordinary_all)
+                ordinary_runner.runtime = copy.deepcopy(runner.runtime)
+                ordinary_runner.runtime_closure_document = copy.deepcopy(runner.runtime_closure_document)
+                ordinary_runner.runtime_closure_guard_evidence = copy.deepcopy(runner.runtime_closure_guard_evidence)
+                ordinary_runner.execution_binding = synthetic_execution_binding(
+                    "all", ordinary_runner.command_plan_digest, platform_name="ubuntu",
+                )
+                ordinary_repo = repo / "ordinary"
+                ordinary_repo.mkdir()
+                ordinary_output = ordinary_repo / ".ci-results"
+                ci.create_fresh_evidence_root(ordinary_output, repo_root=ordinary_repo)
+                ci.write_evidence(
+                    ordinary_runner, empty_comparison(), output_dir=ordinary_output,
+                    evidence_authority_root=ordinary_repo,
+                )
+                ordinary_data = (ordinary_output / "command-results.json").read_bytes()
+                self.assertLess(len(ordinary_data), ci.MAX_COMMAND_RESULTS_JSON_BYTES)
+                profile_documents[_R2_ORDINARY_PROFILE.name] = ci.strict_json_loads(ordinary_data)
+                profile_serialized_documents[_R2_ORDINARY_PROFILE.name] = ordinary_data
+                profile_producer_plans[_R2_ORDINARY_PROFILE.name] = ordinary_all
 
             def independently_reloaded_claims(
                 serialized: bytes,
@@ -26054,8 +26187,8 @@ def run_with_receipt(argv: list[str]) -> int:
 
     result = unittest.main(module=__name__, argv=[sys.argv[0]], verbosity=2,
                            testRunner=InventoryTextTestRunner, exit=False).result
-    complete = (result.wasSuccessful() and result.testsRun == 476
-                and len(result.inventory_ids) == 476
+    complete = (result.wasSuccessful() and result.testsRun == 480
+                and len(result.inventory_ids) == 480
                 and set(result.inventory_ids) == result.executed_test_ids == result.successful_test_ids)
     if before is not None and complete:
         try:
