@@ -8114,23 +8114,31 @@ def check_workflow_text(text: str) -> list[str]:
     ):
         return sorted(set(errors + _validate_scalar_token_policy(workflow)))
 
-    # Issue #104 A4.1 admits only these exact LF/CRLF workflow sources.
+    # Historical A4.1 and PR #80 Linux-24.04 workflows have exact byte authority.
     a4_1_workflow_sha256 = (
         "b1836c822e1d9742bf82bffca67f1a421ca74a82e00b68860448c251bc6b3f0f",
         "424e61cc604a05850799d947e7e6071d4fd767b741e1311ad332974efbf258c0",
     )
+    linux24_workflow_sha256 = (
+        "35c55bd4500ffc064ccda249c4a10aa8df9d0764a5775d54cf892a9f5dc8a40e",
+        "d2cc2a81a04a2671f0998d7de7f3e927d3608938100d55d8b820bb408797869a",
+    )
+    workflow_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
     repository_policy_timeout = (
-        "35" if hashlib.sha256(text.encode("utf-8")).hexdigest()
-        in a4_1_workflow_sha256 else "20"
+        "35" if workflow_sha256 in (*a4_1_workflow_sha256, *linux24_workflow_sha256)
+        else "20"
+    )
+    linux_runner = (
+        "ubuntu-24.04" if workflow_sha256 in linux24_workflow_sha256 else "ubuntu-latest"
     )
     job_schemas = {
-        "repository-policy-producer": (("name", "runs-on", "timeout-minutes", "steps"), "Repository policy producer (untrusted evidence)", None, "ubuntu-latest", repository_policy_timeout),
-        "ubuntu-canonical-producer": (("name", "runs-on", "timeout-minutes", "steps"), "Ubuntu canonical producer (untrusted evidence)", None, "ubuntu-latest", "45"),
+        "repository-policy-producer": (("name", "runs-on", "timeout-minutes", "steps"), "Repository policy producer (untrusted evidence)", None, linux_runner, repository_policy_timeout),
+        "ubuntu-canonical-producer": (("name", "runs-on", "timeout-minutes", "steps"), "Ubuntu canonical producer (untrusted evidence)", None, linux_runner, "45"),
         "windows-compatibility-producer": (("name", "runs-on", "timeout-minutes", "steps"), "Windows compatibility producer (untrusted evidence)", None, "windows-latest", "45"),
-        "repository-policy": (("name", "needs", "runs-on", "timeout-minutes", "steps"), "Repository policy", ["repository-policy-producer"], "ubuntu-latest", "25"),
-        "ubuntu-canonical": (("name", "needs", "runs-on", "timeout-minutes", "steps"), "Ubuntu canonical validation", ["ubuntu-canonical-producer"], "ubuntu-latest", "55"),
+        "repository-policy": (("name", "needs", "runs-on", "timeout-minutes", "steps"), "Repository policy", ["repository-policy-producer"], linux_runner, "25"),
+        "ubuntu-canonical": (("name", "needs", "runs-on", "timeout-minutes", "steps"), "Ubuntu canonical validation", ["ubuntu-canonical-producer"], linux_runner, "55"),
         "windows-compatibility": (("name", "needs", "runs-on", "timeout-minutes", "steps"), "Windows compatibility validation", ["windows-compatibility-producer"], "windows-latest", "55"),
-        "final-result": (("name", "if", "needs", "runs-on", "timeout-minutes", "steps"), "Final result", ["repository-policy", "ubuntu-canonical", "windows-compatibility"], "ubuntu-latest", "10"),
+        "final-result": (("name", "if", "needs", "runs-on", "timeout-minutes", "steps"), "Final result", ["repository-policy", "ubuntu-canonical", "windows-compatibility"], linux_runner, "10"),
     }
     for job_name, (keys, display_name, needs, runner_name, timeout_value) in job_schemas.items():
         job = jobs.get(job_name)

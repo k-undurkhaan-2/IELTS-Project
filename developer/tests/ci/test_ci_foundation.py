@@ -402,6 +402,7 @@ _R2_STAGING_PATHS = (
 _R2_STAGING_MANIFEST = (
     "29429a7c07fd55e9e0b7db12d7c0bebd1958d6d3e1686f94711e6ac126157931"
 )
+_R2_STAGING_LINUX24_MANIFEST = "2a5e45ae58b5e0afa411ba059ddaa301141f34358753935f18702190e48e6e67"
 _R2_STAGING_PROFILE = replace(
     _R2_ORDINARY_PROFILE,
     name="ci-staging-foundation",
@@ -410,7 +411,7 @@ _R2_STAGING_PROFILE = replace(
     tree_manifest_sha256=_R2_STAGING_MANIFEST,
     a1_integrated_tree_manifest_sha256=_R2_STAGING_MANIFEST,
     a3_integrated_tree_manifest_sha256=_R2_STAGING_MANIFEST,
-    a4_1_integrated_tree_manifest_sha256=_R2_STAGING_MANIFEST,
+    a4_1_integrated_tree_manifest_sha256=_R2_STAGING_LINUX24_MANIFEST,
     path_count=917,
     serialized_bytes=40_658,
     sorted_path_sha256=(
@@ -536,6 +537,18 @@ _R2_A4_1_SECURITY_CONTENT_DELTA = {
         "size": 1130230,
         "sha256": "3369edc76f440a5cf93960ecf4dbb8df447b51d483eaf82b20d8256ddc99f1d0",
     },
+}
+_R2_STAGING_LINUX24_CONTENT_DELTA = {
+    ".github/workflows/ci.yml": {
+        "gitBlob": "986592e06b067bdeeaf6997d39e7e7f333f8826d",
+        "size": 15648,
+        "sha256": "35c55bd4500ffc064ccda249c4a10aa8df9d0764a5775d54cf892a9f5dc8a40e"
+    },
+    "developer/tests/ci/run_ci_foundation.py": {
+        "gitBlob": "afd09289bfb4a8547a05d6f3d3d28d06b79a4972",
+        "size": 1130583,
+        "sha256": "1f8d9652b3f21881b434481e1ecd117d66593f8ea30a464e4a1a4ef6db94a1ec"
+    }
 }
 _R2_STATIC_COMMAND_PREFIX = (
     "baseline-schema",
@@ -828,13 +841,16 @@ def _r2_validate_git_object_authority(
         if profile is not _R2_SECURITY_PROFILE
         else _R2_SECURITY_CONTENT_DELTA
     )
-    if manifest_digest == profile.a4_1_integrated_tree_manifest_sha256:
+    if (manifest_digest == profile.a4_1_integrated_tree_manifest_sha256
+            or profile is _R2_STAGING_PROFILE):
         content_authority = {
             **content_authority,
             **(_R2_A4_1_ORDINARY_CONTENT_DELTA
                if profile is not _R2_SECURITY_PROFILE
                else _R2_A4_1_SECURITY_CONTENT_DELTA),
         }
+    if profile is _R2_STAGING_PROFILE and manifest_digest == _R2_STAGING_LINUX24_MANIFEST:
+        content_authority = {**content_authority, **_R2_STAGING_LINUX24_CONTENT_DELTA}
     for relative, expected in content_authority.items():
         entry = object_entries.get(relative)
         if entry is None or entry[2] != expected["gitBlob"]:
@@ -4979,10 +4995,28 @@ def _assert_windows_runtime_capture(test: unittest.TestCase, fixture_factory) ->
 class WorkflowPolicyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.workflow = ci.WORKFLOW_PATH.read_text(encoding="utf-8")
+        cls.current_workflow = ci.WORKFLOW_PATH.read_text(encoding="utf-8")
+        # Preserve historical mutation fixtures alongside the exact current pin.
+        cls.workflow = cls.current_workflow.replace("runs-on: ubuntu-24.04", "runs-on: ubuntu-latest")
         cls.policy = (ci.REPO_ROOT / "docs" / "CI_POLICY.md").read_text(encoding="utf-8")
 
+    def test_pinned_linux24_workflow_rejects_unregistered_runner_changes(self) -> None:
+        current = self.current_workflow
+        self.assertEqual(current.count("runs-on: ubuntu-24.04"), 5)
+        self.assertEqual(current.count("runs-on: windows-latest"), 2)
+        self.assertEqual(ci.check_workflow_text(current), [])
+        self.assertEqual(ci.check_workflow_text(current.replace("\n", "\r\n")), [])
+        for runner in ("ubuntu-latest", "ubuntu-22.04", "ubuntu-26.04", "self-hosted"):
+            with self.subTest(runner=runner):
+                self.assertTrue(ci.check_workflow_text(current.replace(
+                    "runs-on: ubuntu-24.04", f"runs-on: {runner}", 1,
+                )))
+        for suffix in ("\n", "# unregistered Linux runner source\n"):
+            with self.subTest(suffix=suffix):
+                self.assertTrue(ci.check_workflow_text(current + suffix))
+
     def test_current_workflow_passes_narrow_policy(self) -> None:
+        self.assertEqual(ci.check_workflow_text(self.current_workflow), [])
         self.assertEqual(ci.check_workflow_text(self.workflow), [])
         historical = self.workflow.replace(
             "    timeout-minutes: 35\n", "    timeout-minutes: 20\n", 1,
@@ -6528,7 +6562,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
             if source_profile is not _R2_SECURITY_PROFILE
             else _R2_A4_1_SECURITY_CONTENT_DELTA
         )
-        if all(
+        if source_profile is _R2_STAGING_PROFILE or all(
             live_object_authority[relative][2] == content["gitBlob"]
             for relative, content in a4_1_live_delta.items()
         ):
@@ -26187,8 +26221,8 @@ def run_with_receipt(argv: list[str]) -> int:
 
     result = unittest.main(module=__name__, argv=[sys.argv[0]], verbosity=2,
                            testRunner=InventoryTextTestRunner, exit=False).result
-    complete = (result.wasSuccessful() and result.testsRun == 480
-                and len(result.inventory_ids) == 480
+    complete = (result.wasSuccessful() and result.testsRun == 481
+                and len(result.inventory_ids) == 481
                 and set(result.inventory_ids) == result.executed_test_ids == result.successful_test_ids)
     if before is not None and complete:
         try:
