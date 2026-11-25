@@ -14,6 +14,7 @@ import fnmatch
 import gzip
 import hashlib
 import http.client
+import ipaddress
 import io
 import json
 import os
@@ -23,6 +24,7 @@ import re
 import secrets
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -86,7 +88,9 @@ class Control:
         self.evidence = self.root / "evidence"
         self.evidence.mkdir()
         self.commands = []
-        self.resources = {"containers": [], "networks": [], "volumes": [], "builders": [], "images": []}
+        self.resources = {"containers": [], "networks": [], "volumes": [], "builders": [], "images": [], "processes": []}
+        self.proxy = None
+        self.proxy_logs = []
         self.results = {row: {"status": "NOT_RUN"} for row in AUTH["expected_rows"]}
         self.env = {k: v for k, v in os.environ.items() if k in {
             "PATH", "LANG", "LC_ALL", "TMPDIR", "LD_LIBRARY_PATH", "SSL_CERT_FILE", "SSL_CERT_DIR"
@@ -172,6 +176,7 @@ class Control:
         self.node = str(Path(shutil.which("node")).resolve())
         self.git_path = str(Path(shutil.which("git")).resolve())
         self.docker_path = str(Path(shutil.which("docker")).resolve())
+        self.openssl_path = str(Path(shutil.which("openssl")).resolve())
         assert self.run([self.node, "--version"]).strip() == b"v24.20.0"
         assert "/hostedtoolcache/" in self.node and "/hostedtoolcache/" in str(Path(sys.executable).resolve())
         image_version = os.environ["ImageVersion"]
@@ -180,6 +185,9 @@ class Control:
             "ubuntu22/" + image_version.rsplit(".", 1)[0] + "/images/ubuntu/Ubuntu2204-Readme.md"
         inventory = get_bytes(inventory_url)
         (self.evidence / "official-runner-inventory.md").write_bytes(inventory)
+        openssl_version = self.run([self.openssl_path, "version"]).decode().strip()
+        openssl_match = re.search(r"OpenSSL (\d+\.\d+\.\d+)", openssl_version)
+        assert openssl_match and openssl_match[1].encode() in inventory
         version = json.loads(self.docker("version", "--format", "{{json .}}"))
         assert version["Server"]["Os"] == "linux" and version["Server"]["Arch"] == "amd64"
         assert version["Client"]["Version"].encode() in inventory and version["Server"]["Version"].encode() in inventory
@@ -189,7 +197,7 @@ class Control:
         info = json.loads(self.docker("info", "--format", "{{json .}}"))
         buildx_path = next(x["Path"] for x in info["ClientInfo"]["Plugins"] if x["Name"] == "buildx")
         paths = [str(Path(sys.executable).resolve()), self.node, self.git_path, self.docker_path,
-            buildx_path, shutil.which("dockerd"), shutil.which("ldd")]
+            buildx_path, shutil.which("dockerd"), shutil.which("ldd"), self.openssl_path]
         binaries = []
         for p in paths:
             assert p and Path(p).is_file()
@@ -203,6 +211,7 @@ class Control:
         self.write("host-admission.json", {"platform": platform.platform(), "runner_image": image_version,
             "provenance": inventory_url, "inventory_sha256": digest(inventory), "binaries": binaries,
             "docker_version": version, "docker_info": info, "buildx_version": buildx_version,
+            "openssl_version": openssl_version,
             "context": json.loads(self.docker("context", "inspect", "default")),
             "control_runtime_setup": {"python": "3.12.10", "node": "24.20.0",
                 "python_action": "5fda3b95a4ea91299a34e894583c3862153e4b97",
@@ -286,7 +295,7 @@ class Control:
             assert "141.0.7390.37" in self.run([p, "--version"]).decode()
             assert b"not found" not in self.run(["ldd", p])
         dependencies = {}
-        for executable in [Path(sys.executable).resolve(), Path(self.node), *executables]:
+        for executable in [Path(sys.executable).resolve(), Path(self.node), Path(self.openssl_path), *executables]:
             listing = self.run(["ldd", executable]).decode()
             assert "not found" not in listing
             for candidate in re.findall(r"(?:=>\s+)?(/[^\s()]+)", listing):
@@ -663,7 +672,7 @@ const {chromium} = require(process.argv[1]);
         if body is not None and not isinstance(body, bytes):
             body = json.dumps(body).encode()
             request_headers["Content-Type"] = "application/json"
-        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
+        connection = http.client.HTTPSConnection("127.0.0.1", self.tls_port, context=self.tls_context, timeout=20)
         try:
             connection.request(method, target, body=body, headers=request_headers)
             response = connection.getresponse()
@@ -678,6 +687,35 @@ const {chromium} = require(process.argv[1]);
         self.write(name + ".json", {"method": method, "target": target, "status": status,
             "headers": pairs, "body_bytes": len(data), "body_sha256": digest(data)})
         return status, {k.lower(): v for k, v in pairs}, data
+
+    def start_tls(self):
+        certificate = self.evidence / "synthetic-tls-certificate.pem"
+        key = self.root / "synthetic-tls-private-key.pem"
+        hosts = [self.auth_host, self.business_host, self.admin_host]
+        names = [h.split(":")[0] for h in hosts]
+        self.run([self.openssl_path, "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes",
+            "-days", "1", "-subj", "/CN=" + names[0], "-addext",
+            "subjectAltName=" + ",".join(["DNS:" + n for n in names] + ["IP:127.0.0.1"]),
+            "-keyout", key, "-out", certificate])
+        key.chmod(0o600)
+        public_key = self.run([self.openssl_path, "pkey", "-in", key, "-pubout", "-outform", "DER"])
+        self.tls_spki = base64.b64encode(hashlib.sha256(public_key).digest()).decode()
+        self.tls_context = ssl.create_default_context(cafile=str(certificate))
+        config = self.root / "tls-proxy-config.json"
+        config.write_bytes(encode({"key": str(key), "certificate": str(certificate), "hosts": hosts,
+            "port": self.tls_port, "upstream": self.port}))
+        config.chmod(0o600)
+        script = self.root / "tls-proxy.cjs"
+        script.write_text(TLS_SOURCE)
+        self.proxy_logs = [(self.evidence / ("tls-proxy." + suffix)).open("wb") for suffix in ["stdout", "stderr"]]
+        self.proxy = subprocess.Popen([self.node, "--max-old-space-size=64", str(script), str(config)],
+            env=self.env, stdin=subprocess.DEVNULL, stdout=self.proxy_logs[0], stderr=self.proxy_logs[1])
+        self.resources["processes"].append({"pid": self.proxy.pid, "script": str(script), "purpose": "owned_loopback_tls"})
+        self.write("resources.json", self.resources)
+        self.write("tls-endpoint.json", {"listen": "127.0.0.1", "port": self.tls_port,
+            "upstream_loopback_port": self.port, "hosts": hosts, "certificate_sha256": file_digest(certificate),
+            "browser_certificate_spki_sha256_base64": self.tls_spki, "control_source_sha256": file_digest(script),
+            "private_key_retained_in_artifact": False, "python_certificate_and_hostname_verification": True})
 
     def start(self, image, label):
         self.running_image = image
@@ -706,9 +744,13 @@ const {chromium} = require(process.argv[1]);
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             self.port = s.getsockname()[1]
-        self.auth_host = "a" * 56 + ".onion:" + str(self.port)
-        self.business_host = "b" * 56 + ".onion:" + str(self.port)
-        self.admin_host = "c" * 56 + ".onion:" + str(self.port)
+            with socket.socket() as tls_socket:
+                tls_socket.bind(("127.0.0.1", 0))
+                self.tls_port = tls_socket.getsockname()[1]
+        assert self.tls_port != self.port
+        self.auth_host = "a" * 56 + ".onion:" + str(self.tls_port)
+        self.business_host = "b" * 56 + ".onion:" + str(self.tls_port)
+        self.admin_host = "c" * 56 + ".onion:" + str(self.tls_port)
         network = self.prefix + "-" + label + "-network"
         database = self.prefix + "-" + label + "-db"
         volume = self.prefix + "-" + label + "-data"
@@ -721,7 +763,10 @@ const {chromium} = require(process.argv[1]);
         self.docker("network", "create", "--driver", "bridge",
             "--opt", "com.docker.network.bridge.host_binding_ipv4=127.0.0.1",
             "--opt", "com.docker.network.bridge.enable_ip_masquerade=false", network)
-        self.write(label + "-network.json", json.loads(self.docker("network", "inspect", network)))
+        network_info = json.loads(self.docker("network", "inspect", network))
+        self.write(label + "-network.json", network_info)
+        gateway = network_info[0]["IPAM"]["Config"][0]["Gateway"]
+        assert ipaddress.ip_address(gateway).is_private and not ipaddress.ip_address(gateway).is_loopback
         self.docker("volume", "create", volume)
         database_password = secrets.token_urlsafe(36)
         self.admin_username = "i79admin" + secrets.token_hex(6)
@@ -735,8 +780,9 @@ const {chromium} = require(process.argv[1]);
             "SESSION_SECRET": secrets.token_urlsafe(48), "AUTH_HANDOFF_STATE_SECRET": secrets.token_urlsafe(48),
             "ADMIN_USERNAME": self.admin_username, "ADMIN_PASSWORD": "Aa1!" + secrets.token_urlsafe(32),
             "TOTP_ENCRYPTION_KEY": base64.b64encode(secrets.token_bytes(32)).decode(),
-            "AUTH_PUBLIC_URL": "http://" + self.auth_host, "BUSINESS_PUBLIC_URL": "http://" + self.business_host,
-            "ADMIN_PUBLIC_URL": "http://" + self.admin_host, "NODE_ENV": "production", "HOST": "0.0.0.0", "PORT": "3000"}
+            "AUTH_PUBLIC_URL": "https://" + self.auth_host, "BUSINESS_PUBLIC_URL": "https://" + self.business_host,
+            "ADMIN_PUBLIC_URL": "https://" + self.admin_host, "TRUST_PROXY": "true", "TRUSTED_PROXY_IPS": gateway,
+            "NODE_ENV": "production", "HOST": "0.0.0.0", "PORT": "3000"}
         app_env.write_text("".join(k + "=" + v + "\n" for k, v in values.items()))
         app_env.chmod(0o600)
         self.docker("pull", "--platform", "linux/amd64", self.image_ref("postgres"), timeout=300)
@@ -764,8 +810,9 @@ const {chromium} = require(process.argv[1]);
         assert inspected["NetworkSettings"]["Ports"]["3000/tcp"] == [{"HostIp": "127.0.0.1", "HostPort": str(self.port)}]
         assert all(not m["RW"] for m in inspected["Mounts"])
         assert {m["Destination"] for m in inspected["Mounts"]} == {"/app/ListeningPractice", "/i79-outside"}
-        inspected["Config"]["Env"] = [v if v.split("=", 1)[0] in {"NODE_ENV", "HOST", "PORT"} else v.split("=", 1)[0] + "=<synthetic-redacted>" for v in inspected["Config"]["Env"]]
+        inspected["Config"]["Env"] = [v if v.split("=", 1)[0] in {"NODE_ENV", "HOST", "PORT", "TRUST_PROXY", "TRUSTED_PROXY_IPS"} else v.split("=", 1)[0] + "=<synthetic-redacted>" for v in inspected["Config"]["Env"]]
         self.write(label + "-running-container.json", inspected)
+        self.start_tls()
         self.wait_health(label)
         self.docker("exec", "--user", "0", self.app, "node", "-e",
             "const fs=require('node:fs');try{fs.writeFileSync('/app/ListeningPractice/i79-write-probe','forbidden');process.exit(9)}catch(e){if(e.code!=='EROFS')throw e;console.log('EROFS verified as container root')}" )
@@ -795,8 +842,9 @@ const {chromium} = require(process.argv[1]);
         raise RuntimeError("Unchanged production CMD did not become healthy")
 
     def browser(self, login_only=False):
-        config = {"auth": "http://" + self.auth_host, "business": "http://" + self.business_host,
-            "admin": "http://" + self.admin_host, "username": self.username, "password": self.password,
+        config = {"auth": "https://" + self.auth_host, "business": "https://" + self.business_host,
+            "admin": "https://" + self.admin_host, "username": self.username, "password": self.password,
+            "tlsSpki": self.tls_spki,
             "exam": EXAM_ID, "marker": self.sentinel.decode(), "evidence": str(self.evidence),
             "cookies": str(self.root / "browser-cookies.json"), "tools": str(self.tools), "loginOnly": login_only}
         config_file = self.root / "browser-config.json"
@@ -811,6 +859,7 @@ const {chromium} = require(process.argv[1]);
         expected = ["ordinary_registration", "ordinary_login", "public_entry", "initial_notice_acknowledged", "browse_search", "exam_wrapper", "private_marker", "question_input", "network_closure", "no_policy_violation"]
         assert result["cases"] == (["ordinary_login"] if login_only else expected) and result["status"] == "PASS"
         cookies = json.loads((self.root / "browser-cookies.json").read_bytes())
+        assert all(c["secure"] for c in cookies if c["name"] in {"ielts.sid", "ielts.sv"})
         self.cookie = "; ".join(c["name"] + "=" + c["value"] for c in cookies
             if c["domain"].lstrip(".") == self.business_host.split(":")[0])
         assert "ielts.sid=" in self.cookie and "ielts.sv=" in self.cookie
@@ -993,6 +1042,17 @@ const {chromium} = require(process.argv[1]);
 
     def cleanup(self):
         errors = []
+        if self.proxy is not None:
+            self.proxy.terminate()
+            try:
+                self.proxy.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proxy.kill()
+                self.proxy.wait(timeout=10)
+            assert self.proxy.poll() is not None
+            self.write("tls-proxy-cleanup.json", {"pid": self.proxy.pid, "terminated": True})
+        for stream in self.proxy_logs:
+            stream.close()
         def remove_if_present(inspect, remove):
             try:
                 self.docker(*inspect, allowed=(0, 1))
@@ -1051,6 +1111,29 @@ def admission_check(evidence):
         "records": {p.name: file_digest(p) for p in evidence.glob("*-admission.json")}}))
 
 
+TLS_SOURCE = r"""
+const fs = require('node:fs');
+const http = require('node:http');
+const https = require('node:https');
+const cfg = JSON.parse(fs.readFileSync(process.argv[2]));
+const server = https.createServer({key: fs.readFileSync(cfg.key), cert: fs.readFileSync(cfg.certificate), minVersion: 'TLSv1.2'}, (req, res) => {
+  if (!cfg.hosts.includes(req.headers.host)) {res.writeHead(400); return res.end();}
+  const headers = {...req.headers, 'x-forwarded-proto': 'https', 'x-forwarded-host': req.headers.host, 'x-forwarded-for': '127.0.0.1'};
+  const upstream = http.request({hostname: '127.0.0.1', port: cfg.upstream, method: req.method, path: req.url, headers}, response => {
+    res.writeHead(response.statusCode, response.headers);
+    response.pipe(res);
+  });
+  upstream.setTimeout(15000, () => upstream.destroy(new Error('upstream timeout')));
+  upstream.on('error', error => {if (!res.headersSent) res.writeHead(502); res.end(); console.error(error.message);});
+  req.pipe(upstream);
+});
+server.maxConnections = 32;
+server.requestTimeout = 20000;
+server.listen(cfg.port, '127.0.0.1', () => console.log(JSON.stringify({address: server.address(), upstream: cfg.upstream})));
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+"""
+
+
 BROWSER_SOURCE = r"""
 const fs = require('node:fs');
 const path = require('node:path');
@@ -1101,7 +1184,8 @@ async function authenticate(ctx, register) {
 }
 (async () => {
   browser = await chromium.launch({headless: true, chromiumSandbox: true,
-    args: ['--host-resolver-rules=' + hosts.map(h => 'MAP ' + h + ' 127.0.0.1').join(', '), '--proxy-bypass-list=*']});
+    args: ['--host-resolver-rules=' + hosts.map(h => 'MAP ' + h + ' 127.0.0.1').join(', '),
+      '--ignore-certificate-errors-spki-list=' + cfg.tlsSpki, '--proxy-bypass-list=*']});
   assert.equal(browser.version(), '141.0.7390.37');
   if (!cfg.loginOnly) {
     context = await freshContext();
@@ -1115,11 +1199,12 @@ async function authenticate(ctx, register) {
   report.cases.push('ordinary_login');
   if (!cfg.loginOnly) {
     assert.equal(new URL(page.url()).origin, cfg.business);
+    assert.equal(await page.evaluate(() => window.isSecureContext), true, 'HTTPS secure context required');
     await page.locator('button[data-view="browse"]').waitFor({state: 'visible'});
     report.cases.push('public_entry');
     const notice = page.locator('#license-modal');
     await notice.locator('[data-index-action="accept-license"]').click();
-    await notice.waitFor({state: 'hidden'});
+    await page.locator('#license-modal.show').waitFor({state: 'hidden'});
     report.cases.push('initial_notice_acknowledged');
     const tour = page.locator('.onboarding-tooltip');
     try {
@@ -1168,7 +1253,7 @@ async function authenticate(ctx, register) {
     assert.deepEqual(report.blockedExternal, [], 'Unexpected browser egress');
     report.cases.push('network_closure');
     assert.deepEqual(report.pageErrors, [], 'Browser application exception');
-    assert.deepEqual(report.console.filter(r => /Content Security Policy|Refused to (?:load|execute|connect|frame)|violat.*directive/i.test(r.text)), [], 'CSP violation');
+    assert.deepEqual(report.console.filter(r => /Content Security Policy|Refused to (?:load|execute|connect|frame)|violat.*directive|Cross-Origin-Opener-Policy.*ignored/i.test(r.text)), [], 'Browser security policy violation');
     report.cases.push('no_policy_violation');
   }
   fs.writeFileSync(cfg.cookies, JSON.stringify(await context.cookies()));
