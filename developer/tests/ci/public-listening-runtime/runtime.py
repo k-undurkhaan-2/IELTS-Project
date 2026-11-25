@@ -704,7 +704,10 @@ class Control:
         self.resources["volumes"].append(volume)
         self.resources["containers"].extend([database, self.app])
         self.write("resources.json", self.resources)
-        self.docker("network", "create", "--internal", network)
+        self.docker("network", "create", "--driver", "bridge",
+            "--opt", "com.docker.network.bridge.host_binding_ipv4=127.0.0.1",
+            "--opt", "com.docker.network.bridge.enable_ip_masquerade=false", network)
+        self.write(label + "-network.json", json.loads(self.docker("network", "inspect", network)))
         self.docker("volume", "create", volume)
         database_password = secrets.token_urlsafe(36)
         self.admin_username = "i79admin" + secrets.token_hex(6)
@@ -734,20 +737,22 @@ class Control:
                 break
             time.sleep(1)
         assert self.commands[-1]["exit"] == 0
+        assert b"16.16" in self.docker("exec", database, "postgres", "--version")
         self.docker("run", "--detach", "--name", self.app, "--network", network,
             "--memory", "768m", "--cpus", "1", "--pids-limit", "256", "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges", "--publish", f"127.0.0.1:{self.port}:3000",
             "--env-file", app_env, "--mount", f"type=bind,src={self.fixtures},dst=/app/ListeningPractice,readonly",
             "--mount", f"type=bind,src={self.outside},dst=/i79-outside,readonly", image)
-        self.wait_health(label)
         inspected = json.loads(self.docker("inspect", self.app))[0]
         assert inspected["Image"] == image and inspected["Config"]["User"] == "node"
         assert not inspected["HostConfig"]["Privileged"] and inspected["HostConfig"]["NetworkMode"] == network
         assert inspected["HostConfig"]["PortBindings"]["3000/tcp"] == [{"HostIp": "127.0.0.1", "HostPort": str(self.port)}]
+        assert inspected["NetworkSettings"]["Ports"]["3000/tcp"] == [{"HostIp": "127.0.0.1", "HostPort": str(self.port)}]
         assert all(not m["RW"] for m in inspected["Mounts"])
         assert {m["Destination"] for m in inspected["Mounts"]} == {"/app/ListeningPractice", "/i79-outside"}
         inspected["Config"]["Env"] = [v if v.split("=", 1)[0] in {"NODE_ENV", "HOST", "PORT"} else v.split("=", 1)[0] + "=<synthetic-redacted>" for v in inspected["Config"]["Env"]]
         self.write(label + "-running-container.json", inspected)
+        self.wait_health(label)
         self.docker("exec", "--user", "0", self.app, "node", "-e",
             "const fs=require('node:fs');try{fs.writeFileSync('/app/ListeningPractice/i79-write-probe','forbidden');process.exit(9)}catch(e){if(e.code!=='EROFS')throw e;console.log('EROFS verified as container root')}" )
         assert not (self.fixtures / "i79-write-probe").exists()
