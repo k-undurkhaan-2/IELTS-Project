@@ -1,0 +1,20 @@
+[
+  { "examId": "p1-high-171", "questionId": "q12", "answers": ["ring", "gold ring"] },
+  { "examId": "p1-high-171", "questionId": "q13", "answers": ["museum", "modern museum"] },
+  { "examId": "p1-low-34", "questionId": "q11", "answers": ["4", "four"] },
+  { "examId": "p1-medium-119", "questionId": "q9", "answers": ["60,000", "60000", "60 000"] },
+  { "examId": "p2-high-250", "questionId": "q12", "answers": ["one mile", "1 mile"], "optional": true },
+  { "examId": "p2-low-75", "questionId": "q12", "answers": ["defects", "abnormalities"] },
+  { "examId": "p3-high-156", "questionId": "q1", "answers": ["hammer", "hammer bone"] },
+  { "examId": "p3-high-161", "questionId": "q8", "answers": ["a panoramic camera", "panoramic camera"] },
+  { "examId": "p3-high-161", "questionId": "q9", "answers": ["the sahara desert", "sahara desert"] },
+  { "examId": "p3-high-181", "questionId": "q7", "answers": ["forest fruit", "fruit"] },
+  { "examId": "p3-high-181", "questionId": "q9", "answers": ["uxi trees", "uxi"] },
+  { "examId": "p3-high-181", "questionId": "q12", "answers": ["subsistence use", "subsistence"] },
+  { "examId": "p3-high-181", "questionId": "q14", "answers": ["non-timber forest products", "ntfps"] },
+  { "examId": "p3-low-187", "questionId": "q7", "answers": ["breathing", "eating"] },
+  { "examId": "p3-low-187", "questionId": "q10", "answers": ["vigorous exercise", "exercise"] },
+  { "examId": "p3-low-44", "questionId": "q8", "answers": ["untrue", "wrong"] },
+  { "examId": "p3-low-54", "questionId": "q8", "answers": ["freshwater pike", "pike"] },
+  { "examId": "p3-low-83", "questionId": "q8", "answers": ["inspiration", "elaboration"] }
+]

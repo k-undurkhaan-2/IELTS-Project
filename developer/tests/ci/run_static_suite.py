@@ -2616,6 +2616,7 @@ def run_checks(*, machine_mode: bool = False) -> Tuple[List[dict], bool]:
     # Integration tests
     deprecated_reading_source_dir = REPO_ROOT / "developer" / "reading-exams"
     integration_tests = [
+        ("Reading text answer variants audit", REPO_ROOT / "developer" / "tests" / "js" / "readingAnswerVariants.test.js"),
         ("Reading migration snapshot integration test", REPO_ROOT / "developer" / "tests" / "js" / "integration" / "readingMigrationSnapshot.test.js"),
         ("多套题提交流程集成测试", REPO_ROOT / "developer" / "tests" / "js" / "integration" / "multiSuiteSubmission.test.js"),
         ("拼写错误收集流程集成测试", REPO_ROOT / "developer" / "tests" / "js" / "integration" / "spellingErrorCollection.test.js"),

@@ -70,7 +70,10 @@
     "q5": "beans",
     "q6": "group",
     "q7": "match",
-    "q8": "untrue",
+    "q8": [
+      "untrue",
+      "wrong"
+    ],
     "q9": "anxious",
     "q10": "Asch",
     "q11": "internalization",

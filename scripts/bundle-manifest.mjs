@@ -105,6 +105,7 @@ const inputs = Object.freeze({
         'js/utils/practiceTimerPreferences.js',
         'js/utils/answerSanitizer.js',
         'js/utils/answerMatchCore.js',
+        'js/utils/readingAnswerMatchCore.js',
         'assets/wordlists/ielts_core.bundle.js',
         'assets/wordlists/ecdict_reading.bundle.js',
         'js/core/dictionaryService.js',

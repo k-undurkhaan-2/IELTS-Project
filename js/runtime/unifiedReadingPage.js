@@ -2874,13 +2874,16 @@
     function getTextualAnswer(questionId) {
         const aliases = resolveAnswerAliases(questionId);
         const fieldMap = new Map();
-        aliases.forEach((alias) => {
+        for (const alias of aliases) {
             document.querySelectorAll(`[name="${escapeSelector(alias)}"]`).forEach((field) => {
                 if (!fieldMap.has(field)) {
                     fieldMap.set(field, true);
                 }
             });
-        });
+            // Display numbers may overlap another question's canonical ID.
+            // Prefer the first matching name, retaining repeated fields for it.
+            if (fieldMap.size) break;
+        }
         const fields = Array.from(fieldMap.keys());
         const values = [];
         for (const field of fields) {
@@ -3023,7 +3026,7 @@
         }
         const text = normalizeAnswerForReplay(rawValue, 'value');
         if (!text) return [];
-        if (text.includes(',')) {
+        if (/^[A-Za-z](?:\s*,\s*[A-Za-z])+$/.test(text)) {
             return text.split(',').map((item) => String(item || '').trim()).filter(Boolean);
         }
         return [text];
@@ -3203,10 +3206,19 @@
         return cleaned;
     }
 
-    function compareAnswers(userAnswer, correctAnswer) {
+    function isTextAnswerQuestion(questionId) {
+        const group = state.dataset?.questionGroups?.find(group => group.questionIds?.includes(questionId));
+        const textCore = global.ReadingAnswerMatchCore;
+        return !!(textCore && group && textCore.isTextKind(group.kind));
+    }
+
+    function compareAnswers(userAnswer, correctAnswer, questionId) {
         const core = getAnswerMatchCore();
         const normalizedUserAnswer = normalizeAnswerForCompare(userAnswer);
         const normalizedCorrectAnswer = normalizeAnswerForCompare(correctAnswer);
+        if (isTextAnswerQuestion(questionId)) {
+            return global.ReadingAnswerMatchCore.matches(normalizedUserAnswer, normalizedCorrectAnswer);
+        }
         if (core && typeof core.compareAnswers === 'function') {
             return core.compareAnswers(normalizedUserAnswer, normalizedCorrectAnswer) === true;
         }
@@ -3251,7 +3263,8 @@
         return tokenEquivalent(actualTokens[0], expectedTokens[0]);
     }
 
-    function questionWeight(correctAnswer) {
+    function questionWeight(correctAnswer, questionId) {
+        if (isTextAnswerQuestion(questionId)) return 1;
         const normalized = normalizeAnswerValue(correctAnswer);
         if (Array.isArray(normalized) && normalized.length > 0) {
             return normalized.length;
@@ -3279,8 +3292,8 @@
         questionOrder.forEach((questionId) => {
             const userAnswer = answers[questionId] || '';
             const correctAnswer = answerKey[questionId];
-            const isCorrect = compareAnswers(userAnswer, correctAnswer);
-            const weight = questionWeight(correctAnswer);
+            const isCorrect = compareAnswers(userAnswer, correctAnswer, questionId);
+            const weight = questionWeight(correctAnswer, questionId);
             const normalizedQuestionId = normalizeQuestionId(questionId) || questionId;
             const questionType = questionTypeMap[normalizedQuestionId] || 'other';
             if (!questionTypePerformance[questionType]) {
@@ -3443,7 +3456,7 @@
                 : (Object.prototype.hasOwnProperty.call(normalizedCorrectAnswers, questionId) ? normalizedCorrectAnswers[questionId] : '');
             let isCorrect = typeof comparisonEntry.isCorrect === 'boolean'
                 ? comparisonEntry.isCorrect
-                : compareAnswers(userAnswer, correctAnswer);
+                : compareAnswers(userAnswer, correctAnswer, questionId);
             if (isCorrect) {
                 correctCount += 1;
             }
