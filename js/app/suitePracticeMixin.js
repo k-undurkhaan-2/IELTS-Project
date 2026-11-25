@@ -192,7 +192,7 @@
                 const flowMode = suitePreference.flowMode;
                 const frequencyScope = suitePreference.frequencyScope;
 
-                if (this.currentSuiteSession && this.currentSuiteSession.status === 'active') {
+                if (this.currentSuiteSession && ['active', 'initializing'].includes(this.currentSuiteSession.status)) {
                     window.showMessage && window.showMessage('套题练习正在进行中，请先完成当前套题。', 'warning');
                     return;
                 }
@@ -395,7 +395,9 @@
             }
 
             // Not last -> advance to next passage
-            if (typeof this.cleanupExamSession === 'function') {
+            // Prepared passages keep their sessions until final teardown, so
+            // switching never waits for storage cleanup or recreates a session.
+            if (!session.preloadReading && typeof this.cleanupExamSession === 'function') {
                 try {
                     await this.cleanupExamSession(examId);
                 } catch (cleanupError) {
@@ -883,6 +885,7 @@
             try {
                 const snapshot = {
                     id: session.id,
+                    preloadReading: session.preloadReading === true,
                     sequence: session.sequence,
                     currentIndex: session.currentIndex,
                     draftsByExam: session.draftsByExam || {},
@@ -1141,10 +1144,32 @@
             session.results.push(normalizedResult);
         },
 
-        _handleSuiteSessionReady(examId) {
+        _handleSuiteSessionReady(examId, data = {}) {
             const session = this.currentSuiteSession;
             if (!session || (session.status !== 'active' && session.status !== 'initializing') || !examId) {
                 return false;
+            }
+            if (session.preloadReading && session.status === 'initializing') {
+                const readyIds = Array.isArray(data.suitePreloadedExamIds) ? data.suitePreloadedExamIds : [];
+                if (!session.sequence.every(entry => readyIds.includes(entry.examId))) {
+                    return false;
+                }
+                const anchorMs = Number(data.suiteTimerAnchorMs);
+                if (!Number.isFinite(anchorMs) || anchorMs <= 0) {
+                    return false;
+                }
+                session.startTime = anchorMs;
+                session.suiteTimerAnchorMs = anchorMs;
+                session.globalTimerAnchorMs = anchorMs;
+                session.suiteTimerRunning = true;
+                session.status = 'active';
+                const info = this.examWindows && this.examWindows.get(examId);
+                if (info) {
+                    info.startTime = anchorMs;
+                    info.suiteTimerAnchorMs = anchorMs;
+                    info.globalTimerAnchorMs = anchorMs;
+                }
+                this._mirrorSessionToStorage(session);
             }
             if (session.flowMode !== 'simulation') {
                 return false;
@@ -2143,7 +2168,7 @@
             );
 
             try {
-                if (this.currentSuiteSession && this.currentSuiteSession.status === 'active') {
+                if (this.currentSuiteSession && ['active', 'initializing'].includes(this.currentSuiteSession.status)) {
                     window.showMessage && window.showMessage('套题练习正在进行中，请先完成当前套题。', 'warning');
                     return false;
                 }
@@ -2167,11 +2192,16 @@
                 const lockedAutoAdvance = flowMode === 'stationary'
                     ? false
                     : true;
-                const timerAnchorMs = Date.now();
+                const preloadReading = normalizedSequence.length === 3
+                    && typeof this._isUnifiedReadingExam === 'function'
+                    && !(typeof this._shouldUsePlaceholderPage === 'function' && this._shouldUsePlaceholderPage())
+                    && normalizedSequence.every(item => this._isUnifiedReadingExam(item.exam));
+                const timerAnchorMs = preloadReading ? null : Date.now();
                 const session = {
                     id: suiteSessionId,
                     status: 'initializing',
                     startTime: timerAnchorMs,
+                    preloadReading,
                     sequence: normalizedSequence,
                     currentIndex: 0,
                     results: [],
@@ -2180,7 +2210,7 @@
                     globalTimerAnchorMs: timerAnchorMs,
                     suiteTimerPausedOffsetMs: 0,
                     suiteTimerPausedAtMs: null,
-                    suiteTimerRunning: true,
+                    suiteTimerRunning: !preloadReading,
                     flowMode,
                     frequencyScope,
                     autoAdvanceAfterSubmit: lockedAutoAdvance,
@@ -2192,7 +2222,7 @@
                 this._registerSuiteSequence(session);
 
                 const firstEntry = normalizedSequence[0];
-                window.showMessage && window.showMessage(launchLabel + ' 已启动，正在打开第一篇。', 'info');
+                window.showMessage && window.showMessage(launchLabel + ' 已启动，正在准备全部题目。', 'info');
 
                 let examWindow = null;
                 try {
@@ -2215,7 +2245,7 @@
 
                 session.windowRef = examWindow;
                 this._ensureSuiteWindowGuard(session, session.windowRef);
-                session.status = 'active';
+                if (!preloadReading) session.status = 'active';
                 session.activeExamId = firstEntry.examId;
                 this._focusSuiteWindow(session.windowRef);
                 return true;

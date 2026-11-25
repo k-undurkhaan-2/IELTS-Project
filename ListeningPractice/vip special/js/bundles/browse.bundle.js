@@ -7560,6 +7560,35 @@
           * 打开指定题目进行练习
           */
         async openExam(examId, options = {}) {
+            // A prepared reading suite keeps one document alive for all passages.
+            const suite = this.currentSuiteSession;
+            const cachedWindow = options.reuseWindow || (suite && suite.windowRef);
+            if (suite && suite.preloadReading && suite.id === options.suiteSessionId
+                && cachedWindow && !cachedWindow.closed) {
+                const runtime = cachedWindow.__READING_SUITE_RUNTIME__;
+                const entry = suite.sequence.find(item => item.examId === examId);
+                if (entry && runtime && runtime.has(examId, suite.id)) {
+                    const info = this.ensureExamWindowSession(examId, cachedWindow);
+                    Object.assign(info, {
+                        suiteSessionId: suite.id,
+                        suiteFlowMode: suite.flowMode,
+                        suiteSequenceIndex: options.sequenceIndex,
+                        suiteSequenceTotal: suite.sequence.length,
+                        pageType: 'unified-reading'
+                    });
+                    if (!this.messageHandlers || !this.messageHandlers.has(examId)) {
+                        this.setupExamWindowCommunication(cachedWindow, examId, entry.exam, options);
+                    }
+                    runtime.activate(examId, {
+                        ...this._buildExamInitPayload(examId, info),
+                        suiteTimerPausedOffsetMs: suite.suiteTimerPausedOffsetMs,
+                        suiteTimerPausedAtMs: suite.suiteTimerPausedAtMs,
+                        suiteTimerRunning: suite.suiteTimerRunning
+                    });
+                    this.updateExamStatus(examId, 'in-progress');
+                    return cachedWindow;
+                }
+            }
             const examIndex = await getActiveExamIndexSnapshot();
             const list = Array.isArray(examIndex) ? examIndex : (Array.isArray(window.examIndex) ? window.examIndex : []);
             const exam = list.find(e => e.id === examId);
@@ -7864,6 +7893,10 @@
                 };
                 safeSet('suiteSessionId', options.suiteSessionId);
                 safeSet('suiteFlowMode', options.suiteFlowMode);
+                const suite = this.currentSuiteSession;
+                if (suite && suite.preloadReading && suite.id === options.suiteSessionId) {
+                    safeSet('suiteExamIds', JSON.stringify(suite.sequence.map(item => item.examId)));
+                }
                 safeSet('suiteTimerAnchorMs', timerContext.suiteTimerAnchorMs);
                 safeSet('globalTimerAnchorMs', timerContext.globalTimerAnchorMs);
                 safeSet('suiteTimerMode', timerContext.suiteTimerMode);
@@ -8000,6 +8033,9 @@
             }
             if (!anchorMs && currentSession && (currentSession.id || currentSession.sessionId || currentSession.status === 'active')) {
                 anchorMs = Date.now();
+            }
+            if (currentSession && currentSession.preloadReading && currentSession.status === 'initializing') {
+                anchorMs = null;
             }
 
             const mode = pickFromSources(
@@ -10782,7 +10818,7 @@
 
             if (this.suiteExamMap && this.suiteExamMap.has(examId) && typeof this._handleSuiteSessionReady === 'function') {
                 try {
-                    this._handleSuiteSessionReady(examId);
+                    this._handleSuiteSessionReady(examId, payload);
                 } catch (suiteReadyError) {
                     console.warn('[SuitePractice] 标记套题页面就绪失败:', suiteReadyError);
                 }
@@ -11466,7 +11502,9 @@
          */
         handleExamWindowClosed(examId) {
 
-            if (this.suiteExamMap && this.suiteExamMap.has(examId) && this.currentSuiteSession && this.currentSuiteSession.status === 'active' && this.suiteExamMap.get(examId) === this.currentSuiteSession.id) {
+            if (this.suiteExamMap && this.suiteExamMap.has(examId) && this.currentSuiteSession
+                && ['active', 'initializing'].includes(this.currentSuiteSession.status)
+                && this.suiteExamMap.get(examId) === this.currentSuiteSession.id) {
                 window.showMessage && window.showMessage('套题练习窗口已关闭，套题模式将被中断并回退到普通模式。', 'warning');
                 if (typeof this._abortSuiteSession === 'function') {
                     this._abortSuiteSession(this.currentSuiteSession, {}).catch(error => {

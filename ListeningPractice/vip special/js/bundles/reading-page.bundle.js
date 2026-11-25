@@ -2477,6 +2477,14 @@
     ]);
     const navStatus = new Map();
     const scriptCache = new Map();
+    const suitePassages = new Map();
+    const passageStateKeys = [
+        'reviewSessionId', 'reviewEntryIndex', 'reviewMode', 'reviewViewMode', 'readOnly',
+        'readOnlyReason', 'reviewContext', 'suiteReviewMode', 'submitted', 'lastResults',
+        'explanation', 'currentActiveQuestionId'
+    ];
+    let suitePrepared = false;
+    let suiteStarted = false;
     const LOCATOR_HIGHLIGHT_SELECTOR = '.reading-locator-highlight, .reading-locator-block';
     function summarizeUnifiedReadingErrorForLog(error) {
         if (!error || typeof error !== 'object') {
@@ -2576,6 +2584,7 @@
         resetBtn: null,
         exitBtn: null
     };
+    const initialPassageState = Object.fromEntries(passageStateKeys.map(key => [key, state[key]]));
 
     const interaction = {
         timerRunning: true,
@@ -3379,8 +3388,20 @@
             const script = document.createElement('script');
             script.src = safeUrl;
             script.defer = true;
-            script.onload = () => resolve(true);
-            script.onerror = () => reject(new Error('reading_exam_script_failed'));
+            const timeout = global.setTimeout(() => finish(new Error('reading_exam_script_timeout')), 30000);
+            const finish = (error) => {
+                global.clearTimeout(timeout);
+                script.onload = script.onerror = null;
+                if (error) {
+                    script.remove();
+                    scriptCache.delete(safeUrl);
+                    reject(error);
+                } else {
+                    resolve(true);
+                }
+            };
+            script.onload = () => finish();
+            script.onerror = () => finish(new Error('reading_exam_script_failed'));
             document.head.appendChild(script);
         });
         scriptCache.set(safeUrl, promise);
@@ -3571,12 +3592,12 @@
         return global.__READING_EXAM_MANIFEST__ || {};
     }
 
-    async function ensureDataset() {
+    async function loadDataset(examId, dataKey = examId) {
         const manifest = await ensureManifest();
-        const entry = manifest[state.dataKey] || manifest[state.examId];
+        const entry = manifest[dataKey] || manifest[examId];
         const registry = global.__READING_EXAM_DATA__;
         if (!entry) {
-            throw new Error(`reading_exam_manifest_entry_missing:${state.examId}`);
+            throw new Error(`reading_exam_manifest_entry_missing:${examId}`);
         }
         if (!registry || typeof registry.get !== 'function') {
             throw new Error('reading_exam_registry_missing');
@@ -3588,9 +3609,137 @@
         if (!dataset) {
             throw new Error(`reading_exam_dataset_missing:${entry.dataKey}`);
         }
-        state.dataset = dataset;
-        state.dataKey = entry.dataKey;
-        return dataset;
+        return { dataset, dataKey: entry.dataKey };
+    }
+
+    async function ensureDataset() {
+        const loaded = await loadDataset(state.examId, state.dataKey);
+        Object.assign(state, loaded);
+        return loaded.dataset;
+    }
+
+    function preparePassageNodes(dataset) {
+        const left = document.createElement('div');
+        const groups = document.createElement('div');
+        left.innerHTML = (dataset.passage?.blocks || [])
+            .map(block => sanitizePassageHtml(block?.bodyHtml || block?.html || '')).join('\n');
+        groups.innerHTML = (dataset.questionGroups || []).map(createGroupMarkup).join('\n');
+        prepareDragDrop(groups);
+        return { left, groups, results: document.createElement('div') };
+    }
+
+    async function preparePassageImages(nodes, onProgress) {
+        const images = [nodes.left, nodes.groups].flatMap(root => [...root.querySelectorAll('img')]);
+        let completed = 0;
+        const results = await Promise.allSettled(images.map(async image => {
+            image.loading = 'eager';
+            let timeout;
+            try {
+                await Promise.race([
+                    image.decode(),
+                    new Promise((_, reject) => {
+                        timeout = global.setTimeout(() => reject(new Error('reading_image_timeout')), 30000);
+                    })
+                ]);
+                completed += 1;
+                onProgress(completed, images.length);
+            } finally {
+                global.clearTimeout(timeout);
+            }
+        }));
+        const failed = results.find(result => result.status === 'rejected');
+        if (failed) throw failed.reason;
+    }
+
+    async function prepareReadingSuite() {
+        const loading = global.ReadingSuiteLoading;
+        if (!loading || !state.suiteSessionId) return false;
+        interaction.timerRunning = false;
+        state.pagePausedAtMs = state.pageStartTime;
+        if (!loading.examIds.includes(state.examId)) throw new Error('reading_suite_exam_missing');
+        while (!suitePrepared) {
+            const attempts = await Promise.allSettled(loading.examIds.map(async examId => {
+                if (suitePassages.has(examId)) return;
+                try {
+                    loading.update(examId, 0, '正在加载题目');
+                    const loaded = await loadDataset(examId);
+                    loading.update(examId, 50, '正在准备题面', loaded.dataset.meta?.title);
+                    const nodes = preparePassageNodes(loaded.dataset);
+                    loading.update(examId, 75, '正在准备图片');
+                    await preparePassageImages(nodes, (done, total) => {
+                        loading.update(examId, 75 + Math.floor(24 * done / total), `图片 ${done} / ${total}`);
+                    });
+                    suitePassages.set(examId, { ...loaded, ...nodes, scroll: [0, 0, 0] });
+                    loading.update(examId, 100, '已就绪');
+                } catch (error) {
+                    loading.update(examId, 0, '加载失败，请重试');
+                    throw error;
+                }
+            }));
+            suitePrepared = attempts.every(attempt => attempt.status === 'fulfilled');
+            if (!suitePrepared) await loading.retry();
+        }
+        const first = suitePassages.get(state.examId);
+        state.dataset = first.dataset;
+        state.dataKey = first.dataKey;
+        global.__READING_SUITE_RUNTIME__ = {
+            has(examId, suiteSessionId) {
+                return suitePrepared && suiteStarted && suiteSessionId === state.suiteSessionId && suitePassages.has(examId);
+            },
+            activate: activateSuitePassage
+        };
+        return true;
+    }
+
+    function activateSuitePassage(examId, init) {
+        const target = suitePassages.get(examId);
+        if (!target || !suiteStarted || init.suiteSessionId !== state.suiteSessionId) return false;
+        if (examId !== state.examId) {
+            stopSimulationDraftSync();
+            closeFloatingPanels();
+            closeReviewHighlightDictionary();
+            global.getSelection()?.removeAllRanges();
+            interaction.lastRange = null;
+            interaction.currentHighlightNode = null;
+            const current = suitePassages.get(state.examId);
+            current.savedState = Object.fromEntries(passageStateKeys.map(key => [key, state[key]]));
+            current.scroll = [dom.left.scrollTop, dom.right.scrollTop, global.scrollY];
+            current.resultsDisplay = dom.results.style.display;
+            current.navStatus = new Map(navStatus);
+            current.left.replaceChildren(...dom.left.childNodes);
+            current.groups.replaceChildren(...dom.groups.childNodes);
+            current.results.replaceChildren(...dom.results.childNodes);
+            Object.assign(state, initialPassageState, target.savedState || {}, {
+                examId, dataset: target.dataset, dataKey: target.dataKey,
+                sessionId: null, sessionReadySent: false, lastInitSignature: '', lastReplaySignature: '',
+                simulationContextReady: false, simulationDraftFingerprint: ''
+            });
+            navStatus.clear();
+            target.navStatus?.forEach((value, key) => navStatus.set(key, value));
+            // Keep URL identity in sync without navigating or reloading any assets.
+            const url = new URL(global.location.href);
+            url.searchParams.set('examId', examId);
+            url.searchParams.set('dataKey', target.dataKey);
+            url.searchParams.set('suiteSequenceIndex', String(init.suiteSequenceIndex));
+            if (/\/practice\/reading\//.test(url.pathname)) {
+                url.pathname = `/practice/reading/${encodeURIComponent(examId)}`;
+            }
+            global.history.replaceState(null, '', url);
+            renderDataset(target.dataset);
+            buildQuestionNav();
+            setReadOnlyMode(state.readOnly, state.readOnlyReason);
+            disableDragInteractions();
+            dom.left.scrollTop = target.scroll[0];
+            dom.right.scrollTop = target.scroll[1];
+            global.scrollTo(0, target.scroll[2]);
+            setReviewNavVisibility(state.suiteReviewMode);
+            updateNavStatuses(state.lastResults);
+        }
+        handleIncoming({
+            origin: global.location.origin, source: state.parentWindow,
+            data: { type: 'INIT_SESSION', data: init }
+        });
+        return true;
     }
 
     async function ensureExplanationManifest() {
@@ -3602,6 +3751,8 @@
     }
 
     async function ensureExplanationDataset() {
+        const examId = state.examId;
+        const dataKey = state.dataKey;
         const registry = global.__READING_EXPLANATION_DATA__;
         if (!registry || typeof registry.get !== 'function') {
             return null;
@@ -3612,7 +3763,7 @@
         } catch (_) {
             return null;
         }
-        const entry = manifest[state.dataKey] || manifest[state.examId];
+        const entry = manifest[dataKey] || manifest[examId];
         if (!entry || !entry.dataKey || !entry.script) {
             return null;
         }
@@ -3624,8 +3775,8 @@
             }
         }
         const payload = registry.get(entry.dataKey);
-        state.explanation = payload || null;
-        return state.explanation;
+        if (state.examId === examId) state.explanation = payload || null;
+        return payload || null;
     }
 
     function ensureExplanationStyles() {
@@ -3833,14 +3984,9 @@
     }
 
     function renderDataset(dataset) {
-        clearExplanations();
-        const passageHtml = (dataset.passage?.blocks || [])
-            .map((block) => sanitizePassageHtml(block?.bodyHtml || block?.html || ''))
-            .join('\n');
-        const groupsHtml = (dataset.questionGroups || [])
-            .map((group) => createGroupMarkup(group))
-            .join('\n');
-        const questionCount = Array.isArray(dataset.questionOrder) ? dataset.questionOrder.length : 0;
+        const prepared = suitePassages.get(state.examId);
+        if (!prepared) clearExplanations();
+        const nodes = prepared || preparePassageNodes(dataset);
 
         document.title = dataset.meta?.title || 'IELTS 阅读练习';
         if (dom.title) {
@@ -3850,15 +3996,15 @@
             renderReadingSubtitle();
         }
         if (dom.left) {
-            dom.left.innerHTML = passageHtml;
+            dom.left.replaceChildren(...nodes.left.childNodes);
         }
         if (dom.groups) {
-            dom.groups.innerHTML = groupsHtml;
+            dom.groups.replaceChildren(...nodes.groups.childNodes);
         }
         applyNbHints();
         if (dom.results) {
-            dom.results.style.display = 'none';
-            dom.results.innerHTML = '';
+            dom.results.style.display = prepared?.resultsDisplay || 'none';
+            dom.results.replaceChildren(...nodes.results.childNodes);
         }
         updateRedesignedSubHeader();
     }
@@ -4882,8 +5028,8 @@
         syncPrimaryActionButtons();
     }
 
-    function getDropzones() {
-        return Array.from(document.querySelectorAll('.paragraph-dropzone, .match-dropzone, .drop-target-summary'));
+    function getDropzones(root = document) {
+        return Array.from(root.querySelectorAll('.paragraph-dropzone, .match-dropzone, .drop-target-summary'));
     }
 
     function ensureDropzoneHolder(dropzone) {
@@ -5073,19 +5219,28 @@
         updateNavStatuses();
     }
 
-    function attachDragDrop() {
-        getDropzones().forEach((dropzone, index) => {
+    function prepareDragDrop(root) {
+        getDropzones(root).forEach((dropzone, index) => {
             if (!dropzone.dataset.dropzoneId) {
                 dropzone.dataset.dropzoneId = `dropzone-${index + 1}`;
             }
             ensureDropzoneHolder(dropzone);
             updateDropzoneState(dropzone);
         });
-        document.querySelectorAll('.drag-item, .draggable-word, .card').forEach((item) => {
+        root.querySelectorAll('.drag-item, .draggable-word, .card').forEach((item) => {
             if (item instanceof HTMLElement) {
                 attachDraggableBehavior(item);
             }
         });
+        root.querySelectorAll('.pool-items').forEach((pool, index) => {
+            if (!pool.id) pool.id = `practice-pool-${index}`;
+        });
+        root.querySelectorAll('.pool-items .drag-item').forEach((item) => {
+            if (!item.dataset.originPool) item.dataset.originPool = item.closest('.pool-items')?.id || '';
+        });
+    }
+
+    function attachDragDrop() {
         document.addEventListener('dragover', (event) => {
             const target = event.target instanceof HTMLElement
                 ? event.target.closest('.paragraph-dropzone, .match-dropzone, .drop-target-summary, .pool-items')
@@ -6016,7 +6171,6 @@
                 );
                 postMessage('REVIEW_NAVIGATE', {
                     direction,
-                    sessionId: null,
                     reviewSessionId: state.reviewSessionId || state.reviewContext?.reviewSessionId || null,
                     suiteSessionId: state.suiteSessionId || state.reviewContext?.suiteSessionId || null,
                     suiteReviewMode: state.suiteReviewMode === true,
@@ -6283,7 +6437,8 @@
             suiteTimerAnchorMs: state.suiteTimerAnchorMs,
             globalTimerAnchorMs: state.suiteTimerAnchorMs,
             suiteTimerMode: state.suiteTimerMode,
-            suiteTimerLimitSeconds: state.suiteTimerLimitSeconds
+            suiteTimerLimitSeconds: state.suiteTimerLimitSeconds,
+            suitePreloadedExamIds: suitePrepared ? [...suitePassages.keys()] : undefined
         });
         state.sessionReadySent = true;
     }
@@ -7094,6 +7249,15 @@
                 state.suiteTimerAnchorMs = Math.floor(initTimerAnchorMs);
                 state.simulationGlobalAnchorMs = Math.floor(initTimerAnchorMs);
             }
+            const startingPreparedSuite = suitePrepared && !suiteStarted;
+            if (startingPreparedSuite) {
+                const anchorMs = initTimerAnchorMs > 0 ? initTimerAnchorMs : Date.now();
+                state.suiteTimerAnchorMs = anchorMs;
+                state.simulationGlobalAnchorMs = anchorMs;
+                state.pageStartTime = anchorMs;
+                state.pagePausedOffsetMs = 0;
+                state.pagePausedAtMs = null;
+            }
             if (typeof data.suiteTimerMode === 'string') {
                 const normalizedTimerMode = data.suiteTimerMode.trim().toLowerCase();
                 if (normalizedTimerMode === 'countdown' || normalizedTimerMode === 'elapsed') {
@@ -7161,6 +7325,11 @@
             state.lastInitSignature = initSignature;
             if (state.memorizeMode && !state.reviewMode && !state.simulationMode) {
                 renderMemorizeStudyLayer().catch(() => {});
+            }
+            if (startingPreparedSuite) {
+                suiteStarted = true;
+                global.ReadingSuiteLoading.complete();
+                renderTimer();
             }
             sendSessionReady();
             return;
@@ -7325,31 +7494,14 @@
     async function bootstrap() {
         parseQuery();
         captureDom();
-        const dataset = await ensureDataset();
+        const preparedSuite = await prepareReadingSuite();
+        const dataset = preparedSuite ? state.dataset : await ensureDataset();
         renderDataset(dataset);
         buildQuestionNav();
         attachNavListeners();
         attachMemorizeLocatorListeners();
         attachDragDrop();
         attachPaneResizer();
-
-        // Ensure drag items can return home when replaced or discarded
-        function initDragPools() {
-            document.querySelectorAll('.pool-items').forEach((pool, index) => {
-                if (!pool.id) {
-                    pool.id = `practice-pool-${index}`;
-                }
-            });
-            document.querySelectorAll('.pool-items .drag-item').forEach((item) => {
-                if (!item.dataset.originPool) {
-                    const pool = item.closest('.pool-items');
-                    if (pool?.id) {
-                        item.dataset.originPool = pool.id;
-                    }
-                }
-            });
-        }
-        initDragPools();
 
         attachUnifiedTimer();
         attachUnifiedPanels();
