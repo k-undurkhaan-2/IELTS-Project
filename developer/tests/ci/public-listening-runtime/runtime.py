@@ -38,6 +38,7 @@ AUTH = json.loads((HERE / "authority.json").read_bytes())
 REPO = "k-undurkhaan-2/IELTS-Project"
 VERSION = AUTH["artifact"]
 EXAM_ID = "listening-p1-very-007-notes-on-a-part-time-society-f0f5f9b6"
+EXAM_ROUTE_ID = "p1-very-007"
 EXAM_PATH = "P1/次高频/7. P1 Notes on A Part time Society/Notes on A Part time Society.html"
 MANIFEST_PATH = f"developer/tests/ci/public-listening-frontend/{VERSION}.manifest.json"
 STAGE_PATH = "developer/tests/ci/stage_public_listening_frontend.py"
@@ -394,6 +395,20 @@ const {chromium} = require(process.argv[1]);
         for record in self.manifest["generated_dependencies"]:
             p = self.candidate / record["source_path"]
             assert file_digest(p) == record["sha256"] and p.stat().st_size == record["length"]
+        generated_text = (self.candidate / "assets/generated/listening-exams/manifest.js").read_text()
+        encoded_manifest = generated_text.split("global.__LISTENING_EXAM_MANIFEST__ = ", 1)[1]
+        exams, end = json.JSONDecoder().raw_decode(encoded_manifest)
+        assert encoded_manifest[end:].strip() == ';\n})(typeof window !== "undefined" ? window : globalThis);'
+        matching = []
+        for key, entry in exams.items():
+            canonical = str(entry.get("examId") or entry.get("dataKey") or key)
+            match = re.match(r"^listening-(p[1-4])-(very|high|medium|low)-(\d{1,4})(?:-|$)", canonical, re.I)
+            if match and f"{match[1].lower()}-{match[2].lower()}-{match[3].zfill(3)}" == EXAM_ROUTE_ID:
+                matching.append(canonical)
+        assert matching == [EXAM_ID]
+        assert exams[EXAM_ID]["path"].rstrip("/") + "/" + exams[EXAM_ID]["filename"] == EXAM_PATH
+        self.write("exam-route-authority.json", {"canonical_exam_id": EXAM_ID, "public_route_id": EXAM_ROUTE_ID,
+            "unique_manifest_mapping": True, "manifest_sha256": digest(generated_text.encode())})
         self.source_inventory = source_inventory
 
     def verify_stage(self, stage, manifest_raw):
@@ -845,7 +860,7 @@ const {chromium} = require(process.argv[1]);
         config = {"auth": "https://" + self.auth_host, "business": "https://" + self.business_host,
             "admin": "https://" + self.admin_host, "username": self.username, "password": self.password,
             "tlsSpki": self.tls_spki,
-            "exam": EXAM_ID, "marker": self.sentinel.decode(), "evidence": str(self.evidence),
+            "exam": EXAM_ID, "routeId": EXAM_ROUTE_ID, "marker": self.sentinel.decode(), "evidence": str(self.evidence),
             "cookies": str(self.root / "browser-cookies.json"), "tools": str(self.tools), "loginOnly": login_only}
         config_file = self.root / "browser-config.json"
         config_file.write_bytes(encode(config))
@@ -904,6 +919,7 @@ const {chromium} = require(process.argv[1]);
         private = "/ListeningPractice/" + urllib.parse.quote(EXAM_PATH, safe="/")
         nested = shell + "ListeningPractice/" + urllib.parse.quote(EXAM_PATH, safe="/")
         wrapper = "/practice/listening/" + EXAM_ID
+        short_wrapper = "/practice/listening/" + EXAM_ROUTE_ID
         wrapper_bytes = (self.candidate / "assets/generated/listening-exams/listening-practice-unified.html").read_text()
         for attribute, value in {"data-exam-id": EXAM_ID, "data-source-url": private,
                 "data-base-href": private.rsplit("/", 1)[0] + "/"}.items():
@@ -912,7 +928,7 @@ const {chromium} = require(process.argv[1]);
         wrapper_bytes = wrapper_bytes.encode()
         for target, policy, expected_data in [(private, "private", self.fixture_bytes),
                 (nested, "private", self.fixture_bytes),
-                (wrapper, "wrapper", wrapper_bytes)]:
+                (wrapper, "wrapper", wrapper_bytes), (short_wrapper, "wrapper", wrapper_bytes)]:
             for method in ["GET", "HEAD"]:
                 status, headers, data = self.http(method, target, cookie=self.cookie, label=policy)
                 assert status == 200
@@ -927,7 +943,7 @@ const {chromium} = require(process.argv[1]);
                     assert not data
                 csp_observed.append({"path": target, "policy": policy})
         protected = [shell, *[r[0] for r in routes if r[2] == "shell"],
-            "/assets/generated/listening-exams/manifest.js", "/assets/generated/listening-exams/listening-index.compat.js", wrapper, private, nested]
+            "/assets/generated/listening-exams/manifest.js", "/assets/generated/listening-exams/listening-index.compat.js", wrapper, short_wrapper, private, nested]
         for target in sorted(set(protected)):
             for method in ["GET", "HEAD"]:
                 status, _, data = self.http(method, target, label="anonymous")
@@ -988,7 +1004,7 @@ const {chromium} = require(process.argv[1]);
                 self.browser(login_only=True)
                 assert self.http("GET", shell, cookie=self.cookie, label="fresh-before-revoke")[0] == 200
             self.docker("exec", self.database, "psql", "-U", "postgres", "-d", "i79", "-c", sql)
-            for target in [shell, wrapper, private, "/assets/generated/listening-exams/manifest.js"]:
+            for target in [shell, wrapper, short_wrapper, private, "/assets/generated/listening-exams/manifest.js"]:
                 for method in ["GET", "HEAD"]:
                     status, _, data = self.http(method, target, cookie=self.cookie, label=mode)
                     assert status == 401 and self.sentinel not in data
@@ -1228,7 +1244,7 @@ async function authenticate(ctx, register) {
     for (let i = 0; i < 100; i++) {
       for (const p of context.pages()) {
         for (const frame of p.frames()) {
-          if (new URL(frame.url() || 'about:blank').pathname === '/practice/listening/' + cfg.exam) wrapper = frame;
+          if (new URL(frame.url() || 'about:blank').pathname === '/practice/listening/' + cfg.routeId) wrapper = frame;
           if (await frame.locator('#synthetic-marker').count()) privateFrame = frame;
         }
       }
@@ -1236,6 +1252,7 @@ async function authenticate(ctx, register) {
       await new Promise(resolve => setTimeout(resolve, 200));
     }
     assert(wrapper, 'The real practice/listening route was not reached');
+    assert.equal(await wrapper.locator('#listening-wrapper-root').getAttribute('data-exam-id'), cfg.exam);
     report.cases.push('exam_wrapper');
     assert(privateFrame, 'The private synthetic iframe was not loaded');
     assert.equal(await privateFrame.locator('#synthetic-marker').innerText(), cfg.marker);
@@ -1260,6 +1277,7 @@ async function authenticate(ctx, register) {
   report.status = 'PASS';
 })().catch(error => {report.error = String(error.stack || error); process.exitCode = 1;}).finally(async () => {
   if (context) {
+    report.finalPages = context.pages().map(p => ({url: p.url(), frames: p.frames().map(f => f.url())}));
     for (const [i, p] of context.pages().entries()) {
       try {const stem = (cfg.loginOnly ? 'browser-login-final-' : 'browser-final-') + i; await p.screenshot({path: path.join(cfg.evidence, stem + '.png')}); fs.writeFileSync(path.join(cfg.evidence, stem + '.html'), await p.content());} catch (_) {}
     }
@@ -1347,9 +1365,11 @@ def main():
         print(traceback.format_exc(), file=sys.stderr)
         browser_report = control.evidence / "browser-report.json"
         if browser_report.is_file():
-            browser_error = json.loads(browser_report.read_bytes()).get("error")
+            report = json.loads(browser_report.read_bytes())
+            browser_error = report.get("error")
             if browser_error:
                 print("Browser failure: " + browser_error[:16000], file=sys.stderr)
+                print(json.dumps({"completed_browser_cases": report["cases"], "final_pages": report.get("finalPages")}), file=sys.stderr)
     finally:
         try:
             cleanup_ok = control.cleanup() if hasattr(control, "docker_path") else True
