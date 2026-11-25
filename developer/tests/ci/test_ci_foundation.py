@@ -403,6 +403,7 @@ _R2_STAGING_MANIFEST = (
     "29429a7c07fd55e9e0b7db12d7c0bebd1958d6d3e1686f94711e6ac126157931"
 )
 _R2_STAGING_LINUX24_MANIFEST = "2a5e45ae58b5e0afa411ba059ddaa301141f34358753935f18702190e48e6e67"
+_R2_STAGING_BACKEND_FIXTURE_MANIFEST = "c7c6a8f6f39970dde693662f233c5b05550bad9c5827d32f4a7595ccfd01474b"
 _R2_STAGING_PROFILE = replace(
     _R2_ORDINARY_PROFILE,
     name="ci-staging-foundation",
@@ -410,8 +411,8 @@ _R2_STAGING_PROFILE = replace(
     authority_tree="849b4071bf43642387b120c5ecefe2e833b33e9d",
     tree_manifest_sha256=_R2_STAGING_MANIFEST,
     a1_integrated_tree_manifest_sha256=_R2_STAGING_MANIFEST,
-    a3_integrated_tree_manifest_sha256=_R2_STAGING_MANIFEST,
-    a4_1_integrated_tree_manifest_sha256=_R2_STAGING_LINUX24_MANIFEST,
+    a3_integrated_tree_manifest_sha256=_R2_STAGING_LINUX24_MANIFEST,
+    a4_1_integrated_tree_manifest_sha256=_R2_STAGING_BACKEND_FIXTURE_MANIFEST,
     path_count=917,
     serialized_bytes=40_658,
     sorted_path_sha256=(
@@ -424,6 +425,26 @@ _R2_PRE_STAGING_GITIGNORE = {
     "gitBlob": "b1678ed64b160bf63445fe166d2e6aad49b53f85",
     "size": 5_734,
     "sha256": "deba41e5b06609abf5ebfaaeb917127877c86ab5f01518cc0abe594fbdc6247b",
+}
+_R2_PRE_STAGING_BACKEND_FIXTURE = {
+    "gitBlob": 'b41be609abec19c96577ce2446dcabc8eb649ea1',
+    "size": 161484,
+    "sha256": '8a3804068d52749a843b8d8ae070e80d17f824577c394cdc0c01145b3ad06d5d',
+}
+_R2_STAGING_BACKEND_FIXTURE_CONTENT = {
+    "gitBlob": "3a7c0cf641d358fc2362040a739a8d4ef786d2e8",
+    "size": 167720,
+    "sha256": "2b28dfbf322d1fba252043325bf2bdac39e109f224b21ddfc66c04003d268f49"
+}
+_R2_PRE_STAGING_BACKEND_VERIFIER = {
+    "gitBlob": "00694ffbe4780e13a8c57dee1ae39e40dfc7a9cd",
+    "size": 53492,
+    "sha256": "eb6760be9000161103e259d7e75fecc68a489848ce3db83a9afc421369dcf25d"
+}
+_R2_STAGING_BACKEND_VERIFIER_CONTENT = {
+    "gitBlob": "af36e4a0d0c34b9ce44fbac8cee626d0b6eaf2e9",
+    "size": 53907,
+    "sha256": "e06077c2cfc2ec1947a5cb0e06c369ad553524dbd872ae92c53d0803e6871569"
 }
 _R2_PROFILES_BY_IDENTITY = {
     (profile.path_count, profile.sorted_path_sha256): profile
@@ -849,8 +870,18 @@ def _r2_validate_git_object_authority(
                if profile is not _R2_SECURITY_PROFILE
                else _R2_A4_1_SECURITY_CONTENT_DELTA),
         }
-    if profile is _R2_STAGING_PROFILE and manifest_digest == _R2_STAGING_LINUX24_MANIFEST:
+    if profile is _R2_STAGING_PROFILE and manifest_digest in (
+        _R2_STAGING_LINUX24_MANIFEST, _R2_STAGING_BACKEND_FIXTURE_MANIFEST,
+    ):
         content_authority = {**content_authority, **_R2_STAGING_LINUX24_CONTENT_DELTA}
+    if profile is _R2_STAGING_PROFILE and manifest_digest == _R2_STAGING_BACKEND_FIXTURE_MANIFEST:
+        content_authority = {
+            **content_authority,
+            "developer/tests/ci/test_backend_canonical_portable_result.py":
+                _R2_STAGING_BACKEND_FIXTURE_CONTENT,
+            "developer/tests/ci/backend_canonical_portable_result.py":
+                _R2_STAGING_BACKEND_VERIFIER_CONTENT,
+        }
     for relative, expected in content_authority.items():
         entry = object_entries.get(relative)
         if entry is None or entry[2] != expected["gitBlob"]:
@@ -5533,6 +5564,10 @@ class StagingSourceInventoryTest(unittest.TestCase):
         self.assertEqual(set(self.paths) - set(ordinary), set(_R2_STAGING_PATHS))
         self.assertEqual(set(security) - set(ordinary), set(_R2_ADDED_JAVASCRIPT_PATHS))
 
+    def test_staging_backend_protocol_keeps_full_target_binding(self) -> None:
+        import test_backend_canonical_portable_result as backend
+        backend.assert_staging_protocol_contract(self)
+
     def test_partial_extra_and_renamed_staging_paths_reject(self) -> None:
         for relative in _R2_STAGING_PATHS:
             with self.subTest(path=relative), self.assertRaises(AssertionError):
@@ -5548,7 +5583,9 @@ class StagingSourceInventoryTest(unittest.TestCase):
 
     def test_staging_blob_mode_and_baseline_drift_reject(self) -> None:
         for relative in (*_R2_STAGING_PATHS, ".gitignore", ".github/workflows/ci.yml",
-                         "developer/tests/ci/run_ci_foundation.py", "README.md"):
+                         "developer/tests/ci/run_ci_foundation.py",
+                         "developer/tests/ci/test_backend_canonical_portable_result.py",
+                         "developer/tests/ci/backend_canonical_portable_result.py", "README.md"):
             mode, kind, oid = self.objects[relative]
             for changed in ((mode, kind, "f" * 40), ("100755", kind, oid)):
                 objects = {**self.objects, relative: changed}
@@ -6575,9 +6612,17 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
         if source_profile is _R2_STAGING_PROFILE:
             ordinary_content_authority = {
                 **ordinary_content_authority, ".gitignore": _R2_PRE_STAGING_GITIGNORE,
+                "developer/tests/ci/test_backend_canonical_portable_result.py":
+                    _R2_PRE_STAGING_BACKEND_FIXTURE,
+                "developer/tests/ci/backend_canonical_portable_result.py":
+                    _R2_PRE_STAGING_BACKEND_VERIFIER,
             }
             security_content_authority = {
                 **security_content_authority, ".gitignore": _R2_PRE_STAGING_GITIGNORE,
+                "developer/tests/ci/test_backend_canonical_portable_result.py":
+                    _R2_PRE_STAGING_BACKEND_FIXTURE,
+                "developer/tests/ci/backend_canonical_portable_result.py":
+                    _R2_PRE_STAGING_BACKEND_VERIFIER,
             }
         candidate_paths = list(immutable_source_paths)
         ordinary_paths, security_paths = _r2_counterpart_inventories(
@@ -26221,8 +26266,8 @@ def run_with_receipt(argv: list[str]) -> int:
 
     result = unittest.main(module=__name__, argv=[sys.argv[0]], verbosity=2,
                            testRunner=InventoryTextTestRunner, exit=False).result
-    complete = (result.wasSuccessful() and result.testsRun == 481
-                and len(result.inventory_ids) == 481
+    complete = (result.wasSuccessful() and result.testsRun == 482
+                and len(result.inventory_ids) == 482
                 and set(result.inventory_ids) == result.executed_test_ids == result.successful_test_ids)
     if before is not None and complete:
         try:

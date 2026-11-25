@@ -7,7 +7,7 @@ The diagnostic reporter is deliberately not imported as an acceptance parser.
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import re
@@ -80,6 +80,13 @@ _V2_PROTOCOL = _ProtocolDescriptor(
     duration_spans=142,
     retained_segments=143,
     expected_counts=(141, 0, 141, 0, 0, 0, 0),
+)
+# PR #80 adds only the exact registered staging inventory to the V2 contract.
+_V2_STAGING_PROTOCOL = replace(
+    _V2_PROTOCOL,
+    path_count=917,
+    path_bytes=40658,
+    path_sha256="098c1776cc517b3793e5848c2b30e90f30d4c56eefa18cf6592a34d92b1fda14",
 )
 _V3_PROTOCOL = _ProtocolDescriptor(
     version=3,
@@ -375,7 +382,7 @@ def _select_protocol(targets):
     """Select solely from protected paths and source identities, never stdout."""
     profile = _trusted_path_profile(targets)
     descriptors = [
-        descriptor for descriptor in (_V2_PROTOCOL, _V3_PROTOCOL)
+        descriptor for descriptor in (_V2_PROTOCOL, _V2_STAGING_PROTOCOL, _V3_PROTOCOL)
         if profile == {
             "trackedPaths": descriptor.path_count,
             "serializedUtf8Bytes": descriptor.path_bytes,
@@ -385,7 +392,7 @@ def _select_protocol(targets):
     if len(descriptors) != 1:
         _reject("unknown-path-profile")
     descriptor = descriptors[0]
-    if descriptor is _V2_PROTOCOL:
+    if descriptor in (_V2_PROTOCOL, _V2_STAGING_PROTOCOL):
         return _ProtocolSelection(descriptor, None, ())
 
     by_path = {target["path"]: target for target in targets}
@@ -423,6 +430,7 @@ def _select_protocol(targets):
 
 _KNOWN_PROTOCOL_SELECTIONS = (
     _ProtocolSelection(_V2_PROTOCOL, None, ()),
+    _ProtocolSelection(_V2_STAGING_PROTOCOL, None, ()),
     *(
         _ProtocolSelection(_V3_PROTOCOL, variant, source_tuple)
         for variant, _total_bytes, source_tuple in _V3_SOURCE_PROFILES
@@ -492,7 +500,7 @@ def _identity_v3(ci, value):
 
 def _identity_for_protocol(ci, value, protocol_binding):
     selection = _selection_from_protocol_binding(protocol_binding)
-    if selection.descriptor is _V2_PROTOCOL:
+    if selection.descriptor in (_V2_PROTOCOL, _V2_STAGING_PROTOCOL):
         return _identity(ci, value)
     if selection.descriptor is _V3_PROTOCOL:
         return _identity_v3(ci, value)
@@ -665,7 +673,7 @@ def _parse_stdout_v3(stdout, package):
 
 def _parse_selected_stdout(stdout, package, protocol_binding):
     selection = _selection_from_protocol_binding(protocol_binding)
-    if selection.descriptor is _V2_PROTOCOL:
+    if selection.descriptor in (_V2_PROTOCOL, _V2_STAGING_PROTOCOL):
         return _parse_stdout(stdout, package)
     if selection.descriptor is _V3_PROTOCOL:
         return _parse_stdout_v3(stdout, package)
