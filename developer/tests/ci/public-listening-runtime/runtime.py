@@ -904,9 +904,13 @@ const {chromium} = require(process.argv[1]);
                 content_types = {".html": "text/html; charset=utf-8", ".js": "application/javascript; charset=utf-8",
                     ".css": "text/css; charset=utf-8", ".json": "application/json; charset=utf-8",
                     ".woff2": "font/woff2", ".svg": "image/svg+xml"}
-                assert headers["content-type"] == content_types[suffix]
-                expected_cache = "private, no-store" if kind == "shell" or target in {
-                    "/assets/generated/listening-exams/manifest.js", "/assets/generated/listening-exams/listening-index.compat.js"} else "public, max-age=0"
+                retained_buffer = kind == "shell" or target in {
+                    "/assets/generated/listening-exams/manifest.js", "/assets/generated/listening-exams/listening-index.compat.js"}
+                expected_type = content_types[suffix]
+                if not retained_buffer:
+                    expected_type = expected_type.replace("charset=utf-8", "charset=UTF-8")
+                assert headers["content-type"] == expected_type, (method, target, headers["content-type"], expected_type)
+                expected_cache = "private, no-store" if retained_buffer else "public, max-age=0"
                 assert headers["cache-control"] == expected_cache
                 if method == "GET":
                     assert digest(data) == record["sha256"] and len(data) == record["length"]
@@ -933,10 +937,13 @@ const {chromium} = require(process.argv[1]);
                 status, headers, data = self.http(method, target, cookie=self.cookie, label=policy)
                 assert status == 200
                 assert headers["content-security-policy"] == AUTH["csp"][policy]
-                assert headers["content-type"] == "text/html; charset=utf-8"
+                expected_type = "text/html; charset=UTF-8" if policy == "private" else "text/html; charset=utf-8"
+                assert headers["content-type"] == expected_type, (method, target, headers["content-type"], expected_type)
                 assert headers["content-length"] == str(len(expected_data))
                 if policy == "private":
                     assert headers["cache-control"] == "public, max-age=0"
+                else:
+                    assert "cache-control" not in headers
                 if method == "GET":
                     assert data == expected_data
                 else:
@@ -946,8 +953,9 @@ const {chromium} = require(process.argv[1]);
             "/assets/generated/listening-exams/manifest.js", "/assets/generated/listening-exams/listening-index.compat.js", wrapper, short_wrapper, private, nested]
         for target in sorted(set(protected)):
             for method in ["GET", "HEAD"]:
-                status, _, data = self.http(method, target, label="anonymous")
+                status, headers, data = self.http(method, target, label="anonymous")
                 assert status == 401 and self.sentinel not in data
+                assert headers.get("cache-control") == "no-store"
         negative = [
             ("http://example.invalid/ListeningPractice/vip%20special/index.html", 400),
             (shell + "not-listed.js", 404), ("//ListeningPractice/vip%20special/index.html", 400),
@@ -1006,8 +1014,9 @@ const {chromium} = require(process.argv[1]);
             self.docker("exec", self.database, "psql", "-U", "postgres", "-d", "i79", "-c", sql)
             for target in [shell, wrapper, short_wrapper, private, "/assets/generated/listening-exams/manifest.js"]:
                 for method in ["GET", "HEAD"]:
-                    status, _, data = self.http(method, target, cookie=self.cookie, label=mode)
+                    status, headers, data = self.http(method, target, cookie=self.cookie, label=mode)
                     assert status == 401 and self.sentinel not in data
+                    assert headers.get("cache-control") == "no-store"
             test_aliases(self.cookie, mode)
         assert len(alias_results) == 288
         self.write("alias-matrix.json", alias_results)
