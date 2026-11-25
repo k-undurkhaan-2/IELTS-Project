@@ -532,6 +532,7 @@ class Control:
                 return tar.extractfile(members[name]).read()
             index = json.loads(raw("index.json"))
             manifests = []
+            manifest_digests = []
             attestations = []
             def follow(descriptor):
                 expected = descriptor["digest"].removeprefix("sha256:")
@@ -545,6 +546,7 @@ class Control:
                     attestations.append(value)
                 elif "config" in value:
                     manifests.append(value)
+                    manifest_digests.append(expected)
             for descriptor in index["manifests"]:
                 follow(descriptor)
             assert len(manifests) == 1
@@ -579,11 +581,24 @@ class Control:
                 for layer in attestation["layers"]:
                     statement = json.loads(blob(layer))
                     provenance.append(statement)
-                    material_found = material_found or any(
-                        material.get("digest", {}).get("sha256") == AUTH["images"]["node"]["manifest"]
-                        for material in statement.get("predicate", {}).get("materials", []))
+                    assert statement["predicateType"] == "https://slsa.dev/provenance/v1"
+                    assert len(statement["subject"]) == 1 and statement["subject"][0]["digest"] == {"sha256": manifest_digests[0]}
+                    definition = statement["predicate"]["buildDefinition"]
+                    dependencies = definition["resolvedDependencies"]
+                    assert len(dependencies) == 2
+                    image_materials = [d for d in dependencies if d["uri"].startswith("pkg:docker/node?")]
+                    context_materials = [d for d in dependencies if d["uri"].startswith("http://buildkit-session/")]
+                    assert len(image_materials) == len(context_materials) == 1
+                    assert image_materials[0]["digest"] == {"sha256": AUTH["images"]["node"]["manifest"]}
+                    assert context_materials[0]["digest"] == {"sha256": self.context_sha}
+                    external = definition["externalParameters"]
+                    assert external["configSource"]["digest"] == {"sha256": self.context_sha}
+                    assert external["configSource"]["path"] == "backend/Dockerfile"
+                    assert external["request"]["args"]["context:node:24-alpine"] == "docker-image://" + self.image_ref("node")
+                    assert definition["internalParameters"]["targetPlatform"] == "linux/amd64"
+                    material_found = True
             self.write(label + "-provenance.json", provenance)
-            assert material_found, "Approved base material missing from OCI provenance"
+            assert material_found and len(provenance) == 1, "Exact approved build materials missing from OCI provenance"
             if runtime_archive:
                 config_name = digest(config_raw) + ".json"
                 append_runtime(config_name, config_raw)
@@ -1153,8 +1168,10 @@ def main():
         if args.role == "verifier":
             assert args.producer and args.producer.is_dir()
             artifacts = public_api(f"repos/{REPO}/actions/runs/{os.environ['GITHUB_RUN_ID']}/artifacts?per_page=100")
-            selected = [a for a in artifacts["artifacts"] if a["name"] == "issue79-runtime-producer-" + os.environ["GITHUB_RUN_ATTEMPT"]]
+            selected = [a for a in artifacts["artifacts"] if str(a["id"]) == os.environ["I79_PRODUCER_ARTIFACT_ID"]]
             assert len(selected) == 1 and not selected[0]["expired"] and re.fullmatch(r"sha256:[0-9a-f]{64}", selected[0]["digest"])
+            assert str(selected[0]["workflow_run"]["id"]) == os.environ["GITHUB_RUN_ID"]
+            assert selected[0]["workflow_run"]["head_sha"] == os.environ["I79_CONTROL_COMMIT"]
             control.write("producer-artifact-api-readback.json", selected[0])
             inventory = json.loads((args.producer / "evidence-index.json").read_bytes())
             actual_names = {p.relative_to(args.producer).as_posix() for p in args.producer.rglob("*") if p.is_file()}
@@ -1162,13 +1179,18 @@ def main():
             for item in inventory:
                 p = args.producer / safe_name(item["path"])
                 assert not p.is_symlink() and p.stat().st_size == item["bytes"] and file_digest(p) == item["sha256"]
+            producer_identity = json.loads((args.producer / "transaction.json").read_bytes())
+            assert producer_identity["role"] == "producer" and producer_identity["run"] == os.environ["GITHUB_RUN_ID"]
+            assert producer_identity["control_commit"] == os.environ["I79_CONTROL_COMMIT"]
+            assert 1 <= int(producer_identity["attempt"]) <= int(os.environ["GITHUB_RUN_ATTEMPT"])
+            assert selected[0]["name"] == "issue79-runtime-producer-" + producer_identity["attempt"]
             producer_context = json.loads((args.producer / "context-identity.json").read_bytes())
             assert producer_context["sha256"] == control.context_sha
             tested_image = control.inspect_image_archives(args.producer / "image.oci.tar", args.producer / "image.docker.tar", "producer")
             control.docker("load", "--input", args.producer / "image.docker.tar", timeout=180)
             with tarfile.open(args.producer / "image.docker.tar", "r:") as image_archive:
                 transferred_tags = json.load(image_archive.extractfile("manifest.json"))[0]["RepoTags"]
-            assert len(transferred_tags) == 1 and transferred_tags[0] == control.prefix.removesuffix("verifier") + "producer:candidate"
+            assert transferred_tags == [f"i79-runtime-{producer_identity['run']}-{producer_identity['attempt']}-producer:candidate"]
             control.resources["images"].extend(transferred_tags)
             control.write("resources.json", control.resources)
             control.inspect_filesystem(tested_image, "producer")
