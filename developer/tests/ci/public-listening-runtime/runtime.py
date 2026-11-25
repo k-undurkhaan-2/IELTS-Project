@@ -494,12 +494,11 @@ class Control:
                 "--platform", "linux/amd64", "--build-context", "node:24-alpine=docker-image://" + self.image_ref("node"),
                 "--file", "backend/Dockerfile", "--tag", self.tag, "--provenance=mode=max",
                 "--metadata-file", self.evidence / "build-metadata.json", "--progress", "plain", "--no-cache",
-                "--output", "type=oci,compression=gzip,dest=" + str(self.oci),
-                "--output", "type=docker,dest=" + str(self.docker_tar), "-",
+                "--output", "type=oci,compression=gzip,dest=" + str(self.oci), "-",
                 stdin=stream, timeout=1200, env=env)
         assert file_digest(self.context_tar) == self.context_sha
         assert self.inventory(self.context) == self.context_inventory
-        self.image_id = self.inspect_image_archives(self.oci, self.docker_tar, "built")
+        self.image_id = self.inspect_image_archives(self.oci, self.docker_tar, "built", create_runtime_archive=True)
         self.docker("load", "--input", self.docker_tar, timeout=180)
         config = json.loads(self.docker("image", "inspect", self.image_id))[0]
         assert config["Id"] == self.image_id
@@ -515,8 +514,19 @@ class Control:
             docker_archive_sha256=file_digest(self.docker_tar), named_base_override=True,
             base_rootfs_verified=True, materials_verified=True)
 
-    def inspect_image_archives(self, oci, docker_tar, label):
-        with tarfile.open(oci, "r:") as tar:
+    def inspect_image_archives(self, oci, docker_tar, label, *, create_runtime_archive=False):
+        # OCI retains attestations. Docker's legacy archive cannot represent an
+        # attestation index, so package the very same verified config and layer
+        # bytes in its documented single-image layout without a second build.
+        with contextlib.ExitStack() as stack:
+            tar = stack.enter_context(tarfile.open(oci, "r:"))
+            runtime_archive = stack.enter_context(tarfile.open(docker_tar, "w")) if create_runtime_archive else None
+            def append_runtime(name, data):
+                member = tarfile.TarInfo(name)
+                member.mode = 0o644
+                member.mtime = 0
+                member.size = len(data)
+                runtime_archive.addfile(member, io.BytesIO(data))
             members = {safe_name(m.name): m for m in tar if m.isfile()}
             def raw(name):
                 return tar.extractfile(members[name]).read()
@@ -548,10 +558,15 @@ class Control:
             assert config["rootfs"]["diff_ids"][:4] == self.registry["node"]["config"]["rootfs"]["diff_ids"]
             assert (config["os"], config["architecture"]) == ("linux", "amd64")
             layer_rows = []
+            runtime_layers = []
             for i, (descriptor, diff_id) in enumerate(zip(manifest["layers"], config["rootfs"]["diff_ids"], strict=True)):
                 compressed = blob(descriptor)
                 data = gzip.decompress(compressed) if "gzip" in descriptor["mediaType"] else compressed
                 assert "sha256:" + digest(data) == diff_id
+                if runtime_archive:
+                    runtime_layer = f"{i}/layer.tar"
+                    append_runtime(runtime_layer, data)
+                    runtime_layers.append(runtime_layer)
                 layer_file = self.root / f"{label}-layer-{i}.tar"
                 layer_file.write_bytes(data)
                 inventory = self.tar_inventory(layer_file)
@@ -569,6 +584,13 @@ class Control:
                         for material in statement.get("predicate", {}).get("materials", []))
             self.write(label + "-provenance.json", provenance)
             assert material_found, "Approved base material missing from OCI provenance"
+            if runtime_archive:
+                config_name = digest(config_raw) + ".json"
+                append_runtime(config_name, config_raw)
+                append_runtime("manifest.json", encode([{"Config": config_name, "RepoTags": [self.tag], "Layers": runtime_layers}]))
+                self.write("runtime-archive-conversion.json", {"source": "The same OCI build result", "config_sha256": digest(config_raw),
+                    "diff_ids": config["rootfs"]["diff_ids"], "conversion": "Verified config bytes and decompressed layer bytes in Docker archive format",
+                    "attestations_retained_in": "image.oci.tar", "second_build_performed": False})
             self.write(label + "-layers.json", layer_rows)
             self.write(label + "-oci-config.json", config)
         with tarfile.open(docker_tar, "r:") as tar:
