@@ -36,12 +36,24 @@
             var reader = response.body.getReader();
             var chunks = [];
             var size = 0;
+            // Fetch decodes compressed responses, so Content-Length is only a
+            // usable byte total when it describes the uncompressed media.
+            var encoding = response.headers.get('content-encoding');
+            var total = !encoding || encoding === 'identity' ? Number(response.headers.get('content-length')) : 0;
+            var lastPercent = -1;
             while (true) {
                 var chunk = await reader.read();
                 if (chunk.done) break;
                 size += chunk.value.byteLength;
                 if (size > MAX_BYTES) throw new Error('Audio exceeds the memory cache limit');
                 chunks.push(chunk.value);
+                if (Number.isFinite(total) && total > 0 && jobs.get(message.id) === controller) {
+                    var percent = Math.min(99, Math.floor(size / total * 100));
+                    if (percent !== lastPercent) {
+                        lastPercent = percent;
+                        scope.postMessage({ type: 'progress', id: message.id, loaded: size, total: total });
+                    }
+                }
             }
             if (!size) throw new Error('Empty audio response');
             if (jobs.get(message.id) === controller) {

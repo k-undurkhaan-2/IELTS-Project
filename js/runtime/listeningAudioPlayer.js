@@ -8,6 +8,16 @@
     var SCRUB_SEEK_INTERVAL = 80;
     var SCRUB_PENDING_SEEK_LIMIT = 200;
 
+    function installProgressStyle(doc) {
+        if (doc.getElementById('listening-audio-progress-style')) return;
+        var style = doc.createElement('style');
+        style.id = 'listening-audio-progress-style';
+        // Paint on the actual track, beneath the existing played fill. This
+        // also fits templates with a tall hit area around a thinner track.
+        style.textContent = '[data-listening-buffered-track] { background-image: var(--listening-buffered-ranges) !important; }';
+        (doc.head || doc.documentElement).appendChild(style);
+    }
+
     function installButtonStyle(doc) {
         if (doc.getElementById('listening-audio-button-style')) return;
         var style = doc.createElement('style');
@@ -116,6 +126,7 @@
     function bindPlayer(doc, audio, root, progress, cache) {
         var win = doc.defaultView || global;
         var fill = progress.querySelector(FILL_SELECTOR);
+        var track = fill ? fill.parentElement : progress;
         var knob = progress.querySelector('.knob');
         var time = root.querySelector(TIME_SELECTOR);
         var pointerId = null;
@@ -135,6 +146,40 @@
             return Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
         }
 
+        function renderBuffered() {
+            var total = duration();
+            var cached = cache && cache.getProgress ? cache.getProgress(audio) : null;
+            var gradients = [];
+            function addRange(start, end) {
+                if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+                start = Math.max(0, Math.min(1, start)) * 100;
+                end = Math.max(0, Math.min(1, end)) * 100;
+                if (end <= start) return;
+                gradients.push('linear-gradient(to right, transparent ' + start + '%, #d1d5db ' + start
+                    + '%, #d1d5db ' + end + '%, transparent ' + end + '%)');
+            }
+            if (cached !== null && Number.isFinite(cached)) {
+                addRange(0, cached);
+            } else if (total && audio.buffered) {
+                // Native streaming may contain gaps after seeking. Keep those
+                // gaps visible rather than implying the whole prefix is ready.
+                var buffered = audio.buffered;
+                for (var index = 0; index < buffered.length; index++) {
+                    addRange(buffered.start(index) / total, buffered.end(index) / total);
+                }
+            }
+            if (gradients.length) {
+                var background = gradients.join(', ');
+                if (track.style.getPropertyValue('--listening-buffered-ranges') !== background) {
+                    track.style.setProperty('--listening-buffered-ranges', background);
+                }
+                if (!track.hasAttribute('data-listening-buffered-track')) track.setAttribute('data-listening-buffered-track', '');
+            } else {
+                track.removeAttribute('data-listening-buffered-track');
+                track.style.removeProperty('--listening-buffered-ranges');
+            }
+        }
+
         function render() {
             var total = duration();
             var current = previewTime !== null ? previewTime : audio.currentTime;
@@ -148,6 +193,7 @@
             progress.setAttribute('aria-valuenow', String(current));
             progress.setAttribute('aria-valuetext', text);
             progress.setAttribute('aria-disabled', total ? 'false' : 'true');
+            renderBuffered();
         }
 
         function consume(event) {
@@ -301,6 +347,9 @@
         ['timeupdate', 'loadedmetadata', 'durationchange', 'seeked', 'ended'].forEach(function bindMediaEvent(type) {
             listen(audio, type, render);
         });
+        ['progress', 'loadeddata', 'canplay', 'canplaythrough', 'listeningcacheprogress'].forEach(function bindBufferEvent(type) {
+            listen(audio, type, renderBuffered);
+        });
         listen(audio, 'seeked', seekCompleted);
         listen(audio, 'emptied', cancel);
         listen(audio, 'error', cancel);
@@ -311,6 +360,8 @@
             destroy: function destroy() {
                 cancel();
                 listeners.forEach(function removeListener(remove) { remove(); });
+                track.removeAttribute('data-listening-buffered-track');
+                track.style.removeProperty('--listening-buffered-ranges');
             }
         };
     }
@@ -322,6 +373,7 @@
         var controllers = new Map();
         var buttons = new Map();
         installButtonStyle(doc);
+        installProgressStyle(doc);
 
         function scan() {
             buttons.forEach(function removeDetached(controller, button) {

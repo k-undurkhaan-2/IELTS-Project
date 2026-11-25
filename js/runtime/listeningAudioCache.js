@@ -50,8 +50,14 @@
             return '';
         }
 
+        function notifyProgress(record) {
+            record.audio.dispatchEvent(new win.Event('listeningcacheprogress'));
+        }
+
         function state(record, value) {
+            if (record.audio.getAttribute('data-listening-cache') === value) return;
             record.audio.setAttribute('data-listening-cache', value);
+            notifyProgress(record);
         }
 
         function apply(record) {
@@ -109,6 +115,14 @@
                         var result = event.data || {};
                         var pending = requests.get(result.id);
                         if (!pending || closed) return;
+                        if (result.type === 'progress') {
+                            if (Number.isFinite(result.loaded) && result.loaded >= 0
+                                && Number.isFinite(result.total) && result.total > 0) {
+                                pending.progress = Math.min(0.99, result.loaded / result.total);
+                                pending.users.forEach(notifyProgress);
+                            }
+                            return;
+                        }
                         requests.delete(result.id);
                         pending.failed = !result.blob || !result.blob.size;
                         if (!pending.failed) pending.objectUrl = win.URL.createObjectURL(result.blob);
@@ -134,6 +148,7 @@
             }
             audio.removeAttribute('data-listening-cache');
             records.delete(audio);
+            notifyProgress(record);
             record.entry.users.delete(record);
             if (record.entry.users.size) return;
             requests.delete(record.entry.id);
@@ -146,7 +161,7 @@
             var entry = downloads.get(url);
             var fresh = !entry;
             if (!entry) {
-                entry = { id: ++nextId, url: url, users: new Set(), objectUrl: '', failed: false };
+                entry = { id: ++nextId, url: url, users: new Set(), objectUrl: '', failed: false, progress: null };
                 downloads.set(url, entry);
             }
             var record = {
@@ -200,6 +215,11 @@
         var observer = new win.MutationObserver(scan);
         observer.observe(doc.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'type'] });
         var manager = {
+            getProgress: function getProgress(audio) {
+                var record = records.get(audio);
+                if (!record || record.failed || record.entry.failed || sourceUrl(audio, record) !== record.url) return null;
+                return record.entry.objectUrl ? 1 : record.entry.progress;
+            },
             setScrubbing: function setScrubbing(audio, active) {
                 var record = records.get(audio);
                 if (!record) return;

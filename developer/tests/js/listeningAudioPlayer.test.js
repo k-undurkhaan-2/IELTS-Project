@@ -135,7 +135,7 @@ const server = http.createServer((request, response) => {
     const pathname = new URL(request.url, 'http://localhost').pathname;
     if (pathname === '/submit-host') {
         const wrapped = new URL(request.url, 'http://localhost').searchParams.has('wrapped');
-        response.setHeader('Content-Type', 'text/html');
+        response.setHeader('Content-Type', 'text/html; charset=utf-8');
         response.end(`<!doctype html><html><body>
             <iframe id="practice" src="${wrapped ? '/wrapper' : '/fixture'}" style="width:100%;height:700px"></iframe>
             <script>
@@ -175,24 +175,24 @@ const server = http.createServer((request, response) => {
         return;
     }
     if (pathname === '/wrapper' || pathname === '/button-wrapper') {
-        response.setHeader('Content-Type', 'text/html');
+        response.setHeader('Content-Type', 'text/html; charset=utf-8');
         response.end(fs.readFileSync(path.join(repoRoot, 'assets/generated/listening-exams/listening-practice-unified.html'), 'utf8')
             .replace('data-source-url=""', 'data-source-url="' + (pathname === '/wrapper' ? '/fixture' : '/buttons') + '"'));
         return;
     }
     if (['/js/bundles/listening-wrapper.bundle.js', '/js/bundles/listening-record-bridge.bundle.js', '/js/bundles/listening-audio-cache-worker.bundle.js'].includes(pathname)) {
-        response.setHeader('Content-Type', 'text/javascript');
+        response.setHeader('Content-Type', 'text/javascript; charset=utf-8');
         response.end(fs.readFileSync(path.join(repoRoot, pathname)));
         return;
     }
     if (pathname === '/fixture') {
-        response.setHeader('Content-Type', 'text/html');
+        response.setHeader('Content-Type', 'text/html; charset=utf-8');
         response.end(new URL(request.url, 'http://localhost').searchParams.has('slow')
             ? fixture.replaceAll('/audio.wav', '/slow-audio.wav') : fixture);
         return;
     }
     if (pathname === '/buttons') {
-        response.setHeader('Content-Type', 'text/html');
+        response.setHeader('Content-Type', 'text/html; charset=utf-8');
         response.end(buttonFixture());
         return;
     }
@@ -226,6 +226,65 @@ async function waitForTime(frame, seconds, id = 'first') {
         const audio = document.querySelector('#' + id + ' audio');
         return !audio.seeking && Math.abs(audio.currentTime - seconds) < 1;
     }, { id, seconds }, { timeout: 1500 });
+}
+
+async function exerciseBufferedRanges(entry) {
+    const page = await browser.newPage({ viewport: { width: 1000, height: 650 } });
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    try {
+        await page.addInitScript(() => { window.Worker = undefined; });
+        await page.goto(baseUrl + entry);
+        const frame = entry === '/wrapper' ? page.frames().find(candidate => candidate.parentFrame()) : page.mainFrame();
+        await frame.waitForFunction(() => [...document.querySelectorAll('audio')].every(audio => audio.duration === 120));
+        await frame.evaluate(() => {
+            window.testBufferedRanges = [[0, 30], [60, 90]];
+            document.querySelectorAll('audio').forEach(audio => {
+                Object.defineProperty(audio, 'buffered', { get: () => ({
+                    length: testBufferedRanges.length,
+                    start: index => testBufferedRanges[index][0], end: index => testBufferedRanges[index][1]
+                }) });
+                audio.currentTime = 12;
+                audio.dispatchEvent(new Event('progress'));
+            });
+        });
+        await waitForTime(frame, 12);
+        for (const id of ['first', 'second']) {
+            const result = await frame.locator('#' + id).evaluate(player => {
+                const track = player.querySelector('.progress-bar-wrapper');
+                const fill = track.querySelector('.progress-bar, .progress-fill');
+                return { background: getComputedStyle(track).backgroundImage,
+                    trackHeight: track.getBoundingClientRect().height, hitHeight: track.parentElement.getBoundingClientRect().height,
+                    fill: fill.style.width, fillColor: getComputedStyle(fill).backgroundColor };
+            });
+            assert.equal((result.background.match(/linear-gradient/g) || []).length, 2, 'separate buffered ranges must retain their gaps');
+            assert.match(result.background, /rgb\(209, 213, 219\) 25%/);
+            assert.match(result.background, /rgb\(209, 213, 219\) 50%/);
+            assert.match(result.background, /rgb\(209, 213, 219\) 75%/);
+            assert.equal(result.trackHeight, 8, 'cache layer must fit the thin visible track');
+            assert.equal(result.hitHeight, 24, 'cache layer must preserve the larger pointer target');
+            assert.equal(result.fill, '10%');
+            assert.equal(result.fillColor, 'rgb(38, 132, 255)', 'played progress must keep its color above cached progress');
+        }
+        if (entry === '/fixture' && process.env.IELTS_AUDIO_PROGRESS_SCREENSHOT) {
+            await page.screenshot({ path: process.env.IELTS_AUDIO_PROGRESS_SCREENSHOT });
+        }
+        await frame.evaluate(() => {
+            window.testBufferedRanges = [];
+            document.querySelectorAll('audio').forEach(audio => audio.dispatchEvent(new Event('emptied')));
+        });
+        assert.equal(await frame.locator('[data-listening-buffered-track]').count(), 0, 'empty buffers must clear obsolete cache shading');
+        await frame.evaluate(() => {
+            window.testBufferedRanges = [[0, 120]];
+            document.querySelectorAll('audio').forEach(audio => {
+                Object.defineProperty(audio, 'duration', { value: Infinity, configurable: true });
+                audio.dispatchEvent(new Event('durationchange'));
+            });
+        });
+        assert.equal(await frame.locator('[data-listening-buffered-track]').count(), 0, 'unknown duration must not render invalid percentages');
+        assert.deepEqual(errors, []);
+        console.log('PASS ' + entry + ': light gray native buffered ranges, preserved gaps, thin tracks, played color and reset');
+    } finally { await page.close(); }
 }
 
 async function exerciseAudibleScrub(entry) {
@@ -702,6 +761,8 @@ async function exerciseSubmission(wrapped, action) {
 }
 
 try {
+    await exerciseBufferedRanges('/fixture');
+    await exerciseBufferedRanges('/wrapper');
     await exerciseAudibleScrub('/fixture');
     await exerciseAudibleScrub('/wrapper');
     await exerciseSlowSeek();

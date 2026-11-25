@@ -55,7 +55,7 @@ const server = http.createServer((request, response) => {
         response.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'none'; worker-src 'self'; media-src 'self' "
             + (state.options.blockBlob ? '' : 'blob:') + "; sandbox allow-scripts allow-same-origin allow-modals");
         response.setHeader('Set-Cookie', 'audio-cache-test=allowed; SameSite=Strict; Path=/');
-        response.setHeader('Content-Type', 'text/html');
+        response.setHeader('Content-Type', 'text/html; charset=utf-8');
         response.end(fixture(url.searchParams.get('case'), state.options));
         return;
     }
@@ -63,7 +63,7 @@ const server = http.createServer((request, response) => {
         const file = path.join(repoRoot, decodeURIComponent(url.pathname));
         if (!fs.existsSync(file)) { response.writeHead(404).end(); return; }
         response.setHeader('Content-Security-Policy', "default-src 'self'; connect-src 'self'");
-        response.setHeader('Content-Type', 'text/javascript');
+        response.setHeader('Content-Type', 'text/javascript; charset=utf-8');
         response.end(fs.readFileSync(file));
         return;
     }
@@ -86,11 +86,15 @@ const server = http.createServer((request, response) => {
                 return;
             }
             assert.match(request.headers.cookie || '', /audio-cache-test=allowed/, 'full downloads must retain same-origin session credentials');
-            response.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': bytes.length, 'Cache-Control': 'no-store' });
+            response.writeHead(200, { 'Content-Type': 'audio/wav', 'Cache-Control': 'no-store',
+                ...(state.options.unknownLength ? {} : { 'Content-Length': bytes.length }) });
             const prefix = 44 + 256 * 1024;
             response.write(bytes.subarray(0, prefix));
-            const transfer = { response, pathname: url.pathname, completed: false, cancelled: false, finish() {
-                if (!response.destroyed) { this.completed = true; response.end(bytes.subarray(prefix)); }
+            const transfer = { response, pathname: url.pathname, completed: false, cancelled: false, sent: prefix, advance() {
+                const end = Math.floor(bytes.length * 0.6);
+                if (!response.destroyed) { response.write(bytes.subarray(this.sent, end)); this.sent = end; }
+            }, finish() {
+                if (!response.destroyed) { this.completed = true; response.end(bytes.subarray(this.sent)); }
             } };
             state.transfers.push(transfer);
             response.on('close', () => { transfer.cancelled = !transfer.completed; });
@@ -145,10 +149,29 @@ async function fullCacheBeforePlay(vip = false) {
     try {
         const { page, state, context } = test;
         await until(() => state.transfers.length === 1, 'question loading must start one complete download before Play');
+        await page.waitForFunction(() => [...document.querySelectorAll('audio')].every(audio => {
+            const progress = document.__listeningAudioCache.getProgress(audio);
+            return progress > 0 && progress < 0.2;
+        }));
+        const partial = await page.locator('.progress-container').evaluateAll(nodes => nodes.map(node => ({
+            background: getComputedStyle(node).backgroundImage, fill: node.querySelector('.progress-bar').style.width
+        })));
+        assert.equal(partial[0].background, partial[1].background, 'shared downloads must update both tracks');
+        assert.match(partial[0].background, /rgb\(209, 213, 219\)/, 'cached bytes must be painted light gray');
+        assert.equal(partial[0].fill, '0%', 'cache updates must not advance playback');
+        state.transfers[0].advance();
+        await page.waitForFunction(() => [...document.querySelectorAll('audio')].every(audio =>
+            document.__listeningAudioCache.getProgress(audio) > 0.59));
+        assert.notEqual(await page.locator('.progress-container').first().evaluate(node => getComputedStyle(node).backgroundImage),
+            partial[0].background, 'the track must grow as more chunks arrive');
         assert.deepEqual(await page.locator('audio').evaluateAll(nodes => nodes.map(audio => audio.paused)), [true, true]);
         await page.getByRole('textbox', { name: 'Answer' }).fill('still usable while downloading');
         state.transfers[0].finish();
         await cached(page);
+        assert.deepEqual(await page.locator('audio').evaluateAll(nodes => nodes.map(audio =>
+            document.__listeningAudioCache.getProgress(audio))), [1, 1]);
+        assert.match(await page.locator('.progress-container').first().evaluate(node => getComputedStyle(node).backgroundImage),
+            /rgb\(209, 213, 219\) 100%/, 'complete cache must fill the track');
         const sources = await page.locator('audio').evaluateAll(nodes => nodes.map(audio => audio.src));
         assert.equal(sources[0], sources[1], 'players sharing a recording must reuse its complete cache');
         assert.equal(state.fullRequests, 1);
@@ -223,6 +246,12 @@ async function sourceLifecycle(children) {
             audio.load();
         }, { children, id });
         await until(() => state.transfers.length === 2, 'new source must get its own cache');
+        await page.waitForFunction(() => {
+            const progress = document.__listeningAudioCache.getProgress(document.querySelector('audio'));
+            return progress > 0 && progress < 0.5;
+        });
+        assert.doesNotMatch(await page.locator('.progress-container').evaluate(node => getComputedStyle(node).backgroundImage),
+            /rgb\(209, 213, 219\) 100%/, 'source replacement must clear the previous complete cache');
         if (!children) await until(() => state.transfers[0].cancelled, 'obsolete source download must abort');
         state.transfers[1].finish();
         await cached(page, 'audio', 60);
@@ -246,6 +275,8 @@ async function fallbacks(options) {
             state.transfers[0].finish();
         }
         await page.waitForFunction(() => document.querySelector('audio').dataset.listeningCache === 'streaming');
+        assert.equal(await page.locator('audio').evaluate(audio => document.__listeningAudioCache.getProgress(audio)), null,
+            'failed caches must fall back to native buffered ranges');
         assert.equal(await page.locator('audio').evaluate(audio => audio.src.startsWith('blob:')), false);
         await page.locator('.play-pause-btn').click();
         await page.waitForFunction(() => !document.querySelector('audio').paused && document.querySelector('audio').currentTime > 0);
@@ -261,6 +292,20 @@ async function abandonedDownload() {
         await test.page.locator('section').evaluate(node => node.remove());
         await until(() => test.state.transfers[0].cancelled, 'removing a question must abort its incomplete download');
         console.log('PASS abandoned question: incomplete download is cancelled');
+    } finally { await test.close(); }
+}
+
+async function unknownDownloadLength() {
+    const test = await open({ unknownLength: true });
+    try {
+        await until(() => test.state.transfers.length === 1, 'download without Content-Length must start');
+        assert.equal(await test.page.locator('audio').evaluate(audio => document.__listeningAudioCache.getProgress(audio)), null);
+        test.state.transfers[0].finish();
+        await cached(test.page);
+        assert.equal(await test.page.locator('audio').evaluate(audio => document.__listeningAudioCache.getProgress(audio)), 1);
+        assert.match(await test.page.locator('.progress-container').evaluate(node => getComputedStyle(node).backgroundImage),
+            /rgb\(209, 213, 219\) 100%/);
+        console.log('PASS unknown download size: native buffering until complete cache is available');
     } finally { await test.close(); }
 }
 
@@ -293,6 +338,7 @@ async function workerSourceBoundaries() {
 try {
     await fullCacheBeforePlay();
     await fullCacheBeforePlay(true);
+    await unknownDownloadLength();
     await preservePlaybackAndScrubbing(false);
     await preservePlaybackAndScrubbing(true);
     await sourceLifecycle(false);
