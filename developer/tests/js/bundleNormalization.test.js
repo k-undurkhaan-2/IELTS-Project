@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import test, { after } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { BUNDLE_PROFILES } from '../../../scripts/bundle-manifest.mjs';
+import { BUNDLE_PROFILES, READING_DICTIONARY_ASSETS } from '../../../scripts/bundle-manifest.mjs';
 import {
     normalizeEol,
     normalizeSourceText,
@@ -80,7 +80,7 @@ function createFixture(sourceEol = 'lf') {
     copyTextFile('scripts/build-bundles.mjs', fixtureRoot);
     copyTextFile('scripts/bundle-manifest.mjs', fixtureRoot);
 
-    const inputPaths = new Set();
+    const inputPaths = new Set(READING_DICTIONARY_ASSETS);
     const outputPaths = new Set();
     for (const profile of Object.values(BUNDLE_PROFILES)) {
         profile.bundles.forEach((bundle) => {
@@ -108,6 +108,30 @@ function bundleDirectoryOutputs(fixtureRoot, profile) {
         .map((entry) => `js/bundles/${entry.name}`)
         .sort();
 }
+
+test('dictionary cache versions follow normalized asset contents without embedding the corpus', () => {
+    const render = (changedPath, eol = '\n') => renderBundle('default', ['js/runtime/readingDictionaryAssets.js'], inputPath => {
+        let source = normalizeSourceText(fs.readFileSync(path.join(repoRoot, inputPath), 'utf8'));
+        if (inputPath === changedPath) source += '// updated corpus\n';
+        return source.replace(/\n/g, eol);
+    });
+    const versions = bundle => JSON.parse(bundle.match(/const ASSET_VERSIONS = (\{[^\n]+\});/)[1]);
+    const original = render();
+    const originalVersions = versions(original);
+    assert(original.length < 20000, 'the loader only embeds hashes, not dictionary data');
+    assert.deepEqual(versions(render(null, '\r\n')), originalVersions, 'line endings do not expire the cache');
+    for (const assetPath of READING_DICTIONARY_ASSETS) {
+        const name = path.basename(assetPath);
+        const expected = crypto.createHash('sha256')
+            .update(normalizeSourceText(fs.readFileSync(path.join(repoRoot, assetPath), 'utf8'))).digest('hex');
+        assert.equal(originalVersions[name], expected);
+        const changed = versions(render(assetPath));
+        assert.notEqual(changed[name], originalVersions[name], 'a corpus update expires its cached version');
+        for (const other of Object.keys(originalVersions).filter(key => key !== name)) {
+            assert.equal(changed[other], originalVersions[other], 'unchanged dictionaries retain their cache');
+        }
+    }
+});
 
 test('manifest is explicit, tracked, public-source-only, and complete', () => {
     assert.deepEqual(Object.keys(BUNDLE_PROFILES), ['default', 'vip']);

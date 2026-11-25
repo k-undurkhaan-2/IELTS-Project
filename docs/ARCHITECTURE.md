@@ -34,6 +34,10 @@ It currently uses:
 
 Historical IELTS Atlas and IELTS Practice names remain in parts of the interface and compatibility identifiers. Their migration is separate from the public documentation identity.
 
+The main Web Client shell preloads the reading dictionaries after page load during idle time and prepares the lookup index in the background. The large IELTS-core and ECDICT payloads remain separate from the shell and reading-page bundles. `ReadingDictionaryAssets` lets same-origin reading popups and frames reuse the shell's loaded data and index; independent pages restore the payloads from IndexedDB. Web Locks, when available, coordinate concurrent cold-cache downloads. Dictionary loading is not part of the question-rendering or suite-readiness promise.
+
+`scripts/build-bundles.mjs` embeds SHA-256 versions derived from normalized dictionary source contents. IndexedDB entries are scoped by application asset URL and checked against those versions; outdated or invalid entries are replaced on demand. Rebuild the bundles whenever a dictionary changes. The cache contains public dictionary data, separate from learner progress and authentication state. Storage denial, quota errors, or blocked storage fall back to ordinary asset loading, and lookup failures remain retryable. Direct source-script development skips persistent caching because it has no build-time versions; the VIP compatibility profile retains its existing asset set.
+
 ### Authentication and application APIs
 
 Tracked server routes support registration, login, logout, session management, TOTP, account actions, practice records, administrative operations, protected resources, and selected site content.

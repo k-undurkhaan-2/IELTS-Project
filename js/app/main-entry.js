@@ -924,6 +924,14 @@
         setupReadingCandidateCodeSettings();
         setupPracticeTimerSettings();
 
+        // Keep dictionary download/indexing outside the shell and exam startup
+        // promises. Reading windows can join this work or restore its cache.
+        if (global.ReadingDictionaryAssets) {
+            global.ReadingDictionaryAssets.preload().catch(function () {
+                // The dictionary bubble provides an on-demand retry if needed.
+            });
+        }
+
         if (STRICT_ON_DEMAND) {
             setTimeout(function () {
                 bootstrapCoreDataInBackground();

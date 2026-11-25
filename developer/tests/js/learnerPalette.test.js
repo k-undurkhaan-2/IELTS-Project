@@ -512,8 +512,11 @@ test('main-entry source and root/VIP ui-shell bundles follow the canonical manif
 
     assert.deepEqual(
         vipContract.inputs,
-        defaultContract.inputs,
-        'default and VIP ui-shell source order should share the canonical manifest contract'
+        defaultContract.inputs.filter(inputPath => ![
+            'js/core/dictionaryService.js',
+            'js/runtime/readingDictionaryAssets.js'
+        ].includes(inputPath)),
+        'VIP retains the shared shell source order without the default reading dictionary assets'
     );
     assert.deepEqual(
         readBundleSectionOrder(rootBundle),

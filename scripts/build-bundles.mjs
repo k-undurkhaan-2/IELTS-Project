@@ -1,7 +1,8 @@
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getBundleProfile } from './bundle-manifest.mjs';
+import { getBundleProfile, READING_DICTIONARY_ASSETS } from './bundle-manifest.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -92,7 +93,14 @@ function readSource(relativePath) {
 
 export function renderBundle(profileName, inputs, sourceReader = readSource) {
     const sections = inputs.map((inputPath) => {
-        const source = sourceReader(inputPath);
+        let source = sourceReader(inputPath);
+        if (inputPath === 'js/runtime/readingDictionaryAssets.js') {
+            const versions = Object.fromEntries(READING_DICTIONARY_ASSETS.map(assetPath => [
+                path.basename(assetPath),
+                createHash('sha256').update(normalizeSourceText(sourceReader(assetPath))).digest('hex')
+            ]));
+            source = source.replace('const ASSET_VERSIONS = null;', `const ASSET_VERSIONS = ${JSON.stringify(versions)};`);
+        }
         return [
             `\n/* ===== ${inputPath} ===== */`,
             source

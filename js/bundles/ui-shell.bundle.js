@@ -1391,6 +1391,638 @@ console.log('[DOM] DOM工具库已加载，统一事件委托、DOM创建和样�
 })(typeof window !== 'undefined' ? window : this);
 
 
+/* ===== js/core/dictionaryService.js ===== */
+(function initDictionaryService(global) {
+    'use strict';
+
+    const ECDICT_SOURCE_ID = 'ecdict';
+    const IELTS_SOURCE_ID = 'ielts_core';
+    const WORD_PATTERN = /^[a-z][a-z0-9 .'-]{1,80}$/;
+    const FILLER_WORDS = new Set([
+        'the', 'and', 'for', 'that', 'with', 'from', 'this', 'have', 'has', 'had',
+        'are', 'was', 'were', 'been', 'being', 'will', 'would', 'could', 'should',
+        'not', 'but', 'you', 'your', 'their', 'they', 'them', 'then', 'than',
+        'into', 'onto', 'over', 'under', 'about', 'which', 'when', 'where', 'what',
+        'who', 'whose', 'how', 'can', 'may', 'might', 'must', 'also', 'such'
+    ]);
+
+    let ready = false;
+    let exactIndex = new Map();
+    let variantIndex = new Map();
+    const EMPTY_ENTRIES = Object.freeze([]);
+    let indexedECDICTEntries = null;
+    let indexedIeltsEntries = null;
+
+    function cleanText(value) {
+        return String(value || '')
+            .replace(/[’‘]/g, "'")
+            .replace(/[“”]/g, '"')
+            .replace(/[‐‑‒–—]/g, '-')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function normalizeTerm(value) {
+        return cleanText(value)
+            .toLowerCase()
+            .replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '')
+            .replace(/'s$/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function isValidLookupTerm(value) {
+        return WORD_PATTERN.test(value);
+    }
+
+    function splitTerms(value) {
+        const normalized = normalizeTerm(value);
+        if (!normalized) {
+            return [];
+        }
+        return normalized
+            .split(/[^a-z0-9'-]+/)
+            .map((word) => normalizeTerm(word))
+            .filter((word) => word.length > 1 && !FILLER_WORDS.has(word));
+    }
+
+    function addCandidate(list, seen, value) {
+        const normalized = normalizeTerm(value);
+        if (!normalized || seen.has(normalized) || !isValidLookupTerm(normalized)) {
+            return;
+        }
+        seen.add(normalized);
+        list.push(normalized);
+    }
+
+    function buildLemmaCandidates(term) {
+        const candidates = [];
+        const seen = new Set();
+        const normalized = normalizeTerm(term);
+        addCandidate(candidates, seen, normalized);
+        if (!normalized) {
+            return candidates;
+        }
+        if (normalized.includes('-')) {
+            addCandidate(candidates, seen, normalized.replace(/-/g, ' '));
+        }
+        if (normalized.includes(' ')) {
+            addCandidate(candidates, seen, normalized.replace(/\s+/g, '-'));
+        }
+        if (/ies$/.test(normalized) && normalized.length > 4) {
+            addCandidate(candidates, seen, normalized.replace(/ies$/, 'y'));
+        }
+        if (/ves$/.test(normalized) && normalized.length > 4) {
+            addCandidate(candidates, seen, normalized.replace(/ves$/, 'f'));
+            addCandidate(candidates, seen, normalized.replace(/ves$/, 'fe'));
+        }
+        if (/ied$/.test(normalized) && normalized.length > 4) {
+            addCandidate(candidates, seen, normalized.replace(/ied$/, 'y'));
+        }
+        if (/ing$/.test(normalized) && normalized.length > 5) {
+            const stem = normalized.replace(/ing$/, '');
+            addCandidate(candidates, seen, stem);
+            addCandidate(candidates, seen, `${stem}e`);
+            if (/([a-z])\1$/.test(stem)) {
+                addCandidate(candidates, seen, stem.slice(0, -1));
+            }
+        }
+        if (/ed$/.test(normalized) && normalized.length > 4) {
+            const stem = normalized.replace(/ed$/, '');
+            addCandidate(candidates, seen, stem);
+            addCandidate(candidates, seen, `${stem}e`);
+            if (/([a-z])\1$/.test(stem)) {
+                addCandidate(candidates, seen, stem.slice(0, -1));
+            }
+        }
+        if (/es$/.test(normalized) && normalized.length > 4) {
+            addCandidate(candidates, seen, normalized.replace(/es$/, ''));
+            addCandidate(candidates, seen, normalized.replace(/s$/, ''));
+        }
+        if (/s$/.test(normalized) && normalized.length > 3 && !/ss$/.test(normalized)) {
+            addCandidate(candidates, seen, normalized.replace(/s$/, ''));
+        }
+        return candidates;
+    }
+
+    function normalizeECDICTEntry(entry) {
+        if (!entry || typeof entry !== 'object') {
+            return null;
+        }
+        const word = normalizeTerm(entry.w || entry.word);
+        const translation = cleanText(entry.t || entry.translation || entry.meaning);
+        const definition = cleanText(entry.d || entry.definition);
+        if (!word || (!translation && !definition)) {
+            return null;
+        }
+        return {
+            word,
+            lemma: word,
+            source: ECDICT_SOURCE_ID,
+            sourceLabel: 'ECDICT',
+            license: 'MIT',
+            zh: translation,
+            en: definition,
+            phonetic: cleanText(entry.p || entry.phonetic),
+            pos: cleanText(entry.pos),
+            tags: Array.isArray(entry.tags) ? entry.tags.map(String).filter(Boolean) : [],
+            rank: {
+                collins: Number.isFinite(Number(entry.c)) ? Number(entry.c) : null,
+                bnc: Number.isFinite(Number(entry.b)) ? Number(entry.b) : null,
+                frq: Number.isFinite(Number(entry.f)) ? Number(entry.f) : null
+            },
+            exchange: cleanText(entry.x || entry.exchange)
+        };
+    }
+
+    function normalizeIeltsEntry(entry) {
+        if (!entry || typeof entry !== 'object') {
+            return null;
+        }
+        const word = normalizeTerm(entry.word);
+        const meaning = cleanText(entry.meaning);
+        if (!word || !meaning) {
+            return null;
+        }
+        return {
+            word,
+            lemma: word,
+            source: IELTS_SOURCE_ID,
+            sourceLabel: 'IELTS 核心词表',
+            license: '',
+            zh: meaning,
+            en: '',
+            phonetic: '',
+            pos: '',
+            example: cleanText(entry.example),
+            tags: ['ielts-core'],
+            rank: {
+                collins: null,
+                bnc: null,
+                frq: Number.isFinite(Number(entry.freq)) ? Number(entry.freq) : null
+            },
+            exchange: ''
+        };
+    }
+
+    function parseExchangeVariants(exchange) {
+        if (!exchange) {
+            return [];
+        }
+        const variants = [];
+        exchange.split('/').forEach((segment) => {
+            const body = segment.includes(':') ? segment.slice(segment.indexOf(':') + 1) : segment;
+            body.split(/[,\s]+/).forEach((item) => {
+                const term = normalizeTerm(item);
+                if (term && isValidLookupTerm(term)) {
+                    variants.push(term);
+                }
+            });
+        });
+        return variants;
+    }
+
+    function putEntry(entry, overwrite = false) {
+        if (!entry || !entry.word) {
+            return;
+        }
+        if (overwrite || !exactIndex.has(entry.word)) {
+            exactIndex.set(entry.word, entry);
+        }
+        parseExchangeVariants(entry.exchange).forEach((variant) => {
+            if (!variantIndex.has(variant)) {
+                variantIndex.set(variant, entry.word);
+            }
+        });
+    }
+
+    function init() {
+        const dictionaries = global.__LOCAL_DICTIONARIES__ || {};
+        const ecdictEntries = dictionaries.ecdict && Array.isArray(dictionaries.ecdict.entries)
+            ? dictionaries.ecdict.entries
+            : EMPTY_ENTRIES;
+        const embeddedWordlists = global.__EMBEDDED_WORDLISTS__ || {};
+        const ieltsEntries = Array.isArray(embeddedWordlists.ielts_core)
+            ? embeddedWordlists.ielts_core
+            : EMPTY_ENTRIES;
+        if (ready && indexedECDICTEntries === ecdictEntries && indexedIeltsEntries === ieltsEntries) {
+            return true;
+        }
+        exactIndex = new Map();
+        variantIndex = new Map();
+        ecdictEntries
+            .map(normalizeECDICTEntry)
+            .filter(Boolean)
+            .forEach((entry) => putEntry(entry, true));
+
+        ieltsEntries
+            .map(normalizeIeltsEntry)
+            .filter(Boolean)
+            .forEach((entry) => putEntry(entry, false));
+
+        indexedECDICTEntries = ecdictEntries;
+        indexedIeltsEntries = ieltsEntries;
+        ready = true;
+        return true;
+    }
+
+    function findEntry(term) {
+        init();
+        const candidates = buildLemmaCandidates(term);
+        for (let index = 0; index < candidates.length; index += 1) {
+            const candidate = candidates[index];
+            if (exactIndex.has(candidate)) {
+                const entry = exactIndex.get(candidate);
+                return { entry, matched: candidate };
+            }
+            const lemma = variantIndex.get(candidate);
+            if (lemma && exactIndex.has(lemma)) {
+                const entry = exactIndex.get(lemma);
+                return { entry, matched: candidate };
+            }
+        }
+        return null;
+    }
+
+    function cloneLookupResult(entry, requested, matched) {
+        return {
+            found: true,
+            requested: cleanText(requested),
+            term: entry.word,
+            lemma: entry.lemma || entry.word,
+            matched,
+            source: entry.source,
+            sourceLabel: entry.sourceLabel,
+            license: entry.license,
+            zh: entry.zh,
+            en: entry.en,
+            phonetic: entry.phonetic,
+            pos: entry.pos,
+            example: entry.example || '',
+            tags: Array.isArray(entry.tags) ? entry.tags.slice() : [],
+            rank: entry.rank ? { ...entry.rank } : {}
+        };
+    }
+
+    function lookup(term) {
+        const requested = cleanText(term);
+        const normalized = normalizeTerm(requested);
+        if (!normalized) {
+            return {
+                found: false,
+                requested,
+                term: '',
+                source: 'local',
+                reason: 'empty'
+            };
+        }
+
+        const direct = findEntry(normalized);
+        if (direct) {
+            return cloneLookupResult(direct.entry, requested, direct.matched);
+        }
+
+        const parts = splitTerms(normalized)
+            .map((part) => {
+                const hit = findEntry(part);
+                return hit ? cloneLookupResult(hit.entry, part, hit.matched) : null;
+            })
+            .filter(Boolean);
+
+        if (parts.length) {
+            return {
+                found: true,
+                requested,
+                term: normalized,
+                source: 'compound',
+                sourceLabel: '本地词典',
+                zh: '',
+                en: '',
+                phonetic: '',
+                pos: '',
+                parts
+            };
+        }
+
+        return {
+            found: false,
+            requested,
+            term: normalized,
+            source: 'local',
+            reason: 'not_found'
+        };
+    }
+
+    function stats() {
+        init();
+        return {
+            entries: exactIndex.size,
+            variants: variantIndex.size
+        };
+    }
+
+    const api = {
+        init,
+        lookup,
+        normalizeTerm,
+        buildLemmaCandidates,
+        stats
+    };
+
+    if (typeof module !== 'undefined' && module.exports) {
+        module.exports = api;
+    } else {
+        global.DictionaryService = api;
+    }
+})(typeof window !== 'undefined' ? window : globalThis);
+
+
+/* ===== js/runtime/readingDictionaryAssets.js ===== */
+(function initReadingDictionaryAssets(global) {
+    'use strict';
+
+    if (global.ReadingDictionaryAssets) return;
+
+    // The bundle builder injects content hashes. Direct source loading skips
+    // persistent caching so an unversioned development script cannot go stale.
+    const ASSET_VERSIONS = {"ielts_core.bundle.js":"987b65edb36a53df1192e39d533e6ae51b64b285b0f813c185bbd1427db98e9f","ecdict_reading.bundle.js":"50a703adeb80565fec65998c42fecc870b4cd618736ffb1ea874d126ea3097cc"};
+    const DATABASE_NAME = 'ielts-reading-dictionaries';
+    const STORE_NAME = 'dictionaries';
+    const CACHE_TIMEOUT_MS = 2000;
+    const sourceUrl = document.currentScript && document.currentScript.src;
+    const baseUrl = new URL('../../assets/wordlists/', sourceUrl || new URL('js/runtime/readingDictionaryAssets.js', document.baseURI));
+    const dictionaries = [
+        {
+            file: 'ielts_core.bundle.js',
+            read: () => global.__EMBEDDED_WORDLISTS__?.ielts_core,
+            valid: value => Array.isArray(value) && value.length > 0
+                && value.every(entry => entry && typeof entry.word === 'string' && typeof entry.meaning === 'string'),
+            write(value) {
+                global.__EMBEDDED_WORDLISTS__ = global.__EMBEDDED_WORDLISTS__ || {};
+                global.__EMBEDDED_WORDLISTS__.ielts_core = value;
+            }
+        },
+        {
+            file: 'ecdict_reading.bundle.js',
+            read: () => global.__LOCAL_DICTIONARIES__?.ecdict,
+            valid: value => Array.isArray(value?.entries) && value.entries.length > 0
+                && value.entries.every(entry => entry && typeof entry.w === 'string'
+                    && (typeof entry.t === 'string' || typeof entry.d === 'string')),
+            write(value) {
+                global.__LOCAL_DICTIONARIES__ = global.__LOCAL_DICTIONARIES__ || {};
+                global.__LOCAL_DICTIONARIES__.ecdict = value;
+            }
+        }
+    ];
+    const cacheKey = `reading-dictionaries-v1:${baseUrl.href}:${JSON.stringify(ASSET_VERSIONS)}`;
+    const pending = new Map();
+    let databasePromise;
+    let loadPromise;
+    let preloadPromise;
+    let sharedService;
+
+    // Only validate full payloads at the storage boundary, not on every lookup.
+    function available(dictionary) {
+        const value = dictionary.read();
+        return dictionary.file === 'ielts_core.bundle.js'
+            ? Array.isArray(value) && value.length > 0
+            : Array.isArray(value?.entries) && value.entries.length > 0;
+    }
+
+    function getSharedOwner() {
+        for (const key of ['parent', 'opener']) {
+            try {
+                const peer = global[key];
+                if (!peer || peer === global || peer.closed) continue;
+                const assets = peer.ReadingDictionaryAssets;
+                if (assets && assets.cacheKey === cacheKey) return { assets, window: peer };
+            } catch (_) { /* A cross-origin parent/opener is not a cache owner. */ }
+        }
+        return null;
+    }
+
+    function adopt(owner) {
+        const snapshot = owner?.assets.snapshot();
+        if (!snapshot) return false;
+        dictionaries.forEach((dictionary, index) => dictionary.write(snapshot.values[index]));
+        sharedService = snapshot.service;
+        return true;
+    }
+
+    function isReady() {
+        if (dictionaries.every(available)) return true;
+        try { return adopt(getSharedOwner()); } catch (_) { return false; }
+    }
+
+    function loadFromOwner(owner) {
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const unavailable = () => finish(false);
+            const timer = global.setTimeout(unavailable, 60000);
+            function finish(loaded, error) {
+                if (settled) return;
+                settled = true;
+                global.clearTimeout(timer);
+                try { owner.window.removeEventListener('pagehide', unavailable); } catch (_) { }
+                if (error) reject(error);
+                else resolve(loaded);
+            }
+            try {
+                // A popup must not wait forever on a promise from an opener
+                // that navigated away or closed during a background download.
+                owner.window.addEventListener('pagehide', unavailable, { once: true });
+                if (owner.window.closed) return finish(false);
+                owner.assets.ensureLoaded({ localOnly: true }).then(() => {
+                    if (settled) return;
+                    try { finish(adopt(owner)); } catch (_) { finish(false); }
+                }, error => finish(false, error));
+            } catch (_) { finish(false); }
+        });
+    }
+
+    function openDatabase() {
+        if (databasePromise) return databasePromise;
+        databasePromise = new Promise(resolve => {
+            let settled = false;
+            const timer = global.setTimeout(() => finish(null), CACHE_TIMEOUT_MS);
+            function finish(database) {
+                if (settled) {
+                    database?.close();
+                    return;
+                }
+                settled = true;
+                global.clearTimeout(timer);
+                resolve(database);
+            }
+            try {
+                if (!ASSET_VERSIONS || !/^https?:$/.test(baseUrl.protocol) || !global.indexedDB) {
+                    finish(null);
+                    return;
+                }
+                const request = global.indexedDB.open(DATABASE_NAME, 1);
+                request.onupgradeneeded = () => request.result.createObjectStore(STORE_NAME);
+                request.onsuccess = () => {
+                    const database = request.result;
+                    database.onversionchange = () => {
+                        database.close();
+                        databasePromise = null;
+                    };
+                    finish(database);
+                };
+                request.onerror = request.onblocked = () => finish(null);
+            } catch (_) { finish(null); }
+        });
+        return databasePromise;
+    }
+
+    async function accessCache(dictionary, value) {
+        const database = await openDatabase();
+        if (!database) return undefined;
+        return new Promise(resolve => {
+            let transaction;
+            let result;
+            let settled = false;
+            const timer = global.setTimeout(() => {
+                finish(undefined);
+                try { transaction?.abort(); } catch (_) { }
+            }, CACHE_TIMEOUT_MS);
+            function finish(value) {
+                if (settled) return;
+                settled = true;
+                global.clearTimeout(timer);
+                resolve(value);
+            }
+            try {
+                const writing = value !== undefined;
+                transaction = database.transaction(STORE_NAME, writing ? 'readwrite' : 'readonly');
+                const store = transaction.objectStore(STORE_NAME);
+                const key = new URL(dictionary.file, baseUrl).href;
+                const request = writing
+                    ? store.put({ version: ASSET_VERSIONS[dictionary.file], value }, key)
+                    : store.get(key);
+                request.onsuccess = () => { result = request.result; };
+                transaction.oncomplete = () => finish(result);
+                transaction.onerror = transaction.onabort = () => finish(undefined);
+            } catch (_) { finish(undefined); }
+        });
+    }
+
+    function loadScript(dictionary) {
+        return new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            const url = new URL(dictionary.file, baseUrl);
+            if (ASSET_VERSIONS) url.searchParams.set('v', ASSET_VERSIONS[dictionary.file]);
+            script.src = url.href;
+            script.async = true;
+            script.fetchPriority = 'low';
+            let settled = false;
+            const timeout = global.setTimeout(() => finish(new Error('reading_dictionary_timeout')), 60000);
+            function finish(error) {
+                if (settled) return;
+                settled = true;
+                global.clearTimeout(timeout);
+                script.onload = script.onerror = null;
+                script.remove();
+                if (error) reject(error);
+                else resolve();
+            }
+            script.onload = () => finish(dictionary.valid(dictionary.read()) ? null : new Error('reading_dictionary_missing'));
+            script.onerror = () => finish(new Error('reading_dictionary_failed'));
+            document.head.appendChild(script);
+        });
+    }
+
+    async function loadCached(dictionary) {
+        if (available(dictionary)) return;
+        const cached = await accessCache(dictionary);
+        if (cached && cached.version === ASSET_VERSIONS?.[dictionary.file] && dictionary.valid(cached.value)) {
+            dictionary.write(cached.value);
+            return;
+        }
+        await loadScript(dictionary);
+        await accessCache(dictionary, dictionary.read());
+    }
+
+    async function loadWithLock(dictionary) {
+        // Independent tabs recheck IndexedDB inside the lock, so only the first
+        // tab downloads a missing version. Parent/child pages also share memory.
+        let entered = false;
+        try {
+            if (global.navigator?.locks?.request) {
+                return await global.navigator.locks.request(`${cacheKey}:${dictionary.file}`, () => {
+                    entered = true;
+                    return loadCached(dictionary);
+                });
+            }
+        } catch (error) {
+            if (entered) throw error;
+        }
+        return loadCached(dictionary);
+    }
+
+    function load(dictionary) {
+        if (available(dictionary)) return Promise.resolve();
+        if (pending.has(dictionary.file)) return pending.get(dictionary.file);
+        const promise = loadWithLock(dictionary).finally(() => pending.delete(dictionary.file));
+        pending.set(dictionary.file, promise);
+        return promise;
+    }
+
+    function ensureLoaded({ localOnly = false } = {}) {
+        if (isReady()) return Promise.resolve();
+        if (loadPromise) return loadPromise;
+        loadPromise = (async () => {
+            const owner = localOnly ? null : getSharedOwner();
+            if (owner && await loadFromOwner(owner)) return;
+            await Promise.all(dictionaries.map(load));
+        })().finally(() => { loadPromise = null; });
+        return loadPromise;
+    }
+
+    function whenIdle() {
+        return new Promise(resolve => {
+            if (typeof global.requestIdleCallback === 'function') {
+                global.requestIdleCallback(resolve, { timeout: 3000 });
+            } else {
+                global.setTimeout(resolve, 0);
+            }
+        });
+    }
+
+    function getService() {
+        return sharedService || global.DictionaryService;
+    }
+
+    function preload() {
+        if (preloadPromise) return preloadPromise;
+        preloadPromise = (async () => {
+            if (document.readyState !== 'complete') {
+                await new Promise(resolve => global.addEventListener('load', resolve, { once: true }));
+            }
+            await whenIdle();
+            await ensureLoaded();
+            await whenIdle();
+            getService()?.init();
+        })().catch(error => {
+            preloadPromise = null;
+            throw error;
+        });
+        return preloadPromise;
+    }
+
+    global.ReadingDictionaryAssets = {
+        cacheKey,
+        isReady,
+        ensureLoaded,
+        preload,
+        getService,
+        snapshot: () => dictionaries.every(available)
+            ? { values: dictionaries.map(dictionary => dictionary.read()), service: getService() }
+            : null
+    };
+})(window);
+
+
 /* ===== js/app/main-entry.js ===== */
 (function bootstrapApp(global) {
     'use strict';
@@ -2317,6 +2949,14 @@ console.log('[DOM] DOM工具库已加载，统一事件委托、DOM创建和样�
         setupLearnerPaletteSettings();
         setupReadingCandidateCodeSettings();
         setupPracticeTimerSettings();
+
+        // Keep dictionary download/indexing outside the shell and exam startup
+        // promises. Reading windows can join this work or restore its cache.
+        if (global.ReadingDictionaryAssets) {
+            global.ReadingDictionaryAssets.preload().catch(function () {
+                // The dictionary bubble provides an on-demand retry if needed.
+            });
+        }
 
         if (STRICT_ON_DEMAND) {
             setTimeout(function () {
@@ -3433,6 +4073,8 @@ console.log('[DOM] DOM工具库已加载，统一事件委托、DOM创建和样�
     "js/views/overviewView.js",
     "js/presentation/navigation-controller.js",
     "js/presentation/message-center.js",
+    "js/core/dictionaryService.js",
+    "js/runtime/readingDictionaryAssets.js",
     "js/app/main-entry.js",
     "js/presentation/indexInteractions.js",
     "js/presentation/emojiIconizer.js"

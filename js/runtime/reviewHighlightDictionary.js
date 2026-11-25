@@ -393,7 +393,8 @@
     }
 
     function getLookupService() {
-        return currentOptions.lookupService || global.DictionaryService || null;
+        return currentOptions.lookupService || global.ReadingDictionaryAssets?.getService()
+            || global.DictionaryService || null;
     }
 
     function lookupTerm(term) {

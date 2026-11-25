@@ -8,6 +8,12 @@ function defineBundle(outputPath, inputs) {
     });
 }
 
+// Hashed by the builder, never concatenated into the UI or reading bundles.
+export const READING_DICTIONARY_ASSETS = Object.freeze([
+    'assets/wordlists/ielts_core.bundle.js',
+    'assets/wordlists/ecdict_reading.bundle.js'
+]);
+
 const inputs = Object.freeze({
     runtimeEntry: Object.freeze([
         'js/presentation/threeBackground.js',
@@ -49,6 +55,8 @@ const inputs = Object.freeze({
         'js/views/overviewView.js',
         'js/presentation/navigation-controller.js',
         'js/presentation/message-center.js',
+        'js/core/dictionaryService.js',
+        'js/runtime/readingDictionaryAssets.js',
         'js/app/main-entry.js',
         'js/presentation/indexInteractions.js',
         'js/presentation/emojiIconizer.js'
@@ -163,6 +171,11 @@ const vipReadingPage = inputs.readingPage.filter((inputPath) => ![
     'js/runtime/readingDictionaryAssets.js'
 ].includes(inputPath));
 
+const vipUiShell = inputs.uiShell.filter((inputPath) => ![
+    'js/core/dictionaryService.js',
+    'js/runtime/readingDictionaryAssets.js'
+].includes(inputPath));
+
 const defaultBundleInputs = Object.freeze({
     'js/bundles/runtime-entry.bundle.js': inputs.runtimeEntry,
     'js/bundles/core-foundation.bundle.js': inputs.coreFoundation,
@@ -185,7 +198,7 @@ const defaultBundleInputs = Object.freeze({
 const vipBundleInputs = Object.freeze({
     'js/bundles/runtime-entry.bundle.js': inputs.runtimeEntry,
     'js/bundles/core-foundation.bundle.js': vipCoreFoundation,
-    'js/bundles/ui-shell.bundle.js': inputs.uiShell,
+    'js/bundles/ui-shell.bundle.js': vipUiShell,
     'js/bundles/legacy-app.bundle.js': inputs.legacyApp,
     'js/bundles/browse.bundle.js': inputs.browse,
     'js/bundles/diagnostics.bundle.js': inputs.diagnostics,

@@ -60,7 +60,7 @@ try {
     let release;
     const gate = new Promise(resolve => { release = resolve; });
     const requests = [];
-    await page.route('**/assets/wordlists/*.bundle.js', async route => {
+    await page.route('**/assets/wordlists/*.bundle.js?*', async route => {
         requests.push(route.request().url());
         await gate;
         await route.continue();
@@ -83,7 +83,7 @@ try {
 
     const retryPage = await openExam('p2-high-25');
     let attempts = 0;
-    await retryPage.route('**/assets/wordlists/ecdict_reading.bundle.js', route => {
+    await retryPage.route('**/assets/wordlists/ecdict_reading.bundle.js?*', route => {
         attempts++;
         return attempts === 1 ? route.abort('failed') : route.continue();
     });
