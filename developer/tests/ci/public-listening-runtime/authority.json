@@ -1,0 +1,192 @@
+{
+  "schema": "ieltmps.issue79.runtime-control-authority.v1",
+  "transaction": "IELTMPS-ISSUE79-CI-RUNTIME-VERIFICATION-EXECUTION-V1",
+  "authority_comment": 7167678279,
+  "ci": "d1f5bccc5acab9691e919b7a6be9201f39ccae1c",
+  "security": "68c8f36c2700b468d3ce8ffa0080c4ae6fbcca58",
+  "ui": "1a576be93d7d18b8955adf5216efb311032bf62a",
+  "artifact": "lpf-v1-1a576be93d7d-a2-fad166773fa6259a",
+  "manifest_sha256": "fad166773fa6259a18c752c240030aa228390f8380b7be5dacac3b8ba8d4b75d",
+  "stage_sha256": "8207a9c1a9cf45ea14e56710837fca06ef61449794ca2b959d9c11b6f145315b",
+  "stage_helper_sha256": "07d80b1725b3467ee06018cb49d9c6565cb84e022d09fbf28d56a61b7e7c8c6a",
+  "active_sha256": "515fa52a87943dab5b8f1c5624ba54a6f78e0d421f41553e4e1f8a77323086a4",
+  "images": {
+    "node": {
+      "repo": "library/node",
+      "manifest": "d8d97e479cdc64f052f81f129362168717c59783ade8dcc1abd22e1cca8dbd7c",
+      "config": "b791832e17c3a8a5897bdb5087381ffbc07b77bc634d204bf603b5f63c1ffe57"
+    },
+    "buildkit": {
+      "repo": "moby/buildkit",
+      "manifest": "7583a0667093d941826bcd1d2878d6a360dfd08a82c93e6d6a6f6cce78801e12",
+      "config": "d0ff8587a88d8adf2744704927bc567a23f4e8a1f4e732b579d673623a8a0fb2"
+    },
+    "postgres": {
+      "repo": "library/postgres",
+      "manifest": "9d9e487c1bd6413c52ccb3c02f46c8e37fa1e1d1a32a84519eb4e68d0ad1da30",
+      "config": "a3c40a6a77a9a545ed6d766860c45f82ab8bc254148266e56c4139f91beec635"
+    }
+  },
+  "browser": {
+    "version": "1.56.1",
+    "revision": "1194",
+    "chromium": "141.0.7390.37",
+    "source_commit": "54c711571a37de525377e6f3d3608c3e029b1829",
+    "lock_sha256": "f63dd2bdb95943d6758fff92dcfdd46652c4dbdf74b904855e76b7caecc17fed"
+  },
+  "expected_rows": [
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "H",
+    "I",
+    "J"
+  ],
+  "source_map": {
+    "operation": "PROPOSED_METADATA_ONLY_NO_CANDIDATE_ASSEMBLED",
+    "runtime_base": "68c8f36c2700b468d3ce8ffa0080c4ae6fbcca58",
+    "runtime_base_tree": "82676cee31e5bb123264f81fc83feff7ab2e20ff",
+    "complete_ui_delta_from": "1a576be93d7d18b8955adf5216efb311032bf62a",
+    "ui_delta": [
+      {
+        "path": "ListeningPractice/vip special/js/bundles/browse.bundle.js",
+        "security_blob": "f809e4a9b62788636fe6aed475981412f109550d",
+        "accepted_ui_blob": "3d2a33305b19b0e0035498a98d6c9d0d89013557",
+        "mode": "100644",
+        "bytes": 802620
+      },
+      {
+        "path": "ListeningPractice/vip special/js/bundles/listening-record-bridge.bundle.js",
+        "security_blob": "295bcf26ecb72665b89d7c1c537bad6acf584332",
+        "accepted_ui_blob": "1fbf755d5b5378f3fa3b625db0be869598c98430",
+        "mode": "100644",
+        "bytes": 112851
+      },
+      {
+        "path": "ListeningPractice/vip special/js/bundles/practice-page-enhancer.bundle.js",
+        "security_blob": "dabd6f3deda74fea65486ef8a9f6d694fa10c820",
+        "accepted_ui_blob": "6e64eadcab8d8e2b9ce99fef27afefe8c3bea66d",
+        "mode": "100644",
+        "bytes": 268328
+      },
+      {
+        "path": "ListeningPractice/vip special/js/bundles/reading-page.bundle.js",
+        "security_blob": "2797b4e2a1f82c44aaf8ff25b96e67ac47fd84fa",
+        "accepted_ui_blob": "52522138a7baf8264decccb5cf81ad2fdec9ab64",
+        "mode": "100644",
+        "bytes": 287073
+      },
+      {
+        "path": "ListeningPractice/vip special/js/bundles/session.bundle.js",
+        "security_blob": "834062cdea85d7a1bb5307cb0db9150b96f1e7c8",
+        "accepted_ui_blob": "026d6e518b4a162907ed74278bd13c098c4b7063",
+        "mode": "100644",
+        "bytes": 128559
+      },
+      {
+        "path": "developer/tests/js/answerComparisonUtilsGuard.test.js",
+        "security_blob": "ddbed469307d1676b65ebd383c84e4c897041a01",
+        "accepted_ui_blob": "842d6bbcbeb5870a2223e4a6ef39471ab8965258",
+        "mode": "100644",
+        "bytes": 4266
+      },
+      {
+        "path": "developer/tests/js/reviewHighlightDictionaryGuard.test.js",
+        "security_blob": "6e4d0e36b2ea762545c3ffd6e30737326d7584ab",
+        "accepted_ui_blob": "c3eae5887cf256960180912ee67dbfe13a2cb2a6",
+        "mode": "100644",
+        "bytes": 13746
+      },
+      {
+        "path": "developer/tests/js/suitePracticeStorageFallback.test.js",
+        "security_blob": "95af5ea9fe17371657149de0a29efb700249ef35",
+        "accepted_ui_blob": "42a66964f5c5f998a6548912f1c6a1a3369439f8",
+        "mode": "100644",
+        "bytes": 12718
+      },
+      {
+        "path": "developer/tests/js/unifiedReadingDraftGuard.test.js",
+        "security_blob": "ecc5a587969bd98b633acd57273f9fa13192ebb8",
+        "accepted_ui_blob": "0a641db064481815c4fb5dea2bac34f748dfd346",
+        "mode": "100644",
+        "bytes": 15690
+      },
+      {
+        "path": "js/app/suitePracticeMixin.js",
+        "security_blob": "3c588ec64e44f055a2d5e566354b6aeca0cbe6ba",
+        "accepted_ui_blob": "b225b43610c27812ec6bccaf1ca10133964c7304",
+        "mode": "100644",
+        "bytes": 130372
+      },
+      {
+        "path": "js/bundles/browse.bundle.js",
+        "security_blob": "d566b1b554f6c61cb1147f458830e6d0d1599258",
+        "accepted_ui_blob": "86ccb986dffe0efeaa7f05246a2a8ecd1138c5a1",
+        "mode": "100644",
+        "bytes": 802606
+      },
+      {
+        "path": "js/bundles/listening-record-bridge.bundle.js",
+        "security_blob": "570fa5beda54a6fd9da41c49098f05b0126af264",
+        "accepted_ui_blob": "4eb96923b6057a3f6fbc34b80229a0f98facb3b6",
+        "mode": "100644",
+        "bytes": 112837
+      },
+      {
+        "path": "js/bundles/practice-page-enhancer.bundle.js",
+        "security_blob": "5566cfefb5e877a2626c724e53c5de078f0e0f01",
+        "accepted_ui_blob": "ea7bd32cf586b832fb711a13618570e6cb9ef377",
+        "mode": "100644",
+        "bytes": 268314
+      },
+      {
+        "path": "js/bundles/reading-page.bundle.js",
+        "security_blob": "3467de2ba31ae914c690c162a4d2bd22f6514bbd",
+        "accepted_ui_blob": "c92574fc04ddf095d4283515277b98e4b7f80812",
+        "mode": "100644",
+        "bytes": 6175640
+      },
+      {
+        "path": "js/bundles/session.bundle.js",
+        "security_blob": "29501002245459b6349281b0ff2196a2a72d93f1",
+        "accepted_ui_blob": "e5d44544670ca23753c25e2be5dc7622ff32bef6",
+        "mode": "100644",
+        "bytes": 128545
+      },
+      {
+        "path": "js/runtime/reviewHighlightDictionary.js",
+        "security_blob": "f721f58fb20c060861c1ecfc8080d9370c6f92a3",
+        "accepted_ui_blob": "4dc577236726a0dc4c352a17ae2fe08f299ba224",
+        "mode": "100644",
+        "bytes": 33862
+      },
+      {
+        "path": "js/runtime/unifiedReadingPage.js",
+        "security_blob": "744c79902e10cc259106c430c85757ce25fcf600",
+        "accepted_ui_blob": "9c1468590dac9216853cdfb62810d3f797dcd5ed",
+        "mode": "100644",
+        "bytes": 199490
+      },
+      {
+        "path": "js/utils/answerMatchCore.js",
+        "security_blob": "b034c8eca32ef11db5242bcd13945768ce94c2f0",
+        "accepted_ui_blob": "1e770ea2ea8df1d77a1c2f36484bc083f8387b65",
+        "mode": "100644",
+        "bytes": 6445
+      }
+    ],
+    "ci_tooling_separate_checkout": "d1f5bccc5acab9691e919b7a6be9201f39ccae1c",
+    "preserve_security_dockerignore": "fa4ee4513d0e30df9316c81fcf0a71086a4a4c31",
+    "branch_merge_performed": false,
+    "dev_integration_performed": false
+  },
+  "csp": {
+    "shell": "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; form-action 'self'; script-src 'self' 'unsafe-inline'; script-src-attr 'unsafe-inline'; style-src 'self' 'unsafe-inline'; style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' data: blob:; connect-src 'self'; frame-src 'self'; child-src 'self' blob:; worker-src 'self' blob:; manifest-src 'self'",
+    "wrapper": "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; script-src 'self'; script-src-attr 'none'; style-src 'self' 'unsafe-inline'; style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' data: blob:; connect-src 'none'; frame-src 'self'; child-src 'self'; worker-src 'self' blob:; manifest-src 'self'",
+    "private": "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; form-action 'none'; script-src 'self' 'unsafe-inline'; script-src-attr 'unsafe-inline'; style-src 'self' 'unsafe-inline'; style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' data: blob:; connect-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'self' blob:; manifest-src 'self'; sandbox allow-scripts allow-downloads allow-same-origin"
+  }
+}

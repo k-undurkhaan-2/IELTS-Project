@@ -446,9 +446,59 @@ _R2_STAGING_BACKEND_VERIFIER_CONTENT = {
     "size": 53907,
     "sha256": "e06077c2cfc2ec1947a5cb0e06c369ad553524dbd872ae92c53d0803e6871569"
 }
+
+# Individually enumerated Issue 79 runtime additions. No historical target is removed.
+_R2_RUNTIME_PATHS = (
+    ".github/workflows/issue79-runtime-verification.yml",
+    "developer/tests/ci/public-listening-runtime/authority.json",
+    "developer/tests/ci/public-listening-runtime/runtime.py",
+)
+_R2_RUNTIME_MANIFEST = "cd767e29b5e5a59f113f741a59d7dc8e5dfa2bcccc98cce2924e655169a3e0fe"
+_R2_RUNTIME_PROFILE = replace(
+    _R2_STAGING_PROFILE,
+    name="ci-listening-runtime",
+    authority_commit="d1f5bccc5acab9691e919b7a6be9201f39ccae1c",
+    authority_tree="e52cd8a614546cd87b147fe4ba8568d4957e0791",
+    tree_manifest_sha256=_R2_RUNTIME_MANIFEST,
+    a1_integrated_tree_manifest_sha256=_R2_RUNTIME_MANIFEST,
+    a3_integrated_tree_manifest_sha256=_R2_RUNTIME_MANIFEST,
+    a4_1_integrated_tree_manifest_sha256=_R2_RUNTIME_MANIFEST,
+    path_count=920,
+    serialized_bytes=40823,
+    sorted_path_sha256="f821db51f0d43ca46ea4379127d80e95b8fdb2b7ce1b7c5c9d19c6edbdb50802",
+    target_reference_count=20_069,
+)
+_R2_RUNTIME_CONTENT = {
+    ".github/workflows/issue79-runtime-verification.yml": {
+        "gitBlob": "4fddbbd7bf2067ebd8f9e93cebd18b92657377d4",
+        "size": 5995,
+        "sha256": "a51f10aaf5e75201cc13b61c7ed69db8780b669525277e3446b959db57c01314"
+    },
+    "developer/tests/ci/public-listening-runtime/authority.json": {
+        "gitBlob": "b975474f194a59acdd75cbdf797b33a0aff860b5",
+        "size": 8654,
+        "sha256": "64fd0950dbaf27843031c67661a706767a5d371c16830048dbfe5e5dcdcd02a1"
+    },
+    "developer/tests/ci/public-listening-runtime/runtime.py": {
+        "gitBlob": "573d5787acfbafe297f01ec85aa27b969472a1b1",
+        "size": 74446,
+        "sha256": "aa15718592ca338dac5b3b21374b42c021cd5efda1ba0b76ad76006f9bb11b5e"
+    },
+    "developer/tests/ci/backend_canonical_portable_result.py": {
+        "gitBlob": "d26c74af6b6fbcbee37143e9b396db0dca356e50",
+        "size": 54306,
+        "sha256": "8942977160bf96f88be4695d7f303fd3396558d9b1dece06f9885f01755e3ef7"
+    },
+    "developer/tests/ci/test_backend_canonical_portable_result.py": {
+        "gitBlob": "6619cbbca4a0a872f395e69424a4369023b2345a",
+        "size": 171889,
+        "sha256": "5e0805b025115af32b36c8b730eb664d219fd24eb002f2fa1282ccaa941c2176"
+    }
+}
+
 _R2_PROFILES_BY_IDENTITY = {
     (profile.path_count, profile.sorted_path_sha256): profile
-    for profile in (_R2_ORDINARY_PROFILE, _R2_SECURITY_PROFILE, _R2_STAGING_PROFILE)
+    for profile in (_R2_ORDINARY_PROFILE, _R2_SECURITY_PROFILE, _R2_STAGING_PROFILE, _R2_RUNTIME_PROFILE)
 }
 _R2_ORDINARY_CONTENT_AUTHORITY = {
     ".github/workflows/ci.yml": {
@@ -882,6 +932,8 @@ def _r2_validate_git_object_authority(
             "developer/tests/ci/backend_canonical_portable_result.py":
                 _R2_STAGING_BACKEND_VERIFIER_CONTENT,
         }
+    if profile is _R2_RUNTIME_PROFILE:
+        content_authority = {**content_authority, **_R2_STAGING_LINUX24_CONTENT_DELTA, **_R2_RUNTIME_CONTENT}
     for relative, expected in content_authority.items():
         entry = object_entries.get(relative)
         if entry is None or entry[2] != expected["gitBlob"]:
@@ -926,6 +978,9 @@ def _r2_counterpart_inventories(
     live_paths: tuple[str, ...],
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     live_profile = _r2_profile_for_paths(live_paths)
+    if live_profile is _R2_RUNTIME_PROFILE:
+        live_paths = tuple(path for path in live_paths if path not in _R2_RUNTIME_PATHS)
+        live_profile = _r2_profile_for_paths(live_paths)
     if live_profile is _R2_STAGING_PROFILE:
         # Historical comparison fixtures retain their exact pre-staging paths.
         live_paths = tuple(path for path in live_paths if path not in _R2_STAGING_PATHS)
@@ -5556,6 +5611,31 @@ class WorkflowPolicyTest(unittest.TestCase):
 class StagingSourceInventoryTest(unittest.TestCase):
     def setUp(self) -> None:
         _, _, self.paths, self.objects = _r2_git_head_inventory()
+        if _r2_profile_for_paths(self.paths) is _R2_RUNTIME_PROFILE:
+            _r2_validate_git_object_authority(_R2_RUNTIME_PROFILE, self.objects)
+            self.objects = {p: v for p, v in self.objects.items() if p not in _R2_RUNTIME_PATHS}
+            for p, value in {
+                "developer/tests/ci/backend_canonical_portable_result.py": _R2_STAGING_BACKEND_VERIFIER_CONTENT,
+                "developer/tests/ci/test_backend_canonical_portable_result.py": _R2_STAGING_BACKEND_FIXTURE_CONTENT,
+            }.items():
+                self.objects[p] = ("100644", "blob", value["gitBlob"])
+            self.paths = tuple(sorted(self.objects))
+
+    def test_exact_runtime_paths_control_blobs_and_rejections(self) -> None:
+        _, _, paths, objects = _r2_git_head_inventory()
+        self.assertIs(_r2_profile_for_paths(paths), _R2_RUNTIME_PROFILE)
+        _r2_validate_git_object_authority(_R2_RUNTIME_PROFILE, objects)
+        ordinary, _ = _r2_counterpart_inventories(paths)
+        self.assertEqual(set(paths) - set(ordinary), set((*_R2_STAGING_PATHS, *_R2_RUNTIME_PATHS)))
+        for p in _R2_RUNTIME_PATHS:
+            with self.subTest(path=p), self.assertRaises(AssertionError):
+                _r2_profile_for_paths(tuple(q for q in paths if q != p))
+            mode, kind, oid = objects[p]
+            for value in ((mode, kind, "f" * 40), ("100755", kind, oid)):
+                with self.subTest(path=p, value=value), self.assertRaises(AssertionError):
+                    _r2_validate_git_object_authority(_R2_RUNTIME_PROFILE, {**objects, p: value})
+        import test_backend_canonical_portable_result as backend
+        backend.assert_runtime_protocol_contract(self)
 
     def test_exact_staging_paths_and_object_authority(self) -> None:
         self.assertIs(_r2_profile_for_paths(self.paths), _R2_STAGING_PROFILE)
@@ -6599,7 +6679,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
             if source_profile is not _R2_SECURITY_PROFILE
             else _R2_A4_1_SECURITY_CONTENT_DELTA
         )
-        if source_profile is _R2_STAGING_PROFILE or all(
+        if source_profile in (_R2_STAGING_PROFILE, _R2_RUNTIME_PROFILE) or all(
             live_object_authority[relative][2] == content["gitBlob"]
             for relative, content in a4_1_live_delta.items()
         ):
@@ -6609,7 +6689,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
             security_content_authority = {
                 **security_content_authority, **_R2_A4_1_SECURITY_CONTENT_DELTA,
             }
-        if source_profile is _R2_STAGING_PROFILE:
+        if source_profile in (_R2_STAGING_PROFILE, _R2_RUNTIME_PROFILE):
             ordinary_content_authority = {
                 **ordinary_content_authority, ".gitignore": _R2_PRE_STAGING_GITIGNORE,
                 "developer/tests/ci/test_backend_canonical_portable_result.py":
@@ -7193,8 +7273,8 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
 
         if source_profile is not _R2_SECURITY_PROFILE:
             ordinary_object_authority = dict(live_object_authority)
-            if source_profile is _R2_STAGING_PROFILE:
-                for relative in _R2_STAGING_PATHS:
+            if source_profile in (_R2_STAGING_PROFILE, _R2_RUNTIME_PROFILE):
+                for relative in (*_R2_STAGING_PATHS, *(_R2_RUNTIME_PATHS if source_profile is _R2_RUNTIME_PROFILE else ())):
                     ordinary_object_authority.pop(relative)
                 ordinary_object_authority = overlay_git_blobs(
                     ordinary_object_authority, ordinary_content_authority,
@@ -7255,7 +7335,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
         def counterpart_profile_for(
             trusted_profile: _R2SourceInventoryProfile,
         ) -> _R2SourceInventoryProfile:
-            if trusted_profile in (_R2_ORDINARY_PROFILE, _R2_STAGING_PROFILE):
+            if trusted_profile in (_R2_ORDINARY_PROFILE, _R2_STAGING_PROFILE, _R2_RUNTIME_PROFILE):
                 return _R2_SECURITY_PROFILE
             if trusted_profile is _R2_SECURITY_PROFILE:
                 return _R2_ORDINARY_PROFILE
@@ -8353,7 +8433,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 counterpart_profile.name: counterpart_plan,
             }
 
-            if source_profile is _R2_STAGING_PROFILE:
+            if source_profile in (_R2_STAGING_PROFILE, _R2_RUNTIME_PROFILE):
                 # Persist the historical Ordinary fixture separately. The live
                 # staging transcript above still covers all 917 actual targets.
                 ordinary_records = [synthetic_record_from_spec(spec) for spec in ordinary_all]
@@ -26266,8 +26346,8 @@ def run_with_receipt(argv: list[str]) -> int:
 
     result = unittest.main(module=__name__, argv=[sys.argv[0]], verbosity=2,
                            testRunner=InventoryTextTestRunner, exit=False).result
-    complete = (result.wasSuccessful() and result.testsRun == 482
-                and len(result.inventory_ids) == 482
+    complete = (result.wasSuccessful() and result.testsRun == 483
+                and len(result.inventory_ids) == 483
                 and set(result.inventory_ids) == result.executed_test_ids == result.successful_test_ids)
     if before is not None and complete:
         try:

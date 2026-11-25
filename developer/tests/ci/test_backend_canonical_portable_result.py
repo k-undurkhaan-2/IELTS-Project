@@ -48,6 +48,12 @@ STAGING_ADDED_PATHS = (
     "developer/tests/ci/stage_public_listening_frontend.py",
     "developer/tests/ci/test_stage_public_listening_frontend.py",
 )
+RUNTIME_PATH_PROFILE = (920, 40823, "f821db51f0d43ca46ea4379127d80e95b8fdb2b7ce1b7c5c9d19c6edbdb50802")
+RUNTIME_ADDED_PATHS = (
+    ".github/workflows/issue79-runtime-verification.yml",
+    "developer/tests/ci/public-listening-runtime/authority.json",
+    "developer/tests/ci/public-listening-runtime/runtime.py",
+)
 V3_ADDED_PATHS = (
     "backend/src/publicListeningFrontend.js",
     "backend/test/publicListeningFrontend.test.js",
@@ -295,9 +301,14 @@ def protocol_paths(version):
         raise AssertionError(errors)
     source_profile = independent_path_profile(paths)
     if len(paths) != len(set(paths)) or source_profile not in (
-        V2_PATH_PROFILE, V3_PATH_PROFILE, STAGING_PATH_PROFILE,
+        V2_PATH_PROFILE, V3_PATH_PROFILE, STAGING_PATH_PROFILE, RUNTIME_PATH_PROFILE,
     ):
         raise AssertionError(("unexpected-live-path-profile", source_profile))
+    if source_profile == RUNTIME_PATH_PROFILE:
+        paths = [path for path in paths if path not in RUNTIME_ADDED_PATHS]
+        source_profile = independent_path_profile(paths)
+        if source_profile != STAGING_PATH_PROFILE:
+            raise AssertionError("runtime projection must retain the exact staging inventory")
     if source_profile == STAGING_PATH_PROFILE:
         # Project only the authenticated staging delta into historical fixtures.
         paths = [path for path in paths if path not in STAGING_ADDED_PATHS]
@@ -887,11 +898,11 @@ def unsafe_stream_cases():
     }
 
 
-def staging_fixture(platform="ubuntu", *, duration="1.25", total="99.5", physical="1"):
+def staging_fixture(platform="ubuntu", *, duration="1.25", total="99.5", physical="1", added_paths=STAGING_ADDED_PATHS):
     evidence = fixture(platform, stdout=npm_stdout(duration, total), physical=physical)
     spec = copy.deepcopy(evidence.expected_authority)
     targets = protocol_targets(2, complete=True, physical=physical)
-    for path in STAGING_ADDED_PATHS:
+    for path in added_paths:
         target = copy.deepcopy(targets[0])
         target.update(path=path, canonicalSourcePath=str(REAL_REPO_ROOT / path),
                       size=len(path.encode()), sha256=digest(b"issue79-staging\0" + path.encode()))
@@ -960,7 +971,62 @@ def assert_staging_protocol_contract(test):
             test.assertTrue(transcript is None or transcript.get("finalAcceptance") != "PASS")
 
 
+def assert_runtime_protocol_contract(test):
+    ordinary_targets = protocol_targets(2)
+    staging_targets = [*ordinary_targets, *({"path": path} for path in (*STAGING_ADDED_PATHS, *RUNTIME_ADDED_PATHS))]
+    expected_profile = {"trackedPaths": 920, "serializedUtf8Bytes": 40823,
+                        "sortedPathSha256": RUNTIME_PATH_PROFILE[2]}
+    binding = portable._protocol_binding(portable._select_protocol(staging_targets))
+    old_binding = portable._protocol_binding(portable._select_protocol(ordinary_targets))
+    test.assertEqual(binding["pathProfile"], expected_profile)
+    test.assertEqual({k: v for k, v in binding.items() if k != "pathProfile"},
+                     {k: v for k, v in old_binding.items() if k != "pathProfile"})
+    test.assertEqual(portable._parse_selected_stdout(npm_stdout(), json.loads(PACKAGE), binding),
+                     portable._parse_stdout(npm_stdout(), json.loads(PACKAGE)))
+    for targets in (
+        staging_targets[:-1],
+        [*staging_targets, {"path": "backend/unapproved-extension.js"}],
+        [*staging_targets[:-1], {"path": (*STAGING_ADDED_PATHS, *RUNTIME_ADDED_PATHS)[-1][:-1] + "!"}],
+        [*staging_targets, staging_targets[-1]],
+        [*staging_targets, *({"path": path} for path in V3_ADDED_PATHS)],
+    ):
+        with test.subTest(target_count=len(targets)), test.assertRaises(ValueError):
+            portable._select_protocol(targets)
+    for left, right in ((binding, old_binding), (old_binding, binding)):
+        test.assertIsNone(portable._derive_equal_result(ci, selected_bound_pair(
+            npm_stdout(), npm_stdout("90", "912"), left, right)))
+    for platform in ("ubuntu", "windows"):
+        producer = staging_fixture(platform, physical="1", added_paths=(*STAGING_ADDED_PATHS, *RUNTIME_ADDED_PATHS))
+        replay = staging_fixture(platform, duration="90", total="912", physical="9", added_paths=(*STAGING_ADDED_PATHS, *RUNTIME_ADDED_PATHS))
+        with test.subTest(platform=platform), outer_fixture(
+            producer, replay, forced_protocol=None,
+        ) as case:
+            with portable_spy("_select_protocol") as selector:
+                errors, transcript = verify(case)
+            test.assertEqual(errors, [])
+            test.assertGreaterEqual(selector.call_count, 6)
+            for call in selector.call_args_list:
+                selected = portable._protocol_binding(portable._select_protocol(call.args[0]))
+                test.assertEqual(selected["pathProfile"], expected_profile)
+            test.assertEqual(transcript["finalAcceptance"], "PASS")
+            result = transcript["backendCanonicalPortableResult"]["result"]
+            test.assertEqual(result["version"], 2)
+            test.assertNotIn("protocol", result)  # Preserve the V2 result wire schema.
+            test.assertEqual(result["portableAuthorityDigest"], ci.canonical_failure_digest(
+                ci._portable_command_plan_value(case.runner.command_plan)))
+            test.assertEqual(result["reporterCounts"]["tests"], 141)
+            record = case.documents["command-results.json"]["records"][0]
+            record["protocolVersion"] = 2
+            reseal_producer(case)
+            errors, transcript = verify(case)
+            test.assertTrue(errors)
+            test.assertTrue(transcript is None or transcript.get("finalAcceptance") != "PASS")
+
+
 class BackendCanonicalPortableResultTest(unittest.TestCase):
+    def test_issue79_runtime_exact_inventory_admission_and_rejection(self):
+        assert_runtime_protocol_contract(self)
+
     def test_issue79_staging_real_selector_and_outer_binding(self):
         assert_staging_protocol_contract(self)
 
