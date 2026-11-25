@@ -808,7 +808,7 @@ const {chromium} = require(process.argv[1]);
             "source": "Frozen BROWSER_SOURCE in runtime.py; no application module import"})
         self.run([self.node, script, config_file], timeout=240)
         result = json.loads((self.evidence / ("browser-login-report.json" if login_only else "browser-report.json")).read_bytes())
-        expected = ["ordinary_registration", "ordinary_login", "public_entry", "browse_search", "exam_wrapper", "private_marker", "question_input", "network_closure", "no_policy_violation"]
+        expected = ["ordinary_registration", "ordinary_login", "public_entry", "initial_notice_acknowledged", "browse_search", "exam_wrapper", "private_marker", "question_input", "network_closure", "no_policy_violation"]
         assert result["cases"] == (["ordinary_login"] if login_only else expected) and result["status"] == "PASS"
         cookies = json.loads((self.root / "browser-cookies.json").read_bytes())
         self.cookie = "; ".join(c["name"] + "=" + c["value"] for c in cookies
@@ -1117,8 +1117,21 @@ async function authenticate(ctx, register) {
     assert.equal(new URL(page.url()).origin, cfg.business);
     await page.locator('button[data-view="browse"]').waitFor({state: 'visible'});
     report.cases.push('public_entry');
-    const skip = page.locator('.onboarding-tooltip [data-action="skip"]');
-    if (await skip.isVisible()) await skip.click();
+    const notice = page.locator('#license-modal');
+    await notice.locator('[data-index-action="accept-license"]').click();
+    await notice.waitFor({state: 'hidden'});
+    report.cases.push('initial_notice_acknowledged');
+    const tour = page.locator('.onboarding-tooltip');
+    try {
+      await tour.waitFor({state: 'visible', timeout: 4000});
+      // Escape is the accepted UI's ordinary onboarding skip operation.
+      await page.keyboard.press('Escape');
+      await tour.waitFor({state: 'hidden'});
+      report.onboarding = 'skipped_through_supported_keyboard_action';
+    } catch (error) {
+      if (error.name !== 'TimeoutError' || await tour.isVisible()) throw error;
+      report.onboarding = 'not_displayed';
+    }
     await page.locator('button[data-view="browse"]').click();
     await page.locator('#exam-search-input').fill('Notes on A Part time Society');
     const start = page.locator('[data-exam-id="' + cfg.exam + '"][data-action="start"], [data-exam-id="' + cfg.exam + '"] [data-action="start"]').first();
