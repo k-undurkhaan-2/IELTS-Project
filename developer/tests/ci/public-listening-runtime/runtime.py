@@ -168,7 +168,7 @@ class Control:
         assert sys.version_info[:3] == (3, 12, 10)
         assert platform.system() == "Linux" and platform.machine() == "x86_64"
         assert os.environ["RUNNER_ENVIRONMENT"] == "github-hosted"
-        assert os.environ["ImageOS"] == "ubuntu24"
+        assert os.environ["ImageOS"] == "ubuntu22"
         self.node = str(Path(shutil.which("node")).resolve())
         self.git_path = str(Path(shutil.which("git")).resolve())
         self.docker_path = str(Path(shutil.which("docker")).resolve())
@@ -177,7 +177,7 @@ class Control:
         image_version = os.environ["ImageVersion"]
         assert re.fullmatch(r"\d{8}\.\d+\.\d+", image_version)
         inventory_url = "https://raw.githubusercontent.com/actions/runner-images/" + \
-            "ubuntu24/" + image_version.rsplit(".", 1)[0] + "/images/ubuntu/Ubuntu2404-Readme.md"
+            "ubuntu22/" + image_version.rsplit(".", 1)[0] + "/images/ubuntu/Ubuntu2204-Readme.md"
         inventory = get_bytes(inventory_url)
         (self.evidence / "official-runner-inventory.md").write_bytes(inventory)
         version = json.loads(self.docker("version", "--format", "{{json .}}"))
@@ -298,6 +298,20 @@ class Control:
             "system_dependency_provenance": "Official GitHub Ubuntu runner image recorded in host-admission.json",
             "executables": [{"path": str(p), "sha256": file_digest(p)} for p in executables],
             "non_applicable_optional_package": "fsevents is macOS-only; this host is Linux/amd64"})
+        sandbox_probe = """
+const {chromium} = require(process.argv[1]);
+(async () => {
+  const browser = await chromium.launch({headless: true, chromiumSandbox: true});
+  try {
+    const page = await browser.newPage();
+    await page.goto('about:blank');
+    console.log(JSON.stringify({version: browser.version(), chromium_sandbox: true, candidate_executed: false}));
+  } finally { await browser.close(); }
+})().catch(error => {console.error(error); process.exitCode = 1;});
+"""
+        probe = json.loads(self.run([self.node, "-e", sandbox_probe, self.tools / "node_modules/playwright"], timeout=60))
+        assert probe == {"version": "141.0.7390.37", "chromium_sandbox": True, "candidate_executed": False}
+        self.write("browser-sandbox-admission.json", probe)
 
     def inventory(self, root):
         result = []
@@ -1028,6 +1042,8 @@ def admission_check(evidence):
         assert file_digest(Path(executable["path"])) == executable["sha256"]
     for p, expected in browser["dynamic_dependency_closure"].items():
         assert file_digest(Path(p)) == expected["sha256"] and Path(p).stat().st_size == expected["bytes"]
+    assert json.loads((evidence / "browser-sandbox-admission.json").read_bytes()) == {
+        "version": "141.0.7390.37", "chromium_sandbox": True, "candidate_executed": False}
     builder = json.loads((evidence / "builder-admission.json").read_bytes())
     assert builder["inspect"]["Image"] == "sha256:" + AUTH["images"]["buildkit"]["config"]
     (evidence / "independent-admission-check.json").write_bytes(encode({
@@ -1231,6 +1247,11 @@ def main():
         control.failed = {"error": str(exc), "traceback": traceback.format_exc()}
         control.write("failure.json", control.failed)
         print(traceback.format_exc(), file=sys.stderr)
+        browser_report = control.evidence / "browser-report.json"
+        if browser_report.is_file():
+            browser_error = json.loads(browser_report.read_bytes()).get("error")
+            if browser_error:
+                print("Browser failure: " + browser_error[:16000], file=sys.stderr)
     finally:
         try:
             cleanup_ok = control.cleanup() if hasattr(control, "docker_path") else True

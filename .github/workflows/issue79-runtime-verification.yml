@@ -21,7 +21,7 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.head.ref == 'codex/issue-79-ci-runtime-verification-v1' &&
       github.event.pull_request.base.sha == 'd1f5bccc5acab9691e919b7a6be9201f39ccae1c'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 45
     outputs:
       evidence-id: ${{ steps.producer-artifact.outputs.artifact-id }}
@@ -39,7 +39,7 @@ jobs:
       - name: Verify frozen runtime control sources
         shell: bash
         run: |
-          printf '%s\n' '6e03c656eb75c26fa25f483b3998b71c1f91d7c1dbb41b9916ec9fb3eed5c113  developer/tests/ci/public-listening-runtime/runtime.py' '64fd0950dbaf27843031c67661a706767a5d371c16830048dbfe5e5dcdcd02a1  developer/tests/ci/public-listening-runtime/authority.json' | sha256sum --check --strict
+          printf '%s\n' '9bc9a8b87d4f6912728c1084cdb53018ad8ac3e85b59560fdcd42fce7736b1ee  developer/tests/ci/public-listening-runtime/runtime.py' '64fd0950dbaf27843031c67661a706767a5d371c16830048dbfe5e5dcdcd02a1  developer/tests/ci/public-listening-runtime/authority.json' | sha256sum --check --strict
       - name: Produce isolated runtime evidence
         env:
           GH_TOKEN: ${{ github.token }}
@@ -74,7 +74,7 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.head.ref == 'codex/issue-79-ci-runtime-verification-v1' &&
       github.event.pull_request.base.sha == 'd1f5bccc5acab9691e919b7a6be9201f39ccae1c'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -90,7 +90,7 @@ jobs:
       - name: Verify frozen runtime control sources
         shell: bash
         run: |
-          printf '%s\n' '6e03c656eb75c26fa25f483b3998b71c1f91d7c1dbb41b9916ec9fb3eed5c113  developer/tests/ci/public-listening-runtime/runtime.py' '64fd0950dbaf27843031c67661a706767a5d371c16830048dbfe5e5dcdcd02a1  developer/tests/ci/public-listening-runtime/authority.json' | sha256sum --check --strict
+          printf '%s\n' '9bc9a8b87d4f6912728c1084cdb53018ad8ac3e85b59560fdcd42fce7736b1ee  developer/tests/ci/public-listening-runtime/runtime.py' '64fd0950dbaf27843031c67661a706767a5d371c16830048dbfe5e5dcdcd02a1  developer/tests/ci/public-listening-runtime/authority.json' | sha256sum --check --strict
       - name: Acquire producer evidence by immutable artifact ID
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
