@@ -23,6 +23,7 @@
     let currentOptions = {};
     let activeHighlight = null;
     let activeLookup = null;
+    let lookupRequestId = 0;
     let outsideHandlerAttached = false;
 
     function summarizeReviewDictionaryErrorForLog(error) {
@@ -441,6 +442,13 @@
                 closeBubble();
                 return;
             }
+            const retryButton = event.target instanceof HTMLElement
+                ? event.target.closest('[data-vocab-retry]')
+                : null;
+            if (retryButton) {
+                openBubble(activeHighlight);
+                return;
+            }
             const addButton = event.target instanceof HTMLElement
                 ? event.target.closest('[data-vocab-add]')
                 : null;
@@ -522,7 +530,11 @@
         head.appendChild(closeButton);
         fragment.appendChild(head);
 
-        if (!found) {
+        if (lookup && lookup.reason === 'dictionary_loading') {
+            appendSection(fragment, '本地词典', '正在加载词典…');
+        } else if (lookup && lookup.reason === 'dictionary_load_failed') {
+            appendSection(fragment, '本地词典', '词典加载失败，请重试。题目可以继续作答。');
+        } else if (!found) {
             appendSection(fragment, '本地词典', '未收录该高亮内容。可先加入阅读高亮生词，后续手动补充释义。');
         } else if (Array.isArray(lookup.parts) && lookup.parts.length) {
             lookup.parts.forEach((part) => appendPart(fragment, part));
@@ -535,11 +547,20 @@
 
         const actions = document.createElement('div');
         actions.className = 'vocab-actions';
+        if (lookup && lookup.reason === 'dictionary_load_failed') {
+            const retryButton = document.createElement('button');
+            retryButton.type = 'button';
+            retryButton.className = 'vocab-add';
+            retryButton.dataset.vocabRetry = '';
+            retryButton.textContent = '重试';
+            actions.appendChild(retryButton);
+        }
         const addButton = document.createElement('button');
         addButton.className = 'vocab-add';
         addButton.type = 'button';
         addButton.dataset.vocabAdd = '';
         addButton.textContent = '加入生词本';
+        addButton.disabled = lookup && lookup.reason === 'dictionary_loading';
         actions.appendChild(addButton);
         fragment.appendChild(actions);
         return fragment;
@@ -563,7 +584,7 @@
         bubble.style.top = `${Math.round(top)}px`;
     }
 
-    function openBubble(highlight) {
+    async function openBubble(highlight) {
         if (!isEnabled() || !highlight) {
             return;
         }
@@ -571,8 +592,13 @@
         if (!term) {
             return;
         }
+        const requestId = ++lookupRequestId;
+        const assets = currentOptions.lookupService ? null : global.ReadingDictionaryAssets;
+        const needsLoad = assets && !assets.isReady();
         activeHighlight = highlight;
-        activeLookup = lookupTerm(term);
+        activeLookup = needsLoad
+            ? { found: false, requested: term, term, reason: 'dictionary_loading' }
+            : lookupTerm(term);
         const bubble = ensureBubble();
         bubble.replaceChildren(renderLookup(activeLookup));
         positionBubble(bubble, highlight);
@@ -583,9 +609,23 @@
             window.addEventListener('resize', closeBubble);
             window.addEventListener('scroll', handleOutsideScroll, true);
         }
+        if (needsLoad) {
+            let lookup;
+            try {
+                await assets.ensureLoaded();
+                lookup = lookupTerm(term);
+            } catch (_) {
+                lookup = { found: false, requested: term, term, reason: 'dictionary_load_failed' };
+            }
+            if (requestId !== lookupRequestId || activeHighlight !== highlight || !isEnabled()) return;
+            activeLookup = lookup;
+            bubble.replaceChildren(renderLookup(activeLookup));
+            positionBubble(bubble, highlight);
+        }
     }
 
     function closeBubble() {
+        lookupRequestId++;
         const bubble = document.getElementById(BUBBLE_ID);
         if (bubble) {
             bubble.style.display = 'none';

@@ -106,9 +106,8 @@ const inputs = Object.freeze({
         'js/utils/answerSanitizer.js',
         'js/utils/answerMatchCore.js',
         'js/utils/readingAnswerMatchCore.js',
-        'assets/wordlists/ielts_core.bundle.js',
-        'assets/wordlists/ecdict_reading.bundle.js',
         'js/core/dictionaryService.js',
+        'js/runtime/readingDictionaryAssets.js',
         'js/runtime/reviewHighlightDictionary.js',
         'js/runtime/unifiedReadingPage.js'
     ]),
@@ -161,8 +160,7 @@ const vipCoreFoundation = inputs.coreFoundation.filter((inputPath) => ![
 ].includes(inputPath));
 
 const vipReadingPage = inputs.readingPage.filter((inputPath) => ![
-    'assets/wordlists/ielts_core.bundle.js',
-    'assets/wordlists/ecdict_reading.bundle.js'
+    'js/runtime/readingDictionaryAssets.js'
 ].includes(inputPath));
 
 const defaultBundleInputs = Object.freeze({

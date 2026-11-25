@@ -15,6 +15,9 @@
     let ready = false;
     let exactIndex = new Map();
     let variantIndex = new Map();
+    const EMPTY_ENTRIES = Object.freeze([]);
+    let indexedECDICTEntries = null;
+    let indexedIeltsEntries = null;
 
     function cleanText(value) {
         return String(value || '')
@@ -200,29 +203,31 @@
     }
 
     function init() {
-        if (ready) {
+        const dictionaries = global.__LOCAL_DICTIONARIES__ || {};
+        const ecdictEntries = dictionaries.ecdict && Array.isArray(dictionaries.ecdict.entries)
+            ? dictionaries.ecdict.entries
+            : EMPTY_ENTRIES;
+        const embeddedWordlists = global.__EMBEDDED_WORDLISTS__ || {};
+        const ieltsEntries = Array.isArray(embeddedWordlists.ielts_core)
+            ? embeddedWordlists.ielts_core
+            : EMPTY_ENTRIES;
+        if (ready && indexedECDICTEntries === ecdictEntries && indexedIeltsEntries === ieltsEntries) {
             return true;
         }
         exactIndex = new Map();
         variantIndex = new Map();
-        const dictionaries = global.__LOCAL_DICTIONARIES__ || {};
-        const ecdictEntries = dictionaries.ecdict && Array.isArray(dictionaries.ecdict.entries)
-            ? dictionaries.ecdict.entries
-            : [];
         ecdictEntries
             .map(normalizeECDICTEntry)
             .filter(Boolean)
             .forEach((entry) => putEntry(entry, true));
 
-        const embeddedWordlists = global.__EMBEDDED_WORDLISTS__ || {};
-        const ieltsEntries = Array.isArray(embeddedWordlists.ielts_core)
-            ? embeddedWordlists.ielts_core
-            : [];
         ieltsEntries
             .map(normalizeIeltsEntry)
             .filter(Boolean)
             .forEach((entry) => putEntry(entry, false));
 
+        indexedECDICTEntries = ecdictEntries;
+        indexedIeltsEntries = ieltsEntries;
         ready = true;
         return true;
     }

@@ -35,9 +35,10 @@ function createContext() {
 
 function main() {
     const context = createContext();
+    loadScript('js/core/dictionaryService.js', context);
+    assert.equal(context.DictionaryService.lookup('emperor').found, false, 'lookup before lazy assets is empty');
     loadScript('assets/wordlists/ielts_core.bundle.js', context);
     loadScript('assets/wordlists/ecdict_reading.bundle.js', context);
-    loadScript('js/core/dictionaryService.js', context);
 
     const service = context.DictionaryService;
     assert(service, 'DictionaryService should be registered');
@@ -68,7 +69,7 @@ function main() {
         fs.readFileSync(path.join(repoRoot, 'scripts/build-bundles.mjs'), 'utf8'),
         fs.readFileSync(path.join(repoRoot, 'scripts/bundle-manifest.mjs'), 'utf8')
     ].join('\n');
-    assert(buildSource.includes('assets/wordlists/ecdict_reading.bundle.js'));
+    assert(buildSource.includes('js/runtime/readingDictionaryAssets.js'));
     assert(buildSource.includes('js/core/dictionaryService.js'));
     assert(buildSource.includes('js/runtime/reviewHighlightDictionary.js'));
 
