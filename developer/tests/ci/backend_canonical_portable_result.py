@@ -88,6 +88,13 @@ _V2_STAGING_PROTOCOL = replace(
     path_bytes=40658,
     path_sha256="098c1776cc517b3793e5848c2b30e90f30d4c56eefa18cf6592a34d92b1fda14",
 )
+# Exact Issue 79 runtime inventory; all existing V2 and V3 contracts remain.
+_V2_RUNTIME_PROTOCOL = replace(
+    _V2_PROTOCOL,
+    path_count=920,
+    path_bytes=40823,
+    path_sha256="f821db51f0d43ca46ea4379127d80e95b8fdb2b7ce1b7c5c9d19c6edbdb50802",
+)
 _V3_PROTOCOL = _ProtocolDescriptor(
     version=3,
     digest_domain="ieltmps-backend-canonical-portable-result-v3",
@@ -382,7 +389,7 @@ def _select_protocol(targets):
     """Select solely from protected paths and source identities, never stdout."""
     profile = _trusted_path_profile(targets)
     descriptors = [
-        descriptor for descriptor in (_V2_PROTOCOL, _V2_STAGING_PROTOCOL, _V3_PROTOCOL)
+        descriptor for descriptor in (_V2_PROTOCOL, _V2_STAGING_PROTOCOL, _V2_RUNTIME_PROTOCOL, _V3_PROTOCOL)
         if profile == {
             "trackedPaths": descriptor.path_count,
             "serializedUtf8Bytes": descriptor.path_bytes,
@@ -392,7 +399,7 @@ def _select_protocol(targets):
     if len(descriptors) != 1:
         _reject("unknown-path-profile")
     descriptor = descriptors[0]
-    if descriptor in (_V2_PROTOCOL, _V2_STAGING_PROTOCOL):
+    if descriptor in (_V2_PROTOCOL, _V2_STAGING_PROTOCOL, _V2_RUNTIME_PROTOCOL):
         return _ProtocolSelection(descriptor, None, ())
 
     by_path = {target["path"]: target for target in targets}
@@ -431,6 +438,7 @@ def _select_protocol(targets):
 _KNOWN_PROTOCOL_SELECTIONS = (
     _ProtocolSelection(_V2_PROTOCOL, None, ()),
     _ProtocolSelection(_V2_STAGING_PROTOCOL, None, ()),
+    _ProtocolSelection(_V2_RUNTIME_PROTOCOL, None, ()),
     *(
         _ProtocolSelection(_V3_PROTOCOL, variant, source_tuple)
         for variant, _total_bytes, source_tuple in _V3_SOURCE_PROFILES
@@ -500,7 +508,7 @@ def _identity_v3(ci, value):
 
 def _identity_for_protocol(ci, value, protocol_binding):
     selection = _selection_from_protocol_binding(protocol_binding)
-    if selection.descriptor in (_V2_PROTOCOL, _V2_STAGING_PROTOCOL):
+    if selection.descriptor in (_V2_PROTOCOL, _V2_STAGING_PROTOCOL, _V2_RUNTIME_PROTOCOL):
         return _identity(ci, value)
     if selection.descriptor is _V3_PROTOCOL:
         return _identity_v3(ci, value)
@@ -673,7 +681,7 @@ def _parse_stdout_v3(stdout, package):
 
 def _parse_selected_stdout(stdout, package, protocol_binding):
     selection = _selection_from_protocol_binding(protocol_binding)
-    if selection.descriptor in (_V2_PROTOCOL, _V2_STAGING_PROTOCOL):
+    if selection.descriptor in (_V2_PROTOCOL, _V2_STAGING_PROTOCOL, _V2_RUNTIME_PROTOCOL):
         return _parse_stdout(stdout, package)
     if selection.descriptor is _V3_PROTOCOL:
         return _parse_stdout_v3(stdout, package)

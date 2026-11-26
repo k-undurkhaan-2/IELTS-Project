@@ -446,9 +446,64 @@ _R2_STAGING_BACKEND_VERIFIER_CONTENT = {
     "size": 53907,
     "sha256": "e06077c2cfc2ec1947a5cb0e06c369ad553524dbd872ae92c53d0803e6871569"
 }
+
+# Individually enumerated Issue 79 runtime additions. No historical target is removed.
+_R2_RUNTIME_PATHS = (
+    ".github/workflows/issue79-runtime-verification.yml",
+    "developer/tests/ci/public-listening-runtime/authority.json",
+    "developer/tests/ci/public-listening-runtime/runtime.py",
+)
+_R2_RUNTIME_MANIFEST = "dc043f61067b271957da1ba786d23409badef0757cd71bc3a239855a684da9f7"
+_R2_RUNTIME_PROFILE = replace(
+    _R2_STAGING_PROFILE,
+    name="ci-listening-runtime",
+    authority_commit="d1f5bccc5acab9691e919b7a6be9201f39ccae1c",
+    authority_tree="e52cd8a614546cd87b147fe4ba8568d4957e0791",
+    tree_manifest_sha256=_R2_RUNTIME_MANIFEST,
+    a1_integrated_tree_manifest_sha256=_R2_RUNTIME_MANIFEST,
+    a3_integrated_tree_manifest_sha256=_R2_RUNTIME_MANIFEST,
+    a4_1_integrated_tree_manifest_sha256=_R2_RUNTIME_MANIFEST,
+    path_count=920,
+    serialized_bytes=40823,
+    sorted_path_sha256="f821db51f0d43ca46ea4379127d80e95b8fdb2b7ce1b7c5c9d19c6edbdb50802",
+    target_reference_count=20_069,
+)
+_R2_RUNTIME_CONTENT = {
+    ".github/workflows/issue79-runtime-verification.yml": {
+        "gitBlob": "d881c51b41c7707541958863c1f77d99aaefb48a",
+        "size": 6195,
+        "sha256": "05b4dfc5a105d2a3b8772c0eb4e118795cdf97fd05394221c3004046e404f3be"
+    },
+    "developer/tests/ci/public-listening-runtime/authority.json": {
+        "gitBlob": "b975474f194a59acdd75cbdf797b33a0aff860b5",
+        "size": 8654,
+        "sha256": "64fd0950dbaf27843031c67661a706767a5d371c16830048dbfe5e5dcdcd02a1"
+    },
+    "developer/tests/ci/public-listening-runtime/runtime.py": {
+        "gitBlob": "b18676c9ba2d3e8e9f78592679c8bf0cc489601c",
+        "size": 92212,
+        "sha256": "7c5ca048556dfd963341db7d45649557ecf58b74a449df475aa0b4acb9d1a47e"
+    },
+    "developer/tests/ci/backend_canonical_portable_result.py": {
+        "gitBlob": "d26c74af6b6fbcbee37143e9b396db0dca356e50",
+        "size": 54306,
+        "sha256": "8942977160bf96f88be4695d7f303fd3396558d9b1dece06f9885f01755e3ef7"
+    },
+    "developer/tests/ci/test_backend_canonical_portable_result.py": {
+        "gitBlob": "6619cbbca4a0a872f395e69424a4369023b2345a",
+        "size": 171889,
+        "sha256": "5e0805b025115af32b36c8b730eb664d219fd24eb002f2fa1282ccaa941c2176"
+    },
+    "developer/tests/ci/run_ci_foundation.py": {
+        "gitBlob": "77a61ac763d3750f41cc4bb0d7b8d91e3362acf8",
+        "size": 1133644,
+        "sha256": "b2bcf6fafe57c02042206e029d1cd0cfa7b7b5490c3142d06083708fbeca6cd3"
+    }
+}
+
 _R2_PROFILES_BY_IDENTITY = {
     (profile.path_count, profile.sorted_path_sha256): profile
-    for profile in (_R2_ORDINARY_PROFILE, _R2_SECURITY_PROFILE, _R2_STAGING_PROFILE)
+    for profile in (_R2_ORDINARY_PROFILE, _R2_SECURITY_PROFILE, _R2_STAGING_PROFILE, _R2_RUNTIME_PROFILE)
 }
 _R2_ORDINARY_CONTENT_AUTHORITY = {
     ".github/workflows/ci.yml": {
@@ -882,6 +937,8 @@ def _r2_validate_git_object_authority(
             "developer/tests/ci/backend_canonical_portable_result.py":
                 _R2_STAGING_BACKEND_VERIFIER_CONTENT,
         }
+    if profile is _R2_RUNTIME_PROFILE:
+        content_authority = {**content_authority, **_R2_STAGING_LINUX24_CONTENT_DELTA, **_R2_RUNTIME_CONTENT}
     for relative, expected in content_authority.items():
         entry = object_entries.get(relative)
         if entry is None or entry[2] != expected["gitBlob"]:
@@ -926,6 +983,9 @@ def _r2_counterpart_inventories(
     live_paths: tuple[str, ...],
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     live_profile = _r2_profile_for_paths(live_paths)
+    if live_profile is _R2_RUNTIME_PROFILE:
+        live_paths = tuple(path for path in live_paths if path not in _R2_RUNTIME_PATHS)
+        live_profile = _r2_profile_for_paths(live_paths)
     if live_profile is _R2_STAGING_PROFILE:
         # Historical comparison fixtures retain their exact pre-staging paths.
         live_paths = tuple(path for path in live_paths if path not in _R2_STAGING_PATHS)
@@ -5556,6 +5616,33 @@ class WorkflowPolicyTest(unittest.TestCase):
 class StagingSourceInventoryTest(unittest.TestCase):
     def setUp(self) -> None:
         _, _, self.paths, self.objects = _r2_git_head_inventory()
+        if _r2_profile_for_paths(self.paths) is _R2_RUNTIME_PROFILE:
+            _r2_validate_git_object_authority(_R2_RUNTIME_PROFILE, self.objects)
+            self.objects = {p: v for p, v in self.objects.items() if p not in _R2_RUNTIME_PATHS}
+            for p, value in {
+                "developer/tests/ci/backend_canonical_portable_result.py": _R2_STAGING_BACKEND_VERIFIER_CONTENT,
+                "developer/tests/ci/test_backend_canonical_portable_result.py": _R2_STAGING_BACKEND_FIXTURE_CONTENT,
+                "developer/tests/ci/run_ci_foundation.py": _R2_STAGING_LINUX24_CONTENT_DELTA[
+                    "developer/tests/ci/run_ci_foundation.py"],
+            }.items():
+                self.objects[p] = ("100644", "blob", value["gitBlob"])
+            self.paths = tuple(sorted(self.objects))
+
+    def test_exact_runtime_paths_control_blobs_and_rejections(self) -> None:
+        _, _, paths, objects = _r2_git_head_inventory()
+        self.assertIs(_r2_profile_for_paths(paths), _R2_RUNTIME_PROFILE)
+        _r2_validate_git_object_authority(_R2_RUNTIME_PROFILE, objects)
+        ordinary, _ = _r2_counterpart_inventories(paths)
+        self.assertEqual(set(paths) - set(ordinary), set((*_R2_STAGING_PATHS, *_R2_RUNTIME_PATHS)))
+        for p in _R2_RUNTIME_CONTENT:
+            with self.subTest(path=p), self.assertRaises(AssertionError):
+                _r2_profile_for_paths(tuple(q for q in paths if q != p))
+            mode, kind, oid = objects[p]
+            for value in ((mode, kind, "f" * 40), ("100755", kind, oid)):
+                with self.subTest(path=p, value=value), self.assertRaises(AssertionError):
+                    _r2_validate_git_object_authority(_R2_RUNTIME_PROFILE, {**objects, p: value})
+        import test_backend_canonical_portable_result as backend
+        backend.assert_runtime_protocol_contract(self)
 
     def test_exact_staging_paths_and_object_authority(self) -> None:
         self.assertIs(_r2_profile_for_paths(self.paths), _R2_STAGING_PROFILE)
@@ -6599,7 +6686,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
             if source_profile is not _R2_SECURITY_PROFILE
             else _R2_A4_1_SECURITY_CONTENT_DELTA
         )
-        if source_profile is _R2_STAGING_PROFILE or all(
+        if source_profile in (_R2_STAGING_PROFILE, _R2_RUNTIME_PROFILE) or all(
             live_object_authority[relative][2] == content["gitBlob"]
             for relative, content in a4_1_live_delta.items()
         ):
@@ -6609,7 +6696,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
             security_content_authority = {
                 **security_content_authority, **_R2_A4_1_SECURITY_CONTENT_DELTA,
             }
-        if source_profile is _R2_STAGING_PROFILE:
+        if source_profile in (_R2_STAGING_PROFILE, _R2_RUNTIME_PROFILE):
             ordinary_content_authority = {
                 **ordinary_content_authority, ".gitignore": _R2_PRE_STAGING_GITIGNORE,
                 "developer/tests/ci/test_backend_canonical_portable_result.py":
@@ -7193,8 +7280,8 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
 
         if source_profile is not _R2_SECURITY_PROFILE:
             ordinary_object_authority = dict(live_object_authority)
-            if source_profile is _R2_STAGING_PROFILE:
-                for relative in _R2_STAGING_PATHS:
+            if source_profile in (_R2_STAGING_PROFILE, _R2_RUNTIME_PROFILE):
+                for relative in (*_R2_STAGING_PATHS, *(_R2_RUNTIME_PATHS if source_profile is _R2_RUNTIME_PROFILE else ())):
                     ordinary_object_authority.pop(relative)
                 ordinary_object_authority = overlay_git_blobs(
                     ordinary_object_authority, ordinary_content_authority,
@@ -7255,7 +7342,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
         def counterpart_profile_for(
             trusted_profile: _R2SourceInventoryProfile,
         ) -> _R2SourceInventoryProfile:
-            if trusted_profile in (_R2_ORDINARY_PROFILE, _R2_STAGING_PROFILE):
+            if trusted_profile in (_R2_ORDINARY_PROFILE, _R2_STAGING_PROFILE, _R2_RUNTIME_PROFILE):
                 return _R2_SECURITY_PROFILE
             if trusted_profile is _R2_SECURITY_PROFILE:
                 return _R2_ORDINARY_PROFILE
@@ -8353,7 +8440,7 @@ class SanitizationAndEvidenceTest(unittest.TestCase):
                 counterpart_profile.name: counterpart_plan,
             }
 
-            if source_profile is _R2_STAGING_PROFILE:
+            if source_profile in (_R2_STAGING_PROFILE, _R2_RUNTIME_PROFILE):
                 # Persist the historical Ordinary fixture separately. The live
                 # staging transcript above still covers all 917 actual targets.
                 ordinary_records = [synthetic_record_from_spec(spec) for spec in ordinary_all]
@@ -22565,6 +22652,210 @@ class _CI8FixtureLease:
         self.closed = True
 
 
+class StandaloneReplayDiagnosticTest(unittest.TestCase):
+    @staticmethod
+    def binding():
+        return {
+            "runtime": dict.fromkeys(("platform", "os", "python", "pythonImplementation",
+                                     "node", "npm", "dependencyClosureDigest",
+                                     "dependencyMemberCount"), "same"),
+            "tools": dict.fromkeys(("pythonExecutable", "nodeExecutable",
+                                   "npmEntrypoint", "gitExecutable"), {"sha256": "same"}),
+            "dependencyClosureDigest": "same",
+            "guard": {"active": False, "mutationState": "clean"},
+        }
+
+    def test_runtime_difference_names_never_expose_values(self):
+        original = self.binding()
+        replay = copy.deepcopy(original)
+        replay["runtime"]["os"] = "sensitive-value-must-not-be-rendered"
+        before = copy.deepcopy((original, replay))
+        actual = ci._standalone_packaging_runtime_difference(
+            json.dumps(original).encode(), json.dumps(replay).encode())
+        self.assertEqual(actual, ["runtime.os"])
+        self.assertNotIn(replay["runtime"]["os"], json.dumps(actual))
+        self.assertEqual((original, replay), before)
+        self.assertEqual(ci._standalone_packaging_runtime_difference(
+            json.dumps(original).encode(), json.dumps(original).encode()), [])
+
+    def test_runtime_difference_covers_each_bound_component(self):
+        original = self.binding()
+        paths = [(group, key) for group in ("runtime", "tools") for key in original[group]]
+        paths += [("dependencyClosureDigest",), ("guard",)]
+        for path in paths:
+            replay = copy.deepcopy(original)
+            target = replay
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = "changed"
+            with self.subTest(path=path):
+                self.assertEqual(ci._standalone_packaging_runtime_difference(
+                    json.dumps(original).encode(), json.dumps(replay).encode()), [".".join(path)])
+        duplicate = json.dumps(original)[:-1] + ', "runtime": {}}'
+        nonfinite = json.dumps(original).replace('"os": "same"', '"os": NaN')
+        for invalid in (b"not-json", b"[]", b"{}", b'{"runtime":null}',
+                        duplicate.encode(), nonfinite.encode()):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(ci._standalone_packaging_runtime_difference(
+                    invalid, json.dumps(original).encode()), ["diagnostic-unavailable"])
+
+    def test_diagnostics_cannot_admit_missing_or_invalid_replay_authority(self):
+        for producer in (None, False, object(), SimpleNamespace(),
+                         ci._StandalonePortableProducer(SimpleNamespace(), (), 0)):
+            messages = []
+            with self.subTest(producer=type(producer).__name__), mock.patch.object(
+                ci, "_derive_standalone_packaging_equal_result",
+                side_effect=AssertionError("diagnostics reached the acceptance parser"),
+            ):
+                self.assertIsNone(ci._bind_standalone_portable_replay(producer))
+                self.assertIsNone(ci._bind_standalone_portable_replay(producer, diagnostics=messages))
+                self.assertEqual(len(messages), 1)
+                self.assertIn(messages[0], {"producer-unavailable", "binding-exception:AttributeError"})
+
+
+class StandaloneReplayRuntimeIdentityTest(unittest.TestCase):
+    AZURE = "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
+    AWS = "Linux-7.0.0-1014-aws-x86_64-with-glibc2.39"
+
+    @staticmethod
+    def seal(closure, guard, runtime, record):
+        for root in closure["dependencyRoots"]:
+            root["memberCount"] = len(root["members"])
+            root["memberManifestDigest"] = hashlib.sha256(
+                ci._canonical_frame(root["members"])).hexdigest()
+        closure["dependencyMemberCount"] = sum(
+            root["memberCount"] for root in closure["dependencyRoots"])
+        semantic = {key: closure[key] for key in
+                    ("lockfiles", "dependencyRoots", "vitest", "nodePath")}
+        closure["dependencyClosureDigest"] = hashlib.sha256(
+            ci._canonical_frame(semantic)).hexdigest()
+        closure["closureDigest"] = hashlib.sha256(ci._canonical_frame({
+            key: value for key, value in closure.items() if key != "closureDigest"
+        })).hexdigest()
+        runtime.update(runtimeClosureDigest=closure["closureDigest"],
+                       dependencyClosureDigest=closure["dependencyClosureDigest"],
+                       dependencyMemberCount=str(closure["dependencyMemberCount"]))
+
+    @classmethod
+    def fixture(cls, os_identity, platform="ubuntu"):
+        import test_backend_canonical_portable_result as backend
+        source = backend.fixture(platform)
+        closure, guard, runtime = copy.deepcopy(
+            (source.runtime_closure, source.runtime_guard, source.runtime))
+        closure["gitExecutable"] = {
+            **copy.deepcopy(closure["pythonExecutable"]),
+            "role": "git-runtime",
+            "canonicalPath": str(Path(sys.executable).parent / "fixture-git"),
+            "sha256": hashlib.sha256(b"fixture-git").hexdigest(),
+        }
+        runtime["os"] = os_identity
+        python = closure["pythonExecutable"]
+        record = {
+            "platform": platform,
+            "resolvedExecutablePath": python["canonicalPath"],
+            "resolvedExecutableSize": python["size"],
+            "resolvedExecutableSha256": python["sha256"],
+            "executionArgv": [python["canonicalPath"], "-B",
+                              "developer/tests/ci/test_standalone_packaging.py"],
+        }
+        cls.seal(closure, guard, runtime, record)
+        return closure, guard, runtime, record
+
+    def test_cloud_kernel_build_is_portable_without_changing_raw_evidence(self):
+        producer, replay = self.fixture(self.AZURE), self.fixture(self.AWS)
+        before = copy.deepcopy((producer, replay))
+        left = ci._standalone_packaging_runtime_binding(*producer)
+        right = ci._standalone_packaging_runtime_binding(*replay)
+        self.assertEqual(left, right)
+        self.assertEqual((producer, replay), before)
+        self.assertEqual(producer[2]["os"], self.AZURE)
+        self.assertEqual(replay[2]["os"], self.AWS)
+        self.assertEqual(ci._standalone_packaging_runtime_difference(left, right), [])
+
+    def test_kernel_release_architecture_and_libc_remain_exact(self):
+        baseline = ci._standalone_packaging_runtime_binding(*self.fixture(self.AZURE))
+        for identity in (
+            self.AWS.replace("7.0.0", "7.0.1"),
+            self.AWS.replace("7.0.0", "6.17.0"),
+            self.AWS.replace("x86_64", "aarch64"),
+            self.AWS.replace("glibc2.39", "glibc2.40"),
+            self.AWS.replace("glibc2.39", "musl1.2.5"),
+        ):
+            with self.subTest(identity=identity):
+                replay = ci._standalone_packaging_runtime_binding(*self.fixture(identity))
+                self.assertNotEqual(baseline, replay)
+                self.assertEqual(ci._standalone_packaging_runtime_difference(
+                    baseline, replay), ["runtime.os"])
+
+    def test_unrecognized_and_non_ubuntu_os_claims_are_not_normalized(self):
+        for first, second in (
+            (self.AZURE.replace("azure", "generic"), self.AWS.replace("aws", "generic")),
+            (self.AZURE + "-extra", self.AWS + "-extra"),
+            ("Linux-test-one", "Linux-test-two"),
+            ("", self.AZURE),
+        ):
+            with self.subTest(first=first, second=second):
+                left = ci._standalone_packaging_runtime_binding(*self.fixture(first))
+                right = ci._standalone_packaging_runtime_binding(*self.fixture(second))
+                self.assertNotEqual(left, right)
+        for platform in ("ubuntu", "windows"):
+            first = "Windows-10.0.26100"
+            second = "Windows-10.0.26101"
+            with self.subTest(platform=platform):
+                self.assertNotEqual(
+                    ci._standalone_packaging_runtime_binding(*self.fixture(first, platform)),
+                    ci._standalone_packaging_runtime_binding(*self.fixture(second, platform)))
+        self.assertNotEqual(
+            ci._standalone_packaging_runtime_binding(*self.fixture(self.AZURE, "windows")),
+            ci._standalone_packaging_runtime_binding(*self.fixture(self.AWS, "windows")))
+
+    def test_runtime_versions_tool_bytes_and_dependency_closure_remain_exact(self):
+        baseline = ci._standalone_packaging_runtime_binding(*self.fixture(self.AZURE))
+        for field in ("python", "pythonImplementation", "node", "npm"):
+            changed = self.fixture(self.AWS)
+            changed[2][field] += "-changed"
+            with self.subTest(runtime_field=field):
+                self.assertNotEqual(baseline, ci._standalone_packaging_runtime_binding(*changed))
+        for field in ("pythonExecutable", "nodeExecutable", "npmEntrypoint", "gitExecutable"):
+            changed = self.fixture(self.AWS)
+            changed[0][field]["sha256"] = "a" * 64
+            if field == "pythonExecutable":
+                changed[3]["resolvedExecutableSha256"] = "a" * 64
+            self.seal(*changed)
+            with self.subTest(tool=field):
+                self.assertNotEqual(baseline, ci._standalone_packaging_runtime_binding(*changed))
+        changed = self.fixture(self.AWS)
+        changed[0]["dependencyRoots"][0]["members"][0]["sha256"] = "b" * 64
+        self.seal(*changed)
+        self.assertNotEqual(baseline, ci._standalone_packaging_runtime_binding(*changed))
+
+    def test_local_runtime_authority_and_guard_fail_closed(self):
+        mutations = [
+            (0, ("pythonExecutable", "leaseHeld"), False),
+            (0, ("nodeExecutable", "leaseHeld"), False),
+            (0, ("npmEntrypoint", "stableIdentity", "reparsePoint"), True),
+            (0, ("gitExecutable", "size"), 0),
+            (0, ("measurementStatus",), "local-nondependency-npm-unavailable"),
+            (1, ("active",), True),
+            (1, ("activeDuringReplay",), False),
+            (1, ("mutationState",), "changed"),
+            (1, ("queueOverflow",), True),
+            (1, ("mutationEventCount",), 1),
+            (1, ("watcherBackend",), "_ModelMutationWatcher"),
+            (3, ("resolvedExecutableSha256",), "a" * 64),
+            (3, ("executionArgv",), [sys.executable, "-c", "pass"]),
+        ]
+        for part, path, value in mutations:
+            changed = self.fixture(self.AWS)
+            target = changed[part]
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            self.seal(*changed)
+            with self.subTest(part=part, path=path), self.assertRaises(ValueError):
+                ci._standalone_packaging_runtime_binding(*changed)
+
+
 class CI8RuntimeDependencyClosureTest(unittest.TestCase):
     def local_tool_authority(self) -> tuple[ci.ToolAuthorityPolicy, dict[str, str]]:
         return _resolved_local_test_authority("python", "node", "git")
@@ -26266,8 +26557,8 @@ def run_with_receipt(argv: list[str]) -> int:
 
     result = unittest.main(module=__name__, argv=[sys.argv[0]], verbosity=2,
                            testRunner=InventoryTextTestRunner, exit=False).result
-    complete = (result.wasSuccessful() and result.testsRun == 482
-                and len(result.inventory_ids) == 482
+    complete = (result.wasSuccessful() and result.testsRun == 491
+                and len(result.inventory_ids) == 491
                 and set(result.inventory_ids) == result.executed_test_ids == result.successful_test_ids)
     if before is not None and complete:
         try:
