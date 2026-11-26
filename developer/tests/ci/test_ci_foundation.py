@@ -453,7 +453,7 @@ _R2_RUNTIME_PATHS = (
     "developer/tests/ci/public-listening-runtime/authority.json",
     "developer/tests/ci/public-listening-runtime/runtime.py",
 )
-_R2_RUNTIME_MANIFEST = "99642cbf2c0d8d558365c96b0fd19ad9f18188d7f564ab3e0819250cbeb529a4"
+_R2_RUNTIME_MANIFEST = "41acbbd1fc28be847a869b52706578edece2679c92a1e83ec86aecbc656e9014"
 _R2_RUNTIME_PROFILE = replace(
     _R2_STAGING_PROFILE,
     name="ci-listening-runtime",
@@ -493,6 +493,11 @@ _R2_RUNTIME_CONTENT = {
         "gitBlob": "6619cbbca4a0a872f395e69424a4369023b2345a",
         "size": 171889,
         "sha256": "5e0805b025115af32b36c8b730eb664d219fd24eb002f2fa1282ccaa941c2176"
+    },
+    "developer/tests/ci/run_ci_foundation.py": {
+        "gitBlob": "950313d3d934244ad604b5f79f3a8517c5aea0d3",
+        "size": 1132735,
+        "sha256": "fc86894064edba18d67854b3178e6a881eb8d23a60620e46bd431f133f76211b"
     }
 }
 
@@ -5617,6 +5622,8 @@ class StagingSourceInventoryTest(unittest.TestCase):
             for p, value in {
                 "developer/tests/ci/backend_canonical_portable_result.py": _R2_STAGING_BACKEND_VERIFIER_CONTENT,
                 "developer/tests/ci/test_backend_canonical_portable_result.py": _R2_STAGING_BACKEND_FIXTURE_CONTENT,
+                "developer/tests/ci/run_ci_foundation.py": _R2_STAGING_LINUX24_CONTENT_DELTA[
+                    "developer/tests/ci/run_ci_foundation.py"],
             }.items():
                 self.objects[p] = ("100644", "blob", value["gitBlob"])
             self.paths = tuple(sorted(self.objects))
@@ -22645,6 +22652,64 @@ class _CI8FixtureLease:
         self.closed = True
 
 
+class StandaloneReplayDiagnosticTest(unittest.TestCase):
+    @staticmethod
+    def binding():
+        return {
+            "runtime": dict.fromkeys(("platform", "os", "python", "pythonImplementation",
+                                     "node", "npm", "dependencyClosureDigest",
+                                     "dependencyMemberCount"), "same"),
+            "tools": dict.fromkeys(("pythonExecutable", "nodeExecutable",
+                                   "npmEntrypoint", "gitExecutable"), {"sha256": "same"}),
+            "dependencyClosureDigest": "same",
+            "guard": {"active": False, "mutationState": "clean"},
+        }
+
+    def test_runtime_difference_names_never_expose_values(self):
+        original = self.binding()
+        replay = copy.deepcopy(original)
+        replay["runtime"]["os"] = "sensitive-value-must-not-be-rendered"
+        before = copy.deepcopy((original, replay))
+        actual = ci._standalone_packaging_runtime_difference(
+            json.dumps(original).encode(), json.dumps(replay).encode())
+        self.assertEqual(actual, ["runtime.os"])
+        self.assertNotIn(replay["runtime"]["os"], json.dumps(actual))
+        self.assertEqual((original, replay), before)
+        self.assertEqual(ci._standalone_packaging_runtime_difference(
+            json.dumps(original).encode(), json.dumps(original).encode()), [])
+
+    def test_runtime_difference_covers_each_bound_component(self):
+        original = self.binding()
+        paths = [(group, key) for group in ("runtime", "tools") for key in original[group]]
+        paths += [("dependencyClosureDigest",), ("guard",)]
+        for path in paths:
+            replay = copy.deepcopy(original)
+            target = replay
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = "changed"
+            with self.subTest(path=path):
+                self.assertEqual(ci._standalone_packaging_runtime_difference(
+                    json.dumps(original).encode(), json.dumps(replay).encode()), [".".join(path)])
+        for invalid in (b"not-json", b"[]", b"{}", b'{"runtime":null}'):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(ci._standalone_packaging_runtime_difference(
+                    invalid, json.dumps(original).encode()), ["diagnostic-unavailable"])
+
+    def test_diagnostics_cannot_admit_missing_or_invalid_replay_authority(self):
+        for producer in (None, False, object(), SimpleNamespace(),
+                         ci._StandalonePortableProducer(SimpleNamespace(), (), 0)):
+            messages = []
+            with self.subTest(producer=type(producer).__name__), mock.patch.object(
+                ci, "_derive_standalone_packaging_equal_result",
+                side_effect=AssertionError("diagnostics reached the acceptance parser"),
+            ):
+                self.assertIsNone(ci._bind_standalone_portable_replay(producer))
+                self.assertIsNone(ci._bind_standalone_portable_replay(producer, diagnostics=messages))
+                self.assertEqual(len(messages), 1)
+                self.assertIn(messages[0], {"producer-unavailable", "binding-exception:AttributeError"})
+
+
 class CI8RuntimeDependencyClosureTest(unittest.TestCase):
     def local_tool_authority(self) -> tuple[ci.ToolAuthorityPolicy, dict[str, str]]:
         return _resolved_local_test_authority("python", "node", "git")
@@ -26346,8 +26411,8 @@ def run_with_receipt(argv: list[str]) -> int:
 
     result = unittest.main(module=__name__, argv=[sys.argv[0]], verbosity=2,
                            testRunner=InventoryTextTestRunner, exit=False).result
-    complete = (result.wasSuccessful() and result.testsRun == 483
-                and len(result.inventory_ids) == 483
+    complete = (result.wasSuccessful() and result.testsRun == 486
+                and len(result.inventory_ids) == 486
                 and set(result.inventory_ids) == result.executed_test_ids == result.successful_test_ids)
     if before is not None and complete:
         try:

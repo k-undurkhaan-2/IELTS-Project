@@ -24160,40 +24160,68 @@ def _standalone_packaging_runtime_binding(closure, guard, runtime, record):
     })
 
 
-def _bind_standalone_portable_replay(producer):
+def _standalone_packaging_runtime_difference(producer, replay):
+    """Bounded diagnostic field names only; never an acceptance projection."""
+    try:
+        left, right = json.loads(producer), json.loads(replay)
+        fields = []
+        groups = {
+            "runtime": ("platform", "os", "python", "pythonImplementation", "node", "npm",
+                        "dependencyClosureDigest", "dependencyMemberCount"),
+            "tools": ("pythonExecutable", "nodeExecutable", "npmEntrypoint", "gitExecutable"),
+        }
+        for group, names in groups.items():
+            if left[group] != right[group]:
+                changed = [group + "." + name for name in names
+                           if left[group].get(name) != right[group].get(name)]
+                fields.extend(changed or [group + ".schema"])
+        for name in ("dependencyClosureDigest", "guard"):
+            if left[name] != right[name]:
+                fields.append(name)
+        return fields
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
+        return ["diagnostic-unavailable"]
+
+
+def _bind_standalone_portable_replay(producer, *, diagnostics=None):
     """Recheck held admission, complete fresh authority and exact raw capture."""
+    def reject(reason):
+        if diagnostics is not None:
+            diagnostics.append(reason)
+        return None
+
     try:
         if type(producer) is not _StandalonePortableProducer:
-            return None
+            return reject("producer-unavailable")
         validation, ordinal = producer.validation, producer.ordinal
         runner, context = validation.runner, validation.context
         if (_observation_authority_for_runner(runner, context) is None
                 or runner.platform not in _STANDALONE_EXECUTION_PLATFORMS
                 or context.runner_os != _STANDALONE_EXECUTION_PLATFORMS[runner.platform][0]
                 or runner.runtime_closure_digest != context.fresh_runtime_closure_digest):
-            return None
+            return reject("external-authority")
         source = validation.records[ordinal]
         raw, = source["producerObservations"]
         if not _matching_observation_admission(producer.admissions, raw, source,
                 records=validation.records, plan=runner.command_plan):
-            return None
+            return reject("producer-admission")
         records, errors = _preflight_command_record_positions(runner.command_results, runner.command_plan)
         if errors or _command_authority_violations(runner.profile, records, runner.observations,
                                                    expected_plan=runner.command_plan):
-            return None
+            return reject("command-authority")
         for index, record in enumerate(records):
             _validate_command_record(record, index, errors, expected_record=runner.command_plan[index])
         if errors or runner.violations or any(r.get("status") != "pass" for r in runner.hard_gate_results):
-            return None
+            return reject("record-validation-or-hard-gate")
         replay = records[ordinal]
         captures = [capture for capture in runner.captures if capture.command_id == "standalone-packaging"]
         if len(captures) != 1 or type(captures[0]) is not CommandCapture:
-            return None
+            return reject("capture-membership")
         capture = captures[0]
         if (capture.target_execution_lease is not None or not capture.execution_passed()
                 or capture.error is not None or capture.process_tree_error is not None
                 or capture.limit_reason is not None):
-            return None
+            return reject("capture-execution")
         # Both records are still local authority, not reporter projections.
         for record in (source, replay):
             if (record["commandId"] != "standalone-packaging"
@@ -24211,11 +24239,11 @@ def _bind_standalone_portable_replay(producer):
                                        "descendantsTerminated", "descendantsSurviving"))
                     or record["descendantsTerminated"] != 0 or record["descendantsSurviving"] != 0
                     or any(record.get(key) is not None for key in ("error", "processTreeError", "limitReason"))):
-                return None
+                return reject("execution-or-containment")
             if runner.platform == "windows":
                 if (record["containmentDisposition"] != "no-descendants"
                         or record["descendantsObserved"] != 0 or record["descendantsReaped"] != 0):
-                    return None
+                    return reject("windows-containment")
             # The trusted Linux supervisor emits natural-exit-reaped only when
             # neither TERM nor KILL was sent. contained-clean additionally binds
             # cleanupOk/cleanupComplete; exitCode is its unforced rootExitCode.
@@ -24223,14 +24251,14 @@ def _bind_standalone_portable_replay(producer):
             elif (record["containmentDisposition"] != "natural-exit-reaped"
                     or record["descendantsObserved"] <= 0
                     or record["descendantsObserved"] != record["descendantsReaped"]):
-                return None
+                return reject("linux-containment")
         expected = runner.command_plan[ordinal]
         if (_portable_command_plan_value([{key: source[key] for key in expected}])
                 != _portable_command_plan_value([expected])):
-            return None
+            return reject("command-plan")
         source_bundle = _validated_portable_protected_input_bundle_digest(source)
         if source_bundle is None or source_bundle != _validated_portable_protected_input_bundle_digest(replay):
-            return None
+            return reject("input-bundle")
         commands = validation.documents["command-results.json"]
         producer_runtime = _standalone_packaging_runtime_binding(commands["runtimeDependencyClosure"],
             commands["runtimeDependencyGuard"], commands["runtime"], source)
@@ -24239,20 +24267,20 @@ def _bind_standalone_portable_replay(producer):
         if (producer_runtime != replay_runtime
                 or runner.runtime_closure_document["closureDigest"] != runner.runtime_closure_digest
                 or runner.runtime_closure_document["dependencyClosureDigest"] != runner.dependency_closure_digest):
-            return None
+            return reject("runtime-binding:" + ",".join(_standalone_packaging_runtime_difference(producer_runtime, replay_runtime) or ["fresh-closure-digest"]))
         streams = []
         for stream in ("stdout", "stderr"):
             exact = raw["rawStructuredFields"][stream].encode("utf-8", errors="strict")
             fresh = getattr(capture, stream + "_raw")
             if (type(fresh) is not bytes or len(fresh) != getattr(capture, stream + "_bytes")
                     or len(fresh) > min(replay[stream + "ByteLimit"], MAX_EVIDENCE_STRING_BYTES)):
-                return None
+                return reject("stream-capture")
             for record, data in ((source, exact), (replay, fresh)):
                 if (len(data) != record[stream + "BytesObserved"]
                         or hashlib.sha256(data).hexdigest() != record[stream + "Sha256"]):
-                    return None
+                    return reject("stream-identity")
             if stream == "stdout" and (exact != b"" or fresh != b""):
-                return None
+                return reject("stdout-not-empty")
             streams.append((exact, fresh))
         replay_raw, = replay["producerObservations"]
         if (_validate_raw_observation_structure(replay_raw, label="standalone replay", source=replay)
@@ -24261,11 +24289,11 @@ def _bind_standalone_portable_replay(producer):
                     "stderr": streams[1][1].decode("utf-8", errors="strict"), "error": None}
                 or any(replay_raw[key] != raw[key] for key in raw
                        if key not in {"rawStructuredFields", "sourceOutputDigest", "producerRecordDigest"})):
-            return None
+            return reject("raw-observation")
         runner_added = {"executionInputs", "executionInputBundleDigest", "protectedTargetBundle",
                         "producerObservations", "producerObservationSetDigest", "completedCommandClass"}
         if any(replay.get(key) != value for key, value in capture.evidence().items() if key not in runner_added):
-            return None
+            return reject("capture-record")
         seal = _observation_bytes({
             "records": records, "observations": runner.observations,
             "plan": runner.command_plan, "runtime": runner.runtime,
@@ -24274,8 +24302,8 @@ def _bind_standalone_portable_replay(producer):
             "producerAdmission": producer.admissions[0].validation.hex(),
         })
         return _StandalonePortablePair(ordinal, *streams[1], seal, runner.platform)
-    except (OSError, AttributeError, IndexError, KeyError, TypeError, ValueError, UnicodeError, OverflowError):
-        return None
+    except (OSError, AttributeError, IndexError, KeyError, TypeError, ValueError, UnicodeError, OverflowError) as exc:
+        return reject("binding-exception:" + type(exc).__name__)
 
 
 def _derive_standalone_packaging_equal_result(pair):
@@ -24535,6 +24563,7 @@ def verify_evidence_with_replay(
         with (_frozen_backend_portable_verifier(verification_runner, expected_context, repo_root=repo_root)
               if backend_portability else nullcontext()) as backend_portable:
             bound_pair = packaging_pair = None
+            packaging_diagnostics = []
             comparison = None
             if not deferred_portability:
                 replay_operation = _run_verification_replay if observation_authority is not None else run_verification_replay
@@ -24581,7 +24610,7 @@ def verify_evidence_with_replay(
                     if packaging_portability and not replay_errors:
                         # Freeze only the completed replay, after its ordinary finalizer
                         # has rebound observation context and cleanup has succeeded.
-                        packaging_pair = _bind_standalone_portable_replay(packaging_context)
+                        packaging_pair = _bind_standalone_portable_replay(packaging_context, diagnostics=packaging_diagnostics)
             errors.extend(replay_errors)
             if transcript is not None and transcript.get("finalAcceptance") != "PASS":
                 errors.append(
@@ -24621,7 +24650,7 @@ def verify_evidence_with_replay(
                 result = packaging_result = None
                 packaging_rebound = None
                 if not errors and packaging_pair is not None:
-                    packaging_rebound = _bind_standalone_portable_replay(packaging_context)
+                    packaging_rebound = _bind_standalone_portable_replay(packaging_context, diagnostics=packaging_diagnostics)
                     if packaging_rebound != packaging_pair:
                         errors.append("verification replay standalone-packaging authority changed")
                 if not errors and backend_portability and bound_pair is not None:
@@ -24639,6 +24668,9 @@ def verify_evidence_with_replay(
                     packaging_result = _derive_standalone_packaging_equal_result(packaging_rebound)
                 if packaging_portability and packaging_result is None:
                     errors.append("verification replay standalone-packaging portable result unavailable or mismatched")
+                    if packaging_diagnostics:
+                        errors.append("verification replay standalone-packaging binding diagnostics: "
+                                      + ",".join(sorted(set(packaging_diagnostics))))
                 if comparison is not None:
                     # A backend record loses its raw difference only after both full
                     # results were derived and compared equal. Every unavailable or
