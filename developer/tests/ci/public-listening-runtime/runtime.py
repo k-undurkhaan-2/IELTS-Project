@@ -78,6 +78,18 @@ def public_api(endpoint: str):
     return json.loads(get_bytes("https://api.github.com/" + endpoint, headers))
 
 
+def assert_revoked_response(method, status, headers, data, sentinel):
+    # Frozen Security app.js requireAuthSessionRegistry returns this JSON before
+    # requireContentAuth can apply its HTML response and no-store header.
+    expected = b'{"error":"Authentication required"}'
+    assert method in {"GET", "HEAD"}
+    assert status == 401 and sentinel not in data
+    assert "cache-control" not in headers
+    assert headers.get("content-type") == "application/json; charset=utf-8"
+    assert headers.get("content-length") == str(len(expected))
+    assert data == (expected if method == "GET" else b"")
+
+
 class Control:
     def __init__(self, role: str, producer: Path | None):
         assert role in {"producer", "verifier"}
@@ -98,6 +110,7 @@ class Control:
         }}
         self.env.update({"CI": "1", "PLAYWRIGHT_BROWSERS_PATH": str(self.root / "browsers")})
         self.number = 0
+        self.browser_logins = 0
         self.failed = None
         self.initial_images = set()
         self.sentinel = (self.prefix + "-SYNTHETIC-ONLY").encode()
@@ -791,7 +804,9 @@ const {chromium} = require(process.argv[1]);
         db_env.write_text(f"POSTGRES_PASSWORD={database_password}\nPOSTGRES_DB=i79\n")
         db_env.chmod(0o600)
         app_env = self.root / (label + "-app.env")
-        values = {"DATABASE_URL": f"postgres://postgres:{database_password}@{database}:5432/i79",
+        database_url = urllib.parse.urlunsplit(("postgres",
+            f"postgres:{urllib.parse.quote(database_password, safe='')}@{database}:5432", "/i79", "", ""))
+        values = {"DATABASE_URL": database_url,
             "SESSION_SECRET": secrets.token_urlsafe(48), "AUTH_HANDOFF_STATE_SECRET": secrets.token_urlsafe(48),
             "ADMIN_USERNAME": self.admin_username, "ADMIN_PASSWORD": "Aa1!" + secrets.token_urlsafe(32),
             "TOTP_ENCRYPTION_KEY": base64.b64encode(secrets.token_bytes(32)).decode(),
@@ -857,10 +872,15 @@ const {chromium} = require(process.argv[1]);
         raise RuntimeError("Unchanged production CMD did not become healthy")
 
     def browser(self, login_only=False):
+        evidence_dir = self.evidence
+        if login_only:
+            self.browser_logins += 1
+            evidence_dir = self.evidence / f"browser-login-{self.browser_logins:02d}"
+            evidence_dir.mkdir()
         config = {"auth": "https://" + self.auth_host, "business": "https://" + self.business_host,
             "admin": "https://" + self.admin_host, "username": self.username, "password": self.password,
             "tlsSpki": self.tls_spki,
-            "exam": EXAM_ID, "routeId": EXAM_ROUTE_ID, "marker": self.sentinel.decode(), "evidence": str(self.evidence),
+            "exam": EXAM_ID, "routeId": EXAM_ROUTE_ID, "marker": self.sentinel.decode(), "evidence": str(evidence_dir),
             "cookies": str(self.root / "browser-cookies.json"), "tools": str(self.tools), "loginOnly": login_only}
         config_file = self.root / "browser-config.json"
         config_file.write_bytes(encode(config))
@@ -870,7 +890,7 @@ const {chromium} = require(process.argv[1]);
         self.write("browser-control-identity.json", {"sha256": file_digest(script),
             "source": "Frozen BROWSER_SOURCE in runtime.py; no application module import"})
         self.run([self.node, script, config_file], timeout=240)
-        result = json.loads((self.evidence / ("browser-login-report.json" if login_only else "browser-report.json")).read_bytes())
+        result = json.loads((evidence_dir / ("browser-login-report.json" if login_only else "browser-report.json")).read_bytes())
         expected = ["ordinary_registration", "ordinary_login", "public_entry", "initial_notice_acknowledged", "browse_search", "exam_wrapper", "private_marker", "question_input", "network_closure", "no_policy_violation"]
         assert result["cases"] == (["ordinary_login"] if login_only else expected) and result["status"] == "PASS"
         cookies = json.loads((self.root / "browser-cookies.json").read_bytes())
@@ -1006,23 +1026,44 @@ const {chromium} = require(process.argv[1]);
         test_aliases(self.cookie, "authenticated")
         test_aliases("", "anonymous")
         # Expiry/revocation alter only this transaction's disposable server-side state.
-        for mode, sql in [("expired", "UPDATE session SET expire = NOW() - INTERVAL '1 day';"),
-                ("revoked", "UPDATE auth_sessions SET revoked_at = NOW() WHERE revoked_at IS NULL;")]:
-            if mode == "revoked":
+        session_targets = [shell, wrapper, short_wrapper, private, nested,
+            "/assets/generated/listening-exams/manifest.js",
+            "/assets/generated/listening-exams/listening-index.compat.js"]
+        self.docker("exec", self.database, "psql", "-U", "postgres", "-d", "i79", "-c",
+            "UPDATE session SET expire = NOW() - INTERVAL '1 day';")
+        for target in session_targets:
+            for method in ["GET", "HEAD"]:
+                status, headers, data = self.http(method, target, cookie=self.cookie, label="expired")
+                assert status == 401 and self.sentinel not in data
+                assert headers.get("cache-control") == "no-store"
+        test_aliases(self.cookie, "expired")
+        revoked_cases = []
+        for target in session_targets:
+            for method in ["GET", "HEAD"]:
+                # The accepted registry middleware destroys a rejected session.
+                # Each case must start from a new ordinary login, otherwise the
+                # later requests would only exercise anonymous rejection.
                 self.browser(login_only=True)
-                assert self.http("GET", shell, cookie=self.cookie, label="fresh-before-revoke")[0] == 200
-            self.docker("exec", self.database, "psql", "-U", "postgres", "-d", "i79", "-c", sql)
-            for target in [shell, wrapper, short_wrapper, private, "/assets/generated/listening-exams/manifest.js"]:
-                for method in ["GET", "HEAD"]:
-                    status, headers, data = self.http(method, target, cookie=self.cookie, label=mode)
-                    assert status == 401 and self.sentinel not in data
-                    assert headers.get("cache-control") == "no-store"
-            test_aliases(self.cookie, mode)
+                assert self.http(method, target, cookie=self.cookie, label="fresh-before-revoke")[0] == 200
+                self.docker("exec", self.database, "psql", "-U", "postgres", "-d", "i79", "-c",
+                    "UPDATE auth_sessions SET revoked_at = NOW() WHERE revoked_at IS NULL;")
+                if not revoked_cases:
+                    # Alias rejection occurs before authentication and therefore
+                    # must be measured while this revoked session still exists.
+                    test_aliases(self.cookie, "revoked")
+                status, headers, data = self.http(method, target, cookie=self.cookie, label="revoked")
+                assert_revoked_response(method, status, headers, data, self.sentinel)
+                revoked_cases.append({"method": method, "target": target,
+                    "ordinary_login_evidence": f"browser-login-{self.browser_logins:02d}",
+                    "pre_revocation_status": 200, "post_revocation_status": status,
+                    "cache_control": None, "response": "accepted_registry_json_rejection"})
+        assert len(revoked_cases) == 14
+        self.write("revoked-session-matrix.json", revoked_cases)
         assert len(alias_results) == 288
         self.write("alias-matrix.json", alias_results)
         self.write("live-csp-comparison.json", {"expected": AUTH["csp"], "observations": csp_observed, "status": "PASS"})
         self.record("F", allowed_get_head_routes=len(routes), alias_cases=288,
-            anonymous=True, expired=True, revoked=True, negative_routes=len(negative))
+            anonymous=True, expired=True, revoked=True, revoked_cases=len(revoked_cases), negative_routes=len(negative))
         self.record("G", public_shell_exact=True, wrapper_exact=True, private_exam_exact=True)
         self.record("B", source_delta_paths=18, generated_dependencies=4,
             stage_and_image_placement=True, browser_network_verified=True)

@@ -453,7 +453,7 @@ _R2_RUNTIME_PATHS = (
     "developer/tests/ci/public-listening-runtime/authority.json",
     "developer/tests/ci/public-listening-runtime/runtime.py",
 )
-_R2_RUNTIME_MANIFEST = "d8ed4bacb27103478710a22ec8746c45b36a7a295a96abde2eb79554a703cb83"
+_R2_RUNTIME_MANIFEST = "e0d5ccd8563c0b690c46037e51e2c4150f6e275083a453bd0dea11a885fb7293"
 _R2_RUNTIME_PROFILE = replace(
     _R2_STAGING_PROFILE,
     name="ci-listening-runtime",
@@ -470,9 +470,9 @@ _R2_RUNTIME_PROFILE = replace(
 )
 _R2_RUNTIME_CONTENT = {
     ".github/workflows/issue79-runtime-verification.yml": {
-        "gitBlob": "29a0e22d113643839f47c042ec926d9b4949ca73",
+        "gitBlob": "27d251f7700bc0dd5af9e88bf3dee4ae54ec2804",
         "size": 6195,
-        "sha256": "846d36e2df868c57baefb86ef996b6ea332f3cf69c27892537b127c952abb748"
+        "sha256": "83ab7a4b511d6a96d7d1820e29251f7486830782d5c0d4a07c17fadbdfc30084"
     },
     "developer/tests/ci/public-listening-runtime/authority.json": {
         "gitBlob": "b975474f194a59acdd75cbdf797b33a0aff860b5",
@@ -480,9 +480,9 @@ _R2_RUNTIME_CONTENT = {
         "sha256": "64fd0950dbaf27843031c67661a706767a5d371c16830048dbfe5e5dcdcd02a1"
     },
     "developer/tests/ci/public-listening-runtime/runtime.py": {
-        "gitBlob": "093819d700b97c037c0637ad1f500bf49fa7d457",
-        "size": 88007,
-        "sha256": "221f5a1735cea35df50200fea8e0e79e9bc47c96eb918960cbe92a12b454cb9d"
+        "gitBlob": "9fdd7819465564a539dd0e86dcffbc7df094d53f",
+        "size": 90386,
+        "sha256": "d878924e842b34f9c6c95a32a2a9ab1eb43750af1af35412b77a9fd48673231b"
     },
     "developer/tests/ci/backend_canonical_portable_result.py": {
         "gitBlob": "d26c74af6b6fbcbee37143e9b396db0dca356e50",
