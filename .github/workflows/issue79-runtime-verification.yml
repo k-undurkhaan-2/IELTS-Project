@@ -39,7 +39,7 @@ jobs:
       - name: Verify frozen runtime control sources
         shell: bash
         run: |
-          printf '%s\n' 'd878924e842b34f9c6c95a32a2a9ab1eb43750af1af35412b77a9fd48673231b  developer/tests/ci/public-listening-runtime/runtime.py' '64fd0950dbaf27843031c67661a706767a5d371c16830048dbfe5e5dcdcd02a1  developer/tests/ci/public-listening-runtime/authority.json' | sha256sum --check --strict
+          printf '%s\n' '7c5ca048556dfd963341db7d45649557ecf58b74a449df475aa0b4acb9d1a47e  developer/tests/ci/public-listening-runtime/runtime.py' '64fd0950dbaf27843031c67661a706767a5d371c16830048dbfe5e5dcdcd02a1  developer/tests/ci/public-listening-runtime/authority.json' | sha256sum --check --strict
       - name: Produce isolated runtime evidence
         env:
           GH_TOKEN: ${{ github.token }}
@@ -90,7 +90,7 @@ jobs:
       - name: Verify frozen runtime control sources
         shell: bash
         run: |
-          printf '%s\n' 'd878924e842b34f9c6c95a32a2a9ab1eb43750af1af35412b77a9fd48673231b  developer/tests/ci/public-listening-runtime/runtime.py' '64fd0950dbaf27843031c67661a706767a5d371c16830048dbfe5e5dcdcd02a1  developer/tests/ci/public-listening-runtime/authority.json' | sha256sum --check --strict
+          printf '%s\n' '7c5ca048556dfd963341db7d45649557ecf58b74a449df475aa0b4acb9d1a47e  developer/tests/ci/public-listening-runtime/runtime.py' '64fd0950dbaf27843031c67661a706767a5d371c16830048dbfe5e5dcdcd02a1  developer/tests/ci/public-listening-runtime/authority.json' | sha256sum --check --strict
       - name: Acquire producer evidence by immutable artifact ID
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:

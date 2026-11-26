@@ -1384,14 +1384,38 @@ def main():
             assert json.loads((args.producer / "built-image-inspect.json").read_bytes())["Id"] == tested_image
             rebuilt_fs = json.loads((control.evidence / "built-filesystem.json").read_bytes())
             producer_fs = json.loads((control.evidence / "producer-filesystem.json").read_bytes())
-            nondeterministic = ("root/.npm/_logs/", "root/.npm/_cacache/index-v5/")
+            # The admitted npm CLI enables Node's compile cache during npm ci.
+            # Its serialized bytes vary between builds. The production node user
+            # cannot read this root-owned 0600 cache; all source/package bytes,
+            # cache names and cache access properties must still match exactly.
+            compile_cache = "tmp/node-compile-cache/v24.22.3-x64-964aae3f-0/"
+            def cache_access(archive):
+                access = {}
+                with tarfile.open(archive, "r:") as tar:
+                    for member in tar:
+                        name = safe_name(member.name)
+                        if name.startswith(compile_cache):
+                            assert re.fullmatch(r"[0-9a-f]{8}", name.removeprefix(compile_cache))
+                            assert member.isfile() and member.uid == member.gid == 0
+                            assert member.mode == 0o600 and not member.linkname
+                            assert 0 < member.size <= 1024 * 1024
+                            assert name not in access
+                            access[name] = {"uid": member.uid, "gid": member.gid, "mode": member.mode, "type": "regular"}
+                assert access, "Expected admitted npm compile-cache evidence is missing"
+                return access
+            rebuilt_cache = cache_access(control.evidence / "built-filesystem.tar")
+            producer_cache = cache_access(control.evidence / "producer-filesystem.tar")
+            assert rebuilt_cache == producer_cache, "Compile-cache names or access properties differ"
+            nondeterministic = ("root/.npm/_logs/", "root/.npm/_cacache/index-v5/", compile_cache)
             def stable_files(rows):
                 return {r["path"]: r for r in rows if not r["path"].startswith(nondeterministic)}
-            assert stable_files(rebuilt_fs) == stable_files(producer_fs), "Independently rebuilt and producer filesystems differ outside npm timestamp metadata"
             control.write("nondeterministic-build-metadata.json", {
                 "recorded_nondeterministic_metadata": list(nondeterministic),
+                "compile_cache_access": producer_cache,
+                "compile_cache_origin": "The immutable base npm/lib/cli.js enables the Node compile cache during npm ci; Scope D does not require bit-identical entire rebuilds",
                 "producer": [r for r in producer_fs if r["path"].startswith(nondeterministic)],
                 "rebuild": [r for r in rebuilt_fs if r["path"].startswith(nondeterministic)]})
+            assert stable_files(rebuilt_fs) == stable_files(producer_fs), "Independently rebuilt and producer filesystems differ outside recorded npm cache metadata"
             control.write("independent-reconstruction.json", {"status": "PASS", "context_sha256": control.context_sha,
                 "rebuilt_image": control.image_id, "producer_image_actually_tested": tested_image,
                 "whole_image_byte_identity_required": False, "candidate_inventory": "candidate-inventory.json"})
