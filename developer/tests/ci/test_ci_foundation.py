@@ -4321,10 +4321,64 @@ def _assert_windows_runtime_capture(test: unittest.TestCase, fixture_factory) ->
 class WorkflowPolicyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.workflow = ci.WORKFLOW_PATH.read_text(encoding="utf-8")
+        cls.current_workflow = ci.WORKFLOW_PATH.read_text(encoding="utf-8")
+        # Keep every historical mutation fixture on the original Documentation bytes.
+        cls.workflow = cls.current_workflow.replace("runs-on: ubuntu-24.04", "runs-on: ubuntu-latest")
         cls.policy = (ci.REPO_ROOT / "docs" / "CI_POLICY.md").read_text(encoding="utf-8")
 
     def test_current_workflow_passes_narrow_policy(self) -> None:
+        current = self.current_workflow
+        linux_jobs = (
+            "repository-policy-producer", "ubuntu-canonical-producer",
+            "repository-policy", "ubuntu-canonical", "final-result",
+        )
+        expected_timeouts = {
+            "repository-policy-producer": "20", "ubuntu-canonical-producer": "45",
+            "windows-compatibility-producer": "45", "repository-policy": "25",
+            "ubuntu-canonical": "55", "windows-compatibility": "55", "final-result": "10",
+        }
+        jobs = ci.parse_canonical_workflow_yaml(current)["jobs"]
+        self.assertEqual({name: job["runs-on"] for name, job in jobs.items()}, {
+            name: "ubuntu-24.04" if name in linux_jobs else "windows-latest"
+            for name in expected_timeouts
+        })
+        self.assertEqual({name: job["timeout-minutes"] for name, job in jobs.items()}, expected_timeouts)
+        for label, text, size, digest, blob in (
+            ("LF", current, 15648,
+             "57f36338af97d5532c0f961c898b83e3ee5b19eb5eb67ff95c3f8c9cdd41b8c1",
+             "e55e3a9cd10fdc76e6806301493fa4e02ac29117"),
+            ("CRLF", current.replace("\n", "\r\n"), 16023,
+             "fe73a004eb937be62bc5a60457c6e391ec8b8302a31658504ec501d9adce25d5",
+             "c95381ba83335e65d75518a90ac112d68ea7514d"),
+        ):
+            with self.subTest(documentation_linux24_identity=label):
+                raw = text.encode("utf-8")
+                self.assertEqual(len(raw), size)
+                self.assertEqual(hashlib.sha256(raw).hexdigest(), digest)
+                self.assertEqual(hashlib.sha1(f"blob {len(raw)}\0".encode("ascii") + raw).hexdigest(), blob)
+                self.assertEqual(ci.check_workflow_text(text), [])
+        self.assertEqual(hashlib.sha256(self.workflow.encode("utf-8")).hexdigest(),
+                         "c406e7277affaa37a9debf7782572e39078e81156295bdb19c8c7037d41e9fbf")
+        self.assertEqual(ci.check_workflow_text(self.workflow.replace("\n", "\r\n")), [])
+        selectors = list(re.finditer(re.escape("runs-on: ubuntu-24.04"), current))
+        self.assertEqual(len(selectors), len(linux_jobs))
+        for job, selector in zip(linux_jobs, selectors):
+            for runner in ("ubuntu-latest", "ubuntu-22.04", "ubuntu-26.04", "self-hosted", "windows-latest"):
+                with self.subTest(documentation_linux_job=job, unauthorized_runner=runner):
+                    candidate = current[:selector.start()] + f"runs-on: {runner}" + current[selector.end():]
+                    self.assertNotEqual(candidate, current)
+                    self.assertTrue(ci.check_workflow_text(candidate))
+        for suffix in ("\n", "# unregistered Documentation workflow\n"):
+            with self.subTest(unregistered_workflow_suffix=suffix):
+                self.assertTrue(ci.check_workflow_text(current + suffix))
+        self.assertTrue(ci.check_workflow_text(current.replace("\n", "\r\n", 1)))
+        for fixture in (current, self.workflow):
+            for timeout in ("0", "19", "21", "35", "999", "20.0"):
+                with self.subTest(original_timeout_preserved=timeout, pinned=(fixture == current)):
+                    candidate = fixture.replace("    timeout-minutes: 20\n",
+                                                f"    timeout-minutes: {timeout}\n", 1)
+                    self.assertNotEqual(candidate, fixture)
+                    self.assertTrue(ci.check_workflow_text(candidate))
         self.assertEqual(ci.check_workflow_text(self.workflow), [])
         self.assertEqual(
             ci.parse_canonical_workflow_yaml(self.workflow)["on"],
