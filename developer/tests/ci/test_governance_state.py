@@ -522,8 +522,8 @@ class ReceiptAdapter(unittest.TestCase):
         self.contract = Path(self.temp.name) / "environment.json"
         self.contract.write_text('{"runtime":"test"}', encoding="utf-8")
         self.args = ["--reuse-receipt-dir", str(self.receipts), "--environment-contract", str(self.contract), "--fixtures-digest", "null"]
-        ids = tuple("test-%d" % index for index in range(476))
-        self.result = SimpleNamespace(wasSuccessful=lambda: True, testsRun=476,
+        ids = tuple("test-%d" % index for index in range(481))
+        self.result = SimpleNamespace(wasSuccessful=lambda: True, testsRun=481,
                                       inventory_ids=ids, executed_test_ids=set(ids), successful_test_ids=set(ids))
 
     def invoke(self, contexts=None, result=None, extra=()):
@@ -571,7 +571,7 @@ class ReceiptAdapter(unittest.TestCase):
         self.assertEqual(broken.read_text(encoding="utf-8"), '{"result":"PASS"}')
 
     def test_failed_partial_or_skipped_suite_cannot_mint_receipt(self):
-        variants = [dict(wasSuccessful=lambda: False), dict(testsRun=475),
+        variants = [dict(wasSuccessful=lambda: False), dict(testsRun=480),
                     dict(successful_test_ids=set(self.result.inventory_ids[:-1]))]
         for changes in variants:
             result = copy.copy(self.result)
