@@ -20010,6 +20010,146 @@ class _CI8FixtureLease:
         self.closed = True
 
 
+class StandaloneReplayRuntimeIdentityTest(unittest.TestCase):
+    AZURE = "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
+    AWS = "Linux-7.0.0-1014-aws-x86_64-with-glibc2.39"
+
+    @staticmethod
+    def seal(closure, guard, runtime, record):
+        for root in closure["dependencyRoots"]:
+            root["memberCount"] = len(root["members"])
+            root["memberManifestDigest"] = hashlib.sha256(
+                ci._canonical_frame(root["members"])).hexdigest()
+        closure["dependencyMemberCount"] = sum(
+            root["memberCount"] for root in closure["dependencyRoots"])
+        semantic = {key: closure[key] for key in
+                    ("lockfiles", "dependencyRoots", "vitest", "nodePath")}
+        closure["dependencyClosureDigest"] = hashlib.sha256(
+            ci._canonical_frame(semantic)).hexdigest()
+        closure["closureDigest"] = hashlib.sha256(ci._canonical_frame({
+            key: value for key, value in closure.items() if key != "closureDigest"
+        })).hexdigest()
+        runtime.update(runtimeClosureDigest=closure["closureDigest"],
+                       dependencyClosureDigest=closure["dependencyClosureDigest"],
+                       dependencyMemberCount=str(closure["dependencyMemberCount"]))
+
+    @classmethod
+    def fixture(cls, os_identity, platform="ubuntu"):
+        import test_backend_canonical_portable_result as backend
+        source = backend.fixture(platform)
+        closure, guard, runtime = copy.deepcopy(
+            (source.runtime_closure, source.runtime_guard, source.runtime))
+        closure["gitExecutable"] = {
+            **copy.deepcopy(closure["pythonExecutable"]),
+            "role": "git-runtime",
+            "canonicalPath": str(Path(sys.executable).parent / "fixture-git"),
+            "sha256": hashlib.sha256(b"fixture-git").hexdigest(),
+        }
+        runtime["os"] = os_identity
+        python = closure["pythonExecutable"]
+        record = {
+            "platform": platform,
+            "resolvedExecutablePath": python["canonicalPath"],
+            "resolvedExecutableSize": python["size"],
+            "resolvedExecutableSha256": python["sha256"],
+            "executionArgv": [python["canonicalPath"], "-B",
+                              "developer/tests/ci/test_standalone_packaging.py"],
+        }
+        cls.seal(closure, guard, runtime, record)
+        return closure, guard, runtime, record
+
+    def test_cloud_kernel_build_is_portable_without_changing_raw_evidence(self):
+        producer, replay = self.fixture(self.AZURE), self.fixture(self.AWS)
+        before = copy.deepcopy((producer, replay))
+        left = ci._standalone_packaging_runtime_binding(*producer)
+        right = ci._standalone_packaging_runtime_binding(*replay)
+        self.assertEqual(left, right)
+        self.assertEqual((producer, replay), before)
+        self.assertEqual(producer[2]["os"], self.AZURE)
+        self.assertEqual(replay[2]["os"], self.AWS)
+
+    def test_kernel_release_architecture_and_libc_remain_exact(self):
+        baseline = ci._standalone_packaging_runtime_binding(*self.fixture(self.AZURE))
+        for identity in (
+            self.AWS.replace("7.0.0", "7.0.1"),
+            self.AWS.replace("7.0.0", "6.17.0"),
+            self.AWS.replace("x86_64", "aarch64"),
+            self.AWS.replace("glibc2.39", "glibc2.40"),
+            self.AWS.replace("glibc2.39", "musl1.2.5"),
+        ):
+            with self.subTest(identity=identity):
+                replay = ci._standalone_packaging_runtime_binding(*self.fixture(identity))
+                self.assertNotEqual(baseline, replay)
+
+    def test_unrecognized_and_non_ubuntu_os_claims_are_not_normalized(self):
+        for first, second in (
+            (self.AZURE.replace("azure", "generic"), self.AWS.replace("aws", "generic")),
+            (self.AZURE + "-extra", self.AWS + "-extra"),
+            ("Linux-test-one", "Linux-test-two"),
+            ("", self.AZURE),
+        ):
+            with self.subTest(first=first, second=second):
+                left = ci._standalone_packaging_runtime_binding(*self.fixture(first))
+                right = ci._standalone_packaging_runtime_binding(*self.fixture(second))
+                self.assertNotEqual(left, right)
+        for platform in ("ubuntu", "windows"):
+            first = "Windows-10.0.26100"
+            second = "Windows-10.0.26101"
+            with self.subTest(platform=platform):
+                self.assertNotEqual(
+                    ci._standalone_packaging_runtime_binding(*self.fixture(first, platform)),
+                    ci._standalone_packaging_runtime_binding(*self.fixture(second, platform)))
+        self.assertNotEqual(
+            ci._standalone_packaging_runtime_binding(*self.fixture(self.AZURE, "windows")),
+            ci._standalone_packaging_runtime_binding(*self.fixture(self.AWS, "windows")))
+
+    def test_runtime_versions_tool_bytes_and_dependency_closure_remain_exact(self):
+        baseline = ci._standalone_packaging_runtime_binding(*self.fixture(self.AZURE))
+        for field in ("python", "pythonImplementation", "node", "npm"):
+            changed = self.fixture(self.AWS)
+            changed[2][field] += "-changed"
+            with self.subTest(runtime_field=field):
+                self.assertNotEqual(baseline, ci._standalone_packaging_runtime_binding(*changed))
+        for field in ("pythonExecutable", "nodeExecutable", "npmEntrypoint", "gitExecutable"):
+            changed = self.fixture(self.AWS)
+            changed[0][field]["sha256"] = "a" * 64
+            if field == "pythonExecutable":
+                changed[3]["resolvedExecutableSha256"] = "a" * 64
+            self.seal(*changed)
+            with self.subTest(tool=field):
+                self.assertNotEqual(baseline, ci._standalone_packaging_runtime_binding(*changed))
+        changed = self.fixture(self.AWS)
+        changed[0]["dependencyRoots"][0]["members"][0]["sha256"] = "b" * 64
+        self.seal(*changed)
+        self.assertNotEqual(baseline, ci._standalone_packaging_runtime_binding(*changed))
+
+    def test_local_runtime_authority_and_guard_fail_closed(self):
+        mutations = [
+            (0, ("pythonExecutable", "leaseHeld"), False),
+            (0, ("nodeExecutable", "leaseHeld"), False),
+            (0, ("npmEntrypoint", "stableIdentity", "reparsePoint"), True),
+            (0, ("gitExecutable", "size"), 0),
+            (0, ("measurementStatus",), "local-nondependency-npm-unavailable"),
+            (1, ("active",), True),
+            (1, ("activeDuringReplay",), False),
+            (1, ("mutationState",), "changed"),
+            (1, ("queueOverflow",), True),
+            (1, ("mutationEventCount",), 1),
+            (1, ("watcherBackend",), "_ModelMutationWatcher"),
+            (3, ("resolvedExecutableSha256",), "a" * 64),
+            (3, ("executionArgv",), [sys.executable, "-c", "pass"]),
+        ]
+        for part, path, value in mutations:
+            changed = self.fixture(self.AWS)
+            target = changed[part]
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            self.seal(*changed)
+            with self.subTest(part=part, path=path), self.assertRaises(ValueError):
+                ci._standalone_packaging_runtime_binding(*changed)
+
+
 class CI8RuntimeDependencyClosureTest(unittest.TestCase):
     def local_tool_authority(self) -> tuple[ci.ToolAuthorityPolicy, dict[str, str]]:
         return _resolved_local_test_authority("python", "node", "git")
@@ -23711,8 +23851,8 @@ def run_with_receipt(argv: list[str]) -> int:
 
     result = unittest.main(module=__name__, argv=[sys.argv[0]], verbosity=2,
                            testRunner=InventoryTextTestRunner, exit=False).result
-    complete = (result.wasSuccessful() and result.testsRun == 476
-                and len(result.inventory_ids) == 476
+    complete = (result.wasSuccessful() and result.testsRun == 481
+                and len(result.inventory_ids) == 481
                 and set(result.inventory_ids) == result.executed_test_ids == result.successful_test_ids)
     if before is not None and complete:
         try:

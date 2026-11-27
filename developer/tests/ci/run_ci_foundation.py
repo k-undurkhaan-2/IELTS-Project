@@ -24147,8 +24147,22 @@ def _standalone_packaging_runtime_binding(closure, guard, runtime, record):
             raise ValueError("standalone runtime tool lease is invalid")
         tools[key] = {name: value for name, value in tool.items()
                       if name not in {"canonicalPath", "stableIdentity"}}
+    runtime_identity = {key: value for key, value in runtime.items() if key != "runtimeClosureDigest"}
+    # Admitted Ubuntu jobs may use different Azure/AWS kernel build variants.
+    # Keep the raw platform text in held evidence. Only this cross-job binding
+    # compares upstream kernel release, architecture and libc after all local
+    # executable, dependency and guard checks above have succeeded.
+    if record["platform"] == "ubuntu":
+        kernel = re.fullmatch(
+            r"Linux-([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})-[0-9]{1,6}-(?:azure|aws)-(x86_64)-with-(glibc[0-9]{1,3}\.[0-9]{1,3})",
+            runtime_identity.get("os", ""))
+        if kernel is not None:
+            runtime_identity["os"] = {
+                "system": "Linux", "kernelRelease": kernel[1],
+                "architecture": kernel[2], "libc": kernel[3],
+            }
     return _observation_bytes({
-        "runtime": {key: value for key, value in runtime.items() if key != "runtimeClosureDigest"},
+        "runtime": runtime_identity,
         "tools": tools, "dependencyClosureDigest": closure["dependencyClosureDigest"],
         "guard": guard,
     })
